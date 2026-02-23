@@ -1,0 +1,63 @@
+bundle:
+  name: "genie-space-optimizer"
+
+variables:
+  catalog:
+    default: "vibe_coding_workshop_catalog"
+  gold_schema:
+    default: "genie_optimization"
+  warehouse_id:
+    default: "02c1885622661afa"
+
+include:
+  - resources/genie_optimization_job.yml
+
+sync:
+  include:
+    - .build
+
+artifacts:
+  default:
+    build: apx build
+
+resources:
+  database_instances:
+    genie-space-optimizer-db:
+      name: "genie-space-optimizer"
+      capacity: "CU_1"
+  apps:
+    genie-space-optimizer-app:
+      name: "genie-space-optimizer"
+      description: "genie-space-optimizer created with apx"
+      source_code_path: ./.build
+      config:
+        env:
+          - name: GENIE_SPACE_OPTIMIZER_CATALOG
+            value: ${var.catalog}
+          - name: GENIE_SPACE_OPTIMIZER_SCHEMA
+            value: ${var.gold_schema}
+          - name: GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID
+            value: ${var.warehouse_id}
+      resources:
+        - name: "db"
+          database:
+            database_name: "databricks_postgres"
+            instance_name: ${resources.database_instances.genie-space-optimizer-db.name}
+            permission: "CAN_CONNECT_AND_CREATE"
+        - name: "sql-warehouse"
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: "CAN_USE"
+      user_api_scopes:
+        - "dashboards.genie"
+        - "sql"
+        - "iam.access-control:read"
+        - "iam.current-user:read"
+      permissions:
+        - user_name: "users"
+          level: "CAN_USE"
+
+targets:
+  dev:
+    mode: development
+    default: true

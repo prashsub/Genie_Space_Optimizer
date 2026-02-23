@@ -1,0 +1,1 @@
+command: ["uvicorn", "genie_space_optimizer.backend.app:app", "--workers", "2"]
