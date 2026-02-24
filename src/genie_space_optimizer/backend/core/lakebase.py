@@ -147,16 +147,27 @@ def initialize_models(engine: Engine) -> None:
 class _LakebaseDependency(LifespanDependency):
     @asynccontextmanager
     async def lifespan(self, app: FastAPI) -> AsyncGenerator[None, None]:
-        db_config = DatabaseConfig()  # ty: ignore[missing-argument]
-        ws = app.state.workspace_client
+        try:
+            db_config = DatabaseConfig()  # ty: ignore[missing-argument]
+            ws = app.state.workspace_client
 
-        engine = create_db_engine(db_config, ws)
-        validate_db(engine, db_config)
-        initialize_models(engine)
+            engine = create_db_engine(db_config, ws)
+            validate_db(engine, db_config)
+            initialize_models(engine)
 
-        app.state.engine = engine
+            app.state.engine = engine
+        except Exception:
+            logger.warning(
+                "Lakebase database unavailable — app will run without DB features. "
+                "Check that the database resource is provisioned and the SP has access.",
+                exc_info=True,
+            )
+            app.state.engine = None
+
         yield
-        engine.dispose()
+
+        if getattr(app.state, "engine", None) is not None:
+            app.state.engine.dispose()
 
     @staticmethod
     def __call__(request: Request) -> Generator[Session, None, None]:

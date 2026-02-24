@@ -490,6 +490,16 @@ PROMPT_ALIAS = "production"
 """Default prompt alias for loading judge prompts."""
 ```
 
+Prompt Registry operational requirement (Unity Catalog schema level):
+- `CREATE FUNCTION`
+- `EXECUTE`
+- `MANAGE`
+
+Best practice:
+- Keep `STRICT_PROMPT_REGISTRATION=true` so missing permissions fail preflight early.
+- Ensure deployment grants include Prompt Registry privileges for the Databricks App service principal.
+- On first-time app creation, run deploy a second time so post-creation grants can be applied.
+
 ---
 
 ## 14. Patch DSL Constants

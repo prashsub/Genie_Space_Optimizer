@@ -64,10 +64,15 @@ def insert_row(
     Values are auto-quoted based on Python type (str → quoted, else raw).
     """
     fqn = _fqn(catalog, schema, table)
+    def _sql_lit(v: Any) -> str:
+        if isinstance(v, str):
+            return f"'{v.replace(chr(39), chr(39)+chr(39))}'"
+        if v is None:
+            return "NULL"
+        return str(v)
+
     columns = ", ".join(row_dict.keys())
-    values = ", ".join(
-        f"'{v}'" if isinstance(v, str) else str(v) for v in row_dict.values()
-    )
+    values = ", ".join(_sql_lit(v) for v in row_dict.values())
     stmt = f"INSERT INTO {fqn} ({columns}) VALUES ({values})"
     logger.debug("insert_row: %s", stmt)
     spark.sql(stmt)
@@ -89,7 +94,12 @@ def update_row(
     fqn = _fqn(catalog, schema, table)
 
     def _fmt(val: Any) -> str:
-        return f"'{val}'" if isinstance(val, str) else str(val)
+        if isinstance(val, str):
+            escaped = val.replace("'", "''")
+            return f"'{escaped}'"
+        if val is None:
+            return "NULL"
+        return str(val)
 
     set_clause = ", ".join(f"{col} = {_fmt(val)}" for col, val in update_cols.items())
     where_clause = " AND ".join(f"{col} = {_fmt(val)}" for col, val in key_cols.items())

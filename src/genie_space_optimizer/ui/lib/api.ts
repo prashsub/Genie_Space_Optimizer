@@ -17,27 +17,8 @@ export interface ActionResponse {
     runId: string;
     status: string;
 }
-export interface ActivityItem {
-    baselineScore?: number | null;
-    initiatedBy: string;
-    optimizedScore?: number | null;
-    runId: string;
-    spaceId: string;
-    spaceName: string;
-    status: string;
-    timestamp: string;
-}
-export interface ComparisonData {
-    baselineScore: number;
-    improvementPct: number;
-    optimized: SpaceConfiguration;
-    optimizedScore: number;
-    original: SpaceConfiguration;
-    perDimensionScores: DimensionScore[];
-    runId: string;
-    spaceId: string;
-    spaceName: string;
-}
+export type ActivityItem = unknown;
+export type ComparisonData = unknown;
 export interface ComplexValue {
     display?: string | null;
     primary?: boolean | null;
@@ -45,86 +26,58 @@ export interface ComplexValue {
     type?: string | null;
     value?: string | null;
 }
-export interface DimensionScore {
-    baseline: number;
-    delta: number;
-    dimension: string;
-    optimized: number;
+export type DimensionScore = unknown;
+export interface FunctionInfo {
+    catalog: string;
+    name: string;
+    schema_name: string;
 }
 export interface HTTPValidationError {
     detail?: ValidationError[];
 }
-export interface LeverStatus {
-    lever: number;
-    name: string;
-    patchCount?: number;
-    patches?: Record<string, unknown>[];
-    rollbackReason?: string | null;
-    scoreAfter?: number | null;
-    scoreBefore?: number | null;
-    scoreDelta?: number | null;
-    status: string;
+export interface JoinInfo {
+    joinColumns?: string[];
+    leftTable: string;
+    relationshipType?: string | null;
+    rightTable: string;
 }
+export type LeverStatus = unknown;
 export interface Name {
     family_name?: string | null;
     given_name?: string | null;
 }
 export interface OptimizeResponse {
     jobRunId: string;
+    jobUrl?: string | null;
     runId: string;
 }
-export interface PipelineRun {
-    baselineScore?: number | null;
-    completedAt?: string | null;
-    convergenceReason?: string | null;
-    initiatedBy: string;
-    levers?: LeverStatus[];
-    optimizedScore?: number | null;
-    runId: string;
-    spaceId: string;
-    spaceName: string;
-    startedAt: string;
-    status: string;
-    steps: PipelineStep[];
+export interface PipelineLink {
+    category: string;
+    label: string;
+    url: string;
 }
-export interface PipelineStep {
-    durationSeconds?: number | null;
-    inputs?: Record<string, unknown> | null;
-    name: string;
-    outputs?: Record<string, unknown> | null;
-    status: string;
-    stepNumber: number;
-    summary?: string | null;
-}
-export interface RunSummary {
-    baselineScore?: number | null;
-    optimizedScore?: number | null;
-    runId: string;
-    status: string;
-    timestamp: string;
-}
+export type PipelineRun = unknown;
+export type PipelineStep = unknown;
+export type RunSummary = unknown;
 export interface SpaceConfiguration {
     instructions: string;
     sampleQuestions: string[];
     tableDescriptions: TableDescription[];
 }
 export interface SpaceDetail {
+    benchmarkQuestions?: string[];
     description: string;
+    functions?: FunctionInfo[];
+    hasActiveRun?: boolean;
     id: string;
     instructions: string;
+    joins?: JoinInfo[];
     name: string;
     optimizationHistory: RunSummary[];
     sampleQuestions: string[];
     tables: TableInfo[];
 }
-export interface SpaceSummary {
-    description: string;
-    id: string;
-    lastModified: string;
-    name: string;
-    qualityScore?: number | null;
-    tableCount: number;
-}
+export type SpaceSummary = unknown;
 export interface TableDescription {
     description: string;
     tableName: string;
@@ -315,13 +268,40 @@ export function useCurrentUserSuspense<TData = {
 }
 export interface GetRunParams {
     run_id: string;
+    "X-Forwarded-Host"?: string | null;
+    "X-Forwarded-Preferred-Username"?: string | null;
+    "X-Forwarded-User"?: string | null;
+    "X-Forwarded-Email"?: string | null;
+    "X-Request-Id"?: string | null;
+    "X-Forwarded-Access-Token"?: string | null;
 }
 export const getRun = async (params: GetRunParams, options?: RequestInit): Promise<{
     data: PipelineRun;
 }> =>{
     const res = await fetch(`/api/genie/runs/${params.run_id}`, {
         ...options,
-        method: "GET"
+        method: "GET",
+        headers: {
+            ...(params?.["X-Forwarded-Host"] != null && {
+                "X-Forwarded-Host": params["X-Forwarded-Host"]
+            }),
+            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
+                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
+            }),
+            ...(params?.["X-Forwarded-User"] != null && {
+                "X-Forwarded-User": params["X-Forwarded-User"]
+            }),
+            ...(params?.["X-Forwarded-Email"] != null && {
+                "X-Forwarded-Email": params["X-Forwarded-Email"]
+            }),
+            ...(params?.["X-Request-Id"] != null && {
+                "X-Request-Id": params["X-Request-Id"]
+            }),
+            ...(params?.["X-Forwarded-Access-Token"] != null && {
+                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
+            }),
+            ...options?.headers
+        }
     });
     if (!res.ok) {
         const body = await res.text();
@@ -373,13 +353,40 @@ export function useGetRunSuspense<TData = {
 }
 export interface ApplyOptimizationParams {
     run_id: string;
+    "X-Forwarded-Host"?: string | null;
+    "X-Forwarded-Preferred-Username"?: string | null;
+    "X-Forwarded-User"?: string | null;
+    "X-Forwarded-Email"?: string | null;
+    "X-Request-Id"?: string | null;
+    "X-Forwarded-Access-Token"?: string | null;
 }
 export const applyOptimization = async (params: ApplyOptimizationParams, options?: RequestInit): Promise<{
     data: ActionResponse;
 }> =>{
     const res = await fetch(`/api/genie/runs/${params.run_id}/apply`, {
         ...options,
-        method: "POST"
+        method: "POST",
+        headers: {
+            ...(params?.["X-Forwarded-Host"] != null && {
+                "X-Forwarded-Host": params["X-Forwarded-Host"]
+            }),
+            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
+                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
+            }),
+            ...(params?.["X-Forwarded-User"] != null && {
+                "X-Forwarded-User": params["X-Forwarded-User"]
+            }),
+            ...(params?.["X-Forwarded-Email"] != null && {
+                "X-Forwarded-Email": params["X-Forwarded-Email"]
+            }),
+            ...(params?.["X-Request-Id"] != null && {
+                "X-Request-Id": params["X-Request-Id"]
+            }),
+            ...(params?.["X-Forwarded-Access-Token"] != null && {
+                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
+            }),
+            ...options?.headers
+        }
     });
     if (!res.ok) {
         const body = await res.text();

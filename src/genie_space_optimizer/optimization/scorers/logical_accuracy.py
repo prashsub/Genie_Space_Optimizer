@@ -17,6 +17,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
+    format_asi_markdown,
 )
 
 if TYPE_CHECKING:
@@ -48,39 +49,57 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
         try:
             result = _call_llm_for_scoring(w, prompt)
         except Exception as e:
+            metadata = build_asi_metadata(
+                failure_type="other",
+                severity="info",
+                confidence=0.0,
+                counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
             return Feedback(
                 name="logical_accuracy",
                 value="unknown",
-                rationale=f"LLM call failed: {e}",
-                source=LLM_SOURCE,
-                metadata=build_asi_metadata(
-                    failure_type="other",
-                    severity="info",
-                    confidence=0.0,
-                    counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+                rationale=format_asi_markdown(
+                    judge_name="logical_accuracy",
+                    value="unknown",
+                    rationale=f"LLM call failed: {e}",
+                    metadata=metadata,
                 ),
+                source=LLM_SOURCE,
+                metadata=metadata,
             )
 
         if result.get("correct", False):
             return Feedback(
                 name="logical_accuracy",
                 value="yes",
-                rationale=result.get("rationale", "Logic correct"),
+                rationale=format_asi_markdown(
+                    judge_name="logical_accuracy",
+                    value="yes",
+                    rationale=result.get("rationale", "Logic correct"),
+                    extra={"llm_response": result},
+                ),
                 source=LLM_SOURCE,
             )
+        metadata = build_asi_metadata(
+            failure_type=result.get("failure_type", "wrong_aggregation"),
+            severity="major",
+            confidence=0.85,
+            wrong_clause=result.get("wrong_clause", ""),
+            blame_set=result.get("blame_set", []),
+            counterfactual_fix="Review aggregation/filter logic in Genie metadata",
+        )
         return Feedback(
             name="logical_accuracy",
             value="no",
-            rationale=result.get("rationale", "Logic mismatch"),
-            source=LLM_SOURCE,
-            metadata=build_asi_metadata(
-                failure_type=result.get("failure_type", "wrong_aggregation"),
-                severity="major",
-                confidence=0.85,
-                wrong_clause=result.get("wrong_clause", ""),
-                blame_set=result.get("blame_set", []),
-                counterfactual_fix="Review aggregation/filter logic in Genie metadata",
+            rationale=format_asi_markdown(
+                judge_name="logical_accuracy",
+                value="no",
+                rationale=result.get("rationale", "Logic mismatch"),
+                metadata=metadata,
+                extra={"llm_response": result},
             ),
+            source=LLM_SOURCE,
+            metadata=metadata,
         )
 
     return logical_accuracy_judge

@@ -17,6 +17,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
+    format_asi_markdown,
 )
 
 if TYPE_CHECKING:
@@ -47,39 +48,57 @@ def _make_schema_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
         try:
             result = _call_llm_for_scoring(w, prompt)
         except Exception as e:
+            metadata = build_asi_metadata(
+                failure_type="other",
+                severity="info",
+                confidence=0.0,
+                counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
             return Feedback(
                 name="schema_accuracy",
                 value="unknown",
-                rationale=f"LLM call failed: {e}",
-                source=LLM_SOURCE,
-                metadata=build_asi_metadata(
-                    failure_type="other",
-                    severity="info",
-                    confidence=0.0,
-                    counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+                rationale=format_asi_markdown(
+                    judge_name="schema_accuracy",
+                    value="unknown",
+                    rationale=f"LLM call failed: {e}",
+                    metadata=metadata,
                 ),
+                source=LLM_SOURCE,
+                metadata=metadata,
             )
 
         if result.get("correct", False):
             return Feedback(
                 name="schema_accuracy",
                 value="yes",
-                rationale=result.get("rationale", "Schema correct"),
+                rationale=format_asi_markdown(
+                    judge_name="schema_accuracy",
+                    value="yes",
+                    rationale=result.get("rationale", "Schema correct"),
+                    extra={"llm_response": result},
+                ),
                 source=LLM_SOURCE,
             )
+        metadata = build_asi_metadata(
+            failure_type=result.get("failure_type", "wrong_column"),
+            severity="major",
+            confidence=0.85,
+            wrong_clause=result.get("wrong_clause", ""),
+            blame_set=result.get("blame_set", []),
+            counterfactual_fix="Review table/column references in Genie metadata",
+        )
         return Feedback(
             name="schema_accuracy",
             value="no",
-            rationale=result.get("rationale", "Schema mismatch"),
-            source=LLM_SOURCE,
-            metadata=build_asi_metadata(
-                failure_type=result.get("failure_type", "wrong_column"),
-                severity="major",
-                confidence=0.85,
-                wrong_clause=result.get("wrong_clause", ""),
-                blame_set=result.get("blame_set", []),
-                counterfactual_fix="Review table/column references in Genie metadata",
+            rationale=format_asi_markdown(
+                judge_name="schema_accuracy",
+                value="no",
+                rationale=result.get("rationale", "Schema mismatch"),
+                metadata=metadata,
+                extra={"llm_response": result},
             ),
+            source=LLM_SOURCE,
+            metadata=metadata,
         )
 
     return schema_accuracy_judge

@@ -7,8 +7,11 @@ as an MLflow LoggedModel. This provides full lineage and one-click rollback.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import logging
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import mlflow
@@ -33,6 +36,7 @@ def create_genie_model_version(
     config: dict,
     iteration: int,
     domain: str,
+    experiment_name: str | None = None,
     *,
     uc_schema: str,
     uc_columns: list[dict] | None = None,
@@ -49,40 +53,66 @@ def create_genie_model_version(
     model_name = MODEL_NAME_TEMPLATE.format(space_id=space_id)
 
     try:
-        model = mlflow.create_logged_model(
-            name=model_name,
-            params={
-                "space_id": space_id,
-                "domain": domain,
-                "iteration": str(iteration),
-                "uc_schema": uc_schema,
-            },
-            tags={
-                "domain": domain,
-                "space_id": space_id,
-                "iteration": str(iteration),
-            },
-        )
-        model_id = model.model_id
+        if experiment_name:
+            mlflow.set_experiment(experiment_name)
 
+        resolved_columns, resolved_tags, resolved_routines = _resolve_uc_metadata(
+            config=config,
+            uc_columns=uc_columns,
+            uc_tags=uc_tags,
+            uc_routines=uc_routines,
+        )
         metadata_snapshot: dict[str, Any] = {
-            "space_config": _safe_serialize(config),
+            "space_config": config,
             "iteration": iteration,
+            "uc_schema": uc_schema,
+            "uc_columns": resolved_columns,
+            "uc_tags": resolved_tags,
+            "uc_routines": resolved_routines,
+            "patch_set": patch_set or [],
+            "parent_model_id": parent_model_id,
         }
-        if uc_columns is not None:
-            metadata_snapshot["uc_columns_count"] = len(uc_columns)
-        if uc_tags is not None:
-            metadata_snapshot["uc_tags_count"] = len(uc_tags)
-        if uc_routines is not None:
-            metadata_snapshot["uc_routines_count"] = len(uc_routines)
-        if patch_set is not None:
-            metadata_snapshot["patch_count"] = len(patch_set)
-        if parent_model_id is not None:
-            metadata_snapshot["parent_model_id"] = parent_model_id
+        artifact_prefix = f"model_snapshots/iter_{iteration}"
 
-        mlflow.log_params(
-            {f"model_{k}": str(v)[:250] for k, v in metadata_snapshot.items()},
+        active_run = mlflow.active_run()
+        run_ctx = nullcontext(active_run) if active_run else mlflow.start_run(
+            run_name=f"model_snapshot_iter_{iteration}",
         )
+        with run_ctx as run:
+            current_run = run if run is not None else mlflow.active_run()
+            run_id = current_run.info.run_id if current_run else ""
+            _log_dict_artifact(config, f"{artifact_prefix}/space_config.json")
+            _log_dict_artifact(metadata_snapshot, f"{artifact_prefix}/metadata_snapshot.json")
+
+            model = _initialize_logged_model(
+                name=model_name,
+                source_run_id=run_id or None,
+                params={
+                    "space_id": space_id,
+                    "domain": domain,
+                    "iteration": str(iteration),
+                    "uc_schema": uc_schema,
+                    "uc_columns_count": str(len(resolved_columns)),
+                    "uc_tags_count": str(len(resolved_tags)),
+                    "uc_routines_count": str(len(resolved_routines)),
+                    "patch_count": str(len(patch_set or [])),
+                    "parent_model_id": str(parent_model_id or ""),
+                    "snapshot_run_id": run_id or "",
+                    "space_config_artifact": f"{artifact_prefix}/space_config.json",
+                    "metadata_artifact": f"{artifact_prefix}/metadata_snapshot.json",
+                    # Backward-compatible key used by rollback fallback path.
+                    "model_space_config": _safe_serialize(config),
+                },
+                tags={
+                    "domain": domain,
+                    "space_id": space_id,
+                    "iteration": str(iteration),
+                    "uc_schema": uc_schema,
+                    "traceability": "genie_space_optimizer",
+                },
+            )
+            model_id = model.model_id
+            _finalize_logged_model(model_id)
 
         logger.info(
             "Created LoggedModel %s (iter=%d, model_id=%s)",
@@ -92,7 +122,7 @@ def create_genie_model_version(
 
     except Exception:
         logger.exception("Failed to create LoggedModel for iter %d", iteration)
-        return f"model_{space_id}_{iteration}"
+        return ""
 
 
 def promote_best_model(
@@ -213,3 +243,77 @@ def _safe_serialize(obj: Any) -> str:
         return s[:250] if len(s) > 250 else s
     except Exception:
         return str(obj)[:250]
+
+
+def _resolve_uc_metadata(
+    *,
+    config: dict,
+    uc_columns: list[dict] | None,
+    uc_tags: list[dict] | None,
+    uc_routines: list[dict] | None,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Resolve UC metadata from explicit args first, then prefetched snapshot."""
+    prefetched = config.get("_prefetched_uc_metadata", {})
+    prefetched_columns = prefetched.get("uc_columns", []) if isinstance(prefetched, dict) else []
+    prefetched_tags = prefetched.get("uc_tags", []) if isinstance(prefetched, dict) else []
+    prefetched_routines = prefetched.get("uc_routines", []) if isinstance(prefetched, dict) else []
+
+    resolved_columns = uc_columns if isinstance(uc_columns, list) else (
+        prefetched_columns if isinstance(prefetched_columns, list) else []
+    )
+    resolved_tags = uc_tags if isinstance(uc_tags, list) else (
+        prefetched_tags if isinstance(prefetched_tags, list) else []
+    )
+    resolved_routines = uc_routines if isinstance(uc_routines, list) else (
+        prefetched_routines if isinstance(prefetched_routines, list) else []
+    )
+    return resolved_columns, resolved_tags, resolved_routines
+
+
+def _initialize_logged_model(
+    *,
+    name: str,
+    source_run_id: str | None,
+    params: dict[str, str],
+    tags: dict[str, str],
+) -> Any:
+    """Create a logged model across MLflow API variants."""
+    init_fn = getattr(mlflow, "initialize_logged_model", None)
+    if callable(init_fn):
+        return init_fn(
+            name=name,
+            source_run_id=source_run_id,
+            params=params,
+            tags=tags,
+            model_type="agent",
+        )
+
+    create_fn = getattr(mlflow, "create_logged_model", None)
+    if callable(create_fn):
+        return create_fn(name=name, params=params, tags=tags)
+
+    raise RuntimeError("No supported MLflow LoggedModel creation API found")
+
+
+def _finalize_logged_model(model_id: str) -> None:
+    """Finalize logged model if the MLflow API supports it."""
+    finalize_fn = getattr(mlflow, "finalize_logged_model", None)
+    if not callable(finalize_fn):
+        return
+    try:
+        finalize_fn(model_id=model_id, status="READY")
+    except Exception:
+        logger.debug("Ignoring finalize_logged_model failure for %s", model_id, exc_info=True)
+
+
+def _log_dict_artifact(payload: dict[str, Any], artifact_file: str) -> None:
+    """Log dict artifact across MLflow API variants."""
+    log_dict_fn = getattr(mlflow, "log_dict", None)
+    if callable(log_dict_fn):
+        log_dict_fn(payload, artifact_file)
+        return
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="genie-opt-"))
+    tmp_file = tmp_dir / Path(artifact_file).name
+    tmp_file.write_text(json.dumps(payload, default=str, indent=2), encoding="utf-8")
+    mlflow.log_artifact(str(tmp_file), artifact_path=str(Path(artifact_file).parent))

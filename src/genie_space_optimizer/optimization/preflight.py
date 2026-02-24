@@ -9,6 +9,7 @@ LoggedModel (iteration 0).
 from __future__ import annotations
 
 import logging
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import mlflow
@@ -18,22 +19,88 @@ from genie_space_optimizer.common.config import (
     TARGET_BENCHMARK_COUNT,
 )
 from genie_space_optimizer.common.genie_client import fetch_space_config
-from genie_space_optimizer.common.uc_metadata import get_columns, get_routines, get_tags
+from genie_space_optimizer.common.uc_metadata import (
+    extract_genie_space_table_refs,
+    get_columns,
+    get_columns_for_tables,
+    get_routines,
+    get_routines_for_schemas,
+    get_tags,
+    get_tags_for_tables,
+)
 from genie_space_optimizer.optimization.benchmarks import validate_benchmarks
+from genie_space_optimizer.optimization.applier import _get_general_instructions
 from genie_space_optimizer.optimization.evaluation import (
     create_evaluation_dataset,
+    extract_genie_space_benchmarks,
     generate_benchmarks,
     load_benchmarks_from_dataset,
+    register_instruction_version,
     register_judge_prompts,
 )
 from genie_space_optimizer.optimization.models import create_genie_model_version
-from genie_space_optimizer.optimization.state import write_stage
+from genie_space_optimizer.optimization.state import load_run, write_stage
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
     from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
+
+
+def _collect_or_empty(fetch_fn: Any, label: str) -> list[dict]:
+    """Best-effort metadata fetch; continue if catalog permissions are limited."""
+    try:
+        return [r.asDict() for r in fetch_fn().collect()]
+    except Exception as exc:
+        logger.warning("Skipping %s metadata due to access issue: %s", label, exc)
+        return []
+
+
+def _resolve_experiment_path(
+    *,
+    run_data: dict,
+    domain: str,
+    ws: WorkspaceClient,
+) -> str:
+    """Pick a stable MLflow experiment path for this run.
+
+    With OBO-first execution the job runs as the triggering user, so we
+    always prefer ``/Users/<user_email>/genie-optimization/<domain>``.
+    ``/Shared/`` is a last-resort fallback when identity cannot be resolved.
+    """
+    triggered_by = str(run_data.get("triggered_by") or "").strip()
+    if "@" in triggered_by:
+        return EXPERIMENT_PATH_TEMPLATE.format(user_email=triggered_by, domain=domain)
+
+    try:
+        current_user = str(ws.current_user.me().user_name or "").strip()
+    except Exception:
+        current_user = ""
+
+    if "@" in current_user:
+        return EXPERIMENT_PATH_TEMPLATE.format(user_email=current_user, domain=domain)
+
+    return f"/Shared/genie-optimization/{domain}"
+
+
+def _ensure_experiment_parent_dir(ws: WorkspaceClient, experiment_path: str) -> None:
+    """Ensure the workspace parent directory exists before creating experiment."""
+    if not experiment_path.startswith("/"):
+        return
+    parent = str(PurePosixPath(experiment_path).parent)
+    if not parent or parent == "/":
+        return
+    try:
+        ws.workspace.mkdirs(parent)
+    except Exception as exc:
+        logger.warning("Could not ensure experiment parent directory %s: %s", parent, exc)
+
+
+def _has_non_email_user_home(path: str) -> bool:
+    """Detect /Users/<principal>/... paths where principal is not an email."""
+    parts = PurePosixPath(path).parts
+    return len(parts) > 2 and parts[0] == "/" and parts[1] == "Users" and "@" not in parts[2]
 
 
 def run_preflight(
@@ -67,15 +134,70 @@ def run_preflight(
         task_key="preflight", catalog=catalog, schema=schema,
     )
 
-    config = fetch_space_config(w, space_id)
-    logger.info("Fetched config for space %s", space_id)
+    run_data = load_run(spark, run_id, catalog, schema) or {}
+    snapshot = run_data.get("config_snapshot", {})
+    config: dict
+    if isinstance(snapshot, dict) and snapshot:
+        config = snapshot
+        logger.info("Using config snapshot from run row for %s", run_id)
+    else:
+        config = fetch_space_config(w, space_id)
+        logger.info("Fetched config for space %s", space_id)
 
-    uc_columns = get_columns(spark, catalog, schema).collect()
-    uc_columns_dicts = [r.asDict() for r in uc_columns]
-    uc_tags = get_tags(spark, catalog, schema).collect()
-    uc_tags_dicts = [r.asDict() for r in uc_tags]
-    uc_routines = get_routines(spark, catalog, schema).collect()
-    uc_routines_dicts = [r.asDict() for r in uc_routines]
+    # OBO-first: jobs run as the triggering user, so Spark can query
+    # information_schema for user catalogs directly.  Prefetched metadata
+    # from the backend OBO call is kept as a cache optimisation only.
+    prefetched = snapshot.get("_prefetched_uc_metadata", {}) if isinstance(snapshot, dict) else {}
+
+    genie_table_refs = extract_genie_space_table_refs(config)
+    if genie_table_refs:
+        logger.info(
+            "Genie space references %d data assets across schemas: %s",
+            len(genie_table_refs),
+            sorted({f"{c}.{s}" for c, s, _ in genie_table_refs if c and s}),
+        )
+
+    _pf = prefetched if isinstance(prefetched, dict) else {}
+
+    if genie_table_refs:
+        uc_columns_dicts = (
+            _pf.get("uc_columns")
+            if isinstance(_pf.get("uc_columns"), list)
+            else _collect_or_empty(
+                lambda: get_columns_for_tables(spark, genie_table_refs), "columns (genie tables)",
+            )
+        )
+        uc_tags_dicts = (
+            _pf.get("uc_tags")
+            if isinstance(_pf.get("uc_tags"), list)
+            else _collect_or_empty(
+                lambda: get_tags_for_tables(spark, genie_table_refs), "tags (genie tables)",
+            )
+        )
+        uc_routines_dicts = (
+            _pf.get("uc_routines")
+            if isinstance(_pf.get("uc_routines"), list)
+            else _collect_or_empty(
+                lambda: get_routines_for_schemas(spark, genie_table_refs), "routines (genie schemas)",
+            )
+        )
+    else:
+        uc_columns_dicts = (
+            _pf.get("uc_columns")
+            if isinstance(_pf.get("uc_columns"), list)
+            else _collect_or_empty(lambda: get_columns(spark, catalog, schema), "columns")
+        )
+        uc_tags_dicts = (
+            _pf.get("uc_tags")
+            if isinstance(_pf.get("uc_tags"), list)
+            else _collect_or_empty(lambda: get_tags(spark, catalog, schema), "tags")
+        )
+        uc_routines_dicts = (
+            _pf.get("uc_routines")
+            if isinstance(_pf.get("uc_routines"), list)
+            else _collect_or_empty(lambda: get_routines(spark, catalog, schema), "routines")
+        )
+
     logger.info(
         "UC metadata: %d columns, %d tags, %d routines",
         len(uc_columns_dicts), len(uc_tags_dicts), len(uc_routines_dicts),
@@ -83,35 +205,90 @@ def run_preflight(
 
     uc_schema = f"{catalog}.{schema}"
     if experiment_name is None:
-        try:
-            user_email = w.current_user.me().user_name
-        except Exception:
-            user_email = "unknown"
-        experiment_name = EXPERIMENT_PATH_TEMPLATE.format(
-            user_email=user_email, domain=domain,
-        )
+        experiment_name = _resolve_experiment_path(run_data=run_data, domain=domain, ws=w)
+    elif _has_non_email_user_home(experiment_name):
+        # Migrate away from service-principal style home paths like /Users/<uuid>/...
+        experiment_name = _resolve_experiment_path(run_data=run_data, domain=domain, ws=w)
+    _ensure_experiment_parent_dir(w, experiment_name)
     mlflow.set_experiment(experiment_name)
     exp = mlflow.get_experiment_by_name(experiment_name)
     experiment_id = exp.experiment_id if exp else ""
     logger.info("Experiment: %s (id=%s)", experiment_name, experiment_id)
+
+    initial_instructions = _get_general_instructions(config.get("_parsed_space", config))
+    if initial_instructions:
+        register_instruction_version(
+            uc_schema=uc_schema,
+            space_id=space_id,
+            instruction_text=initial_instructions,
+            run_id=run_id,
+            lever=0,
+            iteration=0,
+            accuracy=0.0,
+            domain=domain,
+        )
 
     benchmarks = _load_or_generate_benchmarks(
         w, spark, config, uc_columns_dicts, uc_tags_dicts, uc_routines_dicts,
         domain, catalog, schema, uc_schema, run_id,
     )
 
+    MIN_VALID_BENCHMARKS = 5
+
     validation_results = validate_benchmarks(
         benchmarks, spark, catalog=catalog, gold_schema=schema,
     )
-    valid_ids = {
-        r["question"] for r in validation_results if r["valid"]
-    }
     pre_count = len(benchmarks)
-    benchmarks = [b for b in benchmarks if b.get("question") in valid_ids]
+    filtered_benchmarks: list[dict] = []
+    invalid_errors: list[str] = []
+    for benchmark, validation in zip(benchmarks, validation_results):
+        if validation.get("valid"):
+            filtered_benchmarks.append(benchmark)
+        else:
+            err = str(validation.get("error") or "").strip()
+            if err:
+                invalid_errors.append(err[:200])
+    benchmarks = filtered_benchmarks
     if len(benchmarks) < pre_count:
         logger.warning(
-            "Discarded %d benchmarks that failed EXPLAIN validation",
+            "Discarded %d/%d benchmarks that failed validation (sample_errors=%s)",
             pre_count - len(benchmarks),
+            pre_count,
+            invalid_errors[:5],
+        )
+
+    if len(benchmarks) < MIN_VALID_BENCHMARKS:
+        logger.warning(
+            "Only %d valid benchmarks after filtering (min %d). "
+            "Re-generating from scratch using Genie space assets.",
+            len(benchmarks), MIN_VALID_BENCHMARKS,
+        )
+        genie_benchmarks_regen = extract_genie_space_benchmarks(
+            config, spark, catalog=catalog, schema=schema,
+        )
+        write_stage(
+            spark, run_id, "BENCHMARK_REGENERATION", "STARTED",
+            task_key="preflight", catalog=catalog, schema=schema,
+            detail={"reason": "too_few_valid_benchmarks", "valid_count": len(benchmarks), "discarded_errors": invalid_errors[:5]},
+        )
+        benchmarks = generate_benchmarks(
+            w, config, uc_columns_dicts, uc_tags_dicts, uc_routines_dicts,
+            domain, catalog, schema, spark,
+            target_count=TARGET_BENCHMARK_COUNT,
+            genie_space_benchmarks=genie_benchmarks_regen,
+        )
+        write_stage(
+            spark, run_id, "BENCHMARK_REGENERATION", "COMPLETE",
+            task_key="preflight",
+            detail={"regenerated_count": len(benchmarks)},
+            catalog=catalog, schema=schema,
+        )
+
+    if not benchmarks:
+        raise RuntimeError(
+            f"All {pre_count} benchmarks failed validation even after regeneration. "
+            f"Sample errors: {invalid_errors[:5]}. "
+            "Check that the Genie space's referenced tables actually exist."
         )
 
     create_evaluation_dataset(
@@ -119,10 +296,11 @@ def run_preflight(
         space_id=space_id, catalog=catalog, gold_schema=schema,
     )
 
-    register_judge_prompts(uc_schema, domain, experiment_name)
+    prompt_registrations = register_judge_prompts(uc_schema, domain, experiment_name)
 
     model_id = create_genie_model_version(
         w, space_id, config, iteration=0, domain=domain,
+        experiment_name=experiment_name,
         uc_schema=uc_schema,
         uc_columns=uc_columns_dicts,
         uc_tags=uc_tags_dicts,
@@ -136,6 +314,7 @@ def run_preflight(
             "benchmark_count": len(benchmarks),
             "experiment_name": experiment_name,
             "model_id": model_id,
+            "prompt_count": len(prompt_registrations),
         },
         catalog=catalog, schema=schema,
     )
@@ -156,13 +335,70 @@ def _load_or_generate_benchmarks(
     uc_schema: str,
     run_id: str,
 ) -> list[dict]:
-    """Try loading existing benchmarks; fall back to LLM generation."""
-    benchmarks = load_benchmarks_from_dataset(spark, uc_schema, domain)
-    if benchmarks and len(benchmarks) >= 5:
-        logger.info("Loaded %d existing benchmarks from UC dataset", len(benchmarks))
-        return benchmarks
+    """Load existing benchmarks or generate new ones from Genie space + LLM.
 
-    logger.info("No existing benchmarks (or too few), generating via LLM")
+    Strategy:
+      1. Extract curated benchmarks from the Genie Space config (example_question_sqls,
+         sample_questions). These are always included as the authoritative ground truth.
+      2. Try loading previously persisted benchmarks from UC dataset.
+         If enough exist AND they already include the curated ones, reuse them.
+      3. Otherwise, generate synthetic benchmarks via LLM to augment the curated set.
+    """
+    genie_benchmarks = extract_genie_space_benchmarks(
+        config, spark, catalog=catalog, schema=schema,
+    )
+    write_stage(
+        spark, run_id, "GENIE_BENCHMARK_EXTRACTION", "COMPLETE",
+        task_key="preflight", catalog=catalog, schema=schema,
+        detail={
+            "genie_space_benchmarks": len(genie_benchmarks),
+            "with_sql": sum(1 for b in genie_benchmarks if b.get("expected_sql")),
+            "question_only": sum(1 for b in genie_benchmarks if not b.get("expected_sql")),
+        },
+    )
+
+    existing = load_benchmarks_from_dataset(spark, uc_schema, domain)
+    if existing and len(existing) >= 5:
+        validation_results = validate_benchmarks(
+            existing, spark, catalog=catalog, gold_schema=schema,
+        )
+        valid_existing = [
+            b for b, v in zip(existing, validation_results)
+            if v.get("valid")
+        ]
+        invalid_count = len(existing) - len(valid_existing)
+        if invalid_count > 0:
+            logger.warning(
+                "Persisted benchmarks: %d/%d failed re-validation (stale references). "
+                "Discarding invalid entries before reuse check.",
+                invalid_count, len(existing),
+            )
+        if len(valid_existing) >= 5:
+            curated_questions = {b.get("question", "").lower().strip() for b in genie_benchmarks}
+            existing_questions = {b.get("question", "").lower().strip() for b in valid_existing}
+            missing_curated = curated_questions - existing_questions
+            if not missing_curated:
+                logger.info(
+                    "Loaded %d valid existing benchmarks from UC dataset (all %d curated included)",
+                    len(valid_existing), len(genie_benchmarks),
+                )
+                return valid_existing
+            logger.info(
+                "UC dataset has %d valid benchmarks but missing %d curated Genie space questions. "
+                "Re-generating to include them.",
+                len(valid_existing), len(missing_curated),
+            )
+        else:
+            logger.info(
+                "Only %d valid benchmarks remain after re-validation (need ≥5). "
+                "Re-generating from scratch.",
+                len(valid_existing),
+            )
+
+    logger.info(
+        "Generating benchmarks: %d curated from Genie space + synthetic to reach %d",
+        len(genie_benchmarks), TARGET_BENCHMARK_COUNT,
+    )
     write_stage(
         spark, run_id, "BENCHMARK_GENERATION", "STARTED",
         task_key="preflight", catalog=catalog, schema=schema,
@@ -172,12 +408,17 @@ def _load_or_generate_benchmarks(
         w, config, uc_columns, uc_tags, uc_routines,
         domain, catalog, schema, spark,
         target_count=TARGET_BENCHMARK_COUNT,
+        genie_space_benchmarks=genie_benchmarks,
     )
 
     write_stage(
         spark, run_id, "BENCHMARK_GENERATION", "COMPLETE",
         task_key="preflight",
-        detail={"generated_count": len(benchmarks)},
+        detail={
+            "total_count": len(benchmarks),
+            "curated_count": len(genie_benchmarks),
+            "synthetic_count": len(benchmarks) - len(genie_benchmarks),
+        },
         catalog=catalog, schema=schema,
     )
     return benchmarks

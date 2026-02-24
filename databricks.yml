@@ -2,12 +2,16 @@ bundle:
   name: "genie-space-optimizer"
 
 variables:
+  app_name:
+    default: "genie-space-optimizer"
   catalog:
     default: "vibe_coding_workshop_catalog"
   gold_schema:
     default: "genie_optimization"
   warehouse_id:
     default: "02c1885622661afa"
+  deploy_profile:
+    default: "genie-test"
 
 include:
   - resources/genie_optimization_job.yml
@@ -18,7 +22,7 @@ sync:
 
 artifacts:
   default:
-    build: apx build
+    build: apx build && uv run python resources/grant_app_uc_permissions.py --profile ${var.deploy_profile} --app-name ${var.app_name} --catalog ${var.catalog} --schema ${var.gold_schema}
 
 resources:
   database_instances:
@@ -27,9 +31,12 @@ resources:
       capacity: "CU_1"
   apps:
     genie-space-optimizer-app:
-      name: "genie-space-optimizer"
+      name: ${var.app_name}
       description: "genie-space-optimizer created with apx"
       source_code_path: ./.build
+      user_api_scopes:
+        - "dashboards.genie"
+        - "sql"
       config:
         env:
           - name: GENIE_SPACE_OPTIMIZER_CATALOG
@@ -48,11 +55,6 @@ resources:
           sql_warehouse:
             id: ${var.warehouse_id}
             permission: "CAN_USE"
-      user_api_scopes:
-        - "dashboards.genie"
-        - "sql"
-        - "iam.access-control:read"
-        - "iam.current-user:read"
       permissions:
         - user_name: "users"
           level: "CAN_USE"

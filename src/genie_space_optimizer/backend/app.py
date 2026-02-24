@@ -1,4 +1,11 @@
+import logging
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+from fastapi import FastAPI
+
 from .core import create_app
+from .core._base import LifespanDependency
 from .router import router
 
 # Import route modules so their @router decorators register on the singleton.
@@ -6,5 +13,33 @@ from .router import router
 from .routes import spaces as _spaces  # noqa: F401
 from .routes import runs as _runs  # noqa: F401
 from .routes import activity as _activity  # noqa: F401
+
+logger = logging.getLogger(__name__)
+
+
+class _DeltaTableBootstrap(LifespanDependency):
+    """Create optimization Delta tables on app startup so read paths never 404."""
+
+    @asynccontextmanager
+    async def lifespan(self, app: FastAPI) -> AsyncGenerator[None, None]:
+        try:
+            from ._spark import get_spark
+            from genie_space_optimizer.optimization.state import ensure_optimization_tables
+
+            config = app.state.config
+            spark = get_spark()
+            ensure_optimization_tables(spark, config.catalog, config.schema_name)
+            logger.info("Optimization Delta tables verified at startup")
+        except Exception:
+            logger.warning(
+                "Could not verify optimization tables at startup — will create on first use",
+                exc_info=True,
+            )
+        yield
+
+    @staticmethod
+    def __call__() -> None:
+        return None
+
 
 app = create_app(routers=[router])

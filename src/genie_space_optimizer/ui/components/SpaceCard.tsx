@@ -18,7 +18,7 @@ interface SpaceCardProps {
   onClick: () => void;
 }
 
-function scoreBadge(score: number | null) {
+function scoreBadge(score: number | null | undefined) {
   if (score == null) return <Badge variant="outline">No score</Badge>;
   const pct = Math.round(score * 100) / 100;
   if (pct >= 80)

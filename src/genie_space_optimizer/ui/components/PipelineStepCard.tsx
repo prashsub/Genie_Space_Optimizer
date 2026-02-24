@@ -3,7 +3,6 @@ import {
   Card,
   CardContent,
   CardHeader,
-  CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -17,42 +16,88 @@ import {
   CheckCircle2,
   XCircle,
   ChevronDown,
+  Settings2,
+  Database,
+  FlaskConical,
+  Wrench,
+  BarChart3,
 } from "lucide-react";
 
 interface PipelineStepCardProps {
   stepNumber: number;
   name: string;
   status: string;
+  description?: string;
   durationSeconds?: number | null;
   summary?: string | null;
   children?: React.ReactNode;
 }
 
+const stepIcons: Record<number, React.ReactNode> = {
+  1: <Settings2 className="h-4 w-4" />,
+  2: <Database className="h-4 w-4" />,
+  3: <FlaskConical className="h-4 w-4" />,
+  4: <Wrench className="h-4 w-4" />,
+  5: <BarChart3 className="h-4 w-4" />,
+};
+
 const statusConfig: Record<
   string,
-  { icon: React.ReactNode; badge: string; color: string }
+  { badge: string; badgeClass: string; ringClass: string }
 > = {
   pending: {
-    icon: <Circle className="h-5 w-5 text-muted-foreground/50" />,
     badge: "Pending",
-    color: "bg-muted text-muted-foreground",
+    badgeClass: "bg-muted text-muted-foreground border-muted-foreground/20",
+    ringClass: "border-muted-foreground/20 bg-muted/50 text-muted-foreground/40",
   },
   running: {
-    icon: <Loader2 className="h-5 w-5 animate-spin text-db-blue" />,
     badge: "Running",
-    color: "bg-db-blue text-white",
+    badgeClass: "bg-db-blue text-white",
+    ringClass: "border-db-blue bg-db-blue/10 text-db-blue",
   },
   completed: {
-    icon: <CheckCircle2 className="h-5 w-5 text-db-green" />,
     badge: "Complete",
-    color: "bg-db-green text-white",
+    badgeClass: "bg-db-green text-white",
+    ringClass: "border-db-green bg-db-green/10 text-db-green",
   },
   failed: {
-    icon: <XCircle className="h-5 w-5 text-db-red-error" />,
     badge: "Failed",
-    color: "bg-db-red-error text-white",
+    badgeClass: "bg-db-red-error text-white",
+    ringClass: "border-db-red-error bg-db-red-error/10 text-db-red-error",
   },
 };
+
+function StatusIndicator({ status }: { status: string }) {
+  if (status === "running") {
+    return (
+      <div className="relative flex h-8 w-8 items-center justify-center">
+        <div className="absolute inset-0 animate-ping rounded-full bg-db-blue/20" />
+        <div className="relative flex h-8 w-8 items-center justify-center rounded-full border-2 border-db-blue bg-db-blue/10">
+          <Loader2 className="h-4 w-4 animate-spin text-db-blue" />
+        </div>
+      </div>
+    );
+  }
+  if (status === "completed") {
+    return (
+      <div className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-db-green bg-db-green/10">
+        <CheckCircle2 className="h-4 w-4 text-db-green" />
+      </div>
+    );
+  }
+  if (status === "failed") {
+    return (
+      <div className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-db-red-error bg-db-red-error/10">
+        <XCircle className="h-4 w-4 text-db-red-error" />
+      </div>
+    );
+  }
+  return (
+    <div className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-muted-foreground/20 bg-muted/50">
+      <Circle className="h-4 w-4 text-muted-foreground/30" />
+    </div>
+  );
+}
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -65,49 +110,90 @@ export function PipelineStepCard({
   stepNumber,
   name,
   status,
+  description,
   durationSeconds,
   summary,
   children,
 }: PipelineStepCardProps) {
   const [open, setOpen] = useState(status === "running" || status === "failed");
   const cfg = statusConfig[status] ?? statusConfig.pending;
+  const hasExpandableContent = summary || children;
   const isExpandable =
-    status === "completed" || status === "running" || status === "failed";
+    hasExpandableContent && (status === "completed" || status === "running" || status === "failed");
+
+  const cardBorder =
+    status === "running"
+      ? "border-db-blue/30 shadow-md shadow-db-blue/5"
+      : status === "failed"
+        ? "border-db-red-error/30"
+        : status === "completed"
+          ? "border-db-green/20"
+          : "border-db-gray-border";
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
-      <Card
-        className={`border transition-colors ${
-          status === "running"
-            ? "border-db-blue/40 shadow-sm"
-            : status === "failed"
-              ? "border-db-red-error/40"
-              : "border-db-gray-border"
-        } bg-white`}
-      >
+      <Card className={`border transition-all duration-300 ${cardBorder} bg-white`}>
         <CollapsibleTrigger asChild disabled={!isExpandable}>
           <CardHeader
-            className={`flex cursor-pointer flex-row items-center gap-3 pb-2 ${
-              !isExpandable ? "cursor-default" : ""
+            className={`flex flex-row items-start gap-4 py-4 ${
+              isExpandable ? "cursor-pointer" : "cursor-default"
             }`}
           >
-            {cfg.icon}
-            <div className="flex flex-1 items-center gap-3">
-              <span className="text-xs font-medium text-muted-foreground">
-                Step {stepNumber}
-              </span>
-              <CardTitle className="text-sm font-semibold">{name}</CardTitle>
+            <StatusIndicator status={status} />
+
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <div className="flex items-center gap-2">
+                <span className={`flex items-center gap-1 text-xs font-medium ${
+                  status === "pending" ? "text-muted-foreground/50" : "text-muted-foreground"
+                }`}>
+                  {stepIcons[stepNumber]}
+                  Step {stepNumber}
+                </span>
+                <span className={`text-sm font-semibold ${
+                  status === "pending" ? "text-muted-foreground/60" : ""
+                }`}>
+                  {name}
+                </span>
+              </div>
+
+              {description && (
+                <p className={`text-xs leading-relaxed ${
+                  status === "pending"
+                    ? "text-muted-foreground/40"
+                    : "text-muted-foreground"
+                }`}>
+                  {description}
+                </p>
+              )}
+
+              {status === "running" && !summary && (
+                <p className="text-xs text-db-blue">
+                  Processing…
+                </p>
+              )}
+
+              {summary && status !== "pending" && (
+                <p className="text-xs font-medium text-muted-foreground">
+                  {summary}
+                </p>
+              )}
             </div>
-            <div className="flex items-center gap-2">
+
+            <div className="flex shrink-0 items-center gap-2">
               {durationSeconds != null && (
-                <span className="text-xs text-muted-foreground">
+                <span className="text-xs tabular-nums text-muted-foreground">
                   {formatDuration(durationSeconds)}
                 </span>
               )}
-              <Badge className={cfg.color}>{cfg.badge}</Badge>
+              <Badge variant="outline" className={cfg.badgeClass}>
+                {status === "running" && (
+                  <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                )}
+                {cfg.badge}
+              </Badge>
               {isExpandable && (
                 <ChevronDown
-                  className={`h-4 w-4 text-muted-foreground transition-transform ${
+                  className={`h-4 w-4 text-muted-foreground transition-transform duration-200 ${
                     open ? "rotate-180" : ""
                   }`}
                 />
@@ -117,10 +203,7 @@ export function PipelineStepCard({
         </CollapsibleTrigger>
 
         <CollapsibleContent>
-          <CardContent className="space-y-3 pt-0">
-            {summary && (
-              <p className="text-sm text-muted-foreground">{summary}</p>
-            )}
+          <CardContent className="space-y-3 border-t border-dashed border-db-gray-border pt-3">
             {children}
           </CardContent>
         </CollapsibleContent>

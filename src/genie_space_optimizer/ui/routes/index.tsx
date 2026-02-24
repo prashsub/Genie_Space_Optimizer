@@ -23,7 +23,7 @@ export const Route = createFileRoute("/")({
   component: () => (
     <ErrorBoundary fallback={<DashboardError />}>
       <Suspense fallback={<DashboardSkeleton />}>
-        <Dashboard />
+        <DashboardContent />
       </Suspense>
     </ErrorBoundary>
   ),
@@ -58,9 +58,77 @@ function DashboardSkeleton() {
   );
 }
 
-function Dashboard() {
+function DashboardContent() {
   const { data: spaces } = useListSpacesSuspense(selector());
+  return (
+    <Dashboard
+      spaces={spaces ?? []}
+    />
+  );
+}
+
+function ActivitySection({ navigate }: { navigate: ReturnType<typeof useNavigate> }) {
   const { data: activity } = useGetActivitySuspense(selector());
+  if (!activity || activity.length === 0) return null;
+
+  return (
+    <Card className="border-db-gray-border bg-white">
+      <CardHeader>
+        <CardTitle className="text-sm font-semibold">
+          Recent Activity
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Space</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Initiated By</TableHead>
+              <TableHead className="text-right">Score</TableHead>
+              <TableHead className="text-right">Time</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {activity.map((item) => (
+                <TableRow
+                  key={item.runId}
+                  className="cursor-pointer hover:bg-muted/50"
+                  onClick={() =>
+                    navigate({
+                      to: "/runs/$runId",
+                      params: { runId: item.runId },
+                    })
+                  }
+                >
+                  <TableCell className="font-medium">
+                    {item.spaceName}
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="outline">{item.status}</Badge>
+                  </TableCell>
+                  <TableCell>{item.initiatedBy}</TableCell>
+                  <TableCell className="text-right">
+                    {item.optimizedScore != null
+                      ? `${item.optimizedScore.toFixed(1)}%`
+                      : "\u2014"}
+                  </TableCell>
+                  <TableCell className="text-right text-xs text-muted-foreground">
+                    {item.timestamp
+                      ? new Date(item.timestamp).toLocaleDateString()
+                      : ""}
+                  </TableCell>
+                </TableRow>
+              ),
+            )}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+function Dashboard({ spaces }: { spaces: NonNullable<ReturnType<typeof useListSpacesSuspense>["data"]> }) {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const navigate = useNavigate();
@@ -82,7 +150,6 @@ function Dashboard() {
   }, [spaces, debouncedSearch]);
 
   const totalSpaces = spaces?.length ?? 0;
-  const recentRuns = activity?.length ?? 0;
   const avgScore = useMemo(() => {
     if (!spaces || spaces.length === 0) return 0;
     const scored = spaces.filter((s) => s.qualityScore != null);
@@ -114,7 +181,7 @@ function Dashboard() {
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <span className="text-2xl font-bold">{recentRuns}</span>
+            <span className="text-2xl font-bold">{"\u2014"}</span>
           </CardContent>
         </Card>
 
@@ -127,7 +194,7 @@ function Dashboard() {
           </CardHeader>
           <CardContent>
             <span className="text-2xl font-bold">
-              {avgScore > 0 ? `${avgScore.toFixed(1)}%` : "—"}
+              {avgScore > 0 ? `${avgScore.toFixed(1)}%` : "\u2014"}
             </span>
           </CardContent>
         </Card>
@@ -136,7 +203,7 @@ function Dashboard() {
       <div className="relative">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
         <Input
-          placeholder="Search spaces by name or description…"
+          placeholder="Search spaces by name or description\u2026"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="pl-9"
@@ -163,61 +230,11 @@ function Dashboard() {
         )}
       </div>
 
-      {activity && activity.length > 0 && (
-        <Card className="border-db-gray-border bg-white">
-          <CardHeader>
-            <CardTitle className="text-sm font-semibold">
-              Recent Activity
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Space</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Initiated By</TableHead>
-                  <TableHead className="text-right">Score</TableHead>
-                  <TableHead className="text-right">Time</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {activity.map((item) => (
-                    <TableRow
-                      key={item.runId}
-                      className="cursor-pointer hover:bg-muted/50"
-                      onClick={() =>
-                        navigate({
-                          to: "/runs/$runId",
-                          params: { runId: item.runId },
-                        })
-                      }
-                    >
-                      <TableCell className="font-medium">
-                        {item.spaceName}
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline">{item.status}</Badge>
-                      </TableCell>
-                      <TableCell>{item.initiatedBy}</TableCell>
-                      <TableCell className="text-right">
-                        {item.optimizedScore != null
-                          ? `${item.optimizedScore.toFixed(1)}%`
-                          : "—"}
-                      </TableCell>
-                      <TableCell className="text-right text-xs text-muted-foreground">
-                        {item.timestamp
-                          ? new Date(item.timestamp).toLocaleDateString()
-                          : ""}
-                      </TableCell>
-                    </TableRow>
-                  ),
-                )}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      )}
+      <ErrorBoundary fallback={null}>
+        <Suspense fallback={null}>
+          <ActivitySection navigate={navigate} />
+        </Suspense>
+      </ErrorBoundary>
     </div>
   );
 }

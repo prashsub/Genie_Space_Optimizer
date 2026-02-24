@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from ..core import Dependencies, create_router
 from ..models import ActivityItem
@@ -40,7 +41,7 @@ def get_activity(
                     spaceId=row.get("space_id", ""),
                     spaceName=row.get("domain", ""),
                     status=row.get("status", ""),
-                    initiatedBy=row.get("triggered_by", "system"),
+                    initiatedBy=row.get("triggered_by") or "system",
                     baselineScore=_safe_float(row.get("best_accuracy")),
                     optimizedScore=_safe_float(row.get("best_accuracy")),
                     timestamp=str(row.get("started_at", "")),
@@ -53,6 +54,7 @@ def _safe_float(val) -> float | None:
     if val is None:
         return None
     try:
-        return float(val)
+        f = float(val)
+        return f if math.isfinite(f) else None
     except (TypeError, ValueError):
         return None

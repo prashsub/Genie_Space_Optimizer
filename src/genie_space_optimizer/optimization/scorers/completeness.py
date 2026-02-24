@@ -17,6 +17,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
+    format_asi_markdown,
 )
 
 if TYPE_CHECKING:
@@ -48,38 +49,56 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
         try:
             result = _call_llm_for_scoring(w, prompt)
         except Exception as e:
+            metadata = build_asi_metadata(
+                failure_type="other",
+                severity="info",
+                confidence=0.0,
+                counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
             return Feedback(
                 name="completeness",
                 value="unknown",
-                rationale=f"LLM call failed: {e}",
-                source=LLM_SOURCE,
-                metadata=build_asi_metadata(
-                    failure_type="other",
-                    severity="info",
-                    confidence=0.0,
-                    counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+                rationale=format_asi_markdown(
+                    judge_name="completeness",
+                    value="unknown",
+                    rationale=f"LLM call failed: {e}",
+                    metadata=metadata,
                 ),
+                source=LLM_SOURCE,
+                metadata=metadata,
             )
 
         if result.get("complete", False):
             return Feedback(
                 name="completeness",
                 value="yes",
-                rationale=result.get("rationale", "Complete"),
+                rationale=format_asi_markdown(
+                    judge_name="completeness",
+                    value="yes",
+                    rationale=result.get("rationale", "Complete"),
+                    extra={"llm_response": result},
+                ),
                 source=LLM_SOURCE,
             )
+        metadata = build_asi_metadata(
+            failure_type=result.get("failure_type", "missing_column"),
+            severity="major",
+            confidence=0.80,
+            blame_set=result.get("blame_set", []),
+            counterfactual_fix="Review column visibility and filter completeness in Genie metadata",
+        )
         return Feedback(
             name="completeness",
             value="no",
-            rationale=result.get("rationale", "Incomplete"),
-            source=LLM_SOURCE,
-            metadata=build_asi_metadata(
-                failure_type=result.get("failure_type", "missing_column"),
-                severity="major",
-                confidence=0.80,
-                blame_set=result.get("blame_set", []),
-                counterfactual_fix="Review column visibility and filter completeness in Genie metadata",
+            rationale=format_asi_markdown(
+                judge_name="completeness",
+                value="no",
+                rationale=result.get("rationale", "Incomplete"),
+                metadata=metadata,
+                extra={"llm_response": result},
             ),
+            source=LLM_SOURCE,
+            metadata=metadata,
         )
 
     return completeness_judge

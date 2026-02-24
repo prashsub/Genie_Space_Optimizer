@@ -41,7 +41,7 @@ def make_all_scorers(
     from .syntax_validity import _make_syntax_validity_scorer
 
     return [
-        _make_syntax_validity_scorer(spark),
+        _make_syntax_validity_scorer(spark, catalog, schema),
         _make_schema_accuracy_judge(w, catalog, schema),
         _make_logical_accuracy_judge(w, catalog, schema),
         _make_semantic_equivalence_judge(w, catalog, schema),

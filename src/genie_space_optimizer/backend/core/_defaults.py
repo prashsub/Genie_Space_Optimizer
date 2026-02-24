@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from typing import Annotated, AsyncGenerator, TypeAlias
 from contextlib import asynccontextmanager
 
@@ -44,13 +45,20 @@ def _get_user_ws(
     """
 
     if not headers.token:
-        raise ValueError(
-            "OBO token is not provided in the header X-Forwarded-Access-Token"
+        logger.warning(
+            "OBO token not available — falling back to service principal credentials. "
+            "User-scoped permissions will not apply."
         )
+        return WorkspaceClient()
 
+    host = os.environ.get("DATABRICKS_HOST", "")
     return WorkspaceClient(
-        token=headers.token.get_secret_value(), auth_type="pat"
-    )  # set pat explicitly to avoid issues with SP client
+        host=host,
+        token=headers.token.get_secret_value(),
+        auth_type="pat",
+        client_id=None,
+        client_secret=None,
+    )
 
 
 ConfigDependency: TypeAlias = Annotated[AppConfig, _ConfigDependency.depends()]

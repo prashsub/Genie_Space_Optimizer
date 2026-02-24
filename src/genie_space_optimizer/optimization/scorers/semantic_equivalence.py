@@ -17,6 +17,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
+    format_asi_markdown,
 )
 
 if TYPE_CHECKING:
@@ -48,38 +49,56 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
         try:
             result = _call_llm_for_scoring(w, prompt)
         except Exception as e:
+            metadata = build_asi_metadata(
+                failure_type="other",
+                severity="info",
+                confidence=0.0,
+                counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
             return Feedback(
                 name="semantic_equivalence",
                 value="unknown",
-                rationale=f"LLM call failed: {e}",
-                source=LLM_SOURCE,
-                metadata=build_asi_metadata(
-                    failure_type="other",
-                    severity="info",
-                    confidence=0.0,
-                    counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+                rationale=format_asi_markdown(
+                    judge_name="semantic_equivalence",
+                    value="unknown",
+                    rationale=f"LLM call failed: {e}",
+                    metadata=metadata,
                 ),
+                source=LLM_SOURCE,
+                metadata=metadata,
             )
 
         if result.get("equivalent", False):
             return Feedback(
                 name="semantic_equivalence",
                 value="yes",
-                rationale=result.get("rationale", "Semantically equivalent"),
+                rationale=format_asi_markdown(
+                    judge_name="semantic_equivalence",
+                    value="yes",
+                    rationale=result.get("rationale", "Semantically equivalent"),
+                    extra={"llm_response": result},
+                ),
                 source=LLM_SOURCE,
             )
+        metadata = build_asi_metadata(
+            failure_type=result.get("failure_type", "different_metric"),
+            severity="major",
+            confidence=0.80,
+            blame_set=result.get("blame_set", []),
+            counterfactual_fix="Review measure definitions and grain in Genie metadata",
+        )
         return Feedback(
             name="semantic_equivalence",
             value="no",
-            rationale=result.get("rationale", "Semantic mismatch"),
-            source=LLM_SOURCE,
-            metadata=build_asi_metadata(
-                failure_type=result.get("failure_type", "different_metric"),
-                severity="major",
-                confidence=0.80,
-                blame_set=result.get("blame_set", []),
-                counterfactual_fix="Review measure definitions and grain in Genie metadata",
+            rationale=format_asi_markdown(
+                judge_name="semantic_equivalence",
+                value="no",
+                rationale=result.get("rationale", "Semantic mismatch"),
+                metadata=metadata,
+                extra={"llm_response": result},
             ),
+            source=LLM_SOURCE,
+            metadata=metadata,
         )
 
     return semantic_equivalence_judge

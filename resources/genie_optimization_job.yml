@@ -35,10 +35,6 @@ resources:
         - task_key: lever_loop
           depends_on:
             - task_key: baseline_eval
-          condition_task:
-            op: "NOT_EQUAL"
-            left: "{{tasks.baseline_eval.values.thresholds_met}}"
-            right: "true"
           notebook_task:
             notebook_path: ../src/genie_space_optimizer/jobs/run_lever_loop.py
             base_parameters:
@@ -55,7 +51,6 @@ resources:
         - task_key: finalize
           depends_on:
             - task_key: lever_loop
-              outcome: "succeeded_or_skipped"
           notebook_task:
             notebook_path: ../src/genie_space_optimizer/jobs/run_finalize.py
             base_parameters:
@@ -67,13 +62,18 @@ resources:
           timeout_seconds: 1800
           max_retries: 1
 
-        - task_key: deploy
+        - task_key: deploy_check
           depends_on:
             - task_key: finalize
           condition_task:
             op: "NOT_EQUAL"
             left: "{{tasks.finalize.values.deploy_target}}"
             right: ""
+
+        - task_key: deploy
+          depends_on:
+            - task_key: deploy_check
+              outcome: "true"
           notebook_task:
             notebook_path: ../src/genie_space_optimizer/jobs/run_deploy.py
             base_parameters:

@@ -1,14 +1,50 @@
 from __future__ import annotations
 
+import json
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from typing import Any
 
 from fastapi import APIRouter, FastAPI
+from starlette.responses import JSONResponse
 
 from ..._metadata import api_prefix, app_name, dist_dir
 from ._base import LifespanDependency
 from ._config import logger
+
+
+class _NaNSafeEncoder(json.JSONEncoder):
+    """JSON encoder that converts NaN / Infinity to null."""
+
+    def default(self, o: Any) -> Any:
+        return super().default(o)
+
+    def iterencode(self, o: Any, _one_shot: bool = False) -> Any:
+        return super().iterencode(_sanitize(o), _one_shot)
+
+
+def _sanitize(obj: Any) -> Any:
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
+class SafeJSONResponse(JSONResponse):
+    """JSONResponse that replaces NaN/Inf with null before serialization."""
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            _sanitize(content),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
 # --- Lifespan ---
 
@@ -62,7 +98,11 @@ def create_app(
         async with _chain_dep_lifespans(all_deps, app):
             yield
 
-    app = FastAPI(title=app_name, lifespan=_composed_lifespan)
+    app = FastAPI(
+        title=app_name,
+        lifespan=_composed_lifespan,
+        default_response_class=SafeJSONResponse,
+    )
 
     api_router: APIRouter = create_router()
     for dep in all_deps:

@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table,
   TableBody,
@@ -17,16 +18,13 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
 import {
   ArrowLeft,
   Rocket,
-  FileText,
-  HelpCircle,
-  Database,
-  History,
 } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
+import { toast } from "sonner";
 
 export const Route = createFileRoute("/spaces/$spaceId")({
   component: () => (
@@ -72,15 +70,80 @@ function SpaceDetail() {
     ...selector(),
   });
   const startOpt = useStartOptimization();
+  const [applyMode, setApplyMode] = useState<"genie_config" | "both">(
+    "genie_config",
+  );
+
+  const hasActiveRun = space?.hasActiveRun ?? false;
+  const benchmarkQuestions = (
+    (space as { benchmarkQuestions?: string[] })?.benchmarkQuestions ?? []
+  );
+  const joins = (
+    (space as {
+      joins?: Array<{
+        leftTable: string;
+        rightTable: string;
+        relationshipType?: string | null;
+        joinColumns?: string[];
+      }>;
+    })?.joins ?? []
+  );
+  const optimizationHistory = (
+    (space as {
+      optimizationHistory?: Array<{
+        runId: string;
+        status: string;
+        baselineScore?: number | null;
+        optimizedScore?: number | null;
+        timestamp: string;
+      }>;
+    })?.optimizationHistory ?? []
+  );
+  const activeRunId = optimizationHistory.find((run) =>
+    ["QUEUED", "IN_PROGRESS", "RUNNING"].includes((run.status || "").toUpperCase()),
+  )?.runId;
 
   function handleOptimize() {
     startOpt.mutate(
-      { params: { space_id: spaceId } },
+      {
+        params: {
+          space_id: spaceId,
+          apply_mode: applyMode,
+        },
+      },
       {
         onSuccess: (res) => {
           const runId = res.data?.runId ?? (res as { runId?: string }).runId;
+          const jobUrl = res.data?.jobUrl ?? (res as { jobUrl?: string }).jobUrl;
           if (runId) {
+            if (jobUrl) {
+              toast.success("Optimization started", {
+                description: "Run launched. Open Workflows for live task logs.",
+                action: {
+                  label: "Open in Workflows",
+                  onClick: () => {
+                    window.open(jobUrl, "_blank", "noopener,noreferrer");
+                  },
+                },
+              });
+            } else {
+              toast.success("Optimization started");
+            }
             navigate({ to: "/runs/$runId", params: { runId } });
+          }
+        },
+        onError: (err) => {
+          const status = (err as { status?: number }).status;
+          const detail =
+            (err as { body?: { detail?: string } }).body?.detail ||
+            (err as Error).message ||
+            "Failed to start optimization";
+          if (status === 409) {
+            toast.warning("Optimization already in progress", {
+              description: detail,
+            });
+          } else {
+            toast.error("Optimization failed", { description: detail });
           }
         },
       },
@@ -101,156 +164,309 @@ function SpaceDetail() {
             Back to Dashboard
           </button>
           <h1 className="text-2xl font-bold">{space.name}</h1>
-          <p className="text-sm text-muted-foreground">{space.description}</p>
         </div>
-        <Button
-          onClick={handleOptimize}
-          disabled={startOpt.isPending}
-          className="bg-db-red hover:bg-db-red/90"
-        >
-          <Rocket className="mr-2 h-4 w-4" />
-          {startOpt.isPending ? "Starting…" : "Start Optimization"}
-        </Button>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <Card className="border-db-gray-border bg-white">
-          <CardHeader className="flex flex-row items-center gap-2 pb-2">
-            <FileText className="h-4 w-4 text-muted-foreground" />
-            <CardTitle className="text-sm font-semibold">
-              Instructions
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <pre className="whitespace-pre-wrap text-sm text-muted-foreground">
-              {space.instructions || "No instructions configured."}
-            </pre>
-          </CardContent>
-        </Card>
-
-        <Card className="border-db-gray-border bg-white">
-          <CardHeader className="flex flex-row items-center gap-2 pb-2">
-            <HelpCircle className="h-4 w-4 text-muted-foreground" />
-            <CardTitle className="text-sm font-semibold">
-              Sample Questions
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            {space.sampleQuestions.length === 0 ? (
-              <p className="text-sm italic text-muted-foreground">
-                No sample questions configured.
-              </p>
-            ) : (
-              <ul className="list-inside list-disc space-y-1 text-sm text-muted-foreground">
-                {space.sampleQuestions.map((q: string, i: number) => (
-                  <li key={i}>{q}</li>
-                ))}
-              </ul>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card className="border-db-gray-border bg-white">
-        <CardHeader className="flex flex-row items-center gap-2">
-          <Database className="h-4 w-4 text-muted-foreground" />
-          <CardTitle className="text-sm font-semibold">
-            Referenced Tables
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          {space.tables.length === 0 ? (
-            <p className="text-sm italic text-muted-foreground">
-              No tables referenced.
-            </p>
-          ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Table Name</TableHead>
-                  <TableHead>Catalog</TableHead>
-                  <TableHead>Schema</TableHead>
-                  <TableHead className="text-right">Columns</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {space.tables.map((t) => (
-                    <TableRow key={t.name}>
-                      <TableCell className="font-medium">{t.name}</TableCell>
-                      <TableCell>{t.catalog}</TableCell>
-                      <TableCell>{t.schema_name}</TableCell>
-                      <TableCell className="text-right">
-                        {t.columnCount}
-                      </TableCell>
-                    </TableRow>
-                  ),
-                )}
-              </TableBody>
-            </Table>
+        <div className="space-y-2 text-right">
+          <div className="inline-flex rounded-md border border-db-gray-border p-1">
+            <Button
+              type="button"
+              size="sm"
+              variant={applyMode === "genie_config" ? "default" : "ghost"}
+              onClick={() => setApplyMode("genie_config")}
+            >
+              Config Only
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={applyMode === "both" ? "default" : "ghost"}
+              onClick={() => setApplyMode("both")}
+            >
+              Config + Deferred UC
+            </Button>
+          </div>
+          <div>
+            <Button
+              onClick={handleOptimize}
+              disabled={startOpt.isPending || hasActiveRun}
+              className="bg-db-red hover:bg-db-red/90"
+              title={hasActiveRun ? "An optimization run is already in progress" : undefined}
+            >
+              <Rocket className="mr-2 h-4 w-4" />
+              {startOpt.isPending
+                ? "Starting…"
+                : hasActiveRun
+                  ? "Optimization In Progress"
+                  : "Start Optimization"}
+            </Button>
+          </div>
+          {hasActiveRun && activeRunId && (
+            <div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => navigate({ to: "/runs/$runId", params: { runId: activeRunId } })}
+              >
+                View Active Run
+              </Button>
+            </div>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </div>
 
-      {space.optimizationHistory.length > 0 && (
-        <Card className="border-db-gray-border bg-white">
-          <CardHeader className="flex flex-row items-center gap-2">
-            <History className="h-4 w-4 text-muted-foreground" />
-            <CardTitle className="text-sm font-semibold">
-              Optimization History
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Run ID</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead className="text-right">Baseline</TableHead>
-                  <TableHead className="text-right">Optimized</TableHead>
-                  <TableHead className="text-right">Date</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {space.optimizationHistory.map((run) => (
-                    <TableRow
-                      key={run.runId}
-                      className="cursor-pointer hover:bg-muted/50"
-                      onClick={() =>
-                        navigate({
-                          to: "/runs/$runId",
-                          params: { runId: run.runId },
-                        })
-                      }
-                    >
-                      <TableCell className="font-mono text-xs">
-                        {run.runId.slice(0, 8)}…
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline">{run.status}</Badge>
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {run.baselineScore != null
-                          ? `${run.baselineScore.toFixed(1)}%`
-                          : "—"}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {run.optimizedScore != null
-                          ? `${run.optimizedScore.toFixed(1)}%`
-                          : "—"}
-                      </TableCell>
-                      <TableCell className="text-right text-xs text-muted-foreground">
-                        {run.timestamp
-                          ? new Date(run.timestamp).toLocaleDateString()
-                          : ""}
-                      </TableCell>
+      <Tabs defaultValue="description" className="space-y-4">
+        <TabsList className="h-auto w-full justify-start overflow-x-auto">
+          <TabsTrigger value="description">Description</TabsTrigger>
+          <TabsTrigger value="instructions">Instructions</TabsTrigger>
+          <TabsTrigger value="sample-questions">Sample Questions</TabsTrigger>
+          <TabsTrigger value="benchmark-questions">Benchmark Questions</TabsTrigger>
+          <TabsTrigger value="referenced-tables">Referenced Tables</TabsTrigger>
+          <TabsTrigger value="referenced-joins">Referenced Joins</TabsTrigger>
+          <TabsTrigger value="referenced-functions">Referenced Functions</TabsTrigger>
+          <TabsTrigger value="optimization-history">Optimization History</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="description">
+          <Card className="border-db-gray-border bg-white">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">Description</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-muted-foreground">
+                {space.description || "No description available."}
+              </p>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="instructions">
+          <Card className="border-db-gray-border bg-white overflow-hidden">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">Instructions</CardTitle>
+            </CardHeader>
+            <CardContent className="overflow-hidden">
+              <pre className="whitespace-pre-wrap break-words text-sm text-muted-foreground overflow-x-auto max-h-96 overflow-y-auto">
+                {space.instructions || "No instructions configured."}
+              </pre>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="sample-questions">
+          <Card className="border-db-gray-border bg-white">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">Sample Questions</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {space.sampleQuestions.length === 0 ? (
+                <p className="text-sm italic text-muted-foreground">
+                  No sample questions configured.
+                </p>
+              ) : (
+                <ul className="list-inside list-disc space-y-1 text-sm text-muted-foreground">
+                  {space.sampleQuestions.map((q: string, i: number) => (
+                    <li key={`${q}-${i}`}>{q}</li>
+                  ))}
+                </ul>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="benchmark-questions">
+          <Card className="border-db-gray-border bg-white">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">Benchmark Questions</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {benchmarkQuestions.length === 0 ? (
+                <p className="text-sm italic text-muted-foreground">
+                  No benchmark questions found for this space yet.
+                </p>
+              ) : (
+                <ul className="list-inside list-disc space-y-1 text-sm text-muted-foreground">
+                  {benchmarkQuestions.map((q: string, i: number) => (
+                    <li key={`${q}-${i}`}>{q}</li>
+                  ))}
+                </ul>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="referenced-tables">
+          <Card className="border-db-gray-border bg-white">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">Referenced Tables</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {space.tables.length === 0 ? (
+                <p className="text-sm italic text-muted-foreground">
+                  No tables referenced.
+                </p>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Table Name</TableHead>
+                      <TableHead>Catalog</TableHead>
+                      <TableHead>Schema</TableHead>
+                      <TableHead className="text-right">Columns</TableHead>
                     </TableRow>
-                  ),
-                )}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      )}
+                  </TableHeader>
+                  <TableBody>
+                    {space.tables.map((t) => (
+                      <TableRow key={t.name}>
+                        <TableCell className="font-medium">{t.name}</TableCell>
+                        <TableCell>{t.catalog}</TableCell>
+                        <TableCell>{t.schema_name}</TableCell>
+                        <TableCell className="text-right">{t.columnCount}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="referenced-joins">
+          <Card className="border-db-gray-border bg-white">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">Referenced Joins</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {joins.length === 0 ? (
+                <p className="text-sm italic text-muted-foreground">
+                  No join specifications referenced.
+                </p>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Left Table</TableHead>
+                      <TableHead>Right Table</TableHead>
+                      <TableHead>Join Columns</TableHead>
+                      <TableHead>Relationship</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {joins.map((join, idx) => (
+                      <TableRow key={`${join.leftTable}-${join.rightTable}-${idx}`}>
+                        <TableCell className="font-medium">{join.leftTable}</TableCell>
+                        <TableCell>{join.rightTable}</TableCell>
+                        <TableCell>
+                          {join.joinColumns && join.joinColumns.length > 0
+                            ? join.joinColumns.join(", ")
+                            : "—"}
+                        </TableCell>
+                        <TableCell>{join.relationshipType || "—"}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="referenced-functions">
+          <Card className="border-db-gray-border bg-white">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">Referenced Functions</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {space.functions && space.functions.length > 0 ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Function Name</TableHead>
+                      <TableHead>Catalog</TableHead>
+                      <TableHead>Schema</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {space.functions.map((fn) => (
+                      <TableRow key={fn.name}>
+                        <TableCell className="font-medium">{fn.name}</TableCell>
+                        <TableCell>{fn.catalog}</TableCell>
+                        <TableCell>{fn.schema_name}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <p className="text-sm italic text-muted-foreground">
+                  No functions referenced.
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="optimization-history">
+          <Card className="border-db-gray-border bg-white">
+            <CardHeader>
+              <CardTitle className="text-sm font-semibold">Optimization History</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {optimizationHistory.length === 0 ? (
+                <p className="text-sm italic text-muted-foreground">
+                  No optimization history yet.
+                </p>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Run ID</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead className="text-right">Baseline</TableHead>
+                      <TableHead className="text-right">Optimized</TableHead>
+                      <TableHead className="text-right">Date</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {optimizationHistory.map((run) => (
+                      <TableRow
+                        key={run.runId}
+                        className="cursor-pointer hover:bg-muted/50"
+                        onClick={() =>
+                          navigate({
+                            to: "/runs/$runId",
+                            params: { runId: run.runId },
+                          })
+                        }
+                      >
+                        <TableCell className="font-mono text-xs">
+                          {run.runId.slice(0, 8)}…
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant="outline">{run.status}</Badge>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {run.baselineScore != null
+                            ? `${run.baselineScore.toFixed(1)}%`
+                            : "—"}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {run.optimizedScore != null
+                            ? `${run.optimizedScore.toFixed(1)}%`
+                            : "—"}
+                        </TableCell>
+                        <TableCell className="text-right text-xs text-muted-foreground">
+                          {run.timestamp
+                            ? new Date(run.timestamp).toLocaleDateString()
+                            : ""}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

@@ -11,7 +11,7 @@ import hashlib
 import logging
 import time
 from collections import Counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from genie_space_optimizer.common.config import (
     RATE_LIMIT_SECONDS,
@@ -47,6 +47,7 @@ def run_repeatability_test(
     *,
     extra_queries: int = REPEATABILITY_EXTRA_QUERIES,
     original_sqls: dict[str, str] | None = None,
+    heartbeat_cb: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     """Re-query each benchmark and compare SQL hashes across invocations.
 
@@ -80,8 +81,17 @@ def run_repeatability_test(
         )
         hashes = [original_hash]
         sqls = [original_sql]
+        if heartbeat_cb:
+            heartbeat_cb(
+                {
+                    "event": "benchmark_start",
+                    "question_id": question_id,
+                    "benchmark_index": idx + 1,
+                    "benchmark_total": len(benchmarks),
+                },
+            )
 
-        for _ in range(extra_queries):
+        for query_idx in range(extra_queries):
             time.sleep(RATE_LIMIT_SECONDS)
             retry_result = run_genie_query(w, space_id, question)
             retry_sql = retry_result.get("sql", "") or ""
@@ -92,6 +102,17 @@ def run_repeatability_test(
             )
             hashes.append(retry_hash)
             sqls.append(retry_sql)
+            if heartbeat_cb:
+                heartbeat_cb(
+                    {
+                        "event": "query_attempt",
+                        "question_id": question_id,
+                        "benchmark_index": idx + 1,
+                        "benchmark_total": len(benchmarks),
+                        "query_attempt": query_idx + 1,
+                        "query_total": extra_queries,
+                    },
+                )
 
         hash_counts = Counter(hashes)
         most_common_count = hash_counts.most_common(1)[0][1]

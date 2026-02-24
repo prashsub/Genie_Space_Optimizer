@@ -2,9 +2,31 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+import math
+from typing import Any
+
+from pydantic import BaseModel, model_serializer
 
 from .. import __version__
+
+
+def _scrub_floats(obj: Any) -> Any:
+    """Recursively replace NaN / Inf floats with None."""
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _scrub_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_scrub_floats(v) for v in obj]
+    return obj
+
+
+class SafeModel(BaseModel):
+    """BaseModel that converts NaN/Inf to None during serialization."""
+
+    @model_serializer(mode="wrap")
+    def _nan_safe_serialize(self, handler: Any) -> Any:
+        return _scrub_floats(handler(self))
 
 
 class VersionOut(BaseModel):
@@ -18,7 +40,7 @@ class VersionOut(BaseModel):
 # ── Space Models ────────────────────────────────────────────────────────
 
 
-class SpaceSummary(BaseModel):
+class SpaceSummary(SafeModel):
     id: str
     name: str
     description: str
@@ -36,7 +58,20 @@ class TableInfo(BaseModel):
     rowCount: int | None = None
 
 
-class RunSummary(BaseModel):
+class FunctionInfo(BaseModel):
+    name: str
+    catalog: str
+    schema_name: str
+
+
+class JoinInfo(BaseModel):
+    leftTable: str
+    rightTable: str
+    relationshipType: str | None = None
+    joinColumns: list[str] = []
+
+
+class RunSummary(SafeModel):
     runId: str
     status: str
     baselineScore: float | None = None
@@ -50,19 +85,24 @@ class SpaceDetail(BaseModel):
     description: str
     instructions: str
     sampleQuestions: list[str]
+    benchmarkQuestions: list[str] = []
     tables: list[TableInfo]
+    joins: list[JoinInfo] = []
+    functions: list[FunctionInfo] = []
     optimizationHistory: list[RunSummary]
+    hasActiveRun: bool = False
 
 
 class OptimizeResponse(BaseModel):
     runId: str
     jobRunId: str
+    jobUrl: str | None = None
 
 
 # ── Pipeline Models ─────────────────────────────────────────────────────
 
 
-class PipelineStep(BaseModel):
+class PipelineStep(SafeModel):
     stepNumber: int
     name: str
     status: str
@@ -72,7 +112,7 @@ class PipelineStep(BaseModel):
     outputs: dict | None = None
 
 
-class LeverStatus(BaseModel):
+class LeverStatus(SafeModel):
     lever: int
     name: str
     status: str
@@ -82,27 +122,35 @@ class LeverStatus(BaseModel):
     scoreDelta: float | None = None
     rollbackReason: str | None = None
     patches: list[dict] = []
+    iterations: list[dict] = []
 
 
-class PipelineRun(BaseModel):
+class PipelineLink(BaseModel):
+    label: str
+    url: str
+    category: str
+
+
+class PipelineRun(SafeModel):
     runId: str
     spaceId: str
     spaceName: str
     status: str
     startedAt: str
     completedAt: str | None = None
-    initiatedBy: str
+    initiatedBy: str = "system"
     baselineScore: float | None = None
     optimizedScore: float | None = None
     steps: list[PipelineStep]
     levers: list[LeverStatus] = []
     convergenceReason: str | None = None
+    links: list[PipelineLink] = []
 
 
 # ── Comparison Models ───────────────────────────────────────────────────
 
 
-class DimensionScore(BaseModel):
+class DimensionScore(SafeModel):
     dimension: str
     baseline: float
     optimized: float
@@ -120,7 +168,7 @@ class SpaceConfiguration(BaseModel):
     tableDescriptions: list[TableDescription]
 
 
-class ComparisonData(BaseModel):
+class ComparisonData(SafeModel):
     runId: str
     spaceId: str
     spaceName: str
@@ -144,12 +192,12 @@ class ActionResponse(BaseModel):
 # ── Activity Models ─────────────────────────────────────────────────────
 
 
-class ActivityItem(BaseModel):
+class ActivityItem(SafeModel):
     runId: str
     spaceId: str
     spaceName: str
     status: str
-    initiatedBy: str
+    initiatedBy: str = "system"
     baselineScore: float | None = None
     optimizedScore: float | None = None
     timestamp: str

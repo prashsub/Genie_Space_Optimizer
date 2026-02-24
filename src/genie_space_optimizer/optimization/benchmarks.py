@@ -16,6 +16,17 @@ from genie_space_optimizer.common.config import TEMPLATE_VARIABLES
 logger = logging.getLogger(__name__)
 
 
+def _quote_identifier(identifier: str) -> str:
+    return f"`{identifier.replace('`', '``')}`"
+
+
+def _set_sql_context(spark: Any, catalog: str, gold_schema: str) -> None:
+    if catalog:
+        spark.sql(f"USE CATALOG {_quote_identifier(catalog)}")
+    if gold_schema:
+        spark.sql(f"USE SCHEMA {_quote_identifier(gold_schema)}")
+
+
 def resolve_sql(sql: str, **kwargs: str) -> str:
     """Substitute ``${catalog}`` / ``${gold_schema}`` template variables."""
     if not sql:
@@ -71,13 +82,55 @@ def load_benchmarks_from_dataset(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _extract_table_references(sql: str) -> list[str]:
+    """Extract fully-qualified table references (catalog.schema.table) from SQL."""
+    import re
+    pattern = re.compile(
+        r"(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+"
+        r"(`[^`]+`\.`[^`]+`\.`[^`]+`"
+        r"|[A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*)",
+        re.IGNORECASE,
+    )
+    refs: list[str] = []
+    for match in pattern.finditer(sql):
+        ref = match.group(1).replace("`", "")
+        if ref:
+            refs.append(ref)
+    return list(dict.fromkeys(refs))
+
+
+def _verify_table_exists(spark: Any, fqn: str) -> tuple[bool, str]:
+    """Check whether a table/view/metric-view exists via SELECT ... LIMIT 0."""
+    try:
+        spark.sql(f"SELECT * FROM {_quote_identifier_fqn(fqn)} LIMIT 0")
+        return True, ""
+    except Exception as e:
+        msg = str(e)
+        if "TABLE_OR_VIEW_NOT_FOUND" in msg or "cannot be found" in msg.lower():
+            return False, f"Table/view does not exist: {fqn}"
+        if "UNRESOLVABLE_TABLE_VALUED_FUNCTION" in msg:
+            return True, ""
+        return True, ""
+
+
+def _quote_identifier_fqn(fqn: str) -> str:
+    """Quote a fully-qualified name like catalog.schema.table."""
+    parts = fqn.split(".")
+    return ".".join(_quote_identifier(p) for p in parts)
+
+
 def validate_ground_truth_sql(
     sql: str,
     spark: Any,
     catalog: str = "",
     gold_schema: str = "",
 ) -> tuple[bool, str]:
-    """Validate a single expected SQL via ``spark.sql(f"EXPLAIN ...")``.
+    """Validate a single expected SQL via EXPLAIN + table existence checks.
+
+    Two-phase validation:
+      1. EXPLAIN: catches syntax errors and unresolvable column references.
+      2. Table existence: catches hallucinated table/view names that EXPLAIN
+         sometimes doesn't catch (e.g. metric views with MEASURE() syntax).
 
     Returns ``(is_valid, error_message)``.
     """
@@ -86,10 +139,18 @@ def validate_ground_truth_sql(
         return False, "Empty SQL"
 
     try:
+        _set_sql_context(spark, catalog, gold_schema)
         spark.sql(f"EXPLAIN {resolved}")
-        return True, ""
     except Exception as e:
         return False, str(e)
+
+    table_refs = _extract_table_references(resolved)
+    for ref in table_refs:
+        exists, err = _verify_table_exists(spark, ref)
+        if not exists:
+            return False, err
+
+    return True, ""
 
 
 def validate_benchmarks(

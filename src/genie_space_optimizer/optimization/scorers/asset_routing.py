@@ -13,6 +13,7 @@ from genie_space_optimizer.optimization.evaluation import (
     CODE_SOURCE,
     _extract_response_text,
     build_asi_metadata,
+    format_asi_markdown,
 )
 
 
@@ -41,7 +42,13 @@ def asset_routing_scorer(inputs: dict, outputs: dict, expectations: dict) -> Fee
     return Feedback(
         name="asset_routing",
         value="yes" if correct else "no",
-        rationale=f"Expected {expected_asset}, got {actual_asset}. SQL: {sql[:100]}",
+        rationale=format_asi_markdown(
+            judge_name="asset_routing",
+            value="yes" if correct else "no",
+            rationale=f"Expected {expected_asset}, got {actual_asset}. SQL: {sql[:100]}",
+            metadata=metadata,
+            extra={"expected_asset": expected_asset, "actual_asset": actual_asset},
+        ),
         source=CODE_SOURCE,
         metadata=metadata,
     )

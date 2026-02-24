@@ -12,6 +12,7 @@ from mlflow.genai.scorers import scorer
 from genie_space_optimizer.optimization.evaluation import (
     CODE_SOURCE,
     build_asi_metadata,
+    format_asi_markdown,
 )
 
 
@@ -24,17 +25,24 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
     cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
     if cmp.get("error"):
+        metadata = build_asi_metadata(
+            failure_type="other",
+            severity="major",
+            confidence=0.7,
+            actual_value=cmp.get("error", "")[:100],
+        )
         return Feedback(
             name="result_correctness",
             value="no",
-            rationale=f"Comparison error: {cmp['error']}",
-            source=CODE_SOURCE,
-            metadata=build_asi_metadata(
-                failure_type="other",
-                severity="major",
-                confidence=0.7,
-                actual_value=cmp.get("error", "")[:100],
+            rationale=format_asi_markdown(
+                judge_name="result_correctness",
+                value="no",
+                rationale=f"Comparison error: {cmp['error']}",
+                metadata=metadata,
+                extra={"comparison": cmp},
             ),
+            source=CODE_SOURCE,
+            metadata=metadata,
         )
 
     if cmp.get("match"):
@@ -42,28 +50,40 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
         return Feedback(
             name="result_correctness",
             value="yes",
-            rationale=(
-                f"Match type: {match_type}. Rows: {cmp.get('gt_rows', '?')}. "
-                f"Hash: {cmp.get('gt_hash', 'n/a')}."
+            rationale=format_asi_markdown(
+                judge_name="result_correctness",
+                value="yes",
+                rationale=(
+                    f"Match type: {match_type}. Rows: {cmp.get('gt_rows', '?')}. "
+                    f"Hash: {cmp.get('gt_hash', 'n/a')}."
+                ),
+                extra={"comparison": cmp},
             ),
             source=CODE_SOURCE,
         )
 
+    metadata = build_asi_metadata(
+        failure_type="wrong_aggregation",
+        severity="major",
+        confidence=0.8,
+        expected_value=f"rows={cmp.get('gt_rows')}, hash={cmp.get('gt_hash')}",
+        actual_value=f"rows={cmp.get('genie_rows')}, hash={cmp.get('genie_hash')}",
+        counterfactual_fix="Review Genie metadata for missing joins, filters, or aggregation logic",
+    )
     return Feedback(
         name="result_correctness",
         value="no",
-        rationale=(
-            f"Mismatch. GT rows={cmp.get('gt_rows', '?')} vs "
-            f"Genie rows={cmp.get('genie_rows', '?')}. "
-            f"Hash GT={cmp.get('gt_hash')} vs Genie={cmp.get('genie_hash')}."
+        rationale=format_asi_markdown(
+            judge_name="result_correctness",
+            value="no",
+            rationale=(
+                f"Mismatch. GT rows={cmp.get('gt_rows', '?')} vs "
+                f"Genie rows={cmp.get('genie_rows', '?')}. "
+                f"Hash GT={cmp.get('gt_hash')} vs Genie={cmp.get('genie_hash')}."
+            ),
+            metadata=metadata,
+            extra={"comparison": cmp},
         ),
         source=CODE_SOURCE,
-        metadata=build_asi_metadata(
-            failure_type="wrong_aggregation",
-            severity="major",
-            confidence=0.8,
-            expected_value=f"rows={cmp.get('gt_rows')}, hash={cmp.get('gt_hash')}",
-            actual_value=f"rows={cmp.get('genie_rows')}, hash={cmp.get('genie_hash')}",
-            counterfactual_fix="Review Genie metadata for missing joins, filters, or aggregation logic",
-        ),
+        metadata=metadata,
     )

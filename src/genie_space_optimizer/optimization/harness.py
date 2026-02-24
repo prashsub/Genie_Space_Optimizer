@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import traceback
 import uuid
@@ -35,15 +36,18 @@ from genie_space_optimizer.common.config import (
     SLICE_GATE_TOLERANCE,
 )
 from genie_space_optimizer.optimization.applier import (
+    _get_general_instructions,
     apply_patch_set,
     proposals_to_patches,
     rollback,
 )
+from genie_space_optimizer.optimization.benchmarks import validate_benchmarks
 from genie_space_optimizer.optimization.evaluation import (
     all_thresholds_met,
     filter_benchmarks_by_scope,
     make_predict_fn,
     normalize_scores,
+    register_instruction_version,
     run_evaluation,
 )
 from genie_space_optimizer.optimization.models import (
@@ -76,6 +80,25 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
+
+FINALIZE_TIMEOUT_SECONDS = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_FINALIZE_TIMEOUT_SECONDS", "6600"),
+)
+FINALIZE_HEARTBEAT_SECONDS = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_FINALIZE_HEARTBEAT_SECONDS", "30"),
+)
+
+
+def _quote_identifier(identifier: str) -> str:
+    return f"`{identifier.replace('`', '``')}`"
+
+
+def _ensure_sql_context(spark: SparkSession, catalog: str, schema: str) -> None:
+    """Set Spark SQL catalog/schema context explicitly for SQL Connect stability."""
+    if catalog:
+        spark.sql(f"USE CATALOG {_quote_identifier(catalog)}")
+    if schema:
+        spark.sql(f"USE SCHEMA {_quote_identifier(schema)}")
 
 
 # ── Result Dataclass ──────────────────────────────────────────────────
@@ -113,8 +136,8 @@ def _safe_stage(
     run_id: str,
     stage_name: str,
     fn: Any,
-    catalog: str,
-    schema: str,
+    state_catalog: str,
+    state_schema: str,
     *args: Any,
     **kwargs: Any,
 ) -> Any:
@@ -128,10 +151,10 @@ def _safe_stage(
             write_stage(
                 spark, run_id, stage_name, "FAILED",
                 error_message=err_msg[:500],
-                catalog=catalog, schema=schema,
+                catalog=state_catalog, schema=state_schema,
             )
             update_run_status(
-                spark, run_id, catalog, schema,
+                spark, run_id, state_catalog, state_schema,
                 status="FAILED",
                 convergence_reason=f"error_in_{stage_name}",
             )
@@ -170,6 +193,8 @@ def _run_preflight(
     update_run_status(
         spark, run_id, catalog, schema,
         status="IN_PROGRESS",
+        experiment_name=exp_name,
+        experiment_id=experiment_id,
     )
 
     return {
@@ -204,53 +229,105 @@ def _run_baseline(
         spark, run_id, "BASELINE_EVAL_STARTED", "STARTED",
         task_key="baseline_eval", catalog=catalog, schema=schema,
     )
+    _ensure_sql_context(spark, catalog, schema)
 
-    predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
-    scorers = make_all_scorers(w, spark, catalog, schema)
+    try:
+        validation_results = validate_benchmarks(
+            benchmarks,
+            spark,
+            catalog=catalog,
+            gold_schema=schema,
+        )
+        baseline_benchmarks = [
+            b for b, validation in zip(benchmarks, validation_results)
+            if validation.get("valid")
+        ]
+        dropped_count = len(benchmarks) - len(baseline_benchmarks)
+        if dropped_count > 0:
+            sample_errors = [
+                f"  Q: {v.get('question', '?')[:60]} → {v.get('error', '?')[:120]}"
+                for v in validation_results if not v.get("valid")
+            ][:5]
+            logger.warning(
+                "Baseline dropped %d/%d invalid benchmarks before evaluation. "
+                "Sample failures:\n%s",
+                dropped_count, len(benchmarks), "\n".join(sample_errors),
+            )
+        if not baseline_benchmarks:
+            all_errors = [
+                v.get("error", "unknown") for v in validation_results
+                if not v.get("valid")
+            ][:10]
+            raise RuntimeError(
+                f"No valid benchmarks available for baseline evaluation. "
+                f"All {len(benchmarks)} loaded benchmarks failed validation. "
+                f"This typically means the benchmark table contains stale entries "
+                f"referencing tables/views that no longer exist. "
+                f"Sample errors: {all_errors}"
+            )
 
-    eval_result = _safe_stage(
-        spark, run_id, "BASELINE_EVAL", run_evaluation,
-        catalog, schema,
-        space_id, exp_name, 0, benchmarks, domain, model_id, "full",
-        predict_fn, scorers,
-        catalog=catalog, gold_schema=schema, uc_schema=f"{catalog}.{schema}",
-    )
+        _ensure_sql_context(spark, catalog, schema)
+        predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
+        scorers = make_all_scorers(w, spark, catalog, schema)
 
-    scores = eval_result.get("scores", {})
-    thresholds_met = eval_result.get("thresholds_met", False)
+        eval_result = _safe_stage(
+            spark, run_id, "BASELINE_EVAL", run_evaluation,
+            catalog, schema,
+            space_id, exp_name, 0, baseline_benchmarks, domain, model_id, "full",
+            predict_fn, scorers,
+            catalog=catalog, gold_schema=schema, uc_schema=f"{catalog}.{schema}",
+        )
 
-    write_iteration(
-        spark, run_id, 0, eval_result,
-        catalog=catalog, schema=schema,
-        eval_scope="full", model_id=model_id,
-    )
+        scores = eval_result.get("scores", {})
+        thresholds_met = eval_result.get("thresholds_met", False)
 
-    link_eval_scores_to_model(model_id, scores)
+        write_iteration(
+            spark, run_id, 0, eval_result,
+            catalog=catalog, schema=schema,
+            eval_scope="full", model_id=model_id,
+        )
 
-    update_run_status(
-        spark, run_id, catalog, schema,
-        best_iteration=0,
-        best_accuracy=eval_result.get("overall_accuracy", 0.0),
-        best_model_id=model_id,
-    )
+        link_eval_scores_to_model(model_id, scores)
 
-    write_stage(
-        spark, run_id, "BASELINE_EVAL_STARTED", "COMPLETE",
-        task_key="baseline_eval",
-        detail={
+        update_run_status(
+            spark, run_id, catalog, schema,
+            best_iteration=0,
+            best_accuracy=eval_result.get("overall_accuracy", 0.0),
+            best_model_id=model_id,
+        )
+
+        write_stage(
+            spark, run_id, "BASELINE_EVAL_STARTED", "COMPLETE",
+            task_key="baseline_eval",
+            detail={
+                "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
+                "thresholds_met": thresholds_met,
+            },
+            catalog=catalog, schema=schema,
+        )
+
+        return {
+            "scores": scores,
             "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
             "thresholds_met": thresholds_met,
-        },
-        catalog=catalog, schema=schema,
-    )
-
-    return {
-        "scores": scores,
-        "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
-        "thresholds_met": thresholds_met,
-        "model_id": model_id,
-        "eval_result": eval_result,
-    }
+            "model_id": model_id,
+            "eval_result": eval_result,
+        }
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("BASELINE_EVAL FAILED for run %s", run_id)
+        write_stage(
+            spark, run_id, "BASELINE_EVAL", "FAILED",
+            task_key="baseline_eval",
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        update_run_status(
+            spark, run_id, catalog, schema,
+            status="FAILED",
+            convergence_reason="error_in_BASELINE_EVAL",
+        )
+        raise
 
 
 # ── Stage 3: LEVER LOOP ─────────────────────────────────────────────
@@ -288,6 +365,7 @@ def _run_lever_loop(
         spark, run_id, "LEVER_LOOP_STARTED", "STARTED",
         task_key="lever_loop", catalog=catalog, schema=schema,
     )
+    _ensure_sql_context(spark, catalog, schema)
 
     resume_state = _resume_lever_loop(spark, run_id, catalog, schema)
     start_lever = resume_state.get("resume_from_lever", 0)
@@ -308,6 +386,7 @@ def _run_lever_loop(
     levers_accepted: list[int] = []
     levers_rolled_back: list[int] = []
 
+    _ensure_sql_context(spark, catalog, schema)
     predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
     scorers = make_all_scorers(w, spark, catalog, schema)
     uc_schema = f"{catalog}.{schema}"
@@ -377,6 +456,7 @@ def _run_lever_loop(
             benchmarks, "slice", patched_objects,
         )
         if slice_benchmarks:
+            _ensure_sql_context(spark, catalog, schema)
             write_stage(
                 spark, run_id, f"LEVER_{lever}_SLICE_EVAL", "STARTED",
                 task_key="lever_loop", lever=lever, iteration=iteration_counter,
@@ -415,6 +495,7 @@ def _run_lever_loop(
         # ── P0 gate ───────────────────────────────────────────────
         p0_benchmarks = filter_benchmarks_by_scope(benchmarks, "p0")
         if p0_benchmarks:
+            _ensure_sql_context(spark, catalog, schema)
             p0_result = run_evaluation(
                 space_id, exp_name, iteration_counter, p0_benchmarks,
                 domain, prev_model_id, "p0",
@@ -448,11 +529,13 @@ def _run_lever_loop(
 
         new_model_id = create_genie_model_version(
             w, space_id, config, iteration_counter, domain,
+            experiment_name=exp_name,
             uc_schema=uc_schema,
             patch_set=patches,
             parent_model_id=prev_model_id,
         )
 
+        _ensure_sql_context(spark, catalog, schema)
         full_result = run_evaluation(
             space_id, exp_name, iteration_counter, benchmarks,
             domain, new_model_id, "full",
@@ -506,6 +589,21 @@ def _run_lever_loop(
             best_accuracy=best_accuracy,
             best_model_id=best_model_id,
         )
+
+        post_instructions = _get_general_instructions(
+            apply_log.get("post_snapshot", metadata_snapshot)
+        )
+        if post_instructions:
+            register_instruction_version(
+                uc_schema=uc_schema,
+                space_id=space_id,
+                instruction_text=post_instructions,
+                run_id=run_id,
+                lever=lever,
+                iteration=iteration_counter,
+                accuracy=best_accuracy,
+                domain=domain,
+            )
 
         write_stage(
             spark, run_id, f"LEVER_{lever}_STARTED", "COMPLETE",
@@ -565,82 +663,268 @@ def _run_finalize(
     run_repeatability: bool = True,
     benchmarks: list[dict] | None = None,
     thresholds: dict[str, float] | None = None,
+    finalize_timeout_seconds: int = FINALIZE_TIMEOUT_SECONDS,
+    heartbeat_interval_seconds: int = FINALIZE_HEARTBEAT_SECONDS,
 ) -> dict:
-    """Stage 4: Repeatability test, promote model, generate report."""
+    """Stage 4: Repeatability test, promote model, generate report.
+
+    Adds heartbeat events + a soft timeout so long-running finalization
+    remains observable and fails with an explicit terminal reason.
+    """
     thresholds = thresholds or DEFAULT_THRESHOLDS
+    finalize_timeout_seconds = max(1, int(finalize_timeout_seconds))
+    heartbeat_interval_seconds = max(5, int(heartbeat_interval_seconds))
+    started_monotonic = time.monotonic()
+    last_heartbeat = 0.0
+    heartbeat_count = 0
+    current_phase = "initializing"
 
-    write_stage(
-        spark, run_id, "FINALIZE_STARTED", "STARTED",
-        task_key="finalize", catalog=catalog, schema=schema,
-    )
+    def _elapsed_seconds() -> float:
+        return time.monotonic() - started_monotonic
 
-    repeatability_pct = 0.0
-    if run_repeatability and benchmarks:
-        write_stage(
-            spark, run_id, "REPEATABILITY_TEST", "STARTED",
-            task_key="finalize", catalog=catalog, schema=schema,
-        )
-        try:
-            rep_result = run_repeatability_test(
-                w, space_id, benchmarks, spark,
+    def _check_timeout(phase: str) -> None:
+        elapsed = _elapsed_seconds()
+        if elapsed > finalize_timeout_seconds:
+            raise TimeoutError(
+                f"Finalize exceeded timeout ({finalize_timeout_seconds}s) "
+                f"during {phase} after {elapsed:.1f}s",
             )
-            repeatability_pct = rep_result.get("average_repeatability_pct", 0.0)
+
+    def _emit_heartbeat(
+        phase: str,
+        *,
+        detail: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> None:
+        nonlocal last_heartbeat, heartbeat_count, current_phase
+        current_phase = phase
+        now = time.monotonic()
+        if not force and (now - last_heartbeat) < heartbeat_interval_seconds:
+            return
+        last_heartbeat = now
+        heartbeat_count += 1
+
+        heartbeat_detail: dict[str, Any] = {
+            "phase": phase,
+            "elapsed_seconds": round(_elapsed_seconds(), 1),
+            "heartbeat_count": heartbeat_count,
+            "timeout_seconds": finalize_timeout_seconds,
+        }
+        if detail:
+            heartbeat_detail.update(detail)
+
+        try:
+            # Touch run.updated_at so stale-state reconciliation doesn't mark finalize as dead.
+            update_run_status(spark, run_id, catalog, schema)
             write_stage(
-                spark, run_id, "REPEATABILITY_TEST", "COMPLETE",
+                spark, run_id, "FINALIZE_HEARTBEAT", "STARTED",
                 task_key="finalize",
-                detail={"average_pct": repeatability_pct},
+                detail=heartbeat_detail,
                 catalog=catalog, schema=schema,
             )
         except Exception:
-            logger.exception("Repeatability test failed")
-            write_stage(
-                spark, run_id, "REPEATABILITY_TEST", "FAILED",
-                task_key="finalize",
-                error_message="Repeatability test exception",
-                catalog=catalog, schema=schema,
+            logger.warning(
+                "Failed to persist finalize heartbeat for run %s",
+                run_id,
+                exc_info=True,
             )
 
-    promoted_model = promote_best_model(spark, run_id, catalog, schema)
-
-    report_path = generate_report(spark, run_id, domain, catalog, schema)
-
-    converged = all_thresholds_met(prev_scores, thresholds)
-    if converged:
-        status = "CONVERGED"
-        reason = "threshold_met"
-    elif iteration_counter >= MAX_ITERATIONS:
-        status = "MAX_ITERATIONS"
-        reason = "max_iterations"
-    else:
-        status = "STALLED"
-        reason = "no_further_improvement"
-
-    update_run_status(
-        spark, run_id, catalog, schema,
-        status=status,
-        convergence_reason=reason,
-        best_repeatability=repeatability_pct,
-    )
-
     write_stage(
-        spark, run_id, "FINALIZE_STARTED", "COMPLETE",
+        spark, run_id, "FINALIZE_STARTED", "STARTED",
         task_key="finalize",
         detail={
-            "status": status,
-            "report_path": report_path,
-            "promoted_model": promoted_model,
-            "repeatability_pct": repeatability_pct,
+            "timeout_seconds": finalize_timeout_seconds,
+            "heartbeat_interval_seconds": heartbeat_interval_seconds,
         },
         catalog=catalog, schema=schema,
     )
+    _emit_heartbeat("finalize_started", force=True)
 
-    return {
-        "status": status,
-        "convergence_reason": reason,
-        "repeatability_pct": repeatability_pct,
-        "report_path": report_path,
-        "promoted_model": promoted_model,
-    }
+    terminal_reason = ""
+    repeatability_pct = 0.0
+    try:
+        _check_timeout("pre_repeatability")
+        if run_repeatability and benchmarks:
+            write_stage(
+                spark, run_id, "REPEATABILITY_TEST", "STARTED",
+                task_key="finalize", catalog=catalog, schema=schema,
+            )
+            _emit_heartbeat(
+                "repeatability_test",
+                force=True,
+                detail={"benchmark_count": len(benchmarks)},
+            )
+
+            def _repeatability_progress(progress: dict[str, Any]) -> None:
+                _check_timeout("repeatability_test")
+                _emit_heartbeat("repeatability_test", detail=progress)
+
+            try:
+                rep_result = run_repeatability_test(
+                    w,
+                    space_id,
+                    benchmarks,
+                    spark,
+                    heartbeat_cb=_repeatability_progress,
+                )
+                _check_timeout("post_repeatability")
+                repeatability_pct = rep_result.get("average_repeatability_pct", 0.0)
+                write_stage(
+                    spark, run_id, "REPEATABILITY_TEST", "COMPLETE",
+                    task_key="finalize",
+                    detail={
+                        "average_pct": repeatability_pct,
+                        "total_questions": rep_result.get("total_questions"),
+                    },
+                    catalog=catalog, schema=schema,
+                )
+            except TimeoutError as exc:
+                write_stage(
+                    spark, run_id, "REPEATABILITY_TEST", "FAILED",
+                    task_key="finalize",
+                    detail={"terminal_reason": "finalize_timeout"},
+                    error_message=str(exc)[:500],
+                    catalog=catalog, schema=schema,
+                )
+                raise
+            except Exception:
+                logger.exception("Repeatability test failed")
+                write_stage(
+                    spark, run_id, "REPEATABILITY_TEST", "FAILED",
+                    task_key="finalize",
+                    error_message="Repeatability test exception",
+                    catalog=catalog, schema=schema,
+                )
+        else:
+            _emit_heartbeat(
+                "repeatability_skipped",
+                force=True,
+                detail={"reason": "disabled_or_no_benchmarks"},
+            )
+
+        _check_timeout("promote_best_model")
+        _emit_heartbeat("promote_best_model", force=True)
+        promoted_model = promote_best_model(spark, run_id, catalog, schema)
+
+        _check_timeout("generate_report")
+        _emit_heartbeat("generate_report", force=True)
+        report_path = generate_report(spark, run_id, domain, catalog, schema)
+
+        _check_timeout("resolve_terminal_status")
+        converged = all_thresholds_met(prev_scores, thresholds)
+        if converged:
+            status = "CONVERGED"
+            reason = "threshold_met"
+        elif iteration_counter >= MAX_ITERATIONS:
+            status = "MAX_ITERATIONS"
+            reason = "max_iterations"
+        else:
+            status = "STALLED"
+            reason = "no_further_improvement"
+
+        terminal_reason = f"finalize_completed:{reason}"
+        update_run_status(
+            spark, run_id, catalog, schema,
+            status=status,
+            convergence_reason=reason,
+            best_repeatability=repeatability_pct,
+        )
+
+        write_stage(
+            spark, run_id, "FINALIZE_TERMINAL", "COMPLETE",
+            task_key="finalize",
+            detail={
+                "terminal_reason": terminal_reason,
+                "status": status,
+                "elapsed_seconds": round(_elapsed_seconds(), 1),
+                "heartbeat_count": heartbeat_count,
+            },
+            catalog=catalog, schema=schema,
+        )
+        write_stage(
+            spark, run_id, "FINALIZE_STARTED", "COMPLETE",
+            task_key="finalize",
+            detail={
+                "status": status,
+                "report_path": report_path,
+                "promoted_model": promoted_model,
+                "repeatability_pct": repeatability_pct,
+                "terminal_reason": terminal_reason,
+                "heartbeat_count": heartbeat_count,
+            },
+            catalog=catalog, schema=schema,
+        )
+
+        return {
+            "status": status,
+            "convergence_reason": reason,
+            "repeatability_pct": repeatability_pct,
+            "report_path": report_path,
+            "promoted_model": promoted_model,
+            "terminal_reason": terminal_reason,
+            "elapsed_seconds": round(_elapsed_seconds(), 1),
+            "heartbeat_count": heartbeat_count,
+        }
+
+    except TimeoutError as exc:
+        terminal_reason = "finalize_timeout"
+        logger.exception("Finalize timeout for run %s", run_id)
+        update_run_status(
+            spark, run_id, catalog, schema,
+            status="FAILED",
+            convergence_reason=terminal_reason,
+            best_repeatability=repeatability_pct,
+        )
+        write_stage(
+            spark, run_id, "FINALIZE_TERMINAL", "FAILED",
+            task_key="finalize",
+            detail={
+                "terminal_reason": terminal_reason,
+                "phase": current_phase,
+                "elapsed_seconds": round(_elapsed_seconds(), 1),
+                "heartbeat_count": heartbeat_count,
+            },
+            error_message=str(exc)[:500],
+            catalog=catalog, schema=schema,
+        )
+        write_stage(
+            spark, run_id, "FINALIZE_STARTED", "FAILED",
+            task_key="finalize",
+            detail={"terminal_reason": terminal_reason, "phase": current_phase},
+            error_message=str(exc)[:500],
+            catalog=catalog, schema=schema,
+        )
+        raise
+    except Exception as exc:
+        terminal_reason = "finalize_error"
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("Finalize failure for run %s", run_id)
+        update_run_status(
+            spark, run_id, catalog, schema,
+            status="FAILED",
+            convergence_reason=terminal_reason,
+            best_repeatability=repeatability_pct,
+        )
+        write_stage(
+            spark, run_id, "FINALIZE_TERMINAL", "FAILED",
+            task_key="finalize",
+            detail={
+                "terminal_reason": terminal_reason,
+                "phase": current_phase,
+                "elapsed_seconds": round(_elapsed_seconds(), 1),
+                "heartbeat_count": heartbeat_count,
+            },
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        write_stage(
+            spark, run_id, "FINALIZE_STARTED", "FAILED",
+            task_key="finalize",
+            detail={"terminal_reason": terminal_reason, "phase": current_phase},
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        raise
 
 
 # ── Stage 5: DEPLOY ─────────────────────────────────────────────────
@@ -820,6 +1104,7 @@ def optimize_genie_space(
     schema: str,
     domain: str,
     *,
+    run_id: str | None = None,
     apply_mode: str = APPLY_MODE,
     experiment_name: str | None = None,
     levers: list[int] | None = None,
@@ -831,23 +1116,29 @@ def optimize_genie_space(
 ) -> OptimizationResult:
     """Run all 5 stages in a single process.
 
-    NOT used by the multi-task job. For ad-hoc notebook use and testing only.
+    When *run_id* is supplied the caller has already created the Delta row
+    (e.g. the backend ``start_optimization`` endpoint), so we skip
+    ``create_run`` to avoid duplicating the row.
     """
     w = WorkspaceClient()
     from pyspark.sql import SparkSession
     spark = SparkSession.builder.getOrCreate()
 
-    run_id = str(uuid.uuid4())
+    _run_created_here = run_id is None
+    if _run_created_here:
+        run_id = str(uuid.uuid4())
 
     ensure_optimization_tables(spark, catalog, schema)
-    create_run(
-        spark, run_id, space_id, domain, catalog, schema,
-        max_iterations=max_iterations,
-        levers=levers,
-        apply_mode=apply_mode,
-        deploy_target=deploy_target,
-        triggered_by=triggered_by,
-    )
+
+    if _run_created_here:
+        create_run(
+            spark, run_id, space_id, domain, catalog, schema,
+            max_iterations=max_iterations,
+            levers=levers,
+            apply_mode=apply_mode,
+            deploy_target=deploy_target,
+            triggered_by=triggered_by,
+        )
 
     result = OptimizationResult(
         run_id=run_id,

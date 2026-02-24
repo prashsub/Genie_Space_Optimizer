@@ -20,6 +20,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
+    format_asi_markdown,
 )
 
 if TYPE_CHECKING:
@@ -56,7 +57,12 @@ def _make_arbiter_scorer(
             return Feedback(
                 name="arbiter",
                 value="skipped",
-                rationale="Results match — arbiter not invoked.",
+                rationale=format_asi_markdown(
+                    judge_name="arbiter",
+                    value="skipped",
+                    rationale="Results match — arbiter not invoked.",
+                    extra={"comparison": cmp},
+                ),
                 source=CODE_SOURCE,
             )
 
@@ -64,7 +70,12 @@ def _make_arbiter_scorer(
             return Feedback(
                 name="arbiter",
                 value="skipped",
-                rationale=f"SQL execution error — cannot arbitrate: {cmp['error']}",
+                rationale=format_asi_markdown(
+                    judge_name="arbiter",
+                    value="skipped",
+                    rationale=f"SQL execution error — cannot arbitrate: {cmp['error']}",
+                    extra={"comparison": cmp},
+                ),
                 source=CODE_SOURCE,
             )
 
@@ -108,22 +119,35 @@ def _make_arbiter_scorer(
             return Feedback(
                 name="arbiter",
                 value=verdict,
-                rationale=result.get("rationale", verdict),
+                rationale=format_asi_markdown(
+                    judge_name="arbiter",
+                    value=verdict,
+                    rationale=result.get("rationale", verdict),
+                    metadata=_meta,
+                    extra={"llm_response": result, "comparison": cmp},
+                ),
                 source=LLM_SOURCE,
                 metadata=_meta,
             )
         except Exception as e:
+            metadata = build_asi_metadata(
+                failure_type="other",
+                severity="info",
+                confidence=0.0,
+                counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+            )
             return Feedback(
                 name="arbiter",
                 value="ground_truth_correct",
-                rationale=f"Arbiter LLM call failed, defaulting to ground_truth_correct: {e}",
-                source=LLM_SOURCE,
-                metadata=build_asi_metadata(
-                    failure_type="other",
-                    severity="info",
-                    confidence=0.0,
-                    counterfactual_fix="LLM judge unavailable — retry or check endpoint",
+                rationale=format_asi_markdown(
+                    judge_name="arbiter",
+                    value="ground_truth_correct",
+                    rationale=f"Arbiter LLM call failed, defaulting to ground_truth_correct: {e}",
+                    metadata=metadata,
+                    extra={"comparison": cmp},
                 ),
+                source=LLM_SOURCE,
+                metadata=metadata,
             )
 
     return arbiter_scorer

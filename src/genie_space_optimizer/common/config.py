@@ -85,6 +85,9 @@ BENCHMARK_GENERATION_PROMPT = (
     '\n'
     'Given the following schema context for domain "{domain}":\n'
     '\n'
+    '## VALID Data Assets (ONLY use these in SQL)\n'
+    '{valid_assets_context}\n'
+    '\n'
     '## Tables and Columns\n'
     '{tables_context}\n'
     '\n'
@@ -100,11 +103,18 @@ BENCHMARK_GENERATION_PROMPT = (
     '## Sample Questions (from Genie Space config)\n'
     '{sample_questions_context}\n'
     '\n'
+    'CRITICAL CONSTRAINT: Your expected_sql MUST ONLY reference the tables, metric views, '
+    'and functions listed in "VALID Data Assets" above. Do NOT invent, hallucinate, or guess '
+    'table/view names. Every FROM clause, JOIN, and function call must reference a real asset '
+    'from the list above. If you are unsure whether an asset exists, do NOT include a benchmark '
+    'for it.\n'
+    '\n'
     'Generate exactly {target_count} diverse benchmark questions that a business user would ask.\n'
     '\n'
     'For each question, provide:\n'
     '1. "question": The natural language question\n'
-    '2. "expected_sql": The correct SQL using ${{catalog}}.${{gold_schema}} template variables\n'
+    '2. "expected_sql": The correct SQL referencing ONLY the valid assets listed above.\n'
+    '   Use fully-qualified names (catalog.schema.table) from the VALID Data Assets list.\n'
     '   - For metric views: use MEASURE() syntax\n'
     '   - For TVFs: use function call syntax\n'
     '   - For tables: use standard SQL\n'
@@ -118,6 +128,35 @@ BENCHMARK_GENERATION_PROMPT = (
     '(filters, multi-table joins, temporal ranges, NULL handling).\n'
     '\n'
     'Return a JSON array of question objects. No markdown, just JSON.'
+)
+
+BENCHMARK_CORRECTION_PROMPT = (
+    'You are a Databricks SQL expert fixing invalid benchmark questions.\n'
+    '\n'
+    'The following benchmark questions have SQL errors. Fix each one so the '
+    'expected_sql is valid, using ONLY the valid assets listed below.\n'
+    '\n'
+    '## VALID Data Assets (ONLY these exist)\n'
+    '{valid_assets_context}\n'
+    '\n'
+    '## Tables and Columns\n'
+    '{tables_context}\n'
+    '\n'
+    '## Benchmarks to Fix\n'
+    '{benchmarks_to_fix}\n'
+    '\n'
+    'For each benchmark:\n'
+    '- If the error is a wrong table/view name, find the closest matching valid asset '
+    'and rewrite the SQL.\n'
+    '- If no valid asset can answer the question, set "expected_sql" to null and '
+    '"unfixable_reason" to explain why.\n'
+    '- Preserve the original question text.\n'
+    '\n'
+    'Return a JSON array of objects with: "question", "expected_sql" (corrected or null), '
+    '"expected_asset", "category", "required_tables", "required_columns", "expected_facts", '
+    '"unfixable_reason" (null if fixed).\n'
+    '\n'
+    'No markdown, just JSON.'
 )
 
 # ── 5b. Proposal Generation Prompts ───────────────────────────────────
@@ -358,6 +397,9 @@ RUN_NAME_TEMPLATE = "genie_eval_iter{iteration}_{timestamp}"
 MODEL_NAME_TEMPLATE = "genie-space-{space_id}"
 PROMPT_NAME_TEMPLATE = "{uc_schema}.genie_opt_{judge_name}"
 PROMPT_ALIAS = "production"
+
+INSTRUCTION_PROMPT_NAME_TEMPLATE = "{uc_schema}.genie_instructions_{space_id}"
+INSTRUCTION_PROMPT_ALIAS = "latest"
 
 # ── 14. Patch DSL Constants ────────────────────────────────────────────
 
