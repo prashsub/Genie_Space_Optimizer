@@ -3,19 +3,12 @@ import json
 import subprocess
 import sys
 
-# SP privileges — backend reads state tables for the UI; it no longer runs
-# user-facing SQL, MLflow, or Prompt Registry operations (those run as user).
+# SP privileges on the optimizer's own schema — the SP runs optimization jobs
+# and needs full write access to state tables, MLflow models, and prompts.
+# Access to *user* schemas (Genie space assets) is granted separately via
+# the app's Data Access Settings page.
 SP_CATALOG_PRIVILEGES = {"USE_CATALOG"}
 SP_SCHEMA_PRIVILEGES = {
-    "USE_SCHEMA",
-    "SELECT",
-}
-
-# User-group privileges — optimization jobs run as the triggering user, so
-# users need write access to the optimizer's state schema for Delta tables,
-# MLflow Prompt Registry, and model logging.
-USER_CATALOG_PRIVILEGES = {"USE_CATALOG"}
-USER_SCHEMA_PRIVILEGES = {
     "USE_SCHEMA",
     "SELECT",
     "MODIFY",
@@ -23,10 +16,8 @@ USER_SCHEMA_PRIVILEGES = {
     "CREATE_FUNCTION",
     "CREATE_MODEL",
     "EXECUTE",
-    "MANAGE",
 }
 
-# Backwards-compat aliases used by _verify_required_privileges for SP checks.
 CATALOG_PRIVILEGES = SP_CATALOG_PRIVILEGES
 SCHEMA_PRIVILEGES = SP_SCHEMA_PRIVILEGES
 
@@ -231,26 +222,6 @@ def main() -> int:
     )
     print(
         f"[grant-app-sp] SP grants applied: principal={principal} "
-        f"on {schema_fqn}",
-    )
-
-    # ── User-group grants (jobs run_as user need write access) ─────────
-    _update_grants(
-        profile=args.profile,
-        securable_type="catalog",
-        full_name=args.catalog,
-        principal="users",
-        add=sorted(USER_CATALOG_PRIVILEGES),
-    )
-    _update_grants(
-        profile=args.profile,
-        securable_type="schema",
-        full_name=schema_fqn,
-        principal="users",
-        add=sorted(USER_SCHEMA_PRIVILEGES),
-    )
-    print(
-        f"[grant-app-sp] User-group grants applied: group=users "
         f"on {schema_fqn}",
     )
 

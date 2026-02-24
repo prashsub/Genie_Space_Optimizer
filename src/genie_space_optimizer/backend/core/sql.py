@@ -43,7 +43,7 @@ class Sql:
 class _SqlDependency(LifespanDependency):
     @asynccontextmanager
     async def lifespan(self, app: FastAPI) -> AsyncGenerator[None, None]:
-        app.state.sql_config = SqlConfig()  # ty: ignore[missing-argument]
+        app.state.sql_config = SqlConfig()
         yield
 
     @staticmethod

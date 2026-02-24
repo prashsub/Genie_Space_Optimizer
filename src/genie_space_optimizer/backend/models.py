@@ -201,3 +201,41 @@ class ActivityItem(SafeModel):
     baselineScore: float | None = None
     optimizedScore: float | None = None
     timestamp: str
+
+
+# ── Data Access Grant Models ───────────────────────────────────────────
+
+
+class DataAccessGrant(BaseModel):
+    id: str
+    catalog: str
+    schema_name: str = ""
+    grantedBy: str
+    grantedAt: str
+    status: str = "active"
+
+
+class DataAccessGrantRequest(BaseModel):
+    catalog: str
+    schema_name: str
+
+
+class DetectedSchema(BaseModel):
+    catalog: str
+    schema_name: str
+    spaceCount: int
+    granted: bool
+    canGrant: bool = False
+
+
+class DataAccessOverview(BaseModel):
+    grants: list[DataAccessGrant]
+    detectedSchemas: list[DetectedSchema]
+    spPrincipalId: str
+    spPrincipalDisplayName: str | None = None
+
+
+class MissingGrantDetail(BaseModel):
+    catalog: str
+    schema_name: str
+    grantCommand: str

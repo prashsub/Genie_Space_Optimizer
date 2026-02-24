@@ -19,7 +19,6 @@ from databricks.sdk.service.iam import AccessControlRequest, PermissionLevel
 from databricks.sdk.service.jobs import (
     JobEnvironment,
     JobParameterDefinition,
-    JobRunAs,
     JobSettings,
     NotebookTask,
     QueueSettings,
@@ -180,22 +179,19 @@ def _ensure_artifacts(ws: WorkspaceClient) -> str:
     return ws_wheel_path
 
 
-def _job_settings(ws_wheel_path: str, *, run_as_user_name: str = "") -> JobSettings:
+def _job_settings(ws_wheel_path: str) -> JobSettings:
     def _job_param_ref(name: str) -> str:
         return f"{{{{job.parameters.{name}}}}}"
-
-    run_as = JobRunAs(user_name=run_as_user_name) if run_as_user_name else None
 
     return JobSettings(
         name=_PERSISTENT_JOB_NAME,
         description=(
             "Persistent DAG optimization runner managed by Genie Space Optimizer app "
             "(preflight → baseline_eval → lever_loop → finalize → deploy). "
-            "Job executes as the triggering user via run_as."
+            "SP executes with granted privileges on user schemas."
         ),
         max_concurrent_runs=20,
         queue=QueueSettings(enabled=True),
-        run_as=run_as,
         parameters=[
             JobParameterDefinition(name=name, default=default)
             for name, default in _JOB_PARAM_DEFAULTS.items()
@@ -290,11 +286,7 @@ def _job_settings(ws_wheel_path: str, *, run_as_user_name: str = "") -> JobSetti
 
 
 def _ensure_job_visibility(ws: WorkspaceClient, job_id: int) -> None:
-    """Best-effort permission update so users can locate runs in Workflows UI.
-
-    CAN_MANAGE_RUN is required for ``run_as`` to work correctly — the job
-    needs to be visible and manageable by the users whose identity it runs as.
-    """
+    """Best-effort permission update so users can view job runs in the UI."""
     try:
         ws.permissions.update(
             "jobs",
@@ -302,13 +294,13 @@ def _ensure_job_visibility(ws: WorkspaceClient, job_id: int) -> None:
             access_control_list=[
                 AccessControlRequest(
                     group_name="users",
-                    permission_level=PermissionLevel.CAN_MANAGE_RUN,
+                    permission_level=PermissionLevel.CAN_VIEW,
                 )
             ],
         )
     except Exception as exc:
         logger.warning(
-            "Could not set CAN_MANAGE_RUN permissions on job %s: %s",
+            "Could not set CAN_VIEW permissions on job %s: %s",
             job_id,
             exc,
         )
@@ -403,36 +395,17 @@ def submit_optimization(
     levers: str = "[1,2,3,4,5,6]",
     max_iterations: str = "5",
     triggered_by: str = "",
-    run_as_user: str = "",
     experiment_name: str = "",
 ) -> tuple[str, int]:
     """Trigger a run on a persistent serverless optimization job.
 
-    The job's ``run_as`` is set to ``run_as_user`` before each ``run_now``
-    call so all tasks execute under the triggering user's identity.  A
-    threading lock serialises the reset→run_now sequence to prevent race
-    conditions when multiple users submit concurrently.
+    The job runs as the SP which has been granted SELECT/EXECUTE on user
+    schemas via the Data Access Settings page.
     """
     ws_wheel_path = _ensure_artifacts(ws)
     job_id = _ensure_persistent_job(ws, ws_wheel_path)
 
     with _job_submit_lock:
-        if run_as_user:
-            user_settings = _job_settings(
-                ws_wheel_path, run_as_user_name=run_as_user,
-            )
-            try:
-                ws.jobs.reset(job_id, new_settings=user_settings)
-                logger.info(
-                    "Set run_as=%s on job %s before submission", run_as_user, job_id,
-                )
-            except Exception:
-                logger.warning(
-                    "Could not update run_as on job %s — run will use default identity",
-                    job_id,
-                    exc_info=True,
-                )
-
         waiter = ws.jobs.run_now(
             job_id=job_id,
             idempotency_token=_build_idempotency_token(
@@ -457,10 +430,9 @@ def submit_optimization(
 
     job_run_id = str(waiter.run_id)
     logger.info(
-        "Triggered optimization run %s on persistent job %s as user=%s (job run %s)",
+        "Triggered optimization run %s on persistent job %s (job run %s)",
         run_id,
         job_id,
-        run_as_user or "(default)",
         job_run_id,
     )
     return job_run_id, job_id

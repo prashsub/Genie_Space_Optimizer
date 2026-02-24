@@ -444,6 +444,25 @@ def _build_step_io(
         )
 
     if step_num == 2:
+        def _to_int(value: Any) -> int | None:
+            if value is None:
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed >= 0 else None
+
+        def _to_list_of_str(value: Any) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            out: list[str] = []
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    out.append(text)
+            return out
+
         prefetched = (
             config_snapshot.get("_prefetched_uc_metadata", {})
             if isinstance(config_snapshot, dict)
@@ -482,18 +501,60 @@ def _build_step_io(
                 continue
             routine_samples.append(str(r.get("routine_name") or r.get("name") or "").strip())
 
+        columns_collected = _to_int(detail.get("columns_collected"))
+        if columns_collected is None:
+            columns_collected = _to_int(detail.get("columnsCollected"))
+        if columns_collected is None:
+            columns_collected = len(uc_columns) if isinstance(uc_columns, list) else 0
+
+        tags_collected = _to_int(detail.get("tags_collected"))
+        if tags_collected is None:
+            tags_collected = _to_int(detail.get("tagsCollected"))
+        if tags_collected is None:
+            tags_collected = len(uc_tags) if isinstance(uc_tags, list) else 0
+
+        routines_collected = _to_int(detail.get("routines_collected"))
+        if routines_collected is None:
+            routines_collected = _to_int(detail.get("routinesCollected"))
+        if routines_collected is None:
+            routines_collected = len(uc_routines) if isinstance(uc_routines, list) else 0
+
+        detail_column_samples = _to_list_of_str(detail.get("column_samples"))
+        if not detail_column_samples:
+            detail_column_samples = _to_list_of_str(detail.get("columnSamples"))
+        detail_tag_samples = _to_list_of_str(detail.get("tag_samples"))
+        if not detail_tag_samples:
+            detail_tag_samples = _to_list_of_str(detail.get("tagSamples"))
+        detail_routine_samples = _to_list_of_str(detail.get("routine_samples"))
+        if not detail_routine_samples:
+            detail_routine_samples = _to_list_of_str(detail.get("routineSamples"))
+
+        referenced_schemas = _to_list_of_str(detail.get("referenced_schemas"))
+        if not referenced_schemas:
+            referenced_schemas = _to_list_of_str(detail.get("referencedSchemas"))
+        referenced_schema_count = _to_int(detail.get("referenced_schema_count"))
+        if referenced_schema_count is None:
+            referenced_schema_count = _to_int(detail.get("referencedSchemaCount"))
+        if referenced_schema_count is None:
+            referenced_schema_count = len(referenced_schemas)
+
         return (
             {
                 "catalog": run_data.get("catalog"),
                 "schema": run_data.get("uc_schema"),
             },
             {
-                "columnsCollected": len(uc_columns) if isinstance(uc_columns, list) else 0,
-                "tagsCollected": len(uc_tags) if isinstance(uc_tags, list) else 0,
-                "routinesCollected": len(uc_routines) if isinstance(uc_routines, list) else 0,
-                "columnSamples": [s for s in column_samples if s],
-                "tagSamples": [s for s in tag_samples if s],
-                "routineSamples": [s for s in routine_samples if s],
+                "columnsCollected": columns_collected,
+                "tagsCollected": tags_collected,
+                "routinesCollected": routines_collected,
+                "columnSamples": detail_column_samples or [s for s in column_samples if s],
+                "tagSamples": detail_tag_samples or [s for s in tag_samples if s],
+                "routineSamples": detail_routine_samples or [s for s in routine_samples if s],
+                "tableRefCount": _to_int(detail.get("table_ref_count")),
+                "referencedSchemaCount": referenced_schema_count,
+                "referencedSchemas": referenced_schemas,
+                "collectionScope": detail.get("collection_scope"),
+                "metadataSource": detail.get("metadata_source"),
                 "stageEvents": timeline,
             },
         )
@@ -570,6 +631,10 @@ def _build_step_io(
                     - _finite(baseline_iter.get("correct_count", 0))
                 ),
                 "mlflowRunId": baseline_iter.get("mlflow_run_id"),
+                "invalidBenchmarkCount": _safe_int(detail.get("invalid_benchmark_count")),
+                "permissionBlockedCount": _safe_int(detail.get("permission_blocked_count")),
+                "unresolvedColumnCount": _safe_int(detail.get("unresolved_column_count")),
+                "harnessRetryCount": _safe_int(detail.get("harness_retry_count")),
                 "sampleQuestions": sample_rows,
                 "stageEvents": timeline,
             },
@@ -645,6 +710,14 @@ def _build_step_summary(
             tables=detail.get("table_count", "?"),
             instructions=detail.get("instruction_count", "?"),
             questions=detail.get("benchmark_count", run_data.get("benchmark_count", "?")),
+        )
+    if step_num == 2:
+        columns = detail.get("columns_collected", detail.get("columnsCollected", "?"))
+        tags = detail.get("tags_collected", detail.get("tagsCollected", "?"))
+        routines = detail.get("routines_collected", detail.get("routinesCollected", "?"))
+        return (
+            f"Collected metadata for {columns} columns, {tags} tags, "
+            f"{routines} routines from Unity Catalog"
         )
     if step_num == 3:
         baseline_iter = next(
@@ -970,8 +1043,65 @@ def _get_baseline_and_best_accuracy(iters_rows: list[dict]) -> tuple[float | Non
 # ── Route Handlers ──────────────────────────────────────────────────────
 
 
+_ACTIVE_RUN_STATUSES_LOCAL = {"QUEUED", "IN_PROGRESS", "RUNNING"}
+_TERMINAL_JOB_STATES_LOCAL = {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
+
+
+def _reconcile_single_run(
+    spark,
+    run_data: dict,
+    sp_ws: WorkspaceClient,
+    catalog: str,
+    schema_name: str,
+) -> dict:
+    """If the Delta status is active but the Databricks job has terminated,
+    update Delta and return refreshed run_data so the caller sees the real state."""
+    from genie_space_optimizer.optimization.state import load_run, update_run_status
+
+    status = str(run_data.get("status") or "")
+    if status not in _ACTIVE_RUN_STATUSES_LOCAL:
+        return run_data
+
+    job_run_id = run_data.get("job_run_id")
+    if not job_run_id:
+        return run_data
+
+    try:
+        run_obj = sp_ws.jobs.get_run(run_id=int(str(job_run_id)))
+        life_cycle = (
+            str(run_obj.state.life_cycle_state).split(".")[-1]
+            if run_obj.state else ""
+        )
+        if life_cycle not in _TERMINAL_JOB_STATES_LOCAL:
+            return run_data
+
+        result_state = (
+            str(run_obj.state.result_state).split(".")[-1].lower()
+            if run_obj.state else ""
+        )
+        new_status = "CANCELLED" if result_state == "canceled" else "FAILED"
+        suffix = f":{result_state}" if result_state and result_state != "none" else ""
+        update_run_status(
+            spark,
+            str(run_data["run_id"]),
+            catalog,
+            schema_name,
+            status=new_status,
+            convergence_reason=f"job_{life_cycle.lower()}_detected_on_poll{suffix}",
+        )
+        logger.info(
+            "Reconciled run %s → %s (job lifecycle=%s, result=%s)",
+            run_data["run_id"], new_status, life_cycle, result_state,
+        )
+        refreshed = load_run(spark, str(run_data["run_id"]), catalog, schema_name)
+        return refreshed if refreshed else run_data
+    except Exception:
+        logger.debug("Could not reconcile run %s with job API", run_data.get("run_id"), exc_info=True)
+        return run_data
+
+
 @router.get("/runs/{run_id}", response_model=PipelineRun, operation_id="getRun")
-def get_run(run_id: str, ws: Dependencies.UserClient, config: Dependencies.Config):
+def get_run(run_id: str, ws: Dependencies.UserClient, sp_ws: Dependencies.Client, config: Dependencies.Config):
     """Run status with 5 user-facing pipeline steps and lever detail."""
     from genie_space_optimizer.optimization.state import (
         load_iterations,
@@ -984,6 +1114,8 @@ def get_run(run_id: str, ws: Dependencies.UserClient, config: Dependencies.Confi
     run_data = load_run(spark, run_id, config.catalog, config.schema_name)
     if not run_data:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    run_data = _reconcile_single_run(spark, run_data, sp_ws, config.catalog, config.schema_name)
 
     stages_df = load_stages(spark, run_id, config.catalog, config.schema_name)
     stages_rows = stages_df.to_dict("records") if not stages_df.empty else []
@@ -1330,12 +1462,18 @@ def _build_links(
 
     job_run_id = run_data.get("job_run_id")
     if job_run_id and job_run_id not in ("pending", ""):
-        job_url = f"{host}/jobs?o=&runId={job_run_id}"
+        job_url = f"{host}/jobs?runId={job_run_id}"
         try:
             run = ws.jobs.get_run(run_id=int(str(job_run_id)))
             workspace_id = ws.get_workspace_id()
             if run.job_id is not None:
-                job_url = f"{host}/jobs/{int(run.job_id)}?o={workspace_id}"
+                # Deep-link directly to this run when job_id is known.
+                job_url = (
+                    f"{host}/jobs/{int(run.job_id)}/runs/{int(str(job_run_id))}"
+                    f"?o={workspace_id}"
+                )
+            elif workspace_id:
+                job_url = f"{host}/jobs?o={workspace_id}&runId={job_run_id}"
         except Exception:
             pass
         links.append(PipelineLink(

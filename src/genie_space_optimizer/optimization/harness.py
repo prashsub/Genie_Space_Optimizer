@@ -41,7 +41,6 @@ from genie_space_optimizer.optimization.applier import (
     proposals_to_patches,
     rollback,
 )
-from genie_space_optimizer.optimization.benchmarks import validate_benchmarks
 from genie_space_optimizer.optimization.evaluation import (
     all_thresholds_met,
     filter_benchmarks_by_scope,
@@ -232,39 +231,9 @@ def _run_baseline(
     _ensure_sql_context(spark, catalog, schema)
 
     try:
-        validation_results = validate_benchmarks(
-            benchmarks,
-            spark,
-            catalog=catalog,
-            gold_schema=schema,
-        )
-        baseline_benchmarks = [
-            b for b, validation in zip(benchmarks, validation_results)
-            if validation.get("valid")
-        ]
-        dropped_count = len(benchmarks) - len(baseline_benchmarks)
-        if dropped_count > 0:
-            sample_errors = [
-                f"  Q: {v.get('question', '?')[:60]} → {v.get('error', '?')[:120]}"
-                for v in validation_results if not v.get("valid")
-            ][:5]
-            logger.warning(
-                "Baseline dropped %d/%d invalid benchmarks before evaluation. "
-                "Sample failures:\n%s",
-                dropped_count, len(benchmarks), "\n".join(sample_errors),
-            )
-        if not baseline_benchmarks:
-            all_errors = [
-                v.get("error", "unknown") for v in validation_results
-                if not v.get("valid")
-            ][:10]
-            raise RuntimeError(
-                f"No valid benchmarks available for baseline evaluation. "
-                f"All {len(benchmarks)} loaded benchmarks failed validation. "
-                f"This typically means the benchmark table contains stale entries "
-                f"referencing tables/views that no longer exist. "
-                f"Sample errors: {all_errors}"
-            )
+        # Strict SQL/routine gating now lives inside run_evaluation so all eval
+        # scopes (baseline, slice, p0, full) share one consistent quarantine path.
+        baseline_benchmarks = benchmarks
 
         _ensure_sql_context(spark, catalog, schema)
         predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
@@ -275,7 +244,7 @@ def _run_baseline(
             catalog, schema,
             space_id, exp_name, 0, baseline_benchmarks, domain, model_id, "full",
             predict_fn, scorers,
-            catalog=catalog, gold_schema=schema, uc_schema=f"{catalog}.{schema}",
+            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=f"{catalog}.{schema}",
         )
 
         scores = eval_result.get("scores", {})
@@ -302,6 +271,10 @@ def _run_baseline(
             detail={
                 "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
                 "thresholds_met": thresholds_met,
+                "invalid_benchmark_count": eval_result.get("invalid_benchmark_count", 0),
+                "permission_blocked_count": eval_result.get("permission_blocked_count", 0),
+                "unresolved_column_count": eval_result.get("unresolved_column_count", 0),
+                "harness_retry_count": eval_result.get("harness_retry_count", 0),
             },
             catalog=catalog, schema=schema,
         )
@@ -466,7 +439,7 @@ def _run_lever_loop(
                 space_id, exp_name, iteration_counter, slice_benchmarks,
                 domain, prev_model_id, "slice",
                 predict_fn, scorers,
-                catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+                spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
                 patched_objects=patched_objects,
             )
             slice_scores = slice_result.get("scores", {})
@@ -500,7 +473,7 @@ def _run_lever_loop(
                 space_id, exp_name, iteration_counter, p0_benchmarks,
                 domain, prev_model_id, "p0",
                 predict_fn, scorers,
-                catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+                spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
             )
             p0_failures = p0_result.get("failures", [])
             if p0_failures:
@@ -540,7 +513,7 @@ def _run_lever_loop(
             space_id, exp_name, iteration_counter, benchmarks,
             domain, new_model_id, "full",
             predict_fn, scorers,
-            catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
         )
 
         full_scores = full_result.get("scores", {})

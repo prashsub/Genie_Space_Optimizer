@@ -19,6 +19,53 @@ import { LayoutGrid, Activity, BarChart3, Search } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
+type SpaceSummary = {
+  id: string;
+  name: string;
+  description: string;
+  tableCount: number;
+  lastModified: string;
+  qualityScore?: number | null;
+};
+
+type ActivityItem = {
+  runId: string;
+  spaceName: string;
+  status: string;
+  initiatedBy?: string | null;
+  optimizedScore?: number | null;
+  timestamp?: string | null;
+};
+
+function toSpaceSummaryArray(value: unknown): SpaceSummary[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .map((item) => ({
+      id: String(item.id ?? ""),
+      name: String(item.name ?? ""),
+      description: String(item.description ?? ""),
+      tableCount: typeof item.tableCount === "number" ? item.tableCount : 0,
+      lastModified: item.lastModified != null ? String(item.lastModified) : "",
+      qualityScore: typeof item.qualityScore === "number" ? item.qualityScore : null,
+    }));
+}
+
+function toActivityItemArray(value: unknown): ActivityItem[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .map((item) => ({
+      runId: String(item.runId ?? ""),
+      spaceName: String(item.spaceName ?? ""),
+      status: String(item.status ?? ""),
+      initiatedBy: item.initiatedBy != null ? String(item.initiatedBy) : "",
+      optimizedScore: typeof item.optimizedScore === "number" ? item.optimizedScore : null,
+      timestamp: item.timestamp != null ? String(item.timestamp) : "",
+    }))
+    .filter((item) => item.runId.length > 0);
+}
+
 export const Route = createFileRoute("/")({
   component: () => (
     <ErrorBoundary fallback={<DashboardError />}>
@@ -59,16 +106,18 @@ function DashboardSkeleton() {
 }
 
 function DashboardContent() {
-  const { data: spaces } = useListSpacesSuspense(selector());
+  const { data } = useListSpacesSuspense(selector());
+  const spaces = toSpaceSummaryArray(data);
   return (
     <Dashboard
-      spaces={spaces ?? []}
+      spaces={spaces}
     />
   );
 }
 
 function ActivitySection({ navigate }: { navigate: ReturnType<typeof useNavigate> }) {
-  const { data: activity } = useGetActivitySuspense(selector());
+  const { data } = useGetActivitySuspense(selector());
+  const activity = toActivityItemArray(data);
   if (!activity || activity.length === 0) return null;
 
   return (
@@ -128,7 +177,7 @@ function ActivitySection({ navigate }: { navigate: ReturnType<typeof useNavigate
   );
 }
 
-function Dashboard({ spaces }: { spaces: NonNullable<ReturnType<typeof useListSpacesSuspense>["data"]> }) {
+function Dashboard({ spaces }: { spaces: SpaceSummary[] }) {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const navigate = useNavigate();
@@ -139,7 +188,6 @@ function Dashboard({ spaces }: { spaces: NonNullable<ReturnType<typeof useListSp
   }, [search]);
 
   const filtered = useMemo(() => {
-    if (!spaces) return [];
     const q = debouncedSearch.toLowerCase();
     if (!q) return spaces;
     return spaces.filter(
@@ -149,9 +197,9 @@ function Dashboard({ spaces }: { spaces: NonNullable<ReturnType<typeof useListSp
     );
   }, [spaces, debouncedSearch]);
 
-  const totalSpaces = spaces?.length ?? 0;
+  const totalSpaces = spaces.length;
   const avgScore = useMemo(() => {
-    if (!spaces || spaces.length === 0) return 0;
+    if (spaces.length === 0) return 0;
     const scored = spaces.filter((s) => s.qualityScore != null);
     if (scored.length === 0) return 0;
     const sum = scored.reduce((acc, s) => acc + (s.qualityScore ?? 0), 0);
@@ -215,9 +263,9 @@ function Dashboard({ spaces }: { spaces: NonNullable<ReturnType<typeof useListSp
             <SpaceCard
               key={space.id}
               {...space}
-              onClick={() =>
-                navigate({ to: "/spaces/$spaceId", params: { spaceId: space.id } })
-              }
+              onClick={() => {
+                void navigate({ to: "/spaces/$spaceId", params: { spaceId: space.id } });
+              }}
             />
           ),
         )}

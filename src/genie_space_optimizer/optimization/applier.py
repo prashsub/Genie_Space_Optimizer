@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 from typing import Any
 
 from databricks.sdk import WorkspaceClient
@@ -643,6 +644,10 @@ def _apply_action_to_uc(w: WorkspaceClient, action: dict) -> bool:
         return False
 
     patch_type = action.get("action_type", "")
+    warehouse_id = os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "").strip()
+    if not warehouse_id:
+        logger.warning("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID is not set; skipping UC DDL action")
+        return False
 
     try:
         if patch_type == "update_column_description":
@@ -653,6 +658,7 @@ def _apply_action_to_uc(w: WorkspaceClient, action: dict) -> bool:
                 escaped = new_text.replace("'", "\\'")
                 w.statement_execution.execute_statement(
                     statement=f"ALTER TABLE {table} ALTER COLUMN {column} COMMENT '{escaped}'",
+                    warehouse_id=warehouse_id,
                     wait_timeout="30s",
                 )
                 return True
@@ -663,6 +669,7 @@ def _apply_action_to_uc(w: WorkspaceClient, action: dict) -> bool:
                 escaped = new_text.replace("'", "\\'")
                 w.statement_execution.execute_statement(
                     statement=f"COMMENT ON TABLE {table} IS '{escaped}'",
+                    warehouse_id=warehouse_id,
                     wait_timeout="30s",
                 )
                 return True
@@ -671,6 +678,7 @@ def _apply_action_to_uc(w: WorkspaceClient, action: dict) -> bool:
             if new_sql:
                 w.statement_execution.execute_statement(
                     statement=new_sql,
+                    warehouse_id=warehouse_id,
                     wait_timeout="60s",
                 )
                 return True

@@ -19,7 +19,9 @@ import os
 import re
 import time
 import traceback
+from difflib import get_close_matches
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Union
 
 import mlflow
@@ -118,7 +120,12 @@ def _call_llm_for_scoring(
                 messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
                 temperature=LLM_TEMPERATURE,
             )
-            content = response.choices[0].message.content
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise ValueError(f"Empty LLM response choices on attempt {attempt + 1}")
+            first_choice = choices[0]
+            message = getattr(first_choice, "message", None)
+            content = getattr(message, "content", None)
             if not content or not content.strip():
                 raise ValueError(f"Empty LLM response on attempt {attempt + 1}")
             content = content.strip()
@@ -133,14 +140,14 @@ def _call_llm_for_scoring(
     raise last_err  # type: ignore[misc]
 
 
-def normalize_result_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
+def normalize_result_df(df: pd.DataFrame | None) -> pd.DataFrame:
     """Deterministic normalization of a result DataFrame.
 
     Sort columns alphabetically, sort rows, round floats to 6 decimals,
     normalize timestamps to UTC, strip whitespace.
     """
     if df is None or df.empty:
-        return df
+        return pd.DataFrame() if df is None else df
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
     df = df[sorted(df.columns)]
@@ -404,6 +411,107 @@ def _is_infrastructure_sql_error(message: str) -> bool:
     return any(p in m for p in patterns)
 
 
+def _extract_sqlstate(message: str) -> str | None:
+    match = re.search(r"SQLSTATE:\s*([A-Z0-9]+)", message or "", flags=re.IGNORECASE)
+    return match.group(1).upper() if match else None
+
+
+def _classify_sql_validation_error(message: str) -> str:
+    """Classify SQL validation failures into stable reason codes."""
+    lowered = (message or "").lower()
+    if "insufficient_permissions" in lowered or "permission denied" in lowered:
+        return "permission_blocked"
+    if "does not have execute on routine" in lowered:
+        return "permission_blocked"
+    if "unresolved_column" in lowered:
+        if "join" in lowered:
+            return "bad_join_key"
+        return "unknown_column"
+    if "table_or_view_not_found" in lowered or "cannot be found" in lowered:
+        return "missing_object"
+    if "parseexception" in lowered or "syntax error" in lowered:
+        return "syntax_error"
+    return "sql_compile_error"
+
+
+def _precheck_benchmarks_for_eval(
+    *,
+    benchmarks: list[dict],
+    spark: SparkSession,
+    catalog: str,
+    gold_schema: str,
+    known_functions: set[str],
+) -> tuple[list[dict], list[dict[str, Any]], dict[str, int]]:
+    """Apply strict SQL + routine checks before entering mlflow.genai.evaluate()."""
+    valid: list[dict] = []
+    quarantined: list[dict[str, Any]] = []
+    reason_counts = {
+        "invalid_benchmark_count": 0,
+        "permission_blocked_count": 0,
+        "unresolved_column_count": 0,
+        "bad_join_key_count": 0,
+    }
+
+    for idx, benchmark in enumerate(benchmarks):
+        question = str(benchmark.get("question") or "").strip()
+        qid = str(benchmark.get("id") or benchmark.get("question_id") or f"q-{idx}")
+        sql = str(benchmark.get("expected_sql") or "").strip()
+        if not sql:
+            valid.append(benchmark)
+            continue
+
+        resolved_sql = resolve_sql(sql, catalog=catalog, gold_schema=gold_schema)
+        try:
+            _set_sql_context(spark, catalog, gold_schema)
+            spark.sql(f"EXPLAIN {resolved_sql}")
+        except Exception as exc:
+            msg = str(exc)
+            reason = _classify_sql_validation_error(msg)
+            quarantined.append(
+                {
+                    "question_id": qid,
+                    "question": question,
+                    "reason": reason,
+                    "sqlstate": _extract_sqlstate(msg),
+                    "error": msg[:500],
+                    "expected_sql": resolved_sql[:1500],
+                }
+            )
+            reason_counts["invalid_benchmark_count"] += 1
+            if reason == "permission_blocked":
+                reason_counts["permission_blocked_count"] += 1
+            if reason == "unknown_column":
+                reason_counts["unresolved_column_count"] += 1
+            if reason == "bad_join_key":
+                reason_counts["bad_join_key_count"] += 1
+            continue
+
+        called_functions = _extract_sql_function_calls(resolved_sql, catalog, gold_schema)
+        blocked_functions = sorted(fn for fn in called_functions if fn not in known_functions)
+        if blocked_functions:
+            quarantined.append(
+                {
+                    "question_id": qid,
+                    "question": question,
+                    "reason": "permission_blocked",
+                    "sqlstate": "42501",
+                    "blocked_routines": blocked_functions,
+                    "error": (
+                        "No EXECUTE privilege or function unavailable for one or more routines: "
+                        + ", ".join(blocked_functions)
+                    ),
+                    "expected_sql": resolved_sql[:1500],
+                }
+            )
+            reason_counts["invalid_benchmark_count"] += 1
+            reason_counts["permission_blocked_count"] += 1
+            continue
+
+        valid.append(benchmark)
+
+    return valid, quarantined, reason_counts
+
+
 # ── Predict Function (Factory Closure) ──────────────────────────────────
 
 
@@ -428,11 +536,6 @@ def make_predict_fn(
         Steps: rate-limit → Genie call → sanitize → resolve GT SQL →
                dual-execute → normalize → compare hashes.
         """
-        time.sleep(RATE_LIMIT_SECONDS)
-        result = run_genie_query(w, space_id, question)
-        genie_sql = sanitize_sql(result.get("sql") or "")
-        gt_sql = resolve_sql(expected_sql, catalog, schema)
-
         comparison: dict[str, Any] = {
             "match": False,
             "match_type": "mismatch",
@@ -444,76 +547,89 @@ def make_predict_fn(
             "genie_signature": None,
             "error": None,
         }
+        result: dict[str, Any] = {}
+        genie_sql = ""
+        gt_sql = ""
+        try:
+            time.sleep(RATE_LIMIT_SECONDS)
+            result = run_genie_query(w, space_id, question)
+            genie_sql = sanitize_sql(result.get("sql") or "")
+            gt_sql = resolve_sql(expected_sql, catalog, schema)
 
-        if genie_sql and gt_sql:
-            try:
-                _set_sql_context(spark, catalog, schema)
-                called_functions = _extract_sql_function_calls(gt_sql, catalog, schema)
-                called_functions.update(_extract_sql_function_calls(genie_sql, catalog, schema))
-                missing_functions = sorted(f for f in called_functions if f not in known_functions)
-                if missing_functions:
-                    comparison["error"] = (
-                        "Missing function(s) in schema "
-                        f"{catalog}.{schema}: {', '.join(missing_functions)}"
+            if genie_sql and gt_sql:
+                try:
+                    _set_sql_context(spark, catalog, schema)
+                    called_functions = _extract_sql_function_calls(gt_sql, catalog, schema)
+                    called_functions.update(_extract_sql_function_calls(genie_sql, catalog, schema))
+                    missing_functions = sorted(f for f in called_functions if f not in known_functions)
+                    if missing_functions:
+                        comparison["error"] = (
+                            "Missing function(s) in schema "
+                            f"{catalog}.{schema}: {', '.join(missing_functions)}"
+                        )
+                        comparison["error_type"] = "permission_blocked"
+                    else:
+                        gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
+                        genie_df = normalize_result_df(spark.sql(genie_sql).toPandas())
+                        gt_hash = hashlib.md5(
+                            gt_df.to_csv(index=False).encode()
+                        ).hexdigest()[:8]
+                        genie_hash = hashlib.md5(
+                            genie_df.to_csv(index=False).encode()
+                        ).hexdigest()[:8]
+                        exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
+                        hash_match = gt_hash == genie_hash
+                        gt_sig = result_signature(gt_df)
+                        genie_sig = result_signature(genie_df)
+                        sig_match = (
+                            gt_sig["schema_hash"] == genie_sig["schema_hash"]
+                            and gt_sig["row_count"] == genie_sig["row_count"]
+                        )
+
+                        if exact_match:
+                            match_type = "exact"
+                        elif hash_match:
+                            match_type = "hash"
+                        elif sig_match:
+                            match_type = "signature"
+                        else:
+                            match_type = "mismatch"
+
+                        comparison = {
+                            "match": exact_match or hash_match,
+                            "match_type": match_type,
+                            "gt_rows": len(gt_df),
+                            "genie_rows": len(genie_df),
+                            "gt_hash": gt_hash,
+                            "genie_hash": genie_hash,
+                            "gt_signature": gt_sig,
+                            "genie_signature": genie_sig,
+                            "error": None,
+                        }
+                except Exception as exc:
+                    err_msg = str(exc)
+                    comparison["error"] = err_msg[:500]
+                    comparison["error_type"] = (
+                        "infrastructure"
+                        if _is_infrastructure_sql_error(err_msg)
+                        else "query_execution"
                     )
-                    return {
-                        "response": genie_sql,
-                        "status": result.get("status", "UNKNOWN"),
-                        "conversation_id": result.get("conversation_id", ""),
-                        "comparison": comparison,
-                    }
-
-                gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
-                genie_df = normalize_result_df(spark.sql(genie_sql).toPandas())
-                gt_hash = hashlib.md5(
-                    gt_df.to_csv(index=False).encode()
-                ).hexdigest()[:8]
-                genie_hash = hashlib.md5(
-                    genie_df.to_csv(index=False).encode()
-                ).hexdigest()[:8]
-                exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
-                hash_match = gt_hash == genie_hash
-                gt_sig = result_signature(gt_df)
-                genie_sig = result_signature(genie_df)
-                sig_match = (
-                    gt_sig["schema_hash"] == genie_sig["schema_hash"]
-                    and gt_sig["row_count"] == genie_sig["row_count"]
-                )
-
-                if exact_match:
-                    match_type = "exact"
-                elif hash_match:
-                    match_type = "hash"
-                elif sig_match:
-                    match_type = "signature"
-                else:
-                    match_type = "mismatch"
-
-                comparison = {
-                    "match": exact_match or hash_match,
-                    "match_type": match_type,
-                    "gt_rows": len(gt_df),
-                    "genie_rows": len(genie_df),
-                    "gt_hash": gt_hash,
-                    "genie_hash": genie_hash,
-                    "gt_signature": gt_sig,
-                    "genie_signature": genie_sig,
-                    "error": None,
-                }
-            except Exception as e:
-                err_msg = str(e)
-                comparison["error"] = err_msg[:500]
-                comparison["error_type"] = (
-                    "infrastructure"
-                    if _is_infrastructure_sql_error(err_msg)
-                    else "query_execution"
-                )
-        else:
-            comparison["error"] = "Missing SQL for comparison"
+                    comparison["sqlstate"] = _extract_sqlstate(err_msg)
+            else:
+                comparison["error"] = "Missing SQL for comparison"
+                comparison["error_type"] = "missing_expected_sql"
+        except Exception as exc:
+            # Never raise from predict_fn: MLflow harness should always receive a row.
+            err_msg = str(exc)
+            comparison["error"] = err_msg[:500]
+            comparison["error_type"] = (
+                "infrastructure" if _is_infrastructure_sql_error(err_msg) else "predict_fn_error"
+            )
+            comparison["sqlstate"] = _extract_sqlstate(err_msg)
 
         return {
             "response": genie_sql,
-            "status": result.get("status", "UNKNOWN"),
+            "status": result.get("status", "ERROR"),
             "conversation_id": result.get("conversation_id", ""),
             "comparison": comparison,
         }
@@ -989,6 +1105,53 @@ def _run_evaluate_with_retries(
     raise RuntimeError("Evaluation retry loop exhausted unexpectedly")
 
 
+def _run_evaluate_sequential_fallback(
+    *,
+    evaluate_kwargs: dict[str, Any],
+) -> Any:
+    """Deterministic fallback path: evaluate one benchmark row at a time."""
+    data = evaluate_kwargs.get("data")
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        raise RuntimeError("Sequential fallback requires non-empty DataFrame input")
+
+    metrics_accumulator: dict[str, list[float]] = {}
+    row_tables: list[pd.DataFrame] = []
+
+    previous_workers = os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS")
+    os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = "1"
+    try:
+        for row_idx in range(len(data)):
+            row_df = data.iloc[[row_idx]].reset_index(drop=True)
+            row_kwargs = dict(evaluate_kwargs)
+            row_kwargs["data"] = row_df
+            row_result = mlflow.genai.evaluate(**row_kwargs)
+
+            if hasattr(row_result, "metrics"):
+                for metric_name, value in row_result.metrics.items():
+                    if isinstance(value, (int, float)):
+                        metrics_accumulator.setdefault(metric_name, []).append(float(value))
+
+            if hasattr(row_result, "tables") and isinstance(row_result.tables, dict):
+                eval_table = row_result.tables.get("eval_results")
+                if isinstance(eval_table, pd.DataFrame):
+                    row_tables.append(eval_table)
+    finally:
+        if previous_workers is None:
+            os.environ.pop("MLFLOW_GENAI_EVAL_MAX_WORKERS", None)
+        else:
+            os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = previous_workers
+
+    metrics = {
+        metric_name: (sum(values) / len(values))
+        for metric_name, values in metrics_accumulator.items()
+        if values
+    }
+    merged_eval_results = (
+        pd.concat(row_tables, ignore_index=True) if row_tables else pd.DataFrame()
+    )
+    return SimpleNamespace(metrics=metrics, tables={"eval_results": merged_eval_results})
+
+
 def _collect_infra_eval_errors(rows: list[dict[str, Any]]) -> list[str]:
     """Extract infrastructure-like SQL errors from eval result rows."""
     infra_errors: list[str] = []
@@ -1070,6 +1233,16 @@ def create_evaluation_dataset(
                     "expectations": {
                         "expected_response": b.get("expected_sql", ""),
                         "expected_asset": b.get("expected_asset", "TABLE"),
+                        "category": b.get("category", ""),
+                        "required_tables": b.get("required_tables", []),
+                        "required_columns": b.get("required_columns", []),
+                        "expected_facts": b.get("expected_facts", []),
+                        "source": b.get("source", ""),
+                        "provenance": b.get("provenance", ""),
+                        "validation_status": b.get("validation_status", ""),
+                        "validation_reason_code": b.get("validation_reason_code", ""),
+                        "validation_error": b.get("validation_error"),
+                        "correction_source": b.get("correction_source", ""),
                     },
                 }
             )
@@ -1103,6 +1276,7 @@ def run_evaluation(
     predict_fn: Any,
     scorers: list[Any],
     *,
+    spark: SparkSession | None = None,
     catalog: str = "",
     gold_schema: str = "",
     uc_schema: str = "",
@@ -1129,32 +1303,51 @@ def run_evaluation(
         warehouse_id=warehouse_id or os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
     )
 
-    filtered = filter_benchmarks_by_scope(benchmarks, eval_scope, patched_objects)
-
-    eval_records = []
-    for b in filtered:
-        eval_records.append(
-            {
-                "inputs": {
-                    "question_id": b.get("id", ""),
-                    "question": b["question"],
-                    "space_id": space_id,
-                    "expected_sql": b.get("expected_sql", ""),
-                    "catalog": catalog,
-                    "gold_schema": gold_schema,
-                },
-                "expectations": {
-                    "expected_response": b.get("expected_sql", ""),
-                    "expected_asset": b.get("expected_asset", "TABLE"),
-                },
-            }
-        )
-    eval_data = pd.DataFrame(eval_records)
+    scope_filtered = filter_benchmarks_by_scope(benchmarks, eval_scope, patched_objects)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = RUN_NAME_TEMPLATE.format(iteration=iteration, timestamp=ts)
 
     with mlflow.start_run(run_name=run_name) as run:
+        if spark is not None:
+            known_functions = _load_known_functions(spark, catalog, gold_schema)
+            filtered, quarantined_benchmarks, precheck_counts = _precheck_benchmarks_for_eval(
+                benchmarks=scope_filtered,
+                spark=spark,
+                catalog=catalog,
+                gold_schema=gold_schema,
+                known_functions=known_functions,
+            )
+        else:
+            filtered = list(scope_filtered)
+            quarantined_benchmarks = []
+            precheck_counts = {
+                "invalid_benchmark_count": 0,
+                "permission_blocked_count": 0,
+                "unresolved_column_count": 0,
+                "bad_join_key_count": 0,
+            }
+
+        eval_records = []
+        for b in filtered:
+            eval_records.append(
+                {
+                    "inputs": {
+                        "question_id": b.get("id", ""),
+                        "question": b["question"],
+                        "space_id": space_id,
+                        "expected_sql": b.get("expected_sql", ""),
+                        "catalog": catalog,
+                        "gold_schema": gold_schema,
+                    },
+                    "expectations": {
+                        "expected_response": b.get("expected_sql", ""),
+                        "expected_asset": b.get("expected_asset", "TABLE"),
+                    },
+                }
+            )
+        eval_data = pd.DataFrame(eval_records)
+
         run_params = {
             "space_id": space_id,
             "iteration": iteration,
@@ -1163,6 +1356,11 @@ def run_evaluation(
             "num_scorers": len(scorers),
             "domain": domain,
             "benchmark_count": len(filtered),
+            "scope_benchmark_count": len(scope_filtered),
+            "invalid_benchmark_count": precheck_counts["invalid_benchmark_count"],
+            "permission_blocked_count": precheck_counts["permission_blocked_count"],
+            "unresolved_column_count": precheck_counts["unresolved_column_count"],
+            "bad_join_key_count": precheck_counts["bad_join_key_count"],
         }
         if model_id:
             run_params["model_id"] = model_id
@@ -1175,6 +1373,32 @@ def run_evaluation(
         if trace_destination:
             run_params["trace_destination"] = trace_destination
         mlflow.log_params(run_params)
+        if quarantined_benchmarks:
+            mlflow.log_dict(
+                {
+                    "total_scoped_benchmarks": len(scope_filtered),
+                    "evaluable_benchmark_count": len(filtered),
+                    "counts": precheck_counts,
+                    "quarantined": quarantined_benchmarks,
+                },
+                "evaluation_runtime/benchmark_precheck.json",
+            )
+        if not filtered:
+            msg = (
+                "No evaluable benchmarks remain after strict pre-eval SQL + routine checks. "
+                f"Counts: {precheck_counts}"
+            )
+            mlflow.log_dict(
+                {
+                    "status": "failed",
+                    "error_type": "NoEvaluableBenchmarks",
+                    "error_message": msg,
+                    "quarantined": quarantined_benchmarks[:50],
+                    "counts": precheck_counts,
+                },
+                "evaluation_failure/no_evaluable_benchmarks.json",
+            )
+            raise RuntimeError(msg)
         # Ensure every evaluation run carries a full, queryable judge manifest.
         register_judge_prompts(
             uc_schema=uc_schema,
@@ -1203,26 +1427,45 @@ def run_evaluation(
             attempts_from_exc = getattr(exc, "_eval_attempts", None)
             if isinstance(attempts_from_exc, list):
                 eval_attempts = attempts_from_exc
-            failure_payload = {
-                "status": "failed",
-                "error_type": type(exc).__name__,
-                "error_message": str(exc)[:2000],
-                "attempts": eval_attempts,
-            }
-            try:
-                mlflow.log_dict(
-                    failure_payload,
-                    "evaluation_failure/evaluate_failure.json",
+            is_retryable = _is_retryable_eval_exception(exc)
+            if is_retryable:
+                logger.warning(
+                    "Falling back to sequential evaluation after retryable harness failure: %s",
+                    str(exc)[:400],
                 )
-                mlflow.set_tags(
+                eval_result = _run_evaluate_sequential_fallback(
+                    evaluate_kwargs=evaluate_kwargs,
+                )
+                eval_attempts.append(
                     {
-                        "evaluation_status": "failed",
-                        "evaluation_error_type": type(exc).__name__,
-                    },
+                        "attempt": len(eval_attempts) + 1,
+                        "workers": "1",
+                        "status": "success",
+                        "mode": "sequential_fallback",
+                    }
                 )
-            except Exception:
-                logger.warning("Could not log evaluation failure artifact", exc_info=True)
-            raise
+                mlflow.set_tag("evaluation_mode", "sequential_fallback")
+            else:
+                failure_payload = {
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:2000],
+                    "attempts": eval_attempts,
+                }
+                try:
+                    mlflow.log_dict(
+                        failure_payload,
+                        "evaluation_failure/evaluate_failure.json",
+                    )
+                    mlflow.set_tags(
+                        {
+                            "evaluation_status": "failed",
+                            "evaluation_error_type": type(exc).__name__,
+                        },
+                    )
+                except Exception:
+                    logger.warning("Could not log evaluation failure artifact", exc_info=True)
+                raise
 
         if eval_attempts:
             mlflow.log_dict(
@@ -1233,6 +1476,8 @@ def run_evaluation(
                 "evaluate_attempt_count",
                 str(len(eval_attempts)),
             )
+        harness_retry_count = max(0, len(eval_attempts) - 1)
+        mlflow.log_metric("harness_retry_count", float(harness_retry_count))
 
         per_judge: dict[str, float] = {}
         for metric_name in eval_result.metrics:
@@ -1282,6 +1527,48 @@ def run_evaluation(
                 else:
                     arbiter_verdicts["skipped"] += 1
 
+        question_failure_artifacts: list[dict[str, Any]] = []
+        for row in rows_for_output:
+            error_val = (
+                row.get("outputs/comparison/error")
+                or row.get("comparison/error")
+                or row.get("comparison.error")
+            )
+            if not error_val:
+                continue
+            question_failure_artifacts.append(
+                {
+                    "question_id": str(
+                        row.get("inputs/question_id")
+                        or row.get("question_id")
+                        or ""
+                    ),
+                    "expected_sql": str(row.get("inputs/expected_sql") or ""),
+                    "generated_sql": str(row.get("outputs/response") or row.get("response") or ""),
+                    "error_type": str(
+                        row.get("outputs/comparison/error_type")
+                        or row.get("comparison/error_type")
+                        or row.get("comparison.error_type")
+                        or ""
+                    ),
+                    "sqlstate": str(
+                        row.get("outputs/comparison/sqlstate")
+                        or row.get("comparison/sqlstate")
+                        or row.get("comparison.sqlstate")
+                        or ""
+                    ),
+                    "error": str(error_val)[:1000],
+                }
+            )
+        if question_failure_artifacts:
+            mlflow.log_dict(
+                {
+                    "count": len(question_failure_artifacts),
+                    "items": question_failure_artifacts,
+                },
+                "evaluation_runtime/question_failure_artifacts.json",
+            )
+
         infra_errors = _collect_infra_eval_errors(rows_for_output)
         if FAIL_ON_INFRA_EVAL_ERRORS and infra_errors:
             mlflow.log_dict(
@@ -1304,6 +1591,34 @@ def run_evaluation(
             )
 
         overall_accuracy = per_judge.get("result_correctness", 0.0)
+        row_unresolved_column_count = sum(
+            1
+            for artifact in question_failure_artifacts
+            if _classify_sql_validation_error(artifact.get("error", "")) == "unknown_column"
+        )
+        row_permission_blocked_count = sum(
+            1
+            for artifact in question_failure_artifacts
+            if (
+                artifact.get("error_type") == "permission_blocked"
+                or _classify_sql_validation_error(artifact.get("error", "")) == "permission_blocked"
+            )
+        )
+        unresolved_column_count = (
+            precheck_counts["unresolved_column_count"] + row_unresolved_column_count
+        )
+        permission_blocked_count = (
+            precheck_counts["permission_blocked_count"] + row_permission_blocked_count
+        )
+        mlflow.set_tags(
+            {
+                "evaluation_status": "success",
+                "invalid_benchmark_count": str(precheck_counts["invalid_benchmark_count"]),
+                "permission_blocked_count": str(permission_blocked_count),
+                "unresolved_column_count": str(unresolved_column_count),
+                "harness_retry_count": str(harness_retry_count),
+            }
+        )
 
         output: dict[str, Any] = {
             "run_id": run.info.run_id,
@@ -1325,6 +1640,11 @@ def run_evaluation(
             "arbiter_actions": [],
             "model_id": model_id,
             "rows": rows_for_output,
+            "invalid_benchmark_count": precheck_counts["invalid_benchmark_count"],
+            "permission_blocked_count": permission_blocked_count,
+            "unresolved_column_count": unresolved_column_count,
+            "harness_retry_count": harness_retry_count,
+            "quarantined_benchmarks": quarantined_benchmarks,
         }
 
     logger.info(
@@ -1527,6 +1847,7 @@ def _attempt_benchmark_correction(
     catalog: str,
     schema: str,
     spark: SparkSession,
+    allowlist: dict[str, Any],
 ) -> list[dict]:
     """Send invalid benchmarks back to the LLM for correction.
 
@@ -1567,8 +1888,27 @@ def _attempt_benchmark_correction(
         if not sql or c.get("unfixable_reason"):
             logger.info("Benchmark unfixable: %s — %s", c.get("question", "")[:60], c.get("unfixable_reason", ""))
             continue
+        metadata_ok, _reason_code, reason_message = _enforce_metadata_constraints(
+            benchmark=c,
+            sql=str(sql),
+            allowlist=allowlist,
+            catalog=catalog,
+            schema=schema,
+        )
+        if not metadata_ok:
+            logger.warning(
+                "Corrected benchmark violates metadata constraints: %s — %s",
+                c.get("question", "")[:60],
+                reason_message,
+            )
+            continue
         is_valid, err = _validate_benchmark_sql(sql, spark, catalog, schema)
         if is_valid:
+            c["provenance"] = "auto_corrected"
+            c["validation_status"] = "valid"
+            c["validation_reason_code"] = "ok"
+            c["validation_error"] = None
+            c["correction_source"] = "llm_correction"
             corrected.append(c)
         else:
             logger.warning(
@@ -1578,6 +1918,216 @@ def _attempt_benchmark_correction(
 
 
 MAX_CORRECTION_ROUNDS = 2
+
+_SQL_REFERENCE_PATTERN = re.compile(
+    r"(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+"
+    r"(`[^`]+`\.`[^`]+`\.`[^`]+`"
+    r"|[A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "", (value or "").lower())
+
+
+def _identifier_candidates(value: str) -> set[str]:
+    cleaned = (value or "").replace("`", "").strip().lower()
+    if not cleaned:
+        return set()
+    parts = [p for p in cleaned.split(".") if p]
+    candidates = {cleaned}
+    if parts:
+        candidates.add(parts[-1])
+    if len(parts) >= 2:
+        candidates.add(".".join(parts[-2:]))
+    return candidates
+
+
+def _build_metadata_allowlist(
+    *,
+    config: dict,
+    uc_columns: list[dict],
+    uc_routines: list[dict],
+) -> dict[str, Any]:
+    allowed_assets: set[str] = set()
+    allowed_columns: set[str] = set()
+    normalized_to_column: dict[str, str] = {}
+    allowed_routines: set[str] = set()
+
+    for key in ("_tables", "_metric_views", "_functions"):
+        for raw in config.get(key, []) if isinstance(config.get(key), list) else []:
+            if not raw:
+                continue
+            allowed_assets.update(_identifier_candidates(str(raw)))
+
+    for col in uc_columns:
+        if not isinstance(col, dict):
+            continue
+        col_name = str(col.get("column_name") or "").strip()
+        table_name = str(col.get("table_name") or "").strip()
+        if col_name:
+            allowed_columns.add(col_name.lower())
+            normalized_to_column.setdefault(_normalize_name(col_name), col_name)
+        if table_name and col_name:
+            fq_col = f"{table_name}.{col_name}".lower()
+            allowed_columns.add(fq_col)
+            normalized_to_column.setdefault(_normalize_name(fq_col), f"{table_name}.{col_name}")
+
+    for routine in uc_routines:
+        if not isinstance(routine, dict):
+            continue
+        raw_name = str(
+            routine.get("routine_name")
+            or routine.get("specific_name")
+            or ""
+        ).strip()
+        if not raw_name:
+            continue
+        allowed_routines.update(_identifier_candidates(raw_name))
+
+    for fn in config.get("_functions", []) if isinstance(config.get("_functions"), list) else []:
+        allowed_routines.update(_identifier_candidates(str(fn)))
+
+    return {
+        "assets": allowed_assets,
+        "columns": allowed_columns,
+        "column_index": normalized_to_column,
+        "routines": allowed_routines,
+    }
+
+
+def _extract_sql_asset_references(sql: str) -> set[str]:
+    refs: set[str] = set()
+    for match in _SQL_REFERENCE_PATTERN.finditer(sql or ""):
+        refs.update(_identifier_candidates(match.group(1)))
+    return refs
+
+
+def _suggest_column_name(column: str, allowed_index: dict[str, str]) -> str | None:
+    if not column:
+        return None
+    normalized = _normalize_name(column)
+    if not normalized:
+        return None
+    exact = allowed_index.get(normalized)
+    if exact:
+        return exact
+    candidates = list(allowed_index.keys())
+    if not candidates:
+        return None
+    closest = get_close_matches(normalized, candidates, n=1, cutoff=0.72)
+    if not closest:
+        return None
+    return allowed_index.get(closest[0])
+
+
+def _apply_metadata_field_drift_corrections(
+    *,
+    sql: str,
+    required_columns: list[str],
+    allowed_index: dict[str, str],
+) -> tuple[str, list[dict[str, str]]]:
+    corrected_sql = sql
+    applied: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for col in required_columns:
+        token = str(col or "").strip()
+        if not token:
+            continue
+        col_leaf = token.split(".")[-1]
+        if not col_leaf:
+            continue
+        key = col_leaf.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        suggestion = _suggest_column_name(col_leaf, allowed_index)
+        if not suggestion:
+            continue
+        suggestion_leaf = suggestion.split(".")[-1]
+        if suggestion_leaf.lower() == col_leaf.lower():
+            continue
+
+        pattern = re.compile(rf"(?i)\b{re.escape(col_leaf)}\b")
+        updated_sql, count = pattern.subn(suggestion_leaf, corrected_sql)
+        if count > 0:
+            corrected_sql = updated_sql
+            applied.append(
+                {
+                    "from": col_leaf,
+                    "to": suggestion_leaf,
+                    "reason": "metadata_field_drift",
+                }
+            )
+
+    return corrected_sql, applied
+
+
+def _enforce_metadata_constraints(
+    *,
+    benchmark: dict,
+    sql: str,
+    allowlist: dict[str, Any],
+    catalog: str,
+    schema: str,
+) -> tuple[bool, str, str]:
+    refs = _extract_sql_asset_references(sql)
+    unknown_refs = sorted(ref for ref in refs if ref not in allowlist["assets"])
+    if unknown_refs:
+        return (
+            False,
+            "unknown_asset",
+            f"SQL references assets not found in metadata: {unknown_refs[:5]}",
+        )
+
+    required_tables = benchmark.get("required_tables", [])
+    if isinstance(required_tables, list):
+        bad_required_tables: list[str] = []
+        for item in required_tables:
+            candidates = _identifier_candidates(str(item))
+            if candidates and not any(c in allowlist["assets"] for c in candidates):
+                bad_required_tables.append(str(item))
+        if bad_required_tables:
+            return (
+                False,
+                "unknown_asset",
+                f"required_tables contains unknown assets: {bad_required_tables[:5]}",
+            )
+
+    required_columns = benchmark.get("required_columns", [])
+    if isinstance(required_columns, list):
+        bad_columns: list[str] = []
+        for col in required_columns:
+            raw = str(col or "").strip()
+            if not raw:
+                continue
+            col_candidates = _identifier_candidates(raw)
+            if any(c in allowlist["columns"] for c in col_candidates):
+                continue
+            leaf = raw.split(".")[-1].lower()
+            if leaf in allowlist["columns"]:
+                continue
+            bad_columns.append(raw)
+        if bad_columns:
+            return (
+                False,
+                "unknown_column",
+                f"required_columns contains unknown metadata fields: {bad_columns[:8]}",
+            )
+
+    called_functions = _extract_sql_function_calls(sql, catalog, schema)
+    unknown_functions = sorted(fn for fn in called_functions if fn not in allowlist["routines"])
+    if unknown_functions:
+        return (
+            False,
+            "unknown_routine",
+            f"SQL references routines not found in metadata: {unknown_functions[:5]}",
+        )
+
+    return True, "ok", ""
 
 
 def generate_benchmarks(
@@ -1600,13 +2150,20 @@ def generate_benchmarks(
       2. Calculate how many synthetic benchmarks to generate to reach target
       3. Build schema context from actual Genie Space assets + UC metadata
       4. Call LLM with BENCHMARK_GENERATION_PROMPT (includes valid asset allowlist)
-      5. Validate each expected_sql via EXPLAIN + table existence check
-      6. Send invalid benchmarks to correction LLM (up to MAX_CORRECTION_ROUNDS)
-      7. Merge curated + synthetic, assign IDs
+      5. Enforce strict metadata constraints (assets/routines/required fields)
+      6. Run deterministic metadata drift auto-correction (field suggestions)
+      7. Validate each expected_sql via EXPLAIN + table existence check
+      8. Send remaining invalid benchmarks to correction LLM (bounded retries)
+      9. Persist provenance + validation metadata per benchmark record
     """
     curated = genie_space_benchmarks or []
     curated_questions = {b.get("question", "").lower().strip() for b in curated}
     synthetic_target = max(target_count - len(curated), 5)
+    allowlist = _build_metadata_allowlist(
+        config=config,
+        uc_columns=uc_columns,
+        uc_routines=uc_routines,
+    )
 
     if curated:
         logger.info(
@@ -1641,24 +2198,119 @@ def generate_benchmarks(
 
     valid_benchmarks: list[dict] = []
     invalid_benchmarks: list[dict] = []
+    accepted_questions: set[str] = set()
+
+    def _register_valid(candidate: dict) -> None:
+        question = str(candidate.get("question") or "").strip().lower()
+        if not question or question in accepted_questions or question in curated_questions:
+            return
+        accepted_questions.add(question)
+        valid_benchmarks.append(candidate)
 
     for b in raw_benchmarks:
-        expected_sql = b.get("expected_sql", "")
+        if not isinstance(b, dict):
+            continue
+        expected_sql = str(b.get("expected_sql", "") or "")
         if not expected_sql:
             continue
-        q_lower = b.get("question", "").lower().strip()
+        q_lower = str(b.get("question", "") or "").lower().strip()
         if q_lower in curated_questions:
             logger.debug("Skipping synthetic duplicate of curated question: %s", q_lower[:50])
             continue
+
+        required_tables = b.get("required_tables", [])
+        if not isinstance(required_tables, list):
+            required_tables = []
+        required_columns = b.get("required_columns", [])
+        if not isinstance(required_columns, list):
+            required_columns = []
+        expected_facts = b.get("expected_facts", [])
+        if not isinstance(expected_facts, list):
+            expected_facts = []
+
+        benchmark: dict[str, Any] = {
+            "question": b.get("question", ""),
+            "expected_sql": expected_sql,
+            "expected_asset": b.get("expected_asset", "TABLE"),
+            "category": b.get("category", ""),
+            "required_tables": [str(t) for t in required_tables],
+            "required_columns": [str(c) for c in required_columns],
+            "expected_facts": [str(f) for f in expected_facts],
+            "source": "llm_generated",
+            "provenance": "synthetic",
+            "validation_status": "valid",
+            "validation_reason_code": "ok",
+            "validation_error": None,
+            "correction_source": "",
+        }
+
+        metadata_ok, reason_code, reason_message = _enforce_metadata_constraints(
+            benchmark=benchmark,
+            sql=expected_sql,
+            allowlist=allowlist,
+            catalog=catalog,
+            schema=schema,
+        )
+        if not metadata_ok:
+            # Deterministic correction for common field drift before LLM-based correction.
+            if reason_code == "unknown_column":
+                corrected_sql, replacements = _apply_metadata_field_drift_corrections(
+                    sql=expected_sql,
+                    required_columns=[str(c) for c in benchmark.get("required_columns", [])],
+                    allowed_index=allowlist["column_index"],
+                )
+                if replacements and corrected_sql != expected_sql:
+                    candidate = dict(benchmark)
+                    candidate["expected_sql"] = corrected_sql
+                    candidate["provenance"] = "auto_corrected"
+                    candidate["correction_source"] = "metadata_suggestion"
+                    candidate["field_drift_fixes"] = replacements
+                    candidate_ok, _, candidate_msg = _enforce_metadata_constraints(
+                        benchmark=candidate,
+                        sql=corrected_sql,
+                        allowlist=allowlist,
+                        catalog=catalog,
+                        schema=schema,
+                    )
+                    if candidate_ok:
+                        is_candidate_valid, candidate_err = _validate_benchmark_sql(
+                            corrected_sql, spark, catalog, schema,
+                        )
+                        if is_candidate_valid:
+                            candidate["validation_status"] = "valid"
+                            candidate["validation_reason_code"] = "ok"
+                            candidate["validation_error"] = None
+                            _register_valid(candidate)
+                            continue
+                        reason_message = candidate_err
+                    else:
+                        reason_message = candidate_msg
+
+            benchmark["validation_status"] = "invalid"
+            benchmark["validation_reason_code"] = reason_code
+            benchmark["validation_error"] = reason_message
+            invalid_benchmarks.append(benchmark)
+            logger.warning(
+                "Benchmark failed metadata constraints: %s — %s",
+                str(benchmark.get("question", ""))[:60],
+                reason_message,
+            )
+            continue
+
         is_valid, err = _validate_benchmark_sql(expected_sql, spark, catalog, schema)
         if is_valid:
-            valid_benchmarks.append(b)
+            benchmark["validation_status"] = "valid"
+            benchmark["validation_reason_code"] = "ok"
+            benchmark["validation_error"] = None
+            _register_valid(benchmark)
         else:
-            b["validation_error"] = err
-            invalid_benchmarks.append(b)
+            benchmark["validation_status"] = "invalid"
+            benchmark["validation_reason_code"] = _classify_sql_validation_error(err)
+            benchmark["validation_error"] = err
+            invalid_benchmarks.append(benchmark)
             logger.warning(
                 "Benchmark failed validation: %s — %s",
-                b.get("question", "")[:60], err,
+                str(benchmark.get("question", ""))[:60], err,
             )
 
     for correction_round in range(MAX_CORRECTION_ROUNDS):
@@ -1668,15 +2320,73 @@ def generate_benchmarks(
             "Correction round %d: attempting to fix %d invalid benchmarks",
             correction_round + 1, len(invalid_benchmarks),
         )
+        metadata_corrected: list[dict] = []
+        still_invalid: list[dict] = []
+        for invalid in invalid_benchmarks:
+            expected_sql = str(invalid.get("expected_sql") or "")
+            if not expected_sql:
+                still_invalid.append(invalid)
+                continue
+            corrected_sql, replacements = _apply_metadata_field_drift_corrections(
+                sql=expected_sql,
+                required_columns=[str(c) for c in invalid.get("required_columns", [])],
+                allowed_index=allowlist["column_index"],
+            )
+            if not replacements or corrected_sql == expected_sql:
+                still_invalid.append(invalid)
+                continue
+            candidate = dict(invalid)
+            candidate["expected_sql"] = corrected_sql
+            candidate["field_drift_fixes"] = replacements
+            candidate["provenance"] = "auto_corrected"
+            candidate["correction_source"] = "metadata_suggestion_loop"
+            candidate_ok, candidate_reason, candidate_message = _enforce_metadata_constraints(
+                benchmark=candidate,
+                sql=corrected_sql,
+                allowlist=allowlist,
+                catalog=catalog,
+                schema=schema,
+            )
+            if not candidate_ok:
+                candidate["validation_status"] = "invalid"
+                candidate["validation_reason_code"] = candidate_reason
+                candidate["validation_error"] = candidate_message
+                still_invalid.append(candidate)
+                continue
+            candidate_valid, candidate_err = _validate_benchmark_sql(
+                corrected_sql, spark, catalog, schema,
+            )
+            if candidate_valid:
+                candidate["validation_status"] = "valid"
+                candidate["validation_reason_code"] = "ok"
+                candidate["validation_error"] = None
+                metadata_corrected.append(candidate)
+                continue
+            candidate["validation_status"] = "invalid"
+            candidate["validation_reason_code"] = _classify_sql_validation_error(candidate_err)
+            candidate["validation_error"] = candidate_err
+            still_invalid.append(candidate)
+
+        for corrected in metadata_corrected:
+            _register_valid(corrected)
+        invalid_benchmarks = still_invalid
+        if not invalid_benchmarks:
+            break
+
         corrected = _attempt_benchmark_correction(
             w, config, uc_columns, uc_routines,
-            invalid_benchmarks, catalog, schema, spark,
+            invalid_benchmarks, catalog, schema, spark, allowlist,
         )
-        valid_benchmarks.extend(corrected)
-        corrected_questions = {c.get("question") for c in corrected}
+        for corrected_item in corrected:
+            _register_valid(corrected_item)
+        corrected_questions = {
+            str(c.get("question") or "").strip().lower()
+            for c in corrected
+            if str(c.get("question") or "").strip()
+        }
         invalid_benchmarks = [
             b for b in invalid_benchmarks
-            if b.get("question") not in corrected_questions
+            if str(b.get("question") or "").strip().lower() not in corrected_questions
         ]
 
     if invalid_benchmarks:
@@ -1693,11 +2403,15 @@ def generate_benchmarks(
         question_id = f"{domain}_gs_{idx + 1:03d}"
         priority = "P0"
         split = "train"
+        expected_sql = str(b.get("expected_sql", "") or "")
+        curated_status = "question_only" if not expected_sql else str(
+            b.get("validation_status", "valid"),
+        )
         all_benchmarks.append(
             {
                 "id": question_id,
                 "question": b.get("question", ""),
-                "expected_sql": b.get("expected_sql", ""),
+                "expected_sql": expected_sql,
                 "expected_asset": b.get("expected_asset", "TABLE"),
                 "category": b.get("category", "curated"),
                 "required_tables": b.get("required_tables", []),
@@ -1706,6 +2420,11 @@ def generate_benchmarks(
                 "priority": priority,
                 "split": split,
                 "source": b.get("source", "genie_space"),
+                "provenance": "curated",
+                "validation_status": curated_status,
+                "validation_reason_code": "ok" if expected_sql else "missing_expected_sql",
+                "validation_error": None if expected_sql else "No expected SQL in curated sample question",
+                "correction_source": "",
             }
         )
 
@@ -1726,7 +2445,12 @@ def generate_benchmarks(
                 "expected_facts": b.get("expected_facts", []),
                 "priority": priority,
                 "split": split,
-                "source": "llm_generated",
+                "source": b.get("source", "llm_generated"),
+                "provenance": b.get("provenance", "synthetic"),
+                "validation_status": b.get("validation_status", "valid"),
+                "validation_reason_code": b.get("validation_reason_code", "ok"),
+                "validation_error": b.get("validation_error"),
+                "correction_source": b.get("correction_source", ""),
             }
         )
 
@@ -1769,6 +2493,10 @@ def load_benchmarks_from_dataset(
                 inputs = json.loads(inputs)
             if isinstance(expectations, str):
                 expectations = json.loads(expectations)
+            if not isinstance(inputs, dict):
+                inputs = {}
+            if not isinstance(expectations, dict):
+                expectations = {}
 
             benchmarks.append(
                 {
@@ -1776,6 +2504,16 @@ def load_benchmarks_from_dataset(
                     "question": inputs.get("question", ""),
                     "expected_sql": inputs.get("expected_sql", expectations.get("expected_response", "")),
                     "expected_asset": expectations.get("expected_asset", "TABLE"),
+                    "category": expectations.get("category", ""),
+                    "required_tables": expectations.get("required_tables", []),
+                    "required_columns": expectations.get("required_columns", []),
+                    "expected_facts": expectations.get("expected_facts", []),
+                    "source": expectations.get("source", ""),
+                    "provenance": expectations.get("provenance", ""),
+                    "validation_status": expectations.get("validation_status", ""),
+                    "validation_reason_code": expectations.get("validation_reason_code", ""),
+                    "validation_error": expectations.get("validation_error"),
+                    "correction_source": expectations.get("correction_source", ""),
                 }
             )
         logger.info("Loaded %d benchmarks from %s", len(benchmarks), table_name)

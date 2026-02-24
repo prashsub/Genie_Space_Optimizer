@@ -15,6 +15,73 @@ import { ArrowLeft, Check, X } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
 import { toast } from "sonner";
 
+type ComparisonData = {
+  spaceName: string;
+  baselineScore: number;
+  optimizedScore: number;
+  improvementPct: number;
+  perDimensionScores: {
+    dimension: string;
+    baseline: number;
+    optimized: number;
+    delta: number;
+  }[];
+  original: {
+    instructions: string;
+    sampleQuestions: string[];
+    tableDescriptions: { tableName: string; description: string }[];
+  };
+  optimized: {
+    instructions: string;
+    sampleQuestions: string[];
+    tableDescriptions: { tableName: string; description: string }[];
+  };
+};
+
+function toComparisonData(value: unknown): ComparisonData | null {
+  if (!value || typeof value !== "object") return null;
+  const obj = value as Record<string, unknown>;
+  const perDimensionScores = Array.isArray(obj.perDimensionScores)
+    ? obj.perDimensionScores
+        .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+        .map((item) => ({
+          dimension: String(item.dimension ?? ""),
+          baseline: typeof item.baseline === "number" ? item.baseline : 0,
+          optimized: typeof item.optimized === "number" ? item.optimized : 0,
+          delta: typeof item.delta === "number" ? item.delta : 0,
+        }))
+    : [];
+
+  const toSpaceConfig = (input: unknown) => {
+    const conf = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+    const tableDescriptions = Array.isArray(conf.tableDescriptions)
+      ? conf.tableDescriptions
+          .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+          .map((item) => ({
+            tableName: String(item.tableName ?? ""),
+            description: String(item.description ?? ""),
+          }))
+      : [];
+    return {
+      instructions: String(conf.instructions ?? ""),
+      sampleQuestions: Array.isArray(conf.sampleQuestions)
+        ? conf.sampleQuestions.map((q) => String(q))
+        : [],
+      tableDescriptions,
+    };
+  };
+
+  return {
+    spaceName: String(obj.spaceName ?? ""),
+    baselineScore: typeof obj.baselineScore === "number" ? obj.baselineScore : 0,
+    optimizedScore: typeof obj.optimizedScore === "number" ? obj.optimizedScore : 0,
+    improvementPct: typeof obj.improvementPct === "number" ? obj.improvementPct : 0,
+    perDimensionScores,
+    original: toSpaceConfig(obj.original),
+    optimized: toSpaceConfig(obj.optimized),
+  };
+}
+
 export const Route = createFileRoute("/runs/$runId/comparison")({
   component: () => (
     <ErrorBoundary fallback={<ComparisonError />}>
@@ -53,10 +120,11 @@ function ComparisonSkeleton() {
 function ComparisonView() {
   const { runId } = Route.useParams();
   const navigate = useNavigate();
-  const { data: comparison } = useGetComparisonSuspense({
+  const { data } = useGetComparisonSuspense({
     params: { run_id: runId },
     ...selector(),
   });
+  const comparison = toComparisonData(data);
   const applyMut = useApplyOptimization();
   const discardMut = useDiscardOptimization();
 

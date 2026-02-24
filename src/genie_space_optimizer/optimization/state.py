@@ -180,12 +180,32 @@ TBLPROPERTIES (
     'delta.autoOptimize.autoCompact' = 'true'
 )"""
 
+TABLE_DATA_ACCESS_GRANTS = "genie_opt_data_access_grants"
+
+_GENIE_OPT_DATA_ACCESS_GRANTS_DDL = """\
+CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_data_access_grants (
+    grant_id            STRING        NOT NULL COMMENT 'UUID for this grant record',
+    target_catalog      STRING        NOT NULL COMMENT 'Catalog the SP was granted access to',
+    target_schema       STRING        NOT NULL COMMENT 'Schema the SP was granted access to',
+    granted_by          STRING        NOT NULL COMMENT 'User who performed the grant',
+    granted_at          TIMESTAMP     NOT NULL COMMENT 'When the grant was applied',
+    revoked_at          TIMESTAMP              COMMENT 'When the grant was revoked (null if active)',
+    status              STRING        NOT NULL COMMENT 'active|revoked'
+)
+USING DELTA
+COMMENT 'Tracks UC privileges granted to the app SP for reading Genie space assets'
+TBLPROPERTIES (
+    'delta.autoOptimize.optimizeWrite' = 'true',
+    'delta.autoOptimize.autoCompact' = 'true'
+)"""
+
 _ALL_DDL: dict[str, str] = {
     TABLE_RUNS: _GENIE_OPT_RUNS_DDL,
     TABLE_STAGES: _GENIE_OPT_STAGES_DDL,
     TABLE_ITERATIONS: _GENIE_OPT_ITERATIONS_DDL,
     TABLE_PATCHES: _GENIE_OPT_PATCHES_DDL,
     TABLE_ASI: _GENIE_EVAL_ASI_RESULTS_DDL,
+    TABLE_DATA_ACCESS_GRANTS: _GENIE_OPT_DATA_ACCESS_GRANTS_DDL,
 }
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, cast
 
 from databricks.sdk import WorkspaceClient
 
@@ -74,11 +74,16 @@ def fetch_space_config(w: WorkspaceClient, space_id: str) -> dict:
     ``_parsed_space``, ``_tables``, ``_metric_views``, ``_functions``,
     ``_instructions``.
     """
-    config: dict[str, Any] = w.api_client.do(
+    raw_config = w.api_client.do(
         "GET",
         f"/api/2.0/genie/spaces/{space_id}",
         query={"include_serialized_space": "true"},
     )
+    if not isinstance(raw_config, dict):
+        raise RuntimeError(
+            f"Unexpected Genie space response type: {type(raw_config).__name__}"
+        )
+    config = cast(dict[str, Any], raw_config)
 
     ss = config.get("serialized_space", {})
     if isinstance(ss, str):
@@ -255,4 +260,7 @@ def patch_space_config(w: WorkspaceClient, space_id: str, config: dict) -> dict:
     clean = strip_non_exportable_fields(config)
     clean = sort_genie_config(clean)
     payload = {"serialized_space": json.dumps(clean)}
-    return w.api_client.do("PATCH", f"/api/2.0/genie/spaces/{space_id}", body=payload)
+    raw_resp = w.api_client.do("PATCH", f"/api/2.0/genie/spaces/{space_id}", body=payload)
+    if isinstance(raw_resp, dict):
+        return raw_resp
+    return {}

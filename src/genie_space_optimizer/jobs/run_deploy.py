@@ -35,11 +35,14 @@
 import json
 import traceback
 from datetime import datetime, timezone
+from typing import Any, cast
 
 from databricks.sdk import WorkspaceClient
 from pyspark.sql import SparkSession
 
 from genie_space_optimizer.optimization.harness import _run_deploy
+
+dbutils = cast(Any, globals().get("dbutils"))
 
 
 def _ts() -> str:

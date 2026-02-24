@@ -13,6 +13,9 @@
 import json
 import traceback
 from datetime import datetime, timezone
+from typing import Any, cast
+
+dbutils = cast(Any, globals().get("dbutils"))
 
 
 def _ts() -> str:

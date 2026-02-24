@@ -78,8 +78,13 @@ function useElapsedTime(startedAt: string | undefined, isActive: boolean) {
       setElapsed(0);
       return;
     }
-    const start = new Date(startedAt).getTime();
-    const tick = () => setElapsed(Math.floor((Date.now() - start) / 1000));
+    const parsed = Date.parse(startedAt);
+    if (Number.isNaN(parsed)) {
+      setElapsed(0);
+      return;
+    }
+    const tick = () =>
+      setElapsed(Math.max(0, Math.floor((Date.now() - parsed) / 1000)));
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
@@ -88,12 +93,12 @@ function useElapsedTime(startedAt: string | undefined, isActive: boolean) {
 }
 
 function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  if (m < 60) return `${m}m ${s}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
+  const safe = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(safe / 3600);
+  const m = Math.floor((safe % 3600) / 60);
+  const s = safe % 60;
+  const pad2 = (v: number) => String(v).padStart(2, "0");
+  return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
 }
 
 function statusDisplayLabel(status: string): string {
@@ -558,6 +563,13 @@ function StepInsights({
     const columnSamples = (outputs.columnSamples as string[] | undefined) ?? [];
     const tagSamples = (outputs.tagSamples as string[] | undefined) ?? [];
     const routineSamples = (outputs.routineSamples as string[] | undefined) ?? [];
+    const tableRefCount = outputs.tableRefCount as number | undefined;
+    const referencedSchemaCount = outputs.referencedSchemaCount as number | undefined;
+    const referencedSchemas = (outputs.referencedSchemas as string[] | undefined) ?? [];
+    const collectionScope = outputs.collectionScope as string | undefined;
+    const metadataSource = outputs.metadataSource as
+      | { columns?: string; tags?: string; routines?: string }
+      | undefined;
 
     return (
       <div className="space-y-2 text-xs">
@@ -565,7 +577,28 @@ function StepInsights({
           <Badge variant="secondary">Columns: {columnsCollected ?? "?"}</Badge>
           <Badge variant="secondary">Tags: {tagsCollected ?? "?"}</Badge>
           <Badge variant="secondary">Routines: {routinesCollected ?? "?"}</Badge>
+          {tableRefCount != null && (
+            <Badge variant="secondary">Referenced assets: {tableRefCount}</Badge>
+          )}
+          {referencedSchemaCount != null && (
+            <Badge variant="secondary">Referenced schemas: {referencedSchemaCount}</Badge>
+          )}
         </div>
+        {collectionScope && (
+          <p className="text-muted-foreground">
+            Collection scope: {collectionScope === "genie_assets" ? "Genie referenced assets" : "Catalog/schema fallback"}
+          </p>
+        )}
+        {metadataSource && (
+          <p className="text-muted-foreground">
+            Source - columns: {metadataSource.columns ?? "unknown"}, tags: {metadataSource.tags ?? "unknown"}, routines: {metadataSource.routines ?? "unknown"}
+          </p>
+        )}
+        {referencedSchemas.length > 0 && (
+          <p className="text-muted-foreground">
+            Schemas: {referencedSchemas.slice(0, 6).join(", ")}
+          </p>
+        )}
         {columnSamples.length > 0 && (
           <p className="text-muted-foreground">Sample columns: {columnSamples.slice(0, 8).join(", ")}</p>
         )}
@@ -582,6 +615,10 @@ function StepInsights({
   if (step.stepNumber === 3) {
     const judgeScores = (outputs.judgeScores as Record<string, number | null> | undefined) ?? {};
     const sampleQuestions = (outputs.sampleQuestions as Record<string, unknown>[] | undefined) ?? [];
+    const invalidBenchmarkCount = outputs.invalidBenchmarkCount as number | undefined;
+    const permissionBlockedCount = outputs.permissionBlockedCount as number | undefined;
+    const unresolvedColumnCount = outputs.unresolvedColumnCount as number | undefined;
+    const harnessRetryCount = outputs.harnessRetryCount as number | undefined;
     const evalUrlFromOutput = outputs.evaluationRunUrl as string | undefined;
     const evalUrlFromLinks = links.find(
       (l) => l.category === "mlflow" && l.label.toLowerCase().includes("baseline"),
@@ -590,6 +627,21 @@ function StepInsights({
 
     return (
       <div className="space-y-3">
+        <div className="flex flex-wrap gap-2">
+          {invalidBenchmarkCount != null && (
+            <Badge variant="secondary">Invalid benchmarks: {invalidBenchmarkCount}</Badge>
+          )}
+          {permissionBlockedCount != null && (
+            <Badge variant="secondary">Permission blocked: {permissionBlockedCount}</Badge>
+          )}
+          {unresolvedColumnCount != null && (
+            <Badge variant="secondary">Unresolved columns: {unresolvedColumnCount}</Badge>
+          )}
+          {harnessRetryCount != null && (
+            <Badge variant="secondary">Harness retries: {harnessRetryCount}</Badge>
+          )}
+        </div>
+
         {!!Object.keys(judgeScores).length && (
           <div className="space-y-1">
             <p className="text-xs font-medium text-muted-foreground">Judge scores</p>

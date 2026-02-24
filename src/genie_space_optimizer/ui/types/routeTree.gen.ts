@@ -9,11 +9,17 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './../routes/__root'
+import { Route as SettingsRouteImport } from './../routes/settings'
 import { Route as IndexRouteImport } from './../routes/index'
 import { Route as SpacesSpaceIdRouteImport } from './../routes/spaces/$spaceId'
 import { Route as RunsRunIdRouteImport } from './../routes/runs/$runId'
 import { Route as RunsRunIdComparisonRouteImport } from './../routes/runs/$runId/comparison'
 
+const SettingsRoute = SettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
@@ -37,12 +43,14 @@ const RunsRunIdComparisonRoute = RunsRunIdComparisonRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/spaces/$spaceId': typeof SpacesSpaceIdRoute
   '/runs/$runId/comparison': typeof RunsRunIdComparisonRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/spaces/$spaceId': typeof SpacesSpaceIdRoute
   '/runs/$runId/comparison': typeof RunsRunIdComparisonRoute
@@ -50,6 +58,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/spaces/$spaceId': typeof SpacesSpaceIdRoute
   '/runs/$runId/comparison': typeof RunsRunIdComparisonRoute
@@ -58,14 +67,21 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/settings'
     | '/runs/$runId'
     | '/spaces/$spaceId'
     | '/runs/$runId/comparison'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/runs/$runId' | '/spaces/$spaceId' | '/runs/$runId/comparison'
+  to:
+    | '/'
+    | '/settings'
+    | '/runs/$runId'
+    | '/spaces/$spaceId'
+    | '/runs/$runId/comparison'
   id:
     | '__root__'
     | '/'
+    | '/settings'
     | '/runs/$runId'
     | '/spaces/$spaceId'
     | '/runs/$runId/comparison'
@@ -73,12 +89,20 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  SettingsRoute: typeof SettingsRoute
   RunsRunIdRoute: typeof RunsRunIdRouteWithChildren
   SpacesSpaceIdRoute: typeof SpacesSpaceIdRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
@@ -124,6 +148,7 @@ const RunsRunIdRouteWithChildren = RunsRunIdRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  SettingsRoute: SettingsRoute,
   RunsRunIdRoute: RunsRunIdRouteWithChildren,
   SpacesSpaceIdRoute: SpacesSpaceIdRoute,
 }

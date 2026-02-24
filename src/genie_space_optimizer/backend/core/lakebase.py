@@ -166,8 +166,9 @@ class _LakebaseDependency(LifespanDependency):
 
         yield
 
-        if getattr(app.state, "engine", None) is not None:
-            app.state.engine.dispose()
+        engine = getattr(app.state, "engine", None)
+        if engine is not None:
+            engine.dispose()
 
     @staticmethod
     def __call__(request: Request) -> Generator[Session, None, None]:

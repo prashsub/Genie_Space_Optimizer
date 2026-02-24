@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -522,6 +523,37 @@ def get_space_detail(
     )
 
 
+def _check_sp_data_access(
+    spark, catalog: str, schema_name: str, genie_refs: list, sp_ws: WorkspaceClient,
+) -> list[tuple[str, str]]:
+    """Return list of (catalog, schema) pairs the SP does NOT have grants for."""
+    from genie_space_optimizer.optimization.state import TABLE_DATA_ACCESS_GRANTS
+    from genie_space_optimizer.common.delta_helpers import run_query
+
+    needed: set[tuple[str, str]] = set()
+    for ref in genie_refs:
+        cat = ref[0] if isinstance(ref, (list, tuple)) else ""
+        sch = ref[1] if isinstance(ref, (list, tuple)) and len(ref) > 1 else ""
+        if cat and sch:
+            needed.add((cat.lower(), sch.lower()))
+
+    if not needed:
+        return []
+
+    fqn = f"`{catalog}`.`{schema_name}`.`{TABLE_DATA_ACCESS_GRANTS}`"
+    try:
+        df = run_query(spark, f"SELECT target_catalog, target_schema FROM {fqn} WHERE status = 'active'")
+        granted = {
+            (str(r.get("target_catalog", "")).lower(), str(r.get("target_schema", "")).lower())
+            for _, r in df.iterrows()
+        } if not df.empty else set()
+    except Exception:
+        granted = set()
+
+    missing = sorted(needed - granted)
+    return missing
+
+
 @router.post(
     "/spaces/{space_id}/optimize",
     response_model=OptimizeResponse,
@@ -607,6 +639,29 @@ def start_optimization(
         from genie_space_optimizer.common.uc_metadata import extract_genie_space_table_refs
 
         genie_refs = extract_genie_space_table_refs(space_snapshot) if space_snapshot else []
+
+        missing = _check_sp_data_access(spark, config.catalog, config.schema_name, genie_refs, sp_ws)
+        if missing:
+            sp_id = (sp_ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "<sp-principal-id>"))
+            lines = []
+            for cat, sch in missing:
+                lines.append(
+                    f"GRANT USE CATALOG ON CATALOG `{cat}` TO `{sp_id}`;\n"
+                    f"GRANT USE SCHEMA ON SCHEMA `{cat}`.`{sch}` TO `{sp_id}`;\n"
+                    f"GRANT SELECT ON SCHEMA `{cat}`.`{sch}` TO `{sp_id}`;\n"
+                    f"GRANT EXECUTE ON SCHEMA `{cat}`.`{sch}` TO `{sp_id}`;"
+                )
+            schemas_str = ", ".join(f"`{c}`.`{s}`" for c, s in missing)
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"The optimizer does not have read access to: {schemas_str}. "
+                    f"An admin with MANAGE privilege on these schemas must grant access "
+                    f"via Settings > Data Access, or run the following SQL:\n\n"
+                    + "\n\n".join(lines)
+                ),
+            )
+
         obo_uc_metadata = _fetch_uc_metadata_obo(
             ws,
             warehouse_id=config.warehouse_id,
@@ -653,7 +708,6 @@ def start_optimization(
             schema=config.schema_name,
             apply_mode=_PIPELINE_APPLY_MODE,
             triggered_by=current_user,
-            run_as_user=current_user,
             experiment_name=prev_experiment or "",
         )
 

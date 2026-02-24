@@ -198,9 +198,72 @@ def run_preflight(
             else _collect_or_empty(lambda: get_routines(spark, catalog, schema), "routines")
         )
 
+    # Keep metadata collections strongly typed for downstream steps.
+    uc_columns_dicts = uc_columns_dicts if isinstance(uc_columns_dicts, list) else []
+    uc_tags_dicts = uc_tags_dicts if isinstance(uc_tags_dicts, list) else []
+    uc_routines_dicts = uc_routines_dicts if isinstance(uc_routines_dicts, list) else []
+
     logger.info(
         "UC metadata: %d columns, %d tags, %d routines",
         len(uc_columns_dicts), len(uc_tags_dicts), len(uc_routines_dicts),
+    )
+    column_samples: list[str] = []
+    for col in uc_columns_dicts[:12]:
+        if not isinstance(col, dict):
+            continue
+        table_name = str(col.get("table_name") or col.get("table") or "").strip()
+        col_name = str(col.get("column_name") or col.get("column") or "").strip()
+        if table_name and col_name:
+            column_samples.append(f"{table_name}.{col_name}")
+        elif col_name:
+            column_samples.append(col_name)
+
+    tag_samples: list[str] = []
+    for tag in uc_tags_dicts[:8]:
+        if not isinstance(tag, dict):
+            continue
+        table_name = str(tag.get("table_name") or "").strip()
+        col_name = str(tag.get("column_name") or "").strip()
+        tag_name = str(tag.get("tag_name") or tag.get("name") or "").strip()
+        tag_value = str(tag.get("tag_value") or tag.get("value") or "").strip()
+        target = ".".join(part for part in [table_name, col_name] if part)
+        if tag_name:
+            tag_samples.append(
+                f"{target}: {tag_name}={tag_value}" if target else f"{tag_name}={tag_value}"
+            )
+
+    routine_samples: list[str] = []
+    for routine in uc_routines_dicts[:8]:
+        if not isinstance(routine, dict):
+            continue
+        routine_name = str(routine.get("routine_name") or routine.get("name") or "").strip()
+        if routine_name:
+            routine_samples.append(routine_name)
+
+    referenced_schemas = sorted(
+        {f"{c}.{s}" for c, s, _ in genie_table_refs if c and s}
+    ) if genie_table_refs else []
+    metadata_source = {
+        "columns": "prefetched" if isinstance(_pf.get("uc_columns"), list) else "spark",
+        "tags": "prefetched" if isinstance(_pf.get("uc_tags"), list) else "spark",
+        "routines": "prefetched" if isinstance(_pf.get("uc_routines"), list) else "spark",
+    }
+    write_stage(
+        spark, run_id, "PREFLIGHT_METADATA_COLLECTION", "COMPLETE",
+        task_key="preflight", catalog=catalog, schema=schema,
+        detail={
+            "columns_collected": len(uc_columns_dicts),
+            "tags_collected": len(uc_tags_dicts),
+            "routines_collected": len(uc_routines_dicts),
+            "column_samples": [s for s in column_samples if s],
+            "tag_samples": [s for s in tag_samples if s],
+            "routine_samples": [s for s in routine_samples if s],
+            "table_ref_count": len(genie_table_refs),
+            "referenced_schema_count": len(referenced_schemas),
+            "referenced_schemas": referenced_schemas[:12],
+            "collection_scope": "genie_assets" if genie_table_refs else "catalog_schema_fallback",
+            "metadata_source": metadata_source,
+        },
     )
 
     uc_schema = f"{catalog}.{schema}"
@@ -243,9 +306,18 @@ def run_preflight(
     invalid_errors: list[str] = []
     for benchmark, validation in zip(benchmarks, validation_results):
         if validation.get("valid"):
+            benchmark["validation_status"] = "valid"
+            benchmark["validation_reason_code"] = benchmark.get("validation_reason_code", "ok")
+            benchmark["validation_error"] = None
             filtered_benchmarks.append(benchmark)
         else:
             err = str(validation.get("error") or "").strip()
+            benchmark["validation_status"] = "invalid"
+            benchmark["validation_reason_code"] = benchmark.get(
+                "validation_reason_code",
+                "sql_compile_error",
+            )
+            benchmark["validation_error"] = err or benchmark.get("validation_error")
             if err:
                 invalid_errors.append(err[:200])
     benchmarks = filtered_benchmarks
@@ -307,10 +379,21 @@ def run_preflight(
         uc_routines=uc_routines_dicts,
     )
 
+    _instr_items = (
+        config.get("_parsed_space", config)
+        .get("instructions", {})
+        .get("text_instructions", [])
+    )
+    _instr_count = sum(
+        len(ti.get("content", [])) if isinstance(ti.get("content"), list) else (1 if ti.get("content") else 0)
+        for ti in _instr_items
+    )
     write_stage(
         spark, run_id, "PREFLIGHT_STARTED", "COMPLETE",
         task_key="preflight",
         detail={
+            "table_count": len(genie_table_refs) if genie_table_refs else 0,
+            "instruction_count": _instr_count,
             "benchmark_count": len(benchmarks),
             "experiment_name": experiment_name,
             "model_id": model_id,
@@ -382,6 +465,12 @@ def _load_or_generate_benchmarks(
                     "Loaded %d valid existing benchmarks from UC dataset (all %d curated included)",
                     len(valid_existing), len(genie_benchmarks),
                 )
+                for benchmark in valid_existing:
+                    benchmark.setdefault("provenance", "synthetic")
+                    benchmark.setdefault("validation_status", "valid")
+                    benchmark.setdefault("validation_reason_code", "ok")
+                    benchmark.setdefault("validation_error", None)
+                    benchmark.setdefault("correction_source", "")
                 return valid_existing
             logger.info(
                 "UC dataset has %d valid benchmarks but missing %d curated Genie space questions. "
@@ -416,8 +505,10 @@ def _load_or_generate_benchmarks(
         task_key="preflight",
         detail={
             "total_count": len(benchmarks),
-            "curated_count": len(genie_benchmarks),
-            "synthetic_count": len(benchmarks) - len(genie_benchmarks),
+            "curated_count": sum(1 for b in benchmarks if b.get("provenance") == "curated"),
+            "synthetic_count": sum(1 for b in benchmarks if b.get("provenance") == "synthetic"),
+            "auto_corrected_count": sum(1 for b in benchmarks if b.get("provenance") == "auto_corrected"),
+            "valid_count": sum(1 for b in benchmarks if b.get("validation_status") == "valid"),
         },
         catalog=catalog, schema=schema,
     )
