@@ -29,6 +29,13 @@ dev = [
 pythonpath = ["src"]
 testpaths = ["tests"]
 
+[tool.ty.src]
+include = ["src/**"]
+exclude = [
+    "genie_space_optimizer/genie_optimizer_skills/**",
+    ".venv/**",
+]
+
 [tool.apx.metadata]
 app-name = "genie-space-optimizer"
 app-slug = "genie_space_optimizer"

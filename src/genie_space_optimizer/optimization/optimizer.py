@@ -16,6 +16,7 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
 from genie_space_optimizer.common.config import (
     APPLY_MODE,
@@ -556,16 +557,25 @@ def _call_llm_for_proposal(
 
     from databricks.sdk import WorkspaceClient as _WC
 
+    text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
             w = _WC()
             response = w.serving_endpoints.query(
                 name=LLM_ENDPOINT,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
                 temperature=LLM_TEMPERATURE,
                 max_tokens=1024,
             )
-            text = response.choices[0].message.content
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise ValueError("LLM response had no choices")
+            first_choice = choices[0]
+            message = getattr(first_choice, "message", None)
+            content = getattr(message, "content", None)
+            if not content:
+                raise ValueError("LLM response content is empty")
+            text = str(content)
             text = text.strip()
             if text.startswith("```"):
                 text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -582,6 +592,10 @@ def _call_llm_for_proposal(
                     "proposed_value": "",
                     "rationale": "LLM call failed",
                 }
+    return {
+        "proposed_value": "",
+        "rationale": "LLM call failed",
+    }
 
 
 def _is_generic_counterfactual(fix: str) -> bool:

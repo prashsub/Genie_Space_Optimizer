@@ -20,7 +20,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from databricks.sdk import WorkspaceClient
 
@@ -131,7 +131,7 @@ class OptimizationResult:
 
 
 def _safe_stage(
-    spark: Any,
+    state_spark: Any,
     run_id: str,
     stage_name: str,
     fn: Any,
@@ -148,12 +148,12 @@ def _safe_stage(
         logger.exception("Stage %s FAILED for run %s", stage_name, run_id)
         try:
             write_stage(
-                spark, run_id, stage_name, "FAILED",
+                state_spark, run_id, stage_name, "FAILED",
                 error_message=err_msg[:500],
                 catalog=state_catalog, schema=state_schema,
             )
             update_run_status(
-                spark, run_id, state_catalog, state_schema,
+                state_spark, run_id, state_catalog, state_schema,
                 status="FAILED",
                 convergence_reason=f"error_in_{stage_name}",
             )
@@ -1035,7 +1035,7 @@ def run_evaluation_via_job(
     try:
         run = w.jobs.submit(
             run_name=f"genie_eval_{space_id}_{iteration}",
-            tasks=[
+            tasks=cast(Any, [
                 {
                     "task_key": "evaluation",
                     "notebook_task": {
@@ -1044,7 +1044,7 @@ def run_evaluation_via_job(
                     },
                     "new_cluster": {"spark_version": "auto", "num_workers": 0},
                 }
-            ],
+            ]),
         )
         run_id = run.run_id
         logger.info("Submitted evaluation job: run_id=%s", run_id)
@@ -1100,12 +1100,14 @@ def optimize_genie_space(
     _run_created_here = run_id is None
     if _run_created_here:
         run_id = str(uuid.uuid4())
+    assert run_id is not None
+    run_id_str = run_id
 
     ensure_optimization_tables(spark, catalog, schema)
 
     if _run_created_here:
         create_run(
-            spark, run_id, space_id, domain, catalog, schema,
+            spark, run_id_str, space_id, domain, catalog, schema,
             max_iterations=max_iterations,
             levers=levers,
             apply_mode=apply_mode,
@@ -1114,7 +1116,7 @@ def optimize_genie_space(
         )
 
     result = OptimizationResult(
-        run_id=run_id,
+        run_id=run_id_str,
         space_id=space_id,
         domain=domain,
         status="FAILED",
@@ -1129,23 +1131,23 @@ def optimize_genie_space(
     try:
         # Stage 1: Preflight
         preflight_out = _run_preflight(
-            w, spark, run_id, space_id, catalog, schema, domain, experiment_name,
+            w, spark, run_id_str, space_id, catalog, schema, domain, experiment_name,
         )
-        config = preflight_out["config"]
-        benchmarks = preflight_out["benchmarks"]
-        model_id = preflight_out["model_id"]
-        exp_name = preflight_out["experiment_name"]
+        config = cast(dict[str, Any], preflight_out["config"])
+        benchmarks = cast(list[dict], preflight_out["benchmarks"])
+        model_id = str(preflight_out["model_id"])
+        exp_name = str(preflight_out["experiment_name"])
         result.experiment_name = exp_name
-        result.experiment_id = preflight_out.get("experiment_id", "")
+        result.experiment_id = str(preflight_out.get("experiment_id", ""))
 
         # Stage 2: Baseline
         baseline_out = _run_baseline(
-            w, spark, run_id, space_id, benchmarks, exp_name,
+            w, spark, run_id_str, space_id, benchmarks, exp_name,
             model_id, catalog, schema, domain,
         )
-        prev_scores = baseline_out["scores"]
-        prev_accuracy = baseline_out["overall_accuracy"]
-        thresholds_met = baseline_out["thresholds_met"]
+        prev_scores = cast(dict[str, float], baseline_out["scores"])
+        prev_accuracy = float(baseline_out["overall_accuracy"])
+        thresholds_met = bool(baseline_out["thresholds_met"])
 
         if thresholds_met:
             result.status = "CONVERGED"
@@ -1154,43 +1156,43 @@ def optimize_genie_space(
             result.best_model_id = model_id
             result.final_scores = prev_scores
             update_run_status(
-                spark, run_id, catalog, schema,
+                spark, run_id_str, catalog, schema,
                 status="CONVERGED",
                 convergence_reason="baseline_meets_thresholds",
             )
         else:
             # Stage 3: Lever Loop
             loop_out = _run_lever_loop(
-                w, spark, run_id, space_id, domain, benchmarks, exp_name,
+                w, spark, run_id_str, space_id, domain, benchmarks, exp_name,
                 prev_scores, prev_accuracy, model_id, config,
                 catalog, schema, levers, max_iterations, thresholds, apply_mode,
             )
-            result.levers_attempted = loop_out["levers_attempted"]
-            result.levers_accepted = loop_out["levers_accepted"]
-            result.levers_rolled_back = loop_out["levers_rolled_back"]
-            result.total_iterations = loop_out["iteration_counter"]
-            result.best_accuracy = loop_out["accuracy"]
-            result.best_model_id = loop_out["model_id"]
-            result.best_iteration = loop_out["best_iteration"]
-            result.final_scores = loop_out["scores"]
+            result.levers_attempted = cast(list[int], loop_out["levers_attempted"])
+            result.levers_accepted = cast(list[int], loop_out["levers_accepted"])
+            result.levers_rolled_back = cast(list[int], loop_out["levers_rolled_back"])
+            result.total_iterations = int(loop_out["iteration_counter"])
+            result.best_accuracy = float(loop_out["accuracy"])
+            result.best_model_id = str(loop_out["model_id"])
+            result.best_iteration = int(loop_out["best_iteration"])
+            result.final_scores = cast(dict[str, float], loop_out["scores"])
 
-            prev_scores = loop_out["scores"]
-            prev_model_id = loop_out["model_id"]
+            prev_scores = cast(dict[str, float], loop_out["scores"])
+            prev_model_id = str(loop_out["model_id"])
 
             # Stage 4: Finalize
             finalize_out = _run_finalize(
-                w, spark, run_id, space_id, domain, exp_name,
-                prev_scores, prev_model_id, loop_out["iteration_counter"],
+                w, spark, run_id_str, space_id, domain, exp_name,
+                prev_scores, prev_model_id, int(loop_out["iteration_counter"]),
                 catalog, schema, run_repeat, benchmarks, thresholds,
             )
-            result.status = finalize_out["status"]
-            result.convergence_reason = finalize_out["convergence_reason"]
-            result.best_repeatability = finalize_out["repeatability_pct"]
-            result.report_path = finalize_out["report_path"]
+            result.status = str(finalize_out["status"])
+            result.convergence_reason = str(finalize_out["convergence_reason"])
+            result.best_repeatability = float(finalize_out["repeatability_pct"])
+            result.report_path = str(finalize_out["report_path"])
 
         # Stage 5: Deploy
         _run_deploy(
-            w, spark, run_id, deploy_target, space_id, exp_name,
+            w, spark, run_id_str, deploy_target, space_id, exp_name,
             domain, result.best_model_id or "", result.total_iterations,
             catalog, schema,
         )
@@ -1198,7 +1200,7 @@ def optimize_genie_space(
     except Exception as exc:
         result.status = "FAILED"
         result.error = traceback.format_exc()
-        logger.exception("optimize_genie_space failed for run %s", run_id)
+        logger.exception("optimize_genie_space failed for run %s", run_id_str)
 
     return result
 

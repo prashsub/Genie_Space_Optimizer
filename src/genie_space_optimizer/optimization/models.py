@@ -166,10 +166,14 @@ def promote_best_model(
     model_name = MODEL_NAME_TEMPLATE.format(space_id=space_id)
 
     try:
-        mlflow.set_logged_model_alias(
-            model_id=best_model_id,
-            alias="champion",
-        )
+        alias_fn = getattr(mlflow, "set_logged_model_alias", None)
+        if callable(alias_fn):
+            alias_fn(
+                model_id=best_model_id,
+                alias="champion",
+            )
+        else:
+            logger.warning("mlflow.set_logged_model_alias is unavailable in this environment")
         logger.info(
             "Promoted model %s (iter=%d, accuracy=%.1f%%) as champion",
             best_model_id, best_iteration, best_accuracy,
