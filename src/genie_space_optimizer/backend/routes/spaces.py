@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -16,6 +15,7 @@ from databricks.sdk.errors.platform import PermissionDenied
 from databricks.sdk.service.sql import Disposition, Format
 from fastapi import HTTPException
 
+from ..constants import ACTIVE_RUN_STATUSES, TERMINAL_JOB_STATES
 from ..core import Dependencies, create_router
 from ..models import (
     FunctionInfo,
@@ -26,12 +26,13 @@ from ..models import (
     SpaceSummary,
     TableInfo,
 )
+from ..utils import ensure_utc_iso, get_sp_principal, safe_float
 from .._spark import get_spark
 
 router = create_router()
 logger = logging.getLogger(__name__)
-_ACTIVE_RUN_STATUSES = {"QUEUED", "IN_PROGRESS", "RUNNING"}
-_TERMINAL_JOB_STATES = {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
+_ACTIVE_RUN_STATUSES = ACTIVE_RUN_STATUSES
+_TERMINAL_JOB_STATES = TERMINAL_JOB_STATES
 _STALE_QUEUE_TIMEOUT = timedelta(minutes=10)
 _SUPPORTED_APPLY_MODES = {"genie_config", "uc_artifact", "both"}
 _PIPELINE_APPLY_MODE = "genie_config"
@@ -50,6 +51,7 @@ def _genie_client(ws: WorkspaceClient, sp_ws: WorkspaceClient) -> WorkspaceClien
         logger.info("OBO token missing genie scope — falling back to SP client")
         return sp_ws
     except Exception:
+        logger.warning("Unexpected error probing OBO genie access — falling back to SP client", exc_info=True)
         return sp_ws
 
 
@@ -214,6 +216,10 @@ def _fetch_uc_metadata_obo(
         except Exception as exc:
             logger.warning("OBO metadata fetch failed for %s: %s", key, exc)
             result[key] = []
+    logger.info(
+        "OBO metadata prefetch (schema fallback): %s",
+        {k: len(v) for k, v in result.items()},
+    )
     return result
 
 
@@ -269,6 +275,10 @@ def _fetch_uc_metadata_obo_for_tables(
         except Exception as exc:
             logger.warning("OBO metadata fetch failed for %s (genie tables): %s", key, exc)
             result[key] = []
+    logger.info(
+        "OBO metadata prefetch (genie tables): %s",
+        {k: len(v) for k, v in result.items()},
+    )
     return result
 
 
@@ -500,7 +510,7 @@ def get_space_detail(
                         status=row.get("status", ""),
                         baselineScore=_safe_float(row.get("best_accuracy")),
                         optimizedScore=_safe_float(row.get("best_accuracy")),
-                        timestamp=str(row.get("started_at", "")),
+                        timestamp=ensure_utc_iso(row.get("started_at")) or "",
                     )
                 )
     except Exception:
@@ -527,8 +537,7 @@ def _check_sp_data_access(
     spark, catalog: str, schema_name: str, genie_refs: list, sp_ws: WorkspaceClient,
 ) -> list[tuple[str, str]]:
     """Return list of (catalog, schema) pairs the SP does NOT have grants for."""
-    from genie_space_optimizer.optimization.state import TABLE_DATA_ACCESS_GRANTS
-    from genie_space_optimizer.common.delta_helpers import run_query
+    from .settings import _load_grants
 
     needed: set[tuple[str, str]] = set()
     for ref in genie_refs:
@@ -540,15 +549,11 @@ def _check_sp_data_access(
     if not needed:
         return []
 
-    fqn = f"`{catalog}`.`{schema_name}`.`{TABLE_DATA_ACCESS_GRANTS}`"
-    try:
-        df = run_query(spark, f"SELECT target_catalog, target_schema FROM {fqn} WHERE status = 'active'")
-        granted = {
-            (str(r.get("target_catalog", "")).lower(), str(r.get("target_schema", "")).lower())
-            for _, r in df.iterrows()
-        } if not df.empty else set()
-    except Exception:
-        granted = set()
+    grants = _load_grants(spark, catalog, schema_name)
+    granted = {
+        (str(g.get("target_catalog", "")).lower(), str(g.get("target_schema", "")).lower())
+        for g in grants
+    }
 
     missing = sorted(needed - granted)
     return missing
@@ -635,14 +640,33 @@ def start_optimization(
     else:
         domain = _infer_domain(client, space_id)
 
+    from genie_space_optimizer.common.uc_metadata import extract_genie_space_table_refs
+
+    genie_refs = extract_genie_space_table_refs(space_snapshot) if space_snapshot else []
+
+    # OBO prefetch first -- runs as the triggering user and is the most
+    # reliable path for fetching UC metadata the SP may not yet have
+    # grants for.  Separated from the access check so one cannot prevent
+    # the other.
     try:
-        from genie_space_optimizer.common.uc_metadata import extract_genie_space_table_refs
+        obo_uc_metadata = _fetch_uc_metadata_obo(
+            ws,
+            warehouse_id=config.warehouse_id,
+            catalog=config.catalog,
+            schema_name=config.schema_name,
+            genie_table_refs=genie_refs or None,
+        )
+        if space_snapshot and obo_uc_metadata and any(obo_uc_metadata.values()):
+            space_snapshot["_prefetched_uc_metadata"] = obo_uc_metadata
+    except Exception:
+        logger.warning("OBO UC metadata prefetch failed for run %s", run_id, exc_info=True)
 
-        genie_refs = extract_genie_space_table_refs(space_snapshot) if space_snapshot else []
-
+    # SP data-access check -- advisory: log a warning when grants are
+    # missing from the app ledger but never silently swallow the error.
+    try:
         missing = _check_sp_data_access(spark, config.catalog, config.schema_name, genie_refs, sp_ws)
         if missing:
-            sp_id = (sp_ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "<sp-principal-id>"))
+            sp_id = get_sp_principal(sp_ws)
             lines = []
             for cat, sch in missing:
                 lines.append(
@@ -652,27 +676,15 @@ def start_optimization(
                     f"GRANT EXECUTE ON SCHEMA `{cat}`.`{sch}` TO `{sp_id}`;"
                 )
             schemas_str = ", ".join(f"`{c}`.`{s}`" for c, s in missing)
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"The optimizer does not have read access to: {schemas_str}. "
-                    f"An admin with MANAGE privilege on these schemas must grant access "
-                    f"via Settings > Data Access, or run the following SQL:\n\n"
-                    + "\n\n".join(lines)
-                ),
+            logger.warning(
+                "SP missing grants on %s for run %s — the job will rely on "
+                "prefetched OBO metadata or Spark fallback. To fix, run:\n%s",
+                schemas_str, run_id, "\n\n".join(lines),
             )
-
-        obo_uc_metadata = _fetch_uc_metadata_obo(
-            ws,
-            warehouse_id=config.warehouse_id,
-            catalog=config.catalog,
-            schema_name=config.schema_name,
-            genie_table_refs=genie_refs or None,
-        )
-        if space_snapshot and obo_uc_metadata:
-            space_snapshot["_prefetched_uc_metadata"] = obo_uc_metadata
+    except HTTPException:
+        raise
     except Exception:
-        logger.warning("Skipping OBO UC metadata prefetch for run %s", run_id)
+        logger.warning("SP data-access check failed for run %s", run_id, exc_info=True)
 
     current_user = headers.user_email or headers.user_name or ""
     if not current_user:
@@ -715,6 +727,7 @@ def start_optimization(
             spark, run_id, config.catalog, config.schema_name,
             status="IN_PROGRESS",
             job_run_id=job_run_id,
+            job_id=str(job_id),
         )
 
         host = (sp_ws.config.host or "").rstrip("/")
@@ -725,9 +738,9 @@ def start_optimization(
             except Exception:
                 workspace_id = None
         if host and workspace_id is not None:
-            job_url = f"{host}/jobs/{job_id}?o={workspace_id}"
+            job_url = f"{host}/jobs/{job_id}/runs/{job_run_id}?o={workspace_id}"
         elif host:
-            job_url = f"{host}/jobs/{job_id}"
+            job_url = f"{host}/jobs/{job_id}/runs/{job_run_id}"
         else:
             job_url = None
         return OptimizeResponse(runId=run_id, jobRunId=job_run_id, jobUrl=job_url)
@@ -752,11 +765,4 @@ def _infer_domain(w, space_id: str) -> str:
         return "default"
 
 
-def _safe_float(val) -> float | None:
-    if val is None:
-        return None
-    try:
-        f = float(val)
-        return f if math.isfinite(f) else None
-    except (TypeError, ValueError):
-        return None
+_safe_float = safe_float

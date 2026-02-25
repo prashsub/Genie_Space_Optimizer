@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .asset_routing import asset_routing_scorer
+from .repeatability import repeatability_scorer
 from .result_correctness import result_correctness_scorer
 
 if TYPE_CHECKING:
@@ -52,8 +53,23 @@ def make_all_scorers(
     ]
 
 
+def make_repeatability_scorers() -> list:
+    """Return scorers for repeatability-only evaluation runs.
+
+    Uses the repeatability scorer plus result_correctness (to track whether
+    the answer is still correct) and asset_routing.
+    """
+    return [
+        repeatability_scorer,
+        result_correctness_scorer,
+        asset_routing_scorer,
+    ]
+
+
 __all__ = [
     "asset_routing_scorer",
+    "repeatability_scorer",
     "result_correctness_scorer",
     "make_all_scorers",
+    "make_repeatability_scorers",
 ]

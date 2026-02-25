@@ -42,7 +42,7 @@ resources:
               catalog: "${var.catalog}"
               schema: "${var.gold_schema}"
               max_iterations: "5"
-              levers: "1,2,3,4,5,6"
+              levers: "[1,2,3,4,5,6]"
               apply_mode: "genie_config"
           environment_key: default
           timeout_seconds: 5400
@@ -67,7 +67,7 @@ resources:
             - task_key: finalize
           condition_task:
             op: "NOT_EQUAL"
-            left: "{{tasks.finalize.values.deploy_target}}"
+            left: "{{tasks.preflight.values.deploy_target}}"
             right: ""
 
         - task_key: deploy

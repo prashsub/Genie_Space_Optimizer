@@ -25,10 +25,6 @@ artifacts:
     build: apx build && uv run python resources/grant_app_uc_permissions.py --profile ${var.deploy_profile} --app-name ${var.app_name} --catalog ${var.catalog} --schema ${var.gold_schema}
 
 resources:
-  database_instances:
-    genie-space-optimizer-db:
-      name: "genie-space-optimizer"
-      capacity: "CU_1"
   apps:
     genie-space-optimizer-app:
       name: ${var.app_name}
@@ -46,11 +42,6 @@ resources:
           - name: GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID
             value: ${var.warehouse_id}
       resources:
-        - name: "db"
-          database:
-            database_name: "databricks_postgres"
-            instance_name: ${resources.database_instances.genie-space-optimizer-db.name}
-            permission: "CAN_CONNECT_AND_CREATE"
         - name: "sql-warehouse"
           sql_warehouse:
             id: ${var.warehouse_id}

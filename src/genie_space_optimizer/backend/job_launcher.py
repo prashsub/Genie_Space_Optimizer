@@ -68,6 +68,8 @@ _WS_NOTEBOOKS = {name: f"{_WS_BASE}/{name}" for name in _NOTEBOOK_SOURCES}
 _cached_wheel_path: str | None = None
 _cached_job_id: int | None = None
 _cached_job_wheel_path: str | None = None
+# Only guards single-process races; with multiple uvicorn workers cross-process
+# safety relies on the Databricks idempotency_token passed to run_now().
 _job_submit_lock = threading.Lock()
 
 

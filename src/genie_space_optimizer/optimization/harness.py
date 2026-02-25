@@ -43,11 +43,13 @@ from genie_space_optimizer.optimization.applier import (
 )
 from genie_space_optimizer.optimization.evaluation import (
     all_thresholds_met,
+    extract_reference_sqls,
     filter_benchmarks_by_scope,
     make_predict_fn,
     normalize_scores,
     register_instruction_version,
     run_evaluation,
+    run_repeatability_evaluation,
 )
 from genie_space_optimizer.optimization.models import (
     create_genie_model_version,
@@ -365,6 +367,24 @@ def _run_lever_loop(
     uc_schema = f"{catalog}.{schema}"
     metadata_snapshot = config.get("_parsed_space", config)
 
+    baseline_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
+    reference_sqls: dict[str, str] = {}
+    if baseline_iter:
+        rows_json = baseline_iter.get("rows_json")
+        if isinstance(rows_json, list):
+            reference_sqls = extract_reference_sqls({"rows": rows_json})
+        elif isinstance(rows_json, str):
+            try:
+                reference_sqls = extract_reference_sqls(
+                    {"rows": json.loads(rows_json)}
+                )
+            except (json.JSONDecodeError, TypeError):
+                pass
+    logger.info(
+        "Lever loop: %d reference SQLs from baseline for repeatability scoring",
+        len(reference_sqls),
+    )
+
     for lever in levers:
         if lever <= start_lever:
             continue
@@ -387,15 +407,38 @@ def _run_lever_loop(
             catalog=catalog, schema=schema,
         )
 
-        eval_result_for_clustering = {
-            "rows": _get_failure_rows(spark, run_id, catalog, schema),
-        }
+        failure_rows = _get_failure_rows(spark, run_id, catalog, schema)
+        logger.info(
+            "Lever %d: loaded %d rows for clustering", lever, len(failure_rows),
+        )
+        if lever == levers[0]:
+            print(f"[DEBUG] Lever {lever}: loaded {len(failure_rows)} rows for clustering")
+            if failure_rows:
+                sample = failure_rows[0]
+                feedback_cols = [
+                    k for k in sample.keys()
+                    if "feedback" in k.lower() or k.endswith("/value")
+                ]
+                print(f"[DEBUG] Sample row keys ({len(sample)} total):")
+                print(f"[DEBUG]   feedback_cols={feedback_cols[:10]}")
+                print(f"[DEBUG]   all_keys={sorted(sample.keys())[:25]}")
+                for fc in feedback_cols[:5]:
+                    print(f"[DEBUG]   {fc} = {sample.get(fc)!r}")
+            else:
+                print("[DEBUG] No failure rows loaded!")
+
+        eval_result_for_clustering = {"rows": failure_rows}
         clusters = cluster_failures(eval_result_for_clustering, metadata_snapshot)
+        cluster_summary = [(c["cluster_id"], c["affected_judge"], c.get("asi_failure_type"), len(c["question_ids"])) for c in clusters[:8]]
+        logger.info("Lever %d: %d clusters — %s", lever, len(clusters), cluster_summary)
+        print(f"[DEBUG] Lever {lever}: {len(clusters)} clusters — {cluster_summary}")
 
         proposals = generate_metadata_proposals(
             clusters, metadata_snapshot,
             target_lever=lever, apply_mode=apply_mode, w=w,
         )
+        logger.info("Lever %d: %d proposals generated", lever, len(proposals))
+        print(f"[DEBUG] Lever {lever}: {len(proposals)} proposals generated")
 
         if not proposals:
             logger.info("No proposals for %s — skipping", lever_name)
@@ -441,6 +484,7 @@ def _run_lever_loop(
                 predict_fn, scorers,
                 spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
                 patched_objects=patched_objects,
+                reference_sqls=reference_sqls if reference_sqls else None,
             )
             slice_scores = slice_result.get("scores", {})
             slice_drops = detect_regressions(
@@ -474,6 +518,7 @@ def _run_lever_loop(
                 domain, prev_model_id, "p0",
                 predict_fn, scorers,
                 spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+                reference_sqls=reference_sqls if reference_sqls else None,
             )
             p0_failures = p0_result.get("failures", [])
             if p0_failures:
@@ -514,6 +559,7 @@ def _run_lever_loop(
             domain, new_model_id, "full",
             predict_fn, scorers,
             spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+            reference_sqls=reference_sqls if reference_sqls else None,
         )
 
         full_scores = full_result.get("scores", {})
@@ -554,6 +600,10 @@ def _run_lever_loop(
         best_iteration = iteration_counter
         prev_scores = full_scores
         prev_model_id = new_model_id
+
+        new_refs = extract_reference_sqls(full_result)
+        if new_refs:
+            reference_sqls.update(new_refs)
 
         link_eval_scores_to_model(new_model_id, full_scores)
         update_run_status(
@@ -615,6 +665,8 @@ def _run_lever_loop(
         "levers_attempted": levers_attempted,
         "levers_accepted": levers_accepted,
         "levers_rolled_back": levers_rolled_back,
+        "_debug_ref_sqls_count": len(reference_sqls),
+        "_debug_failure_rows_loaded": len(_get_failure_rows(spark, run_id, catalog, schema)),
     }
 
 
@@ -725,29 +777,73 @@ def _run_finalize(
             _emit_heartbeat(
                 "repeatability_test",
                 force=True,
-                detail={"benchmark_count": len(benchmarks)},
+                detail={"benchmark_count": len(benchmarks), "runs": 2},
             )
 
-            def _repeatability_progress(progress: dict[str, Any]) -> None:
-                _check_timeout("repeatability_test")
-                _emit_heartbeat("repeatability_test", detail=progress)
+            uc_schema = f"{catalog}.{schema}"
+            latest_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
+            reference_sqls: dict[str, str] = {}
+            if latest_iter:
+                rows_json = latest_iter.get("rows_json")
+                if isinstance(rows_json, list):
+                    reference_sqls = extract_reference_sqls({"rows": rows_json})
+                elif isinstance(rows_json, str):
+                    try:
+                        reference_sqls = extract_reference_sqls(
+                            {"rows": json.loads(rows_json)}
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            logger.info(
+                "Repeatability: %d reference SQLs from latest iteration",
+                len(reference_sqls),
+            )
 
+            _ensure_sql_context(spark, catalog, schema)
+            predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
+
+            rep_pcts: list[float] = []
             try:
-                rep_result = run_repeatability_test(
-                    w,
-                    space_id,
-                    benchmarks,
-                    spark,
-                    heartbeat_cb=_repeatability_progress,
-                )
+                for rep_run_idx in range(1, 3):
+                    _check_timeout(f"repeatability_run_{rep_run_idx}")
+                    _emit_heartbeat(
+                        f"repeatability_run_{rep_run_idx}",
+                        force=True,
+                        detail={"run": rep_run_idx, "of": 2},
+                    )
+                    rep_result = run_repeatability_evaluation(
+                        space_id=space_id,
+                        experiment_name=exp_name,
+                        iteration=iteration_counter,
+                        benchmarks=benchmarks,
+                        domain=domain,
+                        reference_sqls=reference_sqls,
+                        predict_fn=predict_fn,
+                        spark=spark,
+                        catalog=catalog,
+                        gold_schema=schema,
+                        uc_schema=uc_schema,
+                        model_id=prev_model_id,
+                        run_label=f"final_{rep_run_idx}",
+                    )
+                    rep_pcts.append(rep_result.get("repeatability_pct", 0.0))
+                    logger.info(
+                        "Repeatability run %d/2: %.1f%%",
+                        rep_run_idx,
+                        rep_pcts[-1],
+                    )
+
                 _check_timeout("post_repeatability")
-                repeatability_pct = rep_result.get("average_repeatability_pct", 0.0)
+                repeatability_pct = (
+                    sum(rep_pcts) / len(rep_pcts) if rep_pcts else 0.0
+                )
                 write_stage(
                     spark, run_id, "REPEATABILITY_TEST", "COMPLETE",
                     task_key="finalize",
                     detail={
                         "average_pct": repeatability_pct,
-                        "total_questions": rep_result.get("total_questions"),
+                        "per_run_pcts": rep_pcts,
+                        "total_questions": len(benchmarks),
                     },
                     catalog=catalog, schema=schema,
                 )
@@ -761,11 +857,15 @@ def _run_finalize(
                 )
                 raise
             except Exception:
-                logger.exception("Repeatability test failed")
+                logger.exception("Repeatability evaluation failed")
+                repeatability_pct = (
+                    sum(rep_pcts) / len(rep_pcts) if rep_pcts else 0.0
+                )
                 write_stage(
                     spark, run_id, "REPEATABILITY_TEST", "FAILED",
                     task_key="finalize",
-                    error_message="Repeatability test exception",
+                    error_message="Repeatability evaluation exception",
+                    detail={"partial_pcts": rep_pcts},
                     catalog=catalog, schema=schema,
                 )
         else:

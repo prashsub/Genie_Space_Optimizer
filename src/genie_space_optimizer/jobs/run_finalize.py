@@ -101,7 +101,8 @@ schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
 
 # Read from lever_loop (or baseline if lever_loop was skipped)
-lever_skipped = dbutils.jobs.taskValues.get(taskKey="lever_loop", key="skipped")
+lever_skipped_raw = dbutils.jobs.taskValues.get(taskKey="lever_loop", key="skipped")
+lever_skipped = str(lever_skipped_raw).lower() in ("true", "1")
 if lever_skipped:
     scores_json = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="scores")
     prev_model_id = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="model_id")

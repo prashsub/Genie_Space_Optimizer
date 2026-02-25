@@ -100,6 +100,7 @@ function SettingsContent() {
       <DetectedSchemasCard
         schemas={detectedSchemas}
         spPrincipalId={spPrincipalId}
+        spDisplayName={spPrincipalDisplayName}
         queryClient={queryClient}
       />
 
@@ -121,9 +122,10 @@ function SPIdentityCard({
   spDisplayName?: string;
 }) {
   const [copied, setCopied] = useState(false);
+  const [showClientId, setShowClientId] = useState(false);
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(spId);
+  const handleCopy = (text: string) => {
+    navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -137,20 +139,15 @@ function SPIdentityCard({
         </CardTitle>
       </CardHeader>
       <CardContent>
-        {spDisplayName && (
-          <p className="mb-2 text-sm font-medium text-foreground">
-            {spDisplayName}
-          </p>
-        )}
         <div className="flex items-center gap-2">
-          <code className="rounded-md bg-muted px-2.5 py-1.5 text-sm font-mono">
-            {spId}
-          </code>
+          <p className="text-base font-semibold text-foreground">
+            {spDisplayName || spId}
+          </p>
           <Button
             variant="ghost"
             size="sm"
             className="h-8 w-8 p-0"
-            onClick={handleCopy}
+            onClick={() => handleCopy(spDisplayName || spId)}
           >
             {copied ? (
               <Check className="h-3.5 w-3.5 text-green-600" />
@@ -159,22 +156,54 @@ function SPIdentityCard({
             )}
           </Button>
         </div>
-        <p className="mt-2 text-xs text-muted-foreground">
-          Display name shown above. Client ID shown here for SQL grants.
+        <p className="mt-1 text-xs text-muted-foreground">
           Grants give it SELECT, EXECUTE, USE CATALOG, and USE SCHEMA on
           target schemas.
         </p>
+        {spDisplayName && (
+          <div className="mt-2">
+            <Button
+              variant="link"
+              size="sm"
+              className="h-auto p-0 text-xs text-muted-foreground"
+              onClick={() => setShowClientId(!showClientId)}
+            >
+              {showClientId ? "Hide" : "Show"} Client ID
+            </Button>
+            {showClientId && (
+              <div className="mt-1 flex items-center gap-2">
+                <code className="rounded-md bg-muted px-2.5 py-1.5 text-xs font-mono">
+                  {spId}
+                </code>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 p-0"
+                  onClick={() => handleCopy(spId)}
+                >
+                  <Copy className="h-3 w-3" />
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
 }
 
-function _buildGrantSql(spId: string, catalog: string, schema: string) {
+function _buildGrantSql(
+  spDisplayName: string,
+  spId: string,
+  catalog: string,
+  schema: string,
+) {
+  const principal = spDisplayName || spId;
   return [
-    `GRANT USE CATALOG ON CATALOG \`${catalog}\` TO \`${spId}\`;`,
-    `GRANT USE SCHEMA ON SCHEMA \`${catalog}\`.\`${schema}\` TO \`${spId}\`;`,
-    `GRANT SELECT ON SCHEMA \`${catalog}\`.\`${schema}\` TO \`${spId}\`;`,
-    `GRANT EXECUTE ON SCHEMA \`${catalog}\`.\`${schema}\` TO \`${spId}\`;`,
+    `GRANT USE CATALOG ON CATALOG \`${catalog}\` TO \`${principal}\`;`,
+    `GRANT USE SCHEMA ON SCHEMA \`${catalog}\`.\`${schema}\` TO \`${principal}\`;`,
+    `GRANT SELECT ON SCHEMA \`${catalog}\`.\`${schema}\` TO \`${principal}\`;`,
+    `GRANT EXECUTE ON SCHEMA \`${catalog}\`.\`${schema}\` TO \`${principal}\`;`,
   ].join("\n");
 }
 
@@ -209,10 +238,12 @@ function CopyableSql({ sql }: { sql: string }) {
 function DetectedSchemasCard({
   schemas,
   spPrincipalId,
+  spDisplayName,
   queryClient,
 }: {
   schemas: DetectedSchema[];
   spPrincipalId: string;
+  spDisplayName: string;
   queryClient: ReturnType<typeof useQueryClient>;
 }) {
   const grantMutation = useGrantDataAccess();
@@ -235,7 +266,8 @@ function DetectedSchemasCard({
           });
         },
         onError: (err) => {
-          toast.error(`Grant failed: ${err.message}`);
+          const detail = (err as any)?.body?.detail || err.message;
+          toast.error(detail, { duration: 10000 });
         },
       },
     );
@@ -343,6 +375,7 @@ function DetectedSchemasCard({
                         </p>
                         <CopyableSql
                           sql={_buildGrantSql(
+                            spDisplayName,
                             spPrincipalId,
                             s.catalog,
                             s.schema_name,
@@ -503,32 +536,54 @@ function ActiveGrantsCard({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {grants.map((g) => (
-                <TableRow key={g.id}>
-                  <TableCell className="font-mono text-sm">
-                    {g.catalog}
-                  </TableCell>
-                  <TableCell className="font-mono text-sm">
-                    {g.schema_name}
-                  </TableCell>
-                  <TableCell className="text-sm">{g.grantedBy}</TableCell>
-                  <TableCell className="text-sm text-muted-foreground">
-                    {new Date(g.grantedAt).toLocaleDateString()}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="text-red-600 hover:bg-red-50 hover:text-red-700"
-                      disabled={revokeMutation.isPending}
-                      onClick={() => handleRevoke(g)}
-                    >
-                      <Trash2 className="mr-1 h-3 w-3" />
-                      Revoke
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
+              {grants.map((g) => {
+                const isUcDetected = (g as any).source === "uc";
+                return (
+                  <TableRow key={g.id}>
+                    <TableCell className="font-mono text-sm">
+                      {g.catalog}
+                    </TableCell>
+                    <TableCell className="font-mono text-sm">
+                      {g.schema_name}
+                    </TableCell>
+                    <TableCell className="text-sm">
+                      {isUcDetected ? (
+                        <span className="text-muted-foreground italic">
+                          {g.grantedBy}
+                        </span>
+                      ) : (
+                        g.grantedBy
+                      )}
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {g.grantedAt
+                        ? new Date(g.grantedAt).toLocaleDateString()
+                        : "\u2014"}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {isUcDetected ? (
+                        <Badge
+                          variant="outline"
+                          className="border-blue-200 bg-blue-50 text-blue-700 text-xs"
+                        >
+                          External
+                        </Badge>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="text-red-600 hover:bg-red-50 hover:text-red-700"
+                          disabled={revokeMutation.isPending}
+                          onClick={() => handleRevoke(g)}
+                        >
+                          <Trash2 className="mr-1 h-3 w-3" />
+                          Revoke
+                        </Button>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         )}

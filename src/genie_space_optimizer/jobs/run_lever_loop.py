@@ -169,7 +169,8 @@ apply_mode = dbutils.jobs.taskValues.get(taskKey="preflight", key="apply_mode")
 scores_json = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="scores")
 prev_scores = json.loads(scores_json)
 prev_accuracy = float(dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="overall_accuracy"))
-thresholds_met = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="thresholds_met")
+thresholds_met_raw = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="thresholds_met")
+thresholds_met = str(thresholds_met_raw).lower() in ("true", "1")
 prev_model_id = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="model_id")
 
 _banner("Resolved Upstream Task Values")
@@ -288,13 +289,21 @@ dbutils.jobs.taskValues.set(key="iteration_counter", value=loop_out["iteration_c
 dbutils.jobs.taskValues.set(key="best_iteration", value=loop_out["best_iteration"])
 dbutils.jobs.taskValues.set(key="skipped", value=False)
 
+debug_info = {
+    k: v for k, v in loop_out.items()
+    if k.startswith("_debug_") or k in ("levers_attempted", "levers_accepted", "levers_rolled_back", "iteration_counter")
+}
+dbutils.jobs.taskValues.set(key="debug_info", value=json.dumps(debug_info, default=str))
+
 _log(
     "Task values published",
     accuracy=loop_out["accuracy"],
     model_id=loop_out["model_id"],
     iteration_counter=loop_out["iteration_counter"],
+    debug_info=debug_info,
 )
 _banner("Task 3 Completed")
+dbutils.notebook.exit(json.dumps(debug_info, default=str))
 
 # COMMAND ----------
 

@@ -152,6 +152,7 @@ dbutils.widgets.text("max_iterations", "5")
 dbutils.widgets.text("levers", "[1,2,3,4,5,6]")
 dbutils.widgets.text("apply_mode", "genie_config")
 dbutils.widgets.text("deploy_target", "")
+dbutils.widgets.text("triggered_by", "")
 
 run_id = dbutils.widgets.get("run_id")
 space_id = dbutils.widgets.get("space_id")
@@ -163,6 +164,7 @@ max_iterations = int(dbutils.widgets.get("max_iterations") or "5")
 levers = json.loads(dbutils.widgets.get("levers") or "[1,2,3,4,5,6]")
 apply_mode = dbutils.widgets.get("apply_mode") or "genie_config"
 deploy_target = dbutils.widgets.get("deploy_target") or None
+triggered_by = dbutils.widgets.get("triggered_by") or ""
 
 _banner("Resolved Widget Inputs")
 _log(
@@ -177,6 +179,7 @@ _log(
     levers=levers,
     apply_mode=apply_mode,
     deploy_target=deploy_target,
+    triggered_by=triggered_by,
 )
 
 # COMMAND ----------
@@ -295,6 +298,7 @@ dbutils.jobs.taskValues.set(key="max_iterations", value=max_iterations)
 dbutils.jobs.taskValues.set(key="levers", value=json.dumps(levers))
 dbutils.jobs.taskValues.set(key="apply_mode", value=apply_mode)
 dbutils.jobs.taskValues.set(key="deploy_target", value=deploy_target or "")
+dbutils.jobs.taskValues.set(key="triggered_by", value=triggered_by)
 
 _log(
     "Task values published",

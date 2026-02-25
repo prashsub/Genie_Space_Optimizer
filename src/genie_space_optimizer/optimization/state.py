@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_runs (
     started_at          TIMESTAMP     NOT NULL COMMENT 'When the run was created',
     completed_at        TIMESTAMP              COMMENT 'When the run reached a terminal state',
     job_run_id          STRING                 COMMENT 'Databricks Job run ID',
+    job_id              STRING                 COMMENT 'Databricks Job definition ID',
     max_iterations      INT           NOT NULL COMMENT 'Maximum lever iterations allowed',
     levers              STRING        NOT NULL COMMENT 'JSON array of lever numbers to try, e.g. [1,2,3,4,5,6]',
     apply_mode          STRING        NOT NULL COMMENT 'Where patches are applied: genie_config|uc_artifact|both',
@@ -213,11 +214,30 @@ _ALL_DDL: dict[str, str] = {
 
 
 def ensure_optimization_tables(spark: SparkSession, catalog: str, schema: str) -> None:
-    """Create all 5 optimization Delta tables if they don't exist (idempotent)."""
+    """Create all optimization Delta tables if they don't exist (idempotent)."""
     for name, ddl in _ALL_DDL.items():
         resolved = ddl.replace("{catalog}", catalog).replace("{schema}", schema)
         spark.sql(resolved)
         logger.info("  [OK] %s.%s.%s", catalog, schema, name)
+
+    _migrate_add_columns(spark, catalog, schema)
+
+
+def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None:
+    """Add columns introduced after initial DDL (safe to run repeatedly)."""
+    migrations = [
+        (TABLE_RUNS, "job_id", "STRING COMMENT 'Databricks Job definition ID'"),
+    ]
+    for table, col, col_def in migrations:
+        fqn = _fqn(catalog, schema, table)
+        try:
+            spark.sql(f"ALTER TABLE {fqn} ADD COLUMN {col} {col_def}")
+            logger.info("  [MIGRATED] Added %s.%s", fqn, col)
+        except Exception as exc:
+            if "already exists" in str(exc).lower():
+                logger.debug("  [SKIP] %s.%s already exists", fqn, col)
+            else:
+                logger.warning("  [WARN] Could not add %s.%s: %s", fqn, col, exc)
 
 
 # ── Write Functions ──────────────────────────────────────────────────────
@@ -286,6 +306,7 @@ def update_run_status(
     best_model_id: str | None = None,
     convergence_reason: str | None = None,
     job_run_id: str | None = None,
+    job_id: str | None = None,
     experiment_name: str | None = None,
     experiment_id: str | None = None,
 ) -> None:
@@ -311,6 +332,8 @@ def update_run_status(
         updates["convergence_reason"] = convergence_reason
     if job_run_id is not None:
         updates["job_run_id"] = job_run_id
+    if job_id is not None:
+        updates["job_id"] = job_id
     if experiment_name is not None:
         updates["experiment_name"] = experiment_name
     if experiment_id is not None:

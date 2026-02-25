@@ -9,10 +9,10 @@ from typing import Any, TypedDict
 
 from databricks.sdk import WorkspaceClient
 from fastapi import HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
+from ..constants import ACTIVE_RUN_STATUSES, TERMINAL_JOB_STATES
 from ..core import Dependencies, create_router
+from ..utils import ensure_utc_iso, safe_finite, safe_float, safe_int, safe_json_parse, scrub_nan_inf
 from .spaces import _genie_client
 from ..models import (
     ActionResponse,
@@ -50,23 +50,6 @@ class _StepDefinition(TypedDict):
     name: str
     stage_prefixes: list[str]
     summary_template: str
-
-
-def _scrub_nan(obj: Any) -> Any:
-    """Recursively replace NaN / Inf floats with None throughout a data tree."""
-    if isinstance(obj, float):
-        return None if not math.isfinite(obj) else obj
-    if isinstance(obj, dict):
-        return {k: _scrub_nan(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_scrub_nan(v) for v in obj]
-    return obj
-
-
-def _json_response(model: BaseModel) -> JSONResponse:
-    """Serialize a Pydantic model to a JSONResponse, scrubbing NaN/Inf."""
-    data = model.model_dump(mode="json")
-    return JSONResponse(content=_scrub_nan(data))
 
 
 def _is_truthy(value: object) -> bool:
@@ -318,15 +301,8 @@ def _total_duration(matching_stages: list[dict]) -> float | None:
 
 def _parse_detail(stage: dict) -> dict:
     """Parse detail_json from a stage row."""
-    raw = stage.get("detail_json")
-    if not raw:
-        return {}
-    if isinstance(raw, dict):
-        return raw
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return {}
+    parsed = safe_json_parse(stage.get("detail_json"))
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def map_stages_to_steps(
@@ -353,17 +329,21 @@ def map_stages_to_steps(
                     matching.append(s)
                     break
 
-        # Steps 1 and 2 split PREFLIGHT stages
+        # Steps 1 and 2 split PREFLIGHT stages.
+        # Stage order: PREFLIGHT_STARTED(STARTED) → PREFLIGHT_METADATA_COLLECTION(COMPLETE) → PREFLIGHT_STARTED(COMPLETE).
+        # Step 1 (Config Analysis) is done once metadata collection has started/completed.
+        # Step 2 (Metadata Collection) only uses the PREFLIGHT_METADATA_COLLECTION stage.
+        has_metadata_stage = any(
+            "METADATA" in str(s.get("stage", "")) for s in stages_rows
+        )
         if step_num == 1:
             matching = [s for s in matching if "STARTED" in str(s.get("stage", ""))]
         elif step_num == 2:
-            matching = [
-                s for s in matching
-                if "STARTED" not in str(s.get("stage", ""))
-                or str(s.get("status", "")).upper() == "COMPLETE"
-            ]
+            matching = [s for s in matching if "METADATA" in str(s.get("stage", ""))]
 
         status = _derive_step_status(matching)
+        if step_num == 1 and status == "running" and has_metadata_stage:
+            status = "completed"
         status = _normalize_step_status_for_terminal_run(
             status=status,
             run_status=str(run_data.get("status", "")),
@@ -681,8 +661,8 @@ def _build_stage_timeline(matching: list[dict]) -> list[dict[str, Any]]:
             {
                 "stage": s.get("stage"),
                 "status": str(s.get("status", "")).lower(),
-                "startedAt": str(s.get("started_at")) if s.get("started_at") is not None else None,
-                "completedAt": str(s.get("completed_at")) if s.get("completed_at") is not None else None,
+                "startedAt": ensure_utc_iso(s.get("started_at")),
+                "completedAt": ensure_utc_iso(s.get("completed_at")),
                 "durationSeconds": _safe_float(s.get("duration_seconds")),
                 "errorMessage": s.get("error_message"),
             }
@@ -857,17 +837,7 @@ def _patch_for_ui(row: dict) -> dict[str, Any]:
     }
 
 
-def _maybe_json(raw: Any) -> Any:
-    if raw is None:
-        return None
-    if isinstance(raw, (dict, list)):
-        return raw
-    if not isinstance(raw, str):
-        return raw
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return raw
+_maybe_json = safe_json_parse
 
 
 def _build_lever_iterations(
@@ -1043,8 +1013,8 @@ def _get_baseline_and_best_accuracy(iters_rows: list[dict]) -> tuple[float | Non
 # ── Route Handlers ──────────────────────────────────────────────────────
 
 
-_ACTIVE_RUN_STATUSES_LOCAL = {"QUEUED", "IN_PROGRESS", "RUNNING"}
-_TERMINAL_JOB_STATES_LOCAL = {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
+_ACTIVE_RUN_STATUSES_LOCAL = ACTIVE_RUN_STATUSES
+_TERMINAL_JOB_STATES_LOCAL = TERMINAL_JOB_STATES
 
 
 def _reconcile_single_run(
@@ -1168,8 +1138,8 @@ def get_run(run_id: str, ws: Dependencies.UserClient, sp_ws: Dependencies.Client
         spaceId=run_data.get("space_id", ""),
         spaceName=run_data.get("space_name", run_data.get("domain", "")),
         status=display_status,
-        startedAt=str(run_data.get("started_at", "")),
-        completedAt=str(run_data["completed_at"]) if run_data.get("completed_at") and str(run_data["completed_at"]) not in ("", "NaT", "None") else None,
+        startedAt=ensure_utc_iso(run_data.get("started_at")) or "",
+        completedAt=ensure_utc_iso(run_data.get("completed_at")),
         initiatedBy=run_data.get("triggered_by") or "system",
         baselineScore=baseline_accuracy,
         optimizedScore=_safe_float(run_data.get("best_accuracy")),
@@ -1462,25 +1432,28 @@ def _build_links(
 
     job_run_id = run_data.get("job_run_id")
     if job_run_id and job_run_id not in ("pending", ""):
-        job_url = f"{host}/jobs?runId={job_run_id}"
-        try:
-            run = ws.jobs.get_run(run_id=int(str(job_run_id)))
+        stored_job_id = run_data.get("job_id")
+        resolved_job_id: int | None = int(str(stored_job_id)) if stored_job_id else None
+
+        if resolved_job_id is None:
+            try:
+                run = ws.jobs.get_run(run_id=int(str(job_run_id)))
+                if run.job_id is not None:
+                    resolved_job_id = int(run.job_id)
+            except Exception:
+                pass
+
+        if resolved_job_id is not None:
             workspace_id = ws.get_workspace_id()
-            if run.job_id is not None:
-                # Deep-link directly to this run when job_id is known.
-                job_url = (
-                    f"{host}/jobs/{int(run.job_id)}/runs/{int(str(job_run_id))}"
-                    f"?o={workspace_id}"
-                )
-            elif workspace_id:
-                job_url = f"{host}/jobs?o={workspace_id}&runId={job_run_id}"
-        except Exception:
-            pass
-        links.append(PipelineLink(
-            label="Optimization Job Run",
-            url=job_url,
-            category="job",
-        ))
+            job_url = (
+                f"{host}/jobs/{resolved_job_id}/runs/{int(str(job_run_id))}"
+                f"?o={workspace_id}"
+            )
+            links.append(PipelineLink(
+                label="Optimization Job Run",
+                url=job_url,
+                category="job",
+            ))
 
     experiment_id = run_data.get("experiment_id")
     experiment_name = run_data.get("experiment_name")
@@ -1582,36 +1555,6 @@ def _extract_space_configuration(ss: dict) -> SpaceConfiguration:
     )
 
 
-def _safe_float(val) -> float | None:
-    if val is None:
-        return None
-    try:
-        import math
-        f = float(val)
-        return f if math.isfinite(f) else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _safe_int(val) -> int | None:
-    if val is None:
-        return None
-    try:
-        f = float(val)
-        if not math.isfinite(f):
-            return None
-        return int(f)
-    except (TypeError, ValueError):
-        return None
-
-
-def _finite(val, default: float = 0.0) -> float:
-    """Convert to float, returning *default* for None / NaN / Inf."""
-    if val is None:
-        return default
-    try:
-        import math
-        f = float(val)
-        return f if math.isfinite(f) else default
-    except (TypeError, ValueError):
-        return default
+_safe_float = safe_float
+_safe_int = safe_int
+_finite = safe_finite

@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from datetime import datetime, timezone
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.catalog import (
     Privilege,
-    PermissionsChange,
     SecurableType,
 )
 from fastapi import HTTPException
@@ -22,25 +20,13 @@ from ..models import (
     DataAccessOverview,
     DetectedSchema,
 )
+from ..utils import get_sp_principal as _get_sp_principal
 from .._spark import get_spark
 
 router = create_router()
 logger = logging.getLogger(__name__)
 
-_CATALOG_PRIVILEGES = [Privilege.USE_CATALOG]
-_SCHEMA_PRIVILEGES = [Privilege.USE_SCHEMA, Privilege.SELECT, Privilege.EXECUTE]
 _ALL_PRIV = Privilege.ALL_PRIVILEGES
-
-
-def _get_sp_principal(ws: WorkspaceClient) -> str:
-    """Return the app's service principal client ID."""
-    cid = ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
-    if not cid:
-        raise HTTPException(
-            status_code=500,
-            detail="Cannot determine app service principal ID.",
-        )
-    return cid
 
 
 def _get_sp_display_name(ws: WorkspaceClient) -> str:
@@ -56,6 +42,17 @@ def _get_sp_display_name(ws: WorkspaceClient) -> str:
     return ""
 
 
+def _sp_sql_principal(sp_ws: WorkspaceClient) -> str:
+    """Return the principal name to use in SQL GRANT/REVOKE statements.
+
+    UC SQL expects the display name or application_id, not the OAuth client_id.
+    """
+    name = _get_sp_display_name(sp_ws)
+    if not name:
+        name = _get_sp_principal(sp_ws)
+    return name.replace("`", "")
+
+
 def _load_grants(spark, catalog: str, schema: str) -> list[dict]:
     from genie_space_optimizer.optimization.state import TABLE_DATA_ACCESS_GRANTS
     from genie_space_optimizer.common.delta_helpers import run_query
@@ -69,15 +66,17 @@ def _load_grants(spark, catalog: str, schema: str) -> list[dict]:
 
 
 def _probe_user_manage_privileges(
-    user_ws: WorkspaceClient,
+    sp_ws: WorkspaceClient,
     schemas: set[tuple[str, str]],
+    user_aliases: set[str],
 ) -> set[tuple[str, str]]:
     """Return the subset of (catalog, schema) pairs where the user can grant.
 
-    Uses the UC REST API (ws.grants.get) to check effective privileges.
-    A user can grant if they have MANAGE or OWN on the catalog or schema.
+    Uses the SP client (M2M auth, no scope restrictions) to call
+    get_effective, then filters results by the current user's identity.
+    A user can grant if they have MANAGE or ALL_PRIVILEGES on the catalog or schema.
     """
-    if not schemas:
+    if not schemas or not user_aliases:
         return set()
 
     by_catalog: dict[str, list[str]] = {}
@@ -89,16 +88,15 @@ def _probe_user_manage_privileges(
     for cat, schema_list in by_catalog.items():
         cat_has_manage = False
         try:
-            cat_grants = user_ws.grants.get_effective(
+            cat_grants = sp_ws.grants.get_effective(
                 securable_type=SecurableType.CATALOG.value,
                 full_name=cat,
             )
-            if cat_grants.privilege_assignments:
-                for pa in cat_grants.privilege_assignments:
-                    privs = {p.privilege for p in (pa.privileges or [])}
-                    if Privilege.MANAGE in privs or Privilege.ALL_PRIVILEGES in privs:
-                        cat_has_manage = True
-                        break
+            user_privs = _effective_privileges_for_principal(
+                cat_grants.privilege_assignments, user_aliases,
+            )
+            if Privilege.MANAGE in user_privs or _ALL_PRIV in user_privs:
+                cat_has_manage = True
         except Exception:
             logger.debug("Could not probe catalog-level grants on %s", cat, exc_info=True)
 
@@ -109,16 +107,15 @@ def _probe_user_manage_privileges(
 
         for sch in schema_list:
             try:
-                sch_grants = user_ws.grants.get_effective(
+                sch_grants = sp_ws.grants.get_effective(
                     securable_type=SecurableType.SCHEMA.value,
                     full_name=f"{cat}.{sch}",
                 )
-                if sch_grants.privilege_assignments:
-                    for pa in sch_grants.privilege_assignments:
-                        privs = {p.privilege for p in (pa.privileges or [])}
-                        if Privilege.MANAGE in privs or Privilege.ALL_PRIVILEGES in privs:
-                            manageable.add((cat.lower(), sch.lower()))
-                            break
+                user_privs = _effective_privileges_for_principal(
+                    sch_grants.privilege_assignments, user_aliases,
+                )
+                if Privilege.MANAGE in user_privs or _ALL_PRIV in user_privs:
+                    manageable.add((cat.lower(), sch.lower()))
             except Exception:
                 logger.debug(
                     "Could not probe schema-level grants on %s.%s", cat, sch, exc_info=True
@@ -208,17 +205,13 @@ def _probe_sp_required_access(
                     exc_info=True,
                 )
 
-            use_catalog = (
-                (Privilege.USE_CATALOG in catalog_privs)
-                or (Privilege.USE_CATALOG in schema_privs)
-                or (_ALL_PRIV in catalog_privs)
-                or (_ALL_PRIV in schema_privs)
-            )
-            use_schema = (Privilege.USE_SCHEMA in schema_privs) or (_ALL_PRIV in schema_privs)
-            can_select = (Privilege.SELECT in schema_privs) or (_ALL_PRIV in schema_privs)
-            can_execute = (Privilege.EXECUTE in schema_privs) or (_ALL_PRIV in schema_privs)
+            all_privs = catalog_privs | schema_privs
 
-            if use_catalog and use_schema and can_select and can_execute:
+            has_catalog_access = bool(all_privs) or (_ALL_PRIV in all_privs)
+            has_schema_access = (Privilege.USE_SCHEMA in all_privs) or (_ALL_PRIV in all_privs)
+            has_select = (Privilege.SELECT in all_privs) or (_ALL_PRIV in all_privs)
+
+            if has_catalog_access and has_schema_access and has_select:
                 granted.add((cat.lower(), sch.lower()))
 
     return granted
@@ -226,10 +219,14 @@ def _probe_sp_required_access(
 
 def _detect_schemas_from_spaces(
     sp_ws: WorkspaceClient,
-    user_ws: WorkspaceClient,
     grants: list[dict],
-) -> list[DetectedSchema]:
-    """Discover catalog.schema pairs referenced by existing Genie spaces."""
+    user_aliases: set[str],
+) -> tuple[list[DetectedSchema], set[tuple[str, str]]]:
+    """Discover catalog.schema pairs referenced by existing Genie spaces.
+
+    Returns (detected_schemas, sp_effective_granted) so the caller can build
+    synthetic Active Grants for externally-managed UC access.
+    """
     from genie_space_optimizer.common.genie_client import list_spaces, fetch_space_config
     from genie_space_optimizer.common.uc_metadata import extract_genie_space_table_refs
 
@@ -264,7 +261,7 @@ def _detect_schemas_from_spaces(
     granted_set = granted_set_from_ledger.union(sp_effective_granted)
 
     ungranted = {k for k in schema_space_count if k not in granted_set}
-    manageable = _probe_user_manage_privileges(user_ws, ungranted)
+    manageable = _probe_user_manage_privileges(sp_ws, ungranted, user_aliases)
 
     detected: list[DetectedSchema] = []
     for (cat, sch), count in sorted(schema_space_count.items()):
@@ -276,7 +273,7 @@ def _detect_schemas_from_spaces(
             granted=is_granted,
             canGrant=not is_granted and (cat, sch) in manageable,
         ))
-    return detected
+    return detected, sp_effective_granted
 
 
 @router.get(
@@ -285,14 +282,15 @@ def _detect_schemas_from_spaces(
     operation_id="getDataAccess",
 )
 def get_data_access(
-    ws: Dependencies.UserClient,
     sp_ws: Dependencies.Client,
     config: Dependencies.Config,
+    headers: Dependencies.Headers,
 ):
     """List active data-access grants and auto-detected schemas."""
     spark = get_spark()
     grants_rows = _load_grants(spark, config.catalog, config.schema_name)
-    grants = [
+
+    ledger_grants = [
         DataAccessGrant(
             id=str(g.get("grant_id", "")),
             catalog=str(g.get("target_catalog", "")),
@@ -300,16 +298,43 @@ def get_data_access(
             grantedBy=str(g.get("granted_by", "")),
             grantedAt=str(g.get("granted_at", "")),
             status=str(g.get("status", "active")),
+            source="app",
         )
         for g in grants_rows
     ]
 
-    detected = _detect_schemas_from_spaces(sp_ws, ws, grants_rows)
+    user_aliases: set[str] = set()
+    for val in (headers.user_email, headers.user_name):
+        if val:
+            user_aliases.add(val.lower())
+
+    detected, sp_effective_granted = _detect_schemas_from_spaces(
+        sp_ws, grants_rows, user_aliases,
+    )
+
+    ledger_keys = {
+        (g.get("target_catalog", "").lower(), g.get("target_schema", "").lower())
+        for g in grants_rows
+    }
+    uc_grants = [
+        DataAccessGrant(
+            id=f"uc-{cat}-{sch}",
+            catalog=cat,
+            schema_name=sch,
+            grantedBy="Detected from UC",
+            grantedAt="",
+            status="active",
+            source="uc",
+        )
+        for cat, sch in sorted(sp_effective_granted)
+        if (cat, sch) not in ledger_keys
+    ]
+
     sp_id = _get_sp_principal(sp_ws)
     sp_display_name = _get_sp_display_name(sp_ws)
 
     return DataAccessOverview(
-        grants=grants,
+        grants=ledger_grants + uc_grants,
         detectedSchemas=detected,
         spPrincipalId=sp_id,
         spPrincipalDisplayName=sp_display_name or None,
@@ -328,7 +353,11 @@ def grant_data_access(
     config: Dependencies.Config,
     headers: Dependencies.Headers,
 ):
-    """Grant the app SP read access to a catalog.schema using the caller's UC privileges."""
+    """Grant the app SP read access to a catalog.schema using the caller's UC privileges.
+
+    Executes GRANT SQL via the Statement Execution API (covered by the ``sql``
+    OBO scope) instead of the UC REST API which requires an unavailable scope.
+    """
     from genie_space_optimizer.optimization.state import (
         ensure_optimization_tables,
     )
@@ -336,7 +365,7 @@ def grant_data_access(
     spark = get_spark()
     ensure_optimization_tables(spark, config.catalog, config.schema_name)
 
-    sp_id = _get_sp_principal(sp_ws)
+    sp_name = _sp_sql_principal(sp_ws)
     current_user = headers.user_email or headers.user_name or "unknown"
 
     cat = body.catalog.strip().strip("`")
@@ -344,31 +373,29 @@ def grant_data_access(
     if not cat or not sch:
         raise HTTPException(status_code=400, detail="Both catalog and schema_name are required.")
 
+    if not config.warehouse_id:
+        raise HTTPException(status_code=500, detail="No SQL warehouse configured for grant execution.")
+
+    grant_statements = [
+        f"GRANT USE CATALOG ON CATALOG `{cat}` TO `{sp_name}`",
+        f"GRANT USE SCHEMA ON SCHEMA `{cat}`.`{sch}` TO `{sp_name}`",
+        f"GRANT SELECT ON SCHEMA `{cat}`.`{sch}` TO `{sp_name}`",
+        f"GRANT EXECUTE ON SCHEMA `{cat}`.`{sch}` TO `{sp_name}`",
+    ]
+
     errors: list[str] = []
-
-    try:
-        ws.grants.update(
-            securable_type=SecurableType.CATALOG.value,
-            full_name=cat,
-            changes=[PermissionsChange(add=_CATALOG_PRIVILEGES, principal=sp_id)],
-        )
-        logger.info("Granted USE CATALOG on %s to %s", cat, sp_id)
-    except Exception as exc:
-        msg = str(exc)
-        logger.warning("Catalog grant failed on %s — %s", cat, msg)
-        errors.append(f"USE CATALOG on `{cat}`: {msg[:300]}")
-
-    try:
-        ws.grants.update(
-            securable_type=SecurableType.SCHEMA.value,
-            full_name=f"{cat}.{sch}",
-            changes=[PermissionsChange(add=_SCHEMA_PRIVILEGES, principal=sp_id)],
-        )
-        logger.info("Granted schema privileges on %s.%s to %s", cat, sch, sp_id)
-    except Exception as exc:
-        msg = str(exc)
-        logger.warning("Schema grant failed on %s.%s — %s", cat, sch, msg)
-        errors.append(f"Schema privileges on `{cat}`.`{sch}`: {msg[:300]}")
+    for stmt in grant_statements:
+        try:
+            ws.statement_execution.execute_statement(
+                warehouse_id=config.warehouse_id,
+                statement=stmt,
+                wait_timeout="30s",
+            )
+            logger.info("Executed: %s", stmt)
+        except Exception as exc:
+            msg = str(exc)
+            logger.warning("Grant SQL failed — %s — %s", stmt, msg)
+            errors.append(f"`{stmt}`: {msg[:300]}")
 
     if errors:
         raise HTTPException(
@@ -420,29 +447,30 @@ def revoke_data_access(
     if not grant:
         raise HTTPException(status_code=404, detail=f"Grant {grant_id} not found.")
 
-    sp_id = _get_sp_principal(sp_ws)
+    sp_name = _sp_sql_principal(sp_ws)
     cat = str(grant["target_catalog"])
     sch = str(grant["target_schema"])
 
-    try:
-        ws.grants.update(
-            securable_type=SecurableType.CATALOG.value,
-            full_name=cat,
-            changes=[PermissionsChange(remove=_CATALOG_PRIVILEGES, principal=sp_id)],
-        )
-        logger.info("Revoked USE CATALOG on %s from %s", cat, sp_id)
-    except Exception as exc:
-        logger.warning("Catalog revoke failed (best-effort) on %s — %s", cat, exc)
+    if not config.warehouse_id:
+        raise HTTPException(status_code=500, detail="No SQL warehouse configured for revoke execution.")
 
-    try:
-        ws.grants.update(
-            securable_type=SecurableType.SCHEMA.value,
-            full_name=f"{cat}.{sch}",
-            changes=[PermissionsChange(remove=_SCHEMA_PRIVILEGES, principal=sp_id)],
-        )
-        logger.info("Revoked schema privileges on %s.%s from %s", cat, sch, sp_id)
-    except Exception as exc:
-        logger.warning("Schema revoke failed (best-effort) on %s.%s — %s", cat, sch, exc)
+    revoke_statements = [
+        f"REVOKE USE CATALOG ON CATALOG `{cat}` FROM `{sp_name}`",
+        f"REVOKE USE SCHEMA ON SCHEMA `{cat}`.`{sch}` FROM `{sp_name}`",
+        f"REVOKE SELECT ON SCHEMA `{cat}`.`{sch}` FROM `{sp_name}`",
+        f"REVOKE EXECUTE ON SCHEMA `{cat}`.`{sch}` FROM `{sp_name}`",
+    ]
+
+    for stmt in revoke_statements:
+        try:
+            ws.statement_execution.execute_statement(
+                warehouse_id=config.warehouse_id,
+                statement=stmt,
+                wait_timeout="30s",
+            )
+            logger.info("Executed: %s", stmt)
+        except Exception as exc:
+            logger.warning("Revoke SQL failed (best-effort) — %s — %s", stmt, exc)
 
     now = datetime.now(timezone.utc).isoformat()
     from genie_space_optimizer.optimization.state import TABLE_DATA_ACCESS_GRANTS

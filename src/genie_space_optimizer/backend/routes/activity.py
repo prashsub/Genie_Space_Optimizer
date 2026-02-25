@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-import math
 
 from ..core import Dependencies, create_router
 from ..models import ActivityItem
+from ..utils import ensure_utc_iso, safe_float
 from .._spark import get_spark
 
 router = create_router()
@@ -42,19 +42,9 @@ def get_activity(
                     spaceName=row.get("domain", ""),
                     status=row.get("status", ""),
                     initiatedBy=row.get("triggered_by") or "system",
-                    baselineScore=_safe_float(row.get("best_accuracy")),
-                    optimizedScore=_safe_float(row.get("best_accuracy")),
-                    timestamp=str(row.get("started_at", "")),
+                    baselineScore=safe_float(row.get("best_accuracy")),
+                    optimizedScore=safe_float(row.get("best_accuracy")),
+                    timestamp=ensure_utc_iso(row.get("started_at")) or "",
                 )
             )
     return items
-
-
-def _safe_float(val) -> float | None:
-    if val is None:
-        return None
-    try:
-        f = float(val)
-        return f if math.isfinite(f) else None
-    except (TypeError, ValueError):
-        return None

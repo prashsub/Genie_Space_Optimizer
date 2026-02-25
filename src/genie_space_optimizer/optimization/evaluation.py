@@ -536,6 +536,16 @@ def make_predict_fn(
         Steps: rate-limit → Genie call → sanitize → resolve GT SQL →
                dual-execute → normalize → compare hashes.
         """
+        try:
+            mlflow.update_current_trace(
+                tags={
+                    "question_id": kwargs.get("question_id", ""),
+                    "space_id": space_id,
+                },
+            )
+        except Exception:
+            pass
+
         comparison: dict[str, Any] = {
             "match": False,
             "match_type": "mismatch",
@@ -569,43 +579,62 @@ def make_predict_fn(
                         )
                         comparison["error_type"] = "permission_blocked"
                     else:
-                        gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
-                        genie_df = normalize_result_df(spark.sql(genie_sql).toPandas())
-                        gt_hash = hashlib.md5(
-                            gt_df.to_csv(index=False).encode()
-                        ).hexdigest()[:8]
-                        genie_hash = hashlib.md5(
-                            genie_df.to_csv(index=False).encode()
-                        ).hexdigest()[:8]
-                        exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
-                        hash_match = gt_hash == genie_hash
-                        gt_sig = result_signature(gt_df)
-                        genie_sig = result_signature(genie_df)
-                        sig_match = (
-                            gt_sig["schema_hash"] == genie_sig["schema_hash"]
-                            and gt_sig["row_count"] == genie_sig["row_count"]
-                        )
+                        compile_failed = False
+                        for _label, _sql in [("ground_truth", gt_sql), ("genie", genie_sql)]:
+                            try:
+                                spark.sql(f"EXPLAIN {_sql}")
+                            except Exception as explain_exc:
+                                explain_msg = str(explain_exc)
+                                comparison["error"] = (
+                                    f"{_label} SQL compilation failed: {explain_msg[:400]}"
+                                )
+                                comparison["error_type"] = (
+                                    "infrastructure"
+                                    if _label == "ground_truth"
+                                    else "query_execution"
+                                )
+                                comparison["sqlstate"] = _extract_sqlstate(explain_msg)
+                                compile_failed = True
+                                break
 
-                        if exact_match:
-                            match_type = "exact"
-                        elif hash_match:
-                            match_type = "hash"
-                        elif sig_match:
-                            match_type = "signature"
-                        else:
-                            match_type = "mismatch"
+                        if not compile_failed:
+                            gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
+                            genie_df = normalize_result_df(spark.sql(genie_sql).toPandas())
+                            gt_hash = hashlib.md5(
+                                gt_df.to_csv(index=False).encode()
+                            ).hexdigest()[:8]
+                            genie_hash = hashlib.md5(
+                                genie_df.to_csv(index=False).encode()
+                            ).hexdigest()[:8]
+                            exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
+                            hash_match = gt_hash == genie_hash
+                            gt_sig = result_signature(gt_df)
+                            genie_sig = result_signature(genie_df)
+                            sig_match = (
+                                gt_sig["schema_hash"] == genie_sig["schema_hash"]
+                                and gt_sig["row_count"] == genie_sig["row_count"]
+                            )
 
-                        comparison = {
-                            "match": exact_match or hash_match,
-                            "match_type": match_type,
-                            "gt_rows": len(gt_df),
-                            "genie_rows": len(genie_df),
-                            "gt_hash": gt_hash,
-                            "genie_hash": genie_hash,
-                            "gt_signature": gt_sig,
-                            "genie_signature": genie_sig,
-                            "error": None,
-                        }
+                            if exact_match:
+                                match_type = "exact"
+                            elif hash_match:
+                                match_type = "hash"
+                            elif sig_match:
+                                match_type = "signature"
+                            else:
+                                match_type = "mismatch"
+
+                            comparison = {
+                                "match": exact_match or hash_match,
+                                "match_type": match_type,
+                                "gt_rows": len(gt_df),
+                                "genie_rows": len(genie_df),
+                                "gt_hash": gt_hash,
+                                "genie_hash": genie_hash,
+                                "gt_signature": gt_sig,
+                                "genie_signature": genie_sig,
+                                "error": None,
+                            }
                 except Exception as exc:
                     err_msg = str(exc)
                     comparison["error"] = err_msg[:500]
@@ -914,6 +943,71 @@ def register_judge_prompts(
     return registered
 
 
+def register_scorers_with_experiment(
+    scorers: list,
+    experiment_name: str,
+) -> dict[str, Any]:
+    """Register scorers with the MLflow experiment so they appear in the Judges tab.
+
+    Iterates over *scorers*, calling ``.register(name=...)`` on each.
+    Failures are logged but do **not** halt evaluation.
+    """
+    mlflow.set_experiment(experiment_name)
+
+    registered: dict[str, Any] = {}
+    failures: list[tuple[str, Exception]] = []
+
+    for s in scorers:
+        name = getattr(s, "name", getattr(s, "__name__", str(s)))
+        try:
+            reg = s.register(name=name)
+            registered[name] = reg
+            logger.info("[Scorer Registration] Registered %s", name)
+        except ValueError as ve:
+            if "already been registered" in str(ve):
+                try:
+                    reg = s.update(name=name)
+                    registered[name] = reg
+                    logger.info("[Scorer Registration] Updated existing %s", name)
+                except Exception as update_exc:
+                    failures.append((name, update_exc))
+                    logger.warning(
+                        "[Scorer Registration] Failed to update %s: %s: %s",
+                        name,
+                        type(update_exc).__name__,
+                        str(update_exc)[:400],
+                    )
+            else:
+                failures.append((name, ve))
+                logger.warning(
+                    "[Scorer Registration] Failed to register %s: %s: %s",
+                    name,
+                    type(ve).__name__,
+                    str(ve)[:400],
+                )
+        except Exception as exc:
+            failures.append((name, exc))
+            logger.warning(
+                "[Scorer Registration] Failed to register %s: %s: %s",
+                name,
+                type(exc).__name__,
+                str(exc)[:400],
+            )
+
+    logger.info(
+        "Scorer registration complete: %d/%d registered",
+        len(registered),
+        len(scorers),
+    )
+    if failures:
+        logger.warning(
+            "Scorer registration failures: %s",
+            ", ".join(f"{n}: {e}" for n, e in failures),
+        )
+
+    return registered
+
+
 def _log_judge_prompt_artifacts(
     *,
     domain: str,
@@ -983,39 +1077,22 @@ def _configure_uc_trace_destination(
     uc_schema: str,
     warehouse_id: str,
 ) -> str:
-    """Best-effort sync of MLflow traces into UC Delta (OTEL tables)."""
-    destination = (
-        os.getenv("MLFLOW_TRACING_DESTINATION")
-        or os.getenv("GENIE_SPACE_OPTIMIZER_TRACE_UC_SCHEMA")
-        or uc_schema
-    )
-    destination = destination.strip("` ").strip()
-    if destination.count(".") != 1:
-        return ""
+    """Traces are stored in the MLflow experiment (default storage).
 
-    catalog_name, schema_name = destination.split(".", 1)
+    UC OTEL trace storage is intentionally skipped: calling
+    ``set_destination(UC)`` before the UC tables are fully provisioned
+    causes all traces to be silently lost, breaking the evaluation UI.
+
+    We also actively clear any stale UC destination that a previous run
+    (or old code path) may have set in this process.
+    """
+    os.environ.pop("MLFLOW_TRACING_DESTINATION", None)
     try:
-        from mlflow.entities import UCSchemaLocation
-
-        location = UCSchemaLocation(catalog_name=catalog_name, schema_name=schema_name)
-        mlflow.tracing.set_destination(destination=location)
-        mlflow.tracing.set_experiment_trace_location(
-            location=location,
-            experiment_id=experiment_id or None,
-            sql_warehouse_id=warehouse_id or None,
-        )
-        if warehouse_id:
-            mlflow.tracing.set_databricks_monitoring_sql_warehouse_id(
-                sql_warehouse_id=warehouse_id,
-                experiment_id=experiment_id or None,
-            )
-        return destination
+        mlflow.tracing.reset()
     except Exception:
-        logger.warning(
-            "UC trace sync not configured for destination=%s; continuing without blocking eval",
-            destination,
-        )
-        return ""
+        pass
+    logger.info("Traces will be stored in MLflow experiment (default storage)")
+    return ""
 
 
 def _is_retryable_eval_exception(exc: Exception) -> bool:
@@ -1046,61 +1123,172 @@ def _is_retryable_eval_exception(exc: Exception) -> bool:
     return False
 
 
+_HARNESS_PATCHED = False
+
+
+def _patch_mlflow_harness_none_trace() -> None:
+    """Monkey-patch MLflow internals that crash when eval_item.trace is None.
+
+    MLflow >=3.4 has multiple code paths that access ``eval_item.trace.info``
+    without guarding against ``trace`` being ``None``:
+
+      1. ``harness._get_new_expectations`` (line ~394) — crashes on
+         ``eval_item.trace.info.assessments``
+      2. ``trace_utils.batch_link_traces_to_run`` (line ~964) — crashes on
+         ``eval_result.eval_item.trace.info.trace_id`` in a list comprehension
+
+    When the predict function involves complex I/O (Genie API + Spark Connect),
+    the MLflow trace context can be lost, leaving ``trace = None``.  These patches
+    allow evaluation to complete successfully even when traces are missing.
+    """
+    global _HARNESS_PATCHED
+    if _HARNESS_PATCHED:
+        return
+
+    patched: list[str] = []
+
+    try:
+        import mlflow.genai.evaluation.harness as _harness_mod
+
+        _orig_get_new_expectations = _harness_mod._get_new_expectations
+
+        def _safe_get_new_expectations(eval_item: Any) -> list:
+            if eval_item is None:
+                return []
+            trace = getattr(eval_item, "trace", None)
+            if trace is None or getattr(trace, "info", None) is None:
+                return []
+            return _orig_get_new_expectations(eval_item)
+
+        _harness_mod._get_new_expectations = _safe_get_new_expectations
+        patched.append("_get_new_expectations")
+    except Exception:
+        logger.warning("Could not patch _get_new_expectations", exc_info=True)
+
+    try:
+        import mlflow.genai.utils.trace_utils as _trace_utils_mod
+
+        _orig_batch_link = _trace_utils_mod.batch_link_traces_to_run
+
+        def _safe_batch_link_traces_to_run(*args: Any, **kwargs: Any) -> Any:
+            eval_results = kwargs.get("eval_results") or (args[1] if len(args) > 1 else [])
+
+            def _has_valid_trace(r: Any) -> bool:
+                ei = getattr(r, "eval_item", None)
+                if ei is None:
+                    return False
+                tr = getattr(ei, "trace", None)
+                return tr is not None and getattr(tr, "info", None) is not None
+
+            safe_results = [r for r in eval_results if _has_valid_trace(r)]
+            if not safe_results:
+                logger.info(
+                    "batch_link_traces_to_run: %d/%d eval results have None traces, skipping linkage",
+                    len(eval_results) - len(safe_results),
+                    len(eval_results),
+                )
+                return None
+            kwargs["eval_results"] = safe_results
+            if args:
+                return _orig_batch_link(args[0], **kwargs)
+            return _orig_batch_link(**kwargs)
+
+        _trace_utils_mod.batch_link_traces_to_run = _safe_batch_link_traces_to_run
+
+        # Aggressively patch every module that imported the function directly,
+        # scanning sys.modules to catch all references regardless of import style.
+        import sys as _sys
+        _patched_modules: list[str] = []
+        for _mod_name, _mod_obj in list(_sys.modules.items()):
+            if _mod_obj is None or _mod_obj is _trace_utils_mod:
+                continue
+            try:
+                if hasattr(_mod_obj, "batch_link_traces_to_run"):
+                    _existing = getattr(_mod_obj, "batch_link_traces_to_run")
+                    if _existing is not _safe_batch_link_traces_to_run:
+                        setattr(_mod_obj, "batch_link_traces_to_run", _safe_batch_link_traces_to_run)
+                        _patched_modules.append(_mod_name)
+            except Exception:
+                pass
+        if _patched_modules:
+            logger.info(
+                "Patched batch_link_traces_to_run in %d modules: %s",
+                len(_patched_modules),
+                ", ".join(_patched_modules),
+            )
+
+        patched.append("batch_link_traces_to_run")
+    except Exception:
+        logger.warning("Could not patch batch_link_traces_to_run", exc_info=True)
+
+    _HARNESS_PATCHED = True
+    if patched:
+        logger.info("Patched MLflow None-trace safety: %s", ", ".join(patched))
+
+
 def _run_evaluate_with_retries(
     *,
     evaluate_kwargs: dict[str, Any],
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Run mlflow.genai.evaluate() with targeted retry for transient harness errors."""
+    _patch_mlflow_harness_none_trace()
+
     attempts: list[dict[str, Any]] = []
     initial_workers = os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS")
+    initial_skip_validation = os.getenv("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION")
+    os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = "True"
 
-    for attempt in range(1, max(1, EVAL_MAX_ATTEMPTS) + 1):
-        # First attempt keeps current worker setting; fallback retries force single worker.
-        workers = initial_workers if attempt == 1 else EVAL_SINGLE_WORKER_FALLBACK
-        if workers is None:
-            os.environ.pop("MLFLOW_GENAI_EVAL_MAX_WORKERS", None)
-        else:
-            os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = workers
-
-        try:
-            result = mlflow.genai.evaluate(**evaluate_kwargs)
-            attempts.append(
-                {
-                    "attempt": attempt,
-                    "workers": os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS"),
-                    "status": "success",
-                }
-            )
-            return result, attempts
-        except Exception as exc:
-            err_type = type(exc).__name__
-            err_message = str(exc)
-            attempts.append(
-                {
-                    "attempt": attempt,
-                    "workers": os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS"),
-                    "status": "failed",
-                    "error_type": err_type,
-                    "error_message": err_message[:1000],
-                    "traceback": traceback.format_exc(limit=30),
-                }
-            )
-            retryable = _is_retryable_eval_exception(exc)
-            logger.exception(
-                "mlflow.genai.evaluate failed (attempt %d/%d, retryable=%s)",
-                attempt,
-                EVAL_MAX_ATTEMPTS,
-                retryable,
-            )
-            if attempt >= EVAL_MAX_ATTEMPTS or not retryable:
-                setattr(exc, "_eval_attempts", attempts)
-                raise
-            time.sleep(EVAL_RETRY_SLEEP_SECONDS * attempt)
-        finally:
-            if initial_workers is None:
+    try:
+        for attempt in range(1, max(1, EVAL_MAX_ATTEMPTS) + 1):
+            workers = initial_workers if attempt == 1 else EVAL_SINGLE_WORKER_FALLBACK
+            if workers is None:
                 os.environ.pop("MLFLOW_GENAI_EVAL_MAX_WORKERS", None)
             else:
-                os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = initial_workers
+                os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = workers
+
+            try:
+                result = mlflow.genai.evaluate(**evaluate_kwargs)
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "workers": os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS"),
+                        "status": "success",
+                    }
+                )
+                return result, attempts
+            except Exception as exc:
+                err_type = type(exc).__name__
+                err_message = str(exc)
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "workers": os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS"),
+                        "status": "failed",
+                        "error_type": err_type,
+                        "error_message": err_message[:1000],
+                        "traceback": traceback.format_exc(limit=30),
+                    }
+                )
+                retryable = _is_retryable_eval_exception(exc)
+                logger.exception(
+                    "mlflow.genai.evaluate failed (attempt %d/%d, retryable=%s)",
+                    attempt,
+                    EVAL_MAX_ATTEMPTS,
+                    retryable,
+                )
+                if attempt >= EVAL_MAX_ATTEMPTS or not retryable:
+                    setattr(exc, "_eval_attempts", attempts)
+                    raise
+                time.sleep(EVAL_RETRY_SLEEP_SECONDS * attempt)
+    finally:
+        if initial_workers is None:
+            os.environ.pop("MLFLOW_GENAI_EVAL_MAX_WORKERS", None)
+        else:
+            os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = initial_workers
+        if initial_skip_validation is None:
+            os.environ.pop("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION", None)
+        else:
+            os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = initial_skip_validation
 
     raise RuntimeError("Evaluation retry loop exhausted unexpectedly")
 
@@ -1109,22 +1297,42 @@ def _run_evaluate_sequential_fallback(
     *,
     evaluate_kwargs: dict[str, Any],
 ) -> Any:
-    """Deterministic fallback path: evaluate one benchmark row at a time."""
+    """Deterministic fallback path: evaluate one benchmark row at a time.
+
+    Each row is wrapped in try/except so a single harness failure (e.g. a
+    None-trace bug in mlflow) does not crash the entire evaluation.
+    """
+    _patch_mlflow_harness_none_trace()
+
     data = evaluate_kwargs.get("data")
     if not isinstance(data, pd.DataFrame) or data.empty:
         raise RuntimeError("Sequential fallback requires non-empty DataFrame input")
 
     metrics_accumulator: dict[str, list[float]] = {}
     row_tables: list[pd.DataFrame] = []
+    skipped_count = 0
+    total_rows = len(data)
 
     previous_workers = os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS")
+    previous_skip = os.getenv("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION")
     os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = "1"
+    os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = "True"
     try:
-        for row_idx in range(len(data)):
+        for row_idx in range(total_rows):
             row_df = data.iloc[[row_idx]].reset_index(drop=True)
             row_kwargs = dict(evaluate_kwargs)
             row_kwargs["data"] = row_df
-            row_result = mlflow.genai.evaluate(**row_kwargs)
+            try:
+                row_result = mlflow.genai.evaluate(**row_kwargs)
+            except Exception as row_exc:
+                logger.warning(
+                    "Sequential fallback: row %d/%d failed, skipping: %s",
+                    row_idx + 1,
+                    total_rows,
+                    str(row_exc)[:300],
+                )
+                skipped_count += 1
+                continue
 
             if hasattr(row_result, "metrics"):
                 for metric_name, value in row_result.metrics.items():
@@ -1140,6 +1348,17 @@ def _run_evaluate_sequential_fallback(
             os.environ.pop("MLFLOW_GENAI_EVAL_MAX_WORKERS", None)
         else:
             os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = previous_workers
+        if previous_skip is None:
+            os.environ.pop("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION", None)
+        else:
+            os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = previous_skip
+
+    if skipped_count:
+        logger.warning(
+            "Sequential fallback completed with %d/%d rows skipped due to harness errors",
+            skipped_count,
+            total_rows,
+        )
 
     metrics = {
         metric_name: (sum(values) / len(values))
@@ -1149,11 +1368,21 @@ def _run_evaluate_sequential_fallback(
     merged_eval_results = (
         pd.concat(row_tables, ignore_index=True) if row_tables else pd.DataFrame()
     )
-    return SimpleNamespace(metrics=metrics, tables={"eval_results": merged_eval_results})
+    return SimpleNamespace(
+        metrics=metrics,
+        tables={"eval_results": merged_eval_results},
+        skipped_count=skipped_count,
+    )
 
 
 def _collect_infra_eval_errors(rows: list[dict[str, Any]]) -> list[str]:
-    """Extract infrastructure-like SQL errors from eval result rows."""
+    """Extract infrastructure-like SQL errors from eval result rows.
+
+    Only checks specific error/comparison columns — NOT scorer rationales or
+    arbitrary string values, which frequently contain error keywords as part of
+    legitimate judge explanations (e.g. "TABLE_OR_VIEW_NOT_FOUND" in a
+    rationale describing why the Genie response was wrong).
+    """
     infra_errors: list[str] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -1165,28 +1394,26 @@ def _collect_infra_eval_errors(rows: list[dict[str, Any]]) -> list[str]:
             comparison = outputs.get("comparison")
             if isinstance(comparison, dict):
                 err = comparison.get("error")
-                if err:
+                err_type = comparison.get("error_type", "")
+                if err and str(err_type) == "infrastructure":
                     candidates.append(str(err))
         for key in (
             "outputs/comparison/error",
             "comparison/error",
-            "error",
+            "comparison.error",
         ):
             err = row.get(key)
-            if err:
+            if not err:
+                continue
+            err_type_key = key.replace("/error", "/error_type").replace(".error", ".error_type")
+            err_type = row.get(err_type_key, "")
+            if str(err_type) == "infrastructure":
                 candidates.append(str(err))
-
-        # Some scorer failures are serialized into rationale/metadata columns.
-        # Scan all string-like values to catch infra errors there too.
-        for value in row.values():
-            if isinstance(value, str) and _is_infrastructure_sql_error(value):
-                candidates.append(value)
 
         for msg in candidates:
             if _is_infrastructure_sql_error(msg):
                 infra_errors.append(msg[:500])
 
-    # de-duplicate while preserving order
     seen: set[str] = set()
     deduped: list[str] = []
     for msg in infra_errors:
@@ -1282,8 +1509,14 @@ def run_evaluation(
     uc_schema: str = "",
     warehouse_id: str = "",
     patched_objects: list[str] | None = None,
+    reference_sqls: dict[str, str] | None = None,
 ) -> dict:
     """Run ``mlflow.genai.evaluate()`` and return structured results.
+
+    Args:
+        reference_sqls: Optional ``{question_id: sql}`` from a prior iteration.
+            When provided the ``repeatability_scorer`` is automatically added
+            and ``previous_sql`` is injected into each row's expectations.
 
     Returns dict with: run_id, run_name, experiment_id, iteration,
     overall_accuracy, per_judge, thresholds_passed, failure_question_ids,
@@ -1328,22 +1561,32 @@ def run_evaluation(
                 "bad_join_key_count": 0,
             }
 
+        has_reference_sqls = bool(reference_sqls)
+        if has_reference_sqls:
+            from genie_space_optimizer.optimization.scorers import repeatability_scorer as _rep_scorer
+            if _rep_scorer not in scorers:
+                scorers = list(scorers) + [_rep_scorer]
+
         eval_records = []
         for b in filtered:
+            qid = b.get("id", "")
+            expectations = {
+                "expected_response": b.get("expected_sql", ""),
+                "expected_asset": b.get("expected_asset", "TABLE"),
+            }
+            if has_reference_sqls:
+                expectations["previous_sql"] = (reference_sqls or {}).get(qid, "")
             eval_records.append(
                 {
                     "inputs": {
-                        "question_id": b.get("id", ""),
+                        "question_id": qid,
                         "question": b["question"],
                         "space_id": space_id,
                         "expected_sql": b.get("expected_sql", ""),
                         "catalog": catalog,
                         "gold_schema": gold_schema,
                     },
-                    "expectations": {
-                        "expected_response": b.get("expected_sql", ""),
-                        "expected_asset": b.get("expected_asset", "TABLE"),
-                    },
+                    "expectations": expectations,
                 }
             )
         eval_data = pd.DataFrame(eval_records)
@@ -1406,6 +1649,9 @@ def run_evaluation(
             experiment_name=experiment_name,
             register_registry=(iteration == 0 and eval_scope == "full"),
         )
+
+        if iteration == 0 and eval_scope == "full":
+            register_scorers_with_experiment(scorers, experiment_name)
 
         if mlflow_model_id:
             mlflow.set_active_model(model_id=mlflow_model_id)
@@ -1654,6 +1900,192 @@ def run_evaluation(
         "PASS" if thresholds_passed else "FAIL",
     )
     return output
+
+
+# ── Repeatability Evaluation ──────────────────────────────────────────
+
+
+REPEATABILITY_RUN_NAME_TEMPLATE = "genie_repeatability_iter{iteration}_{timestamp}"
+
+
+def run_repeatability_evaluation(
+    space_id: str,
+    experiment_name: str,
+    iteration: int,
+    benchmarks: list[dict],
+    domain: str,
+    reference_sqls: dict[str, str],
+    predict_fn: Any,
+    *,
+    spark: SparkSession | None = None,
+    catalog: str = "",
+    gold_schema: str = "",
+    uc_schema: str = "",
+    model_id: str | None = None,
+    run_label: str = "",
+) -> dict:
+    """Run a repeatability evaluation through ``mlflow.genai.evaluate()``.
+
+    Re-queries Genie via *predict_fn* and uses a repeatability scorer to
+    compare the new SQL against *reference_sqls* (``{question_id: sql}``
+    from a prior iteration).  Produces full MLflow traces and judge verdicts.
+
+    Args:
+        reference_sqls: Mapping of question_id → SQL from a previous run.
+        run_label: Optional suffix for the run name (e.g. "final_1").
+    """
+    from genie_space_optimizer.optimization.scorers import make_repeatability_scorers
+
+    mlflow.set_experiment(experiment_name)
+    exp = mlflow.get_experiment_by_name(experiment_name)
+
+    trace_destination = _configure_uc_trace_destination(
+        experiment_id=exp.experiment_id if exp else "",
+        uc_schema=uc_schema,
+        warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
+    )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = f"_{run_label}" if run_label else ""
+    run_name = f"genie_repeatability_iter{iteration}_{ts}{suffix}"
+
+    scorers = make_repeatability_scorers()
+
+    mlflow_model_id = (
+        model_id
+        if isinstance(model_id, str) and model_id.startswith("m-")
+        else None
+    )
+
+    eval_records = []
+    for b in benchmarks:
+        qid = b.get("id", "")
+        prev_sql = reference_sqls.get(qid, "")
+        eval_records.append(
+            {
+                "inputs": {
+                    "question_id": qid,
+                    "question": b["question"],
+                    "space_id": space_id,
+                    "expected_sql": b.get("expected_sql", ""),
+                    "catalog": catalog,
+                    "gold_schema": gold_schema,
+                },
+                "expectations": {
+                    "expected_response": b.get("expected_sql", ""),
+                    "expected_asset": b.get("expected_asset", "TABLE"),
+                    "previous_sql": prev_sql,
+                },
+            }
+        )
+    eval_data = pd.DataFrame(eval_records)
+
+    with mlflow.start_run(run_name=run_name) as run:
+        mlflow.log_params(
+            {
+                "space_id": space_id,
+                "iteration": iteration,
+                "eval_type": "repeatability",
+                "domain": domain,
+                "benchmark_count": len(benchmarks),
+                "reference_sql_count": sum(1 for v in reference_sqls.values() if v),
+                "run_label": run_label or "standard",
+            }
+        )
+
+        if mlflow_model_id:
+            mlflow.set_active_model(model_id=mlflow_model_id)
+
+        evaluate_kwargs: dict[str, Any] = {
+            "predict_fn": predict_fn,
+            "data": eval_data,
+            "scorers": scorers,
+        }
+        if mlflow_model_id:
+            evaluate_kwargs["model_id"] = mlflow_model_id
+
+        try:
+            eval_result, eval_attempts = _run_evaluate_with_retries(
+                evaluate_kwargs=evaluate_kwargs,
+            )
+        except Exception as exc:
+            if _is_retryable_eval_exception(exc):
+                logger.warning(
+                    "Repeatability eval falling back to sequential: %s",
+                    str(exc)[:300],
+                )
+                eval_result = _run_evaluate_sequential_fallback(
+                    evaluate_kwargs=evaluate_kwargs,
+                )
+            else:
+                logger.error("Repeatability evaluation failed: %s", str(exc)[:500])
+                raise
+
+        per_judge: dict[str, float] = {}
+        for metric_name in eval_result.metrics:
+            if "/mean" in metric_name:
+                judge_name = metric_name.replace("/mean", "")
+                per_judge[judge_name] = eval_result.metrics[metric_name]
+
+        repeatability_raw = per_judge.get("repeatability", 0.0)
+        repeatability_pct = repeatability_raw * 100 if repeatability_raw <= 1.0 else repeatability_raw
+
+        rows_for_output: list[dict] = []
+        if hasattr(eval_result, "tables") and "eval_results" in eval_result.tables:
+            for _, row in eval_result.tables["eval_results"].iterrows():
+                row_dict = {}
+                for col in eval_result.tables["eval_results"].columns:
+                    val = row[col]
+                    if hasattr(val, "item"):
+                        val = val.item()
+                    row_dict[col] = val
+                rows_for_output.append(row_dict)
+
+        mlflow.log_metric("repeatability_pct", repeatability_pct)
+        mlflow.set_tags(
+            {
+                "evaluation_type": "repeatability",
+                "repeatability_pct": f"{repeatability_pct:.1f}",
+                "iteration": str(iteration),
+            }
+        )
+
+    logger.info(
+        "Repeatability evaluation complete: %s — repeatability=%.1f%%",
+        run_name,
+        repeatability_pct,
+    )
+
+    return {
+        "run_id": run.info.run_id,
+        "mlflow_run_id": run.info.run_id,
+        "run_name": run_name,
+        "repeatability_pct": repeatability_pct,
+        "per_judge": per_judge,
+        "rows": rows_for_output,
+        "scores": normalize_scores(per_judge),
+    }
+
+
+def extract_reference_sqls(eval_result: dict) -> dict[str, str]:
+    """Extract ``{question_id: generated_sql}`` from an evaluation output.
+
+    Used to build *reference_sqls* for subsequent repeatability evaluations.
+    """
+    ref: dict[str, str] = {}
+    rows = eval_result.get("rows", [])
+    for row in rows:
+        qid = (
+            row.get("inputs/question_id")
+            or (row.get("inputs", {}) or {}).get("question_id", "")
+        )
+        sql = (
+            row.get("outputs/response")
+            or (row.get("outputs", {}) or {}).get("response", "")
+        )
+        if qid:
+            ref[str(qid)] = str(sql or "")
+    return ref
 
 
 # ── Benchmark Extraction from Genie Space ──────────────────────────────

@@ -48,13 +48,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _collect_or_empty(fetch_fn: Any, label: str) -> list[dict]:
-    """Best-effort metadata fetch; continue if catalog permissions are limited."""
+def _collect_or_empty(fetch_fn: Any, label: str) -> tuple[list[dict], str | None]:
+    """Best-effort metadata fetch; continue if catalog permissions are limited.
+
+    Returns ``(rows, error_message)``.  *error_message* is ``None`` on
+    success and a human-readable string when the query fails.
+    """
     try:
-        return [r.asDict() for r in fetch_fn().collect()]
+        df = fetch_fn()
+        rows = [r.asDict() for r in df.collect()]
+        if not rows:
+            logger.info(
+                "UC metadata query for %s returned 0 rows (query succeeded, no data matched)", label,
+            )
+        return rows, None
     except Exception as exc:
-        logger.warning("Skipping %s metadata due to access issue: %s", label, exc)
-        return []
+        logger.warning(
+            "Skipping %s metadata: %s: %s", label, type(exc).__name__, exc,
+        )
+        return [], f"{type(exc).__name__}: {exc}"
 
 
 def _resolve_experiment_path(
@@ -158,47 +170,63 @@ def run_preflight(
         )
 
     _pf = prefetched if isinstance(prefetched, dict) else {}
+    _actual_source: dict[str, str] = {}
+
+    def _usable_prefetch(key: str) -> list | None:
+        """Return prefetched list only when non-empty; empty lists are treated as cache misses."""
+        val = _pf.get(key)
+        if isinstance(val, list) and val:
+            _actual_source[key] = "prefetched"
+            return val
+        if isinstance(val, list):
+            logger.info("Prefetched %s is empty, falling back to Spark query", key)
+        return None
+
+    _collection_errors: dict[str, str] = {}
+
+    def _spark_collect(fetch_fn: Any, label: str, source_key: str) -> list[dict]:
+        _actual_source[source_key] = "spark"
+        rows, err = _collect_or_empty(fetch_fn, label)
+        if err:
+            _collection_errors[source_key] = err
+        return rows
 
     if genie_table_refs:
         uc_columns_dicts = (
-            _pf.get("uc_columns")
-            if isinstance(_pf.get("uc_columns"), list)
-            else _collect_or_empty(
-                lambda: get_columns_for_tables(spark, genie_table_refs), "columns (genie tables)",
+            _usable_prefetch("uc_columns")
+            or _spark_collect(
+                lambda: get_columns_for_tables(spark, genie_table_refs),
+                "columns (genie tables)", "uc_columns",
             )
         )
         uc_tags_dicts = (
-            _pf.get("uc_tags")
-            if isinstance(_pf.get("uc_tags"), list)
-            else _collect_or_empty(
-                lambda: get_tags_for_tables(spark, genie_table_refs), "tags (genie tables)",
+            _usable_prefetch("uc_tags")
+            or _spark_collect(
+                lambda: get_tags_for_tables(spark, genie_table_refs),
+                "tags (genie tables)", "uc_tags",
             )
         )
         uc_routines_dicts = (
-            _pf.get("uc_routines")
-            if isinstance(_pf.get("uc_routines"), list)
-            else _collect_or_empty(
-                lambda: get_routines_for_schemas(spark, genie_table_refs), "routines (genie schemas)",
+            _usable_prefetch("uc_routines")
+            or _spark_collect(
+                lambda: get_routines_for_schemas(spark, genie_table_refs),
+                "routines (genie schemas)", "uc_routines",
             )
         )
     else:
         uc_columns_dicts = (
-            _pf.get("uc_columns")
-            if isinstance(_pf.get("uc_columns"), list)
-            else _collect_or_empty(lambda: get_columns(spark, catalog, schema), "columns")
+            _usable_prefetch("uc_columns")
+            or _spark_collect(lambda: get_columns(spark, catalog, schema), "columns", "uc_columns")
         )
         uc_tags_dicts = (
-            _pf.get("uc_tags")
-            if isinstance(_pf.get("uc_tags"), list)
-            else _collect_or_empty(lambda: get_tags(spark, catalog, schema), "tags")
+            _usable_prefetch("uc_tags")
+            or _spark_collect(lambda: get_tags(spark, catalog, schema), "tags", "uc_tags")
         )
         uc_routines_dicts = (
-            _pf.get("uc_routines")
-            if isinstance(_pf.get("uc_routines"), list)
-            else _collect_or_empty(lambda: get_routines(spark, catalog, schema), "routines")
+            _usable_prefetch("uc_routines")
+            or _spark_collect(lambda: get_routines(spark, catalog, schema), "routines", "uc_routines")
         )
 
-    # Keep metadata collections strongly typed for downstream steps.
     uc_columns_dicts = uc_columns_dicts if isinstance(uc_columns_dicts, list) else []
     uc_tags_dicts = uc_tags_dicts if isinstance(uc_tags_dicts, list) else []
     uc_routines_dicts = uc_routines_dicts if isinstance(uc_routines_dicts, list) else []
@@ -244,26 +272,31 @@ def run_preflight(
         {f"{c}.{s}" for c, s, _ in genie_table_refs if c and s}
     ) if genie_table_refs else []
     metadata_source = {
-        "columns": "prefetched" if isinstance(_pf.get("uc_columns"), list) else "spark",
-        "tags": "prefetched" if isinstance(_pf.get("uc_tags"), list) else "spark",
-        "routines": "prefetched" if isinstance(_pf.get("uc_routines"), list) else "spark",
+        "columns": _actual_source.get("uc_columns", "unknown"),
+        "tags": _actual_source.get("uc_tags", "unknown"),
+        "routines": _actual_source.get("uc_routines", "unknown"),
     }
+    stage_detail: dict[str, Any] = {
+        "columns_collected": len(uc_columns_dicts),
+        "tags_collected": len(uc_tags_dicts),
+        "routines_collected": len(uc_routines_dicts),
+        "column_samples": [s for s in column_samples if s],
+        "tag_samples": [s for s in tag_samples if s],
+        "routine_samples": [s for s in routine_samples if s],
+        "table_ref_count": len(genie_table_refs),
+        "referenced_schema_count": len(referenced_schemas),
+        "referenced_schemas": referenced_schemas[:12],
+        "collection_scope": "genie_assets" if genie_table_refs else "catalog_schema_fallback",
+        "metadata_source": metadata_source,
+    }
+    if _collection_errors:
+        stage_detail["collection_errors"] = {
+            k: v[:500] for k, v in _collection_errors.items()
+        }
     write_stage(
         spark, run_id, "PREFLIGHT_METADATA_COLLECTION", "COMPLETE",
         task_key="preflight", catalog=catalog, schema=schema,
-        detail={
-            "columns_collected": len(uc_columns_dicts),
-            "tags_collected": len(uc_tags_dicts),
-            "routines_collected": len(uc_routines_dicts),
-            "column_samples": [s for s in column_samples if s],
-            "tag_samples": [s for s in tag_samples if s],
-            "routine_samples": [s for s in routine_samples if s],
-            "table_ref_count": len(genie_table_refs),
-            "referenced_schema_count": len(referenced_schemas),
-            "referenced_schemas": referenced_schemas[:12],
-            "collection_scope": "genie_assets" if genie_table_refs else "catalog_schema_fallback",
-            "metadata_source": metadata_source,
-        },
+        detail=stage_detail,
     )
 
     uc_schema = f"{catalog}.{schema}"

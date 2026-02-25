@@ -2,23 +2,12 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from pydantic import BaseModel, model_serializer
 
 from .. import __version__
-
-
-def _scrub_floats(obj: Any) -> Any:
-    """Recursively replace NaN / Inf floats with None."""
-    if isinstance(obj, float):
-        return None if not math.isfinite(obj) else obj
-    if isinstance(obj, dict):
-        return {k: _scrub_floats(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_scrub_floats(v) for v in obj]
-    return obj
+from .utils import scrub_nan_inf
 
 
 class SafeModel(BaseModel):
@@ -26,7 +15,7 @@ class SafeModel(BaseModel):
 
     @model_serializer(mode="wrap")
     def _nan_safe_serialize(self, handler: Any) -> Any:
-        return _scrub_floats(handler(self))
+        return scrub_nan_inf(handler(self))
 
 
 class VersionOut(BaseModel):
@@ -213,6 +202,7 @@ class DataAccessGrant(BaseModel):
     grantedBy: str
     grantedAt: str
     status: str = "active"
+    source: str = "app"
 
 
 class DataAccessGrantRequest(BaseModel):

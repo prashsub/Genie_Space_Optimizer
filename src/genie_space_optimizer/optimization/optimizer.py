@@ -158,7 +158,7 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
 
     Groups by ``(judge, asi_failure_type, blame_set_str)``.  Falls back to
     ``(judge, _extract_pattern(rationale), "")`` when ASI is absent.
-    Only returns clusters with >= 2 questions; singletons go to long-tail.
+    Returns clusters with >= 1 question so even single failures are actionable.
     """
     failures: list[dict] = []
     table = None
@@ -196,13 +196,16 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
             continue
         for col_name, val in list(row.items()):
             judge: str | None = None
-            if col_name.startswith("feedback/"):
-                judge = col_name.replace("feedback/", "")
-            elif col_name.endswith("/value"):
-                judge = col_name.replace("/value", "")
+            if col_name.startswith("feedback/") and col_name.endswith("/value"):
+                judge = col_name.removeprefix("feedback/").removesuffix("/value")
+            elif col_name.startswith("feedback/") and "/value" not in col_name:
+                judge = col_name.removeprefix("feedback/")
+            elif col_name.endswith("/value") and not col_name.startswith("feedback/"):
+                judge = col_name.removesuffix("/value")
             if judge and "no" in str(val).lower():
                 rationale = (
-                    row.get(f"{judge}/rationale")
+                    row.get(f"feedback/{judge}/rationale")
+                    or row.get(f"{judge}/rationale")
                     or row.get(f"rationale/{judge}")
                     or row.get("rationale", "")
                 )
@@ -212,22 +215,29 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
                     or row.get("question_id")
                     or row.get("question", "unknown")
                 )
-                judge_meta = row.get(f"{judge}/metadata", {})
+                judge_meta = (
+                    row.get(f"feedback/{judge}/metadata")
+                    or row.get(f"{judge}/metadata")
+                    or {}
+                )
                 if not isinstance(judge_meta, dict):
-                    judge_meta = {}
+                    try:
+                        judge_meta = json.loads(judge_meta) if isinstance(judge_meta, str) else {}
+                    except (json.JSONDecodeError, TypeError):
+                        judge_meta = {}
                 asi_failure_type = (
-                    row.get(f"metadata/{judge}/failure_type")
-                    or judge_meta.get("failure_type")
+                    judge_meta.get("failure_type")
+                    or row.get(f"metadata/{judge}/failure_type")
                     or row.get("metadata/failure_type")
                 )
                 asi_blame_set = (
-                    row.get(f"metadata/{judge}/blame_set")
-                    or judge_meta.get("blame_set")
+                    judge_meta.get("blame_set")
+                    or row.get(f"metadata/{judge}/blame_set")
                     or row.get("metadata/blame_set")
                 )
                 asi_counterfactual = (
-                    row.get(f"metadata/{judge}/counterfactual_fix")
-                    or judge_meta.get("counterfactual_fix")
+                    judge_meta.get("counterfactual_fix")
+                    or row.get(f"metadata/{judge}/counterfactual_fix")
                     or row.get("metadata/counterfactual_fix")
                 )
                 failures.append(
@@ -270,7 +280,7 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
                 if i.get("asi_counterfactual_fix")
             ],
         }
-        if len(items) >= 2:
+        if len(items) >= 1:
             clusters.append(entry)
 
     clusters.sort(key=lambda c: len(c["question_ids"]), reverse=True)

@@ -193,7 +193,8 @@ function Dashboard({ spaces }: { spaces: SpaceSummary[] }) {
     return spaces.filter(
       (s) =>
         s.name.toLowerCase().includes(q) ||
-        s.description.toLowerCase().includes(q),
+        s.description.toLowerCase().includes(q) ||
+        s.id.toLowerCase().includes(q),
     );
   }, [spaces, debouncedSearch]);
 
@@ -251,7 +252,7 @@ function Dashboard({ spaces }: { spaces: SpaceSummary[] }) {
       <div className="relative">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
         <Input
-          placeholder="Search spaces by name or description\u2026"
+          placeholder="Search spaces by name, description, or space ID..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="pl-9"
