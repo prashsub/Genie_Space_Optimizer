@@ -167,17 +167,16 @@ BENCHMARK_CORRECTION_PROMPT = (
 # ── 5b. Proposal Generation Prompts ───────────────────────────────────
 
 PROPOSAL_GENERATION_PROMPT = (
-    'You are a Databricks metadata optimization expert.\n'
+    'You are a Databricks metadata optimization expert. Your job is to fix a Genie Space\n'
+    'so that it generates correct SQL for user questions.\n'
     '\n'
-    'Given these evaluation failures and the current metadata state, generate a concrete\n'
-    'metadata change to fix the failures.\n'
-    '\n'
-    '## Failure Cluster\n'
-    '- Failure type: {failure_type}\n'
+    '## Failure Analysis\n'
+    '- Root cause: {failure_type}\n'
     '- Blamed objects: {blame_set}\n'
-    '- Affected questions: {affected_questions}\n'
-    '- Counterfactual fixes suggested by judges: {counterfactual_fixes}\n'
-    '- Severity: {severity}\n'
+    '- Affected questions ({severity}): {affected_questions}\n'
+    '\n'
+    '## SQL Diffs (Expected vs Generated)\n'
+    '{sql_diffs}\n'
     '\n'
     '## Current Metadata for Blamed Objects\n'
     '{current_metadata}\n'
@@ -185,20 +184,61 @@ PROPOSAL_GENERATION_PROMPT = (
     '## Target Change Type\n'
     '{patch_type_description}\n'
     '\n'
-    'Generate the exact new value for the metadata field. Be specific and actionable.\n'
-    'For column descriptions: include business definition, data type context, and usage hints.\n'
+    'Analyze the SQL diffs above carefully. Identify EXACTLY what metadata change\n'
+    '(column description, table description, or instruction) would guide Genie\n'
+    'to produce the expected SQL instead of the generated SQL.\n'
+    '\n'
+    'Be specific — reference actual table/column names from the SQL.\n'
+    'Do NOT generate generic instructions. Generate a targeted metadata fix.\n'
+    '\n'
+    'IMPORTANT: Instruction budget remaining: {instruction_char_budget} chars. Keep additions under 500 chars.\n'
     '\n'
     'Return JSON: {{"proposed_value": "...", "rationale": "..."}}'
+)
+
+LEVER_1_2_COLUMN_PROMPT = (
+    'You are a Databricks Genie Space metadata expert. Your job is to fix column\n'
+    'descriptions and synonyms so that Genie generates correct SQL for user questions.\n'
+    '\n'
+    '## Failure Analysis\n'
+    '- Root cause: {failure_type}\n'
+    '- Blamed objects: {blame_set}\n'
+    '- Affected questions: {affected_questions}\n'
+    '\n'
+    '## SQL Diffs (Expected vs Generated)\n'
+    '{sql_diffs}\n'
+    '\n'
+    '## Full Genie Space Schema (all tables, columns, descriptions, synonyms)\n'
+    '{full_schema_context}\n'
+    '\n'
+    '## Column Config Format\n'
+    'Genie Space column configs use this exact structure:\n'
+    '```json\n'
+    '{{"column_name": "store_number", "description": ["Store business key for human readability"], "synonyms": ["store id", "location number"]}}\n'
+    '```\n'
+    '- `description` is a list of strings. If the column already has an adequate\n'
+    '  description or should inherit its description from Unity Catalog, set to null.\n'
+    '- `synonyms` are alternative names users might use to refer to this column.\n'
+    '- Do NOT add a description to columns that already have a correct one.\n'
+    '  Prefer adding synonyms when the issue is naming/aliasing.\n'
+    '- Do NOT repeat existing synonyms.\n'
+    '\n'
+    'Analyze the SQL diffs carefully. Identify which columns Genie confused or\n'
+    'could not resolve, then propose targeted description or synonym changes.\n'
+    '\n'
+    'Return JSON with one entry per column that needs fixing:\n'
+    '{{"changes": [\n'
+    '  {{"table": "<fully_qualified_table_name>", "column": "<column_name>",\n'
+    '    "description": ["<new description>"] or null,\n'
+    '    "synonyms": ["<term1>", "<term2>"] or null}}\n'
+    '], "rationale": "..."}}\n'
 )
 
 LEVER_4_JOIN_SPEC_PROMPT = (
     'You are a Databricks Genie Space join optimization expert.\n'
     '\n'
-    'Given these join-related failures and the current join_specs configuration,\n'
-    'generate a join specification that would help Genie correctly join the relevant tables.\n'
-    '\n'
-    '## Failures\n'
-    '{failures_context}\n'
+    '## SQL Diffs showing join issues\n'
+    '{sql_diffs}\n'
     '\n'
     '## Current Join Specs\n'
     '{current_join_specs}\n'
@@ -206,65 +246,141 @@ LEVER_4_JOIN_SPEC_PROMPT = (
     '## Table Relationships\n'
     '{table_relationships}\n'
     '\n'
-    '## Available Tables\n'
-    '{table_names}\n'
+    '## Full Schema Context (tables, columns, data types, descriptions)\n'
+    '{full_schema_context}\n'
     '\n'
-    'Generate a valid join_spec JSON object. Include:\n'
-    '- left_table_name and right_table_name (fully qualified)\n'
-    '- join_columns array with left_column and right_column pairs\n'
-    '- relationship_type annotation (e.g., "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--")\n'
+    'Analyze the SQL diffs to determine which tables need to be joined and how.\n'
+    'Compare the expected SQL JOIN clauses with the generated SQL to identify\n'
+    'the missing or incorrect join specification.\n'
+    '\n'
+    'IMPORTANT: The join columns MUST have compatible data types. Check the\n'
+    'column types in the schema context above before proposing a join.\n'
+    'For example, joining an INT column to a STRING column is invalid.\n'
+    '\n'
+    'Generate a valid join_spec JSON matching the Genie Space API format:\n'
+    '- "left": {{"identifier": "<fully_qualified_table>", "alias": "<short_table_name>"}}\n'
+    '- "right": {{"identifier": "<fully_qualified_table>", "alias": "<short_table_name>"}}\n'
+    '- "sql": ["<join_condition_using_aliases>", "--rt=<relationship_type>--"]\n'
+    '\n'
+    'The alias should be the unqualified table name (last segment of the identifier).\n'
+    'The join condition must use backtick-quoted aliases, e.g.:\n'
+    '  "`fact_sales`.`product_key` = `dim_product`.`product_key`"\n'
+    'The relationship_type annotation must be one of:\n'
+    '  --rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--\n'
+    '  --rt=FROM_RELATIONSHIP_TYPE_ONE_TO_MANY--\n'
+    '  --rt=FROM_RELATIONSHIP_TYPE_ONE_TO_ONE--\n'
     '\n'
     'Return JSON: {{"join_spec": {{...}}, "rationale": "..."}}'
 )
 
-LEVER_5_DISCOVERY_PROMPT = (
-    'You are a Databricks Genie Space column discovery expert.\n'
+LEVER_4_JOIN_DISCOVERY_PROMPT = (
+    'You are a Databricks Genie Space join optimization expert.\n'
+    'Your task is to identify MISSING join relationships between tables.\n'
     '\n'
-    'Given these column discovery failures and the current column_configs,\n'
-    'recommend which columns should have format assistance (get_example_values),\n'
-    'entity matching (build_value_dictionary), or synonyms.\n'
+    '## Full Schema Context (tables, columns, data types, descriptions)\n'
+    '{full_schema_context}\n'
     '\n'
-    '## Failures\n'
-    '{failures_context}\n'
+    '## Currently Defined Join Specs\n'
+    '{current_join_specs}\n'
     '\n'
-    '## Current Column Configs\n'
-    '{current_column_configs}\n'
+    '## Heuristic Candidate Hints\n'
+    'The following table pairs have been flagged by automated analysis as\n'
+    'potential join candidates. Each hint includes the reason it was flagged.\n'
+    'These are HINTS only — you must validate them using the schema context.\n'
     '\n'
-    '## Constraints\n'
-    '- Maximum {max_value_dictionary_cols} string columns can have build_value_dictionary enabled\n'
-    '- Currently {string_column_count} string columns exist, {current_dictionary_count} have build_value_dictionary enabled\n'
+    '{discovery_hints}\n'
     '\n'
-    'Generate specific column-level recommendations.\n'
+    '## Instructions\n'
+    'Review the heuristic hints above alongside the full schema context.\n'
+    'For each hint, decide whether a join relationship actually exists by checking:\n'
+    '1. Column data types MUST be compatible (e.g. INT=INT, BIGINT=INT, STRING=STRING).\n'
+    '   Do NOT propose joining columns with incompatible types (e.g. INT to STRING).\n'
+    '2. Column names and/or descriptions suggest a foreign-key relationship.\n'
+    '3. The join is not already defined in the current join specs.\n'
     '\n'
-    'Return JSON: {{"recommendations": [{{"table": "...", "column": "...", '
-    '"action": "enable_example_values|enable_value_dictionary|add_synonym", '
-    '"value": "..."|null}}], "rationale": "..."}}'
+    'Also look for any additional missing joins NOT covered by the hints.\n'
+    '\n'
+    'For each valid join, generate a join_spec in Genie Space API format:\n'
+    '- "left": {{"identifier": "<fully_qualified_table>", "alias": "<short_table_name>"}}\n'
+    '- "right": {{"identifier": "<fully_qualified_table>", "alias": "<short_table_name>"}}\n'
+    '- "sql": ["<join_condition_using_aliases>", "--rt=<relationship_type>--"]\n'
+    '\n'
+    'The alias should be the unqualified table name (last segment of the identifier).\n'
+    'The join condition must use backtick-quoted aliases.\n'
+    'The relationship_type annotation must be one of:\n'
+    '  --rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--\n'
+    '  --rt=FROM_RELATIONSHIP_TYPE_ONE_TO_MANY--\n'
+    '  --rt=FROM_RELATIONSHIP_TYPE_ONE_TO_ONE--\n'
+    '\n'
+    'Return JSON: {{"join_specs": [{{...}}, ...], "rationale": "..."}}\n'
+    'If no valid joins are found, return: {{"join_specs": [], "rationale": "..."}}'
 )
 
-LEVER_6_INSTRUCTION_PROMPT = (
+LEVER_5_INSTRUCTION_PROMPT = (
     'You are a Databricks Genie Space instruction expert.\n'
     '\n'
-    'Given these routing/disambiguation failures and the current Genie Space instructions,\n'
-    'generate a new instruction that would help Genie route to the correct asset or\n'
-    'disambiguate the user\'s question.\n'
+    '## SQL Diffs showing routing/disambiguation issues\n'
+    '{sql_diffs}\n'
     '\n'
-    '## Failures\n'
-    '{failures_context}\n'
-    '\n'
-    '## Current Instructions\n'
+    '## Current Text Instructions\n'
     '{current_instructions}\n'
+    '\n'
+    '## Existing Example SQL Queries\n'
+    '{existing_example_sqls}\n'
     '\n'
     '## Available Assets\n'
     'Tables: {table_names}\n'
     'Metric Views: {mv_names}\n'
     'TVFs: {tvf_names}\n'
     '\n'
-    'Generate a clear, concise instruction. Focus on:\n'
-    '- When to use which asset type\n'
-    '- How to interpret ambiguous terms\n'
-    '- Default behaviors for common question patterns\n'
+    '## Instruction Type Priority (MUST follow this hierarchy)\n'
+    '1. **SQL expressions** — Use for defining business metrics, filters, or dimensions '
+    '(e.g., revenue, active_customers, gross_margin). These are handled by levers 1-4; '
+    'choose this ONLY when the fix is a column-level semantic definition that earlier levers missed.\n'
+    '2. **Example SQL queries** — Use to teach Genie how to handle ambiguous, multi-part, '
+    'or complex question patterns. Provide a representative question and its correct SQL. '
+    'Genie uses these to match similar user prompts and learn query patterns.\n'
+    '3. **Text instructions** — Use ONLY as a last resort when SQL expressions and example '
+    'SQL cannot address the need (e.g., clarification prompts, formatting rules, '
+    'cross-cutting behavioral guidance).\n'
     '\n'
-    'Return JSON: {{"instruction_text": "...", "rationale": "..."}}'
+    'Analyze the SQL diffs and choose the HIGHEST-PRIORITY instruction type that fixes the issue.\n'
+    '\n'
+    '## Rules for Text Instructions (when you must use them)\n'
+    '- Be SPECIFIC: include trigger condition, missing details, required action, and example.\n'
+    '  BAD: "Ask clarification questions when asked about sales."\n'
+    '  GOOD: "When users ask about sales metrics without specifying product name or '
+    'sales channel, ask: To proceed with sales analysis, specify your product name and sales channel."\n'
+    '- NEVER conflict with existing example SQL or text instructions. If a text instruction '
+    'says round to 2 decimals, example SQL must also round to 2 decimals.\n'
+    '- Keep under 500 chars. Instruction budget remaining: {instruction_char_budget} chars.\n'
+    '\n'
+    '## Rules for Example SQL\n'
+    '- The question must be a realistic user prompt that matches the failure pattern.\n'
+    '- The SQL must be correct, executable, and consistent with existing instructions.\n'
+    '- Do NOT duplicate an existing example SQL question (see above).\n'
+    '- Use named parameter markers (`:param_name`) when the query filters on a value '
+    'the user is likely to vary (e.g., date range, threshold, category). '
+    'Parameterized queries produce **trusted asset** responses in Genie.\n'
+    '- For each parameter, provide: name (matching the `:param_name` in SQL), '
+    'type_hint (STRING, INTEGER, DATE, or DECIMAL), and a sensible default_value.\n'
+    '- Include a usage_guidance string describing when Genie should match this query.\n'
+    '- If no parameters are needed, set "parameters" to [] and still provide usage_guidance.\n'
+    '\n'
+    'Return JSON with one of these formats based on instruction_type:\n'
+    '\n'
+    'For example_sql:\n'
+    '{{"instruction_type": "example_sql", "example_question": "...", "example_sql": "...", '
+    '"parameters": [{{"name": "param_name", "type_hint": "STRING|INTEGER|DATE|DECIMAL", '
+    '"default_value": "..."}}], '
+    '"usage_guidance": "When to use this query", "rationale": "..."}}\n'
+    '\n'
+    'For text_instruction:\n'
+    '{{"instruction_type": "text_instruction", "instruction_text": "...", "rationale": "..."}}\n'
+    '\n'
+    'For sql_expression (delegate to levers 1-4):\n'
+    '{{"instruction_type": "sql_expression", "target_table": "...", "target_column": "...", '
+    '"expression": "...", "rationale": "..."}}'
 )
 
 # ── 6. Non-Exportable Genie Config Fields ──────────────────────────────
@@ -377,15 +493,41 @@ LEVER_NAMES = {
     2: "Metric Views",
     3: "Table-Valued Functions",
     4: "Join Specifications",
-    5: "Column Discovery Settings",
-    6: "Genie Space Instructions",
+    5: "Genie Space Instructions",
 }
 
-DEFAULT_LEVER_ORDER = [1, 2, 3, 4, 5, 6]
+DEFAULT_LEVER_ORDER = [1, 2, 3, 4, 5]
 
 MAX_VALUE_DICTIONARY_COLUMNS = 120
 """Maximum number of string columns per Genie Space that can have
-build_value_dictionary=true. Enforced by the Lever 5 optimizer."""
+build_value_dictionary=true. Enforced by auto_apply_prompt_matching()."""
+
+ENABLE_PROMPT_MATCHING_AUTO_APPLY = True
+"""When True, format assistance and entity matching are applied as a
+best-practice hygiene step between baseline evaluation and the lever loop."""
+
+CATEGORICAL_COLUMN_PATTERNS = [
+    "industry", "type", "status", "state", "country", "region",
+    "department", "category", "segment", "code", "tier", "level",
+    "stage", "phase", "class", "group", "channel", "source", "priority",
+    "currency", "unit", "role", "gender", "brand", "vendor", "supplier",
+]
+
+FREE_TEXT_COLUMN_PATTERNS = [
+    "description", "comment", "notes", "address", "email", "url",
+    "path", "body", "message", "content", "text", "summary", "detail",
+    "narrative", "reason", "explanation",
+]
+
+NUMERIC_DATA_TYPES = {
+    "DOUBLE", "FLOAT", "DECIMAL", "INT", "INTEGER", "BIGINT",
+    "SMALLINT", "TINYINT", "LONG", "SHORT", "BYTE", "NUMBER",
+}
+
+MEASURE_NAME_PREFIXES = [
+    "avg_", "sum_", "count_", "total_", "pct_", "ratio_",
+    "min_", "max_", "num_", "mean_", "median_", "stddev_",
+]
 
 # ── 12. Delta Table Names ─────────────────────────────────────────────
 
@@ -619,7 +761,7 @@ PATCH_TYPES = {
         "risk_level": "low",
         "affects": ["column_config", "synonyms"],
     },
-    # Lever 6: Genie Space Instructions
+    # Lever 6: Genie Space Instructions (text)
     "add_instruction": {
         "type": "add_instruction",
         "scope": "genie_config",
@@ -637,6 +779,25 @@ PATCH_TYPES = {
         "scope": "genie_config",
         "risk_level": "medium",
         "affects": ["instructions"],
+    },
+    # Lever 6: Genie Space Example SQL (preferred over text instructions)
+    "add_example_sql": {
+        "type": "add_example_sql",
+        "scope": "genie_config",
+        "risk_level": "low",
+        "affects": ["instructions", "example_question_sqls"],
+    },
+    "update_example_sql": {
+        "type": "update_example_sql",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["instructions", "example_question_sqls"],
+    },
+    "remove_example_sql": {
+        "type": "remove_example_sql",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["instructions", "example_question_sqls"],
     },
     # Shared: Filters
     "add_default_filter": {
@@ -659,7 +820,7 @@ PATCH_TYPES = {
     },
 }
 
-# ── 18. Conflict Rules (18 pairs) ─────────────────────────────────────
+# ── 18. Conflict Rules (23 pairs) ─────────────────────────────────────
 
 CONFLICT_RULES = [
     ("add_table", "remove_table"),
@@ -680,6 +841,13 @@ CONFLICT_RULES = [
     ("enable_example_values", "disable_example_values"),
     ("enable_value_dictionary", "disable_value_dictionary"),
     ("update_join_spec", "remove_join_spec"),
+    # Example SQL conflict pairs
+    ("add_example_sql", "remove_example_sql"),
+    ("add_example_sql", "update_example_sql"),
+    ("update_example_sql", "remove_example_sql"),
+    # Cross-type conflicts: example SQL vs text instructions on same routing
+    ("add_example_sql", "add_instruction"),
+    ("add_example_sql", "update_instruction"),
 ]
 
 # ── 19. Failure Taxonomy (22 types) ───────────────────────────────────
@@ -788,9 +956,9 @@ _LEVER_TO_PATCH_TYPE: dict[tuple[str, int], str] = {
     ("wrong_table", 1): "update_description",
     ("description_mismatch", 1): "update_column_description",
     ("missing_synonym", 1): "add_column_synonym",
-    # Lever 2: Metric Views
-    ("wrong_aggregation", 2): "update_mv_measure",
-    ("wrong_measure", 2): "update_mv_measure",
+    # Lever 2: Metric Views — route aggregation/measure issues to column descriptions
+    ("wrong_aggregation", 2): "update_column_description",
+    ("wrong_measure", 2): "update_column_description",
     ("missing_filter", 2): "update_mv_yaml",
     ("missing_temporal_filter", 2): "update_mv_yaml",
     # Lever 3: Table-Valued Functions
@@ -800,13 +968,9 @@ _LEVER_TO_PATCH_TYPE: dict[tuple[str, int], str] = {
     ("wrong_join", 4): "update_join_spec",
     ("missing_join_spec", 4): "add_join_spec",
     ("wrong_join_spec", 4): "update_join_spec",
-    # Lever 5: Column Discovery Settings
-    ("missing_format_assistance", 5): "enable_example_values",
-    ("missing_entity_matching", 5): "enable_value_dictionary",
-    ("missing_synonym", 5): "add_column_synonym",
-    # Lever 6: Genie Space Instructions
-    ("asset_routing_error", 6): "add_instruction",
-    ("missing_instruction", 6): "add_instruction",
-    ("ambiguous_question", 6): "add_instruction",
-    ("missing_filter", 6): "add_instruction",
+    # Lever 5: Genie Space Instructions (example SQL preferred over text)
+    ("asset_routing_error", 5): "add_example_sql",
+    ("missing_instruction", 5): "add_example_sql",
+    ("ambiguous_question", 5): "add_example_sql",
+    ("missing_filter", 5): "add_example_sql",
 }

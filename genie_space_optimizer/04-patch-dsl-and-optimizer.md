@@ -692,22 +692,44 @@ def sort_genie_config(config: dict) -> dict:
 
 Lever 4 optimizes the `join_specs` array in the Genie Space config. Join specs guide Genie on how to join tables for questions that cannot be answered by a single metric view or TVF.
 
+Lever 4 has two pathways:
+
+**Reactive (failure-driven):**
 1. `cluster_failures()` identifies join-related failures (`failure_type` in: `wrong_join`, `missing_join_spec`, `wrong_join_spec`)
-2. `generate_metadata_proposals(target_lever=4)` calls Claude Opus 4.6 with `LEVER_4_JOIN_SPEC_PROMPT` providing current join_specs and table relationships
+2. `generate_metadata_proposals(target_lever=4)` calls Claude Opus 4.6 with `LEVER_4_JOIN_SPEC_PROMPT` providing SQL diffs, current join_specs, and table relationships
 3. `apply_patch_set()` applies `add_join_spec` / `update_join_spec` / `remove_join_spec` patches
 
-Join spec structure in Genie config:
+**Proactive (discovery-driven):**
+1. `discover_join_candidates()` scans table column_configs for matching key columns (`_key`, `_id`, `_code`, `_fk` suffixes) across table pairs that lack a join spec
+2. Candidates are converted directly to `add_join_spec` proposals (no LLM call needed — the heuristic provides the join column and relationship type)
+3. Fact→dim directionality is inferred from table name prefixes (`fact_*` / `dim_*`), with `MANY_TO_ONE` as the default relationship type
+4. Proposals flow through the normal `apply_patch_set()` → 3-gate evaluation → accept/rollback pipeline
+
+Note: Genie Space automatically inherits declared foreign keys from Unity Catalog, so FK-based discovery is not needed. The column-name heuristic catches undeclared relationships that follow naming conventions.
+
+Join spec structure in the Genie Space API (used in `data_sources.join_specs`):
 
 ```python
 {
-    "left_table_name": "catalog.schema.fact_booking",
-    "right_table_name": "catalog.schema.dim_hotel",
-    "join_columns": [
-        {"left_column": "hotel_id", "right_column": "hotel_id"}
-    ],
-    "relationship_type": "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"
+    "id": "01f0ad0d633619c7b3f7c7fbc9ac975e",
+    "left": {
+        "identifier": "catalog.schema.fact_booking",
+        "alias": "fact_booking"
+    },
+    "right": {
+        "identifier": "catalog.schema.dim_hotel",
+        "alias": "dim_hotel"
+    },
+    "sql": [
+        "`fact_booking`.`hotel_id` = `dim_hotel`.`hotel_id`",
+        "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"
+    ]
 }
 ```
+
+The `sql` array contains the join condition (using backtick-quoted aliases) followed by a relationship type annotation. The `id` is server-generated.
+
+Helper functions `_join_spec_left_id()` / `_join_spec_right_id()` in `applier.py` extract identifiers from either the API format (nested `left`/`right` objects) or legacy format (flat `left_table_name`/`right_table_name`).
 
 Always `genie_config` scope — `apply_mode` does not affect this lever.
 

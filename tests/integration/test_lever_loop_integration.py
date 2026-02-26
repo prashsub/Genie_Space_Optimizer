@@ -32,7 +32,7 @@ class TestClusterToPropose:
                 cluster["root_cause"],
                 asi_failure_type=cluster.get("asi_failure_type"),
             )
-            assert 1 <= lever <= 6
+            assert 1 <= lever <= 5
 
     def test_proposals_to_patches_structure(self, sample_clusters):
         proposals = []
@@ -76,7 +76,7 @@ class TestApplyPatchToConfig:
         patch = {
             "type": "add_instruction",
             "new_text": "Always filter by status = active.",
-            "lever": 6,
+            "lever": 5,
         }
         rendered = render_patch(patch, "space-1", config)
         applied = _apply_action_to_config(config, rendered)
@@ -90,7 +90,7 @@ class TestApplyPatchToConfig:
 class TestApplyPatchSet:
     def test_apply_patch_set_returns_log(self, sample_metadata):
         patches = [
-            {"type": "add_instruction", "new_text": "Use UTC.", "lever": 6},
+            {"type": "add_instruction", "new_text": "Use UTC.", "lever": 5},
         ]
         log = apply_patch_set(
             w=None,
@@ -126,7 +126,7 @@ class TestConflictBatching:
         proposals = [
             {"patch_type": "add_description", "lever": 1},
             {"patch_type": "add_column_description", "lever": 1},
-            {"patch_type": "add_instruction", "lever": 6},
+            {"patch_type": "add_instruction", "lever": 5},
         ]
         batches = detect_conflicts_and_batch(proposals)
         total = sum(len(b) for b in batches)

@@ -78,8 +78,8 @@ class TestLLMConfig:
 
 
 class TestLeverConfig:
-    def test_lever_names_covers_1_to_6(self):
-        for i in range(1, 7):
+    def test_lever_names_covers_1_to_5(self):
+        for i in range(1, 6):
             assert i in LEVER_NAMES, f"Lever {i} missing from LEVER_NAMES"
 
     def test_lever_names_are_strings(self):

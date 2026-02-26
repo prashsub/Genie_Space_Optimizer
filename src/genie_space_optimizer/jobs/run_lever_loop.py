@@ -11,22 +11,22 @@
 # MAGIC The lever loop:
 # MAGIC 1. **Reads** baseline scores and thresholds_met from Task 2 (baseline_eval)
 # MAGIC 2. **Skips** entirely if baseline already meets all quality thresholds (baseline gate)
-# MAGIC 3. **Iterates** through levers 1–6 in order, up to `max_iterations`
+# MAGIC 3. **Iterates** through levers 1–5 in order, up to `max_iterations`
 # MAGIC 4. For each lever: clusters failures → generates proposals → applies patches → runs 3-gate evaluation → accepts or rolls back
 # MAGIC 5. **Publishes** final scores, model_id, iteration counts, and lever outcomes to downstream tasks
 # MAGIC
-# MAGIC ## The 6 Levers
+# MAGIC ## The 5 Levers
 # MAGIC
 # MAGIC | Lever | Name | What It Optimizes | Example Patches | Risk Level |
 # MAGIC |-------|------|-------------------|-----------------|------------|
-# MAGIC | 1 | **Tables & Columns** | Column descriptions, visibility, aliases | `update_column_description`, `hide_column`, `add_column_description` | Low–Medium |
+# MAGIC | 1 | **Tables & Columns** | Column descriptions, visibility, aliases, synonyms | `update_column_description`, `hide_column`, `add_column_synonym` | Low–Medium |
 # MAGIC | 2 | **Metric Views** | MV measures, dimensions, YAML definitions | `update_mv_measure`, `add_mv_dimension`, `update_mv_yaml` | Medium–High |
 # MAGIC | 3 | **Table-Valued Functions** | TVF SQL, parameters, signatures | `update_tvf_sql`, `add_tvf_parameter`, `add_tvf` | Medium–High |
-# MAGIC | 4 | **Join Specifications** | Table relationships, join columns | `add_join_spec`, `update_join_spec`, `remove_join_spec` | Medium |
-# MAGIC | 5 | **Column Discovery** | Example values, value dictionaries, synonyms | `enable_example_values`, `enable_value_dictionary`, `add_column_synonym` | Low |
-# MAGIC | 6 | **Genie Space Instructions** | Routing rules, disambiguation, default behaviors | `add_instruction`, `update_instruction` | Low–Medium |
+# MAGIC | 4 | **Join Specifications** | Table relationships, join columns (reactive + column-name discovery) | `add_join_spec`, `update_join_spec`, `remove_join_spec` | Medium |
+# MAGIC | 5 | **Genie Space Instructions** | Routing rules, disambiguation, default behaviors | `add_instruction`, `update_instruction` | Low–Medium |
 # MAGIC
-# MAGIC Levers 1–3 are governed by `apply_mode` (genie_config, uc_artifact, or both). Levers 4–6 always write to Genie Space config.
+# MAGIC Format assistance and entity matching are applied automatically between baseline and the lever loop (Stage 2.5).
+# MAGIC Levers 1–3 are governed by `apply_mode` (genie_config, uc_artifact, or both). Levers 4–5 always write to Genie Space config.
 # MAGIC
 # MAGIC ## Convergence Logic
 # MAGIC
@@ -141,7 +141,7 @@ def _log(event: str, **payload) -> None:
 # MAGIC - `run_id`, `space_id`, `domain`, `catalog`, `schema` — run and UC context
 # MAGIC - `experiment_name` — MLflow experiment for evaluations
 # MAGIC - `max_iterations` — cap on lever loop iterations
-# MAGIC - `levers` — list of lever indices to try (default `[1,2,3,4,5,6]`)
+# MAGIC - `levers` — list of lever indices to try (default `[1,2,3,4,5]`)
 # MAGIC - `apply_mode` — where levers 1–3 write: `genie_config`, `uc_artifact`, or `both`
 # MAGIC
 # MAGIC **From baseline_eval:**

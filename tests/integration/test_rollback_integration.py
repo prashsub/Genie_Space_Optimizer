@@ -19,7 +19,7 @@ from genie_space_optimizer.optimization.optimizer import detect_regressions
 def applied_state(sample_metadata):
     """Apply a patch set and return (metadata, apply_log)."""
     patches = [
-        {"type": "add_instruction", "new_text": "Filter by active.", "lever": 6},
+        {"type": "add_instruction", "new_text": "Filter by active.", "lever": 5},
         {"type": "add_description", "target": "orders", "new_text": "Revenue orders", "lever": 1},
     ]
     log = apply_patch_set(

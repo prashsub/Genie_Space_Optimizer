@@ -416,19 +416,37 @@ def get_space_detail(
     for join in joins_raw:
         if not isinstance(join, dict):
             continue
-        left = str(join.get("left_table_name") or "")
-        right = str(join.get("right_table_name") or "")
-        rel = join.get("relationship_type")
-        join_columns_raw = join.get("join_columns", [])
+        left_obj = join.get("left", {})
+        right_obj = join.get("right", {})
+        if isinstance(left_obj, dict) and isinstance(right_obj, dict):
+            left = left_obj.get("identifier", "")
+            right = right_obj.get("identifier", "")
+        else:
+            left = str(join.get("left_table_name") or "")
+            right = str(join.get("right_table_name") or "")
+
+        sql_arr = join.get("sql", [])
+        rel: str | None = None
         join_columns: list[str] = []
-        if isinstance(join_columns_raw, list):
-            for jc in join_columns_raw:
-                if not isinstance(jc, dict):
-                    continue
-                left_col = str(jc.get("left_column") or "")
-                right_col = str(jc.get("right_column") or "")
-                if left_col or right_col:
-                    join_columns.append(f"{left_col} = {right_col}")
+        if isinstance(sql_arr, list) and sql_arr:
+            for entry in sql_arr:
+                entry_str = str(entry)
+                if entry_str.startswith("--rt="):
+                    rel = entry_str
+                elif entry_str.strip():
+                    join_columns.append(entry_str)
+        else:
+            rel = join.get("relationship_type")
+            join_columns_raw = join.get("join_columns", [])
+            if isinstance(join_columns_raw, list):
+                for jc in join_columns_raw:
+                    if not isinstance(jc, dict):
+                        continue
+                    left_col = str(jc.get("left_column") or "")
+                    right_col = str(jc.get("right_column") or "")
+                    if left_col or right_col:
+                        join_columns.append(f"{left_col} = {right_col}")
+
         joins.append(
             JoinInfo(
                 leftTable=left,

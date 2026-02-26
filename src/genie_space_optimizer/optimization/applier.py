@@ -18,10 +18,15 @@ from databricks.sdk import WorkspaceClient
 
 from genie_space_optimizer.common.config import (
     APPLY_MODE,
+    CATEGORICAL_COLUMN_PATTERNS,
+    FREE_TEXT_COLUMN_PATTERNS,
     HIGH_RISK_PATCHES,
     LOW_RISK_PATCHES,
+    MAX_VALUE_DICTIONARY_COLUMNS,
+    MEASURE_NAME_PREFIXES,
     MEDIUM_RISK_PATCHES,
     NON_EXPORTABLE_FIELDS,
+    NUMERIC_DATA_TYPES,
     PATCH_TYPES,
     _LEVER_TO_PATCH_TYPE,
 )
@@ -63,6 +68,52 @@ def sort_genie_config(config: dict) -> dict:
     return config
 
 
+_MAX_INSTRUCTION_CHARS = 24_500  # Genie Space API enforces 25 000; leave margin
+
+
+# ── Join Spec Helpers ─────────────────────────────────────────────────
+# The Genie Space API uses nested objects for join specs:
+#   {"left": {"identifier": "...", "alias": "..."}, "right": {...}, "sql": [...]}
+# These helpers extract identifiers for matching across add/update/remove ops.
+
+
+def _join_spec_left_id(spec: dict) -> str:
+    """Extract left table identifier from a join spec (API or legacy format)."""
+    left = spec.get("left")
+    if isinstance(left, dict):
+        return left.get("identifier", "")
+    return spec.get("left_table_name", "")
+
+
+def _join_spec_right_id(spec: dict) -> str:
+    """Extract right table identifier from a join spec (API or legacy format)."""
+    right = spec.get("right")
+    if isinstance(right, dict):
+        return right.get("identifier", "")
+    return spec.get("right_table_name", "")
+
+
+def _enforce_instruction_limit(config: dict) -> None:
+    """Trim text_instructions content so it stays under the API limit."""
+    ti = (config.get("instructions") or {}).get("text_instructions", [])
+    if not ti:
+        return
+    content = ti[0].get("content", [])
+    if not isinstance(content, list):
+        content = [str(content)]
+    total = sum(len(line) for line in content)
+    if total <= _MAX_INSTRUCTION_CHARS:
+        return
+    logger.warning(
+        "Instruction text %d chars exceeds limit %d — trimming from end",
+        total, _MAX_INSTRUCTION_CHARS,
+    )
+    while content and total > _MAX_INSTRUCTION_CHARS:
+        removed = content.pop()
+        total -= len(removed)
+    ti[0]["content"] = content
+
+
 def _get_general_instructions(config: dict) -> str:
     """Extract general instructions as joined text from text_instructions."""
     inst = config.get("instructions", {})
@@ -86,6 +137,205 @@ def _set_general_instructions(
         ti[0] = {"id": ti[0].get("id", instruction_id), "content": lines}
     else:
         ti.append({"id": instruction_id, "content": lines})
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1b. Prompt Matching Auto-Config
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _is_measure_column(column_name: str, data_type: str) -> bool:
+    """Return True if the column looks like a metric view measure."""
+    dt_upper = (data_type or "").upper().split("(")[0].strip()
+    if dt_upper in NUMERIC_DATA_TYPES:
+        return True
+    lower_name = column_name.lower()
+    return any(lower_name.startswith(p) for p in MEASURE_NAME_PREFIXES)
+
+
+def _is_hidden(cc: dict) -> bool:
+    if cc.get("visible") is False:
+        return True
+    if cc.get("exclude") is True:
+        return True
+    return False
+
+
+def _entity_matching_score(column_name: str) -> int:
+    """Score a STRING column for entity matching priority.
+
+    Higher score = higher priority.  Returns 0-2.
+    """
+    lower = column_name.lower()
+    if any(pat in lower for pat in FREE_TEXT_COLUMN_PATTERNS):
+        return 0
+    if any(pat in lower for pat in CATEGORICAL_COLUMN_PATTERNS):
+        return 2
+    return 1
+
+
+def auto_apply_prompt_matching(
+    w: WorkspaceClient,
+    space_id: str,
+    config: dict,
+) -> dict:
+    """Enable format assistance and entity matching as a best-practice step.
+
+    Operates deterministically (no LLM calls).  Mutates ``config`` in-place
+    and PATCHes the Genie Space via the API.
+
+    Returns an apply_log dict with ``applied`` list, ``patched_objects``,
+    ``pre_snapshot``, ``post_snapshot``, and summary stats.
+    """
+    parsed = config.get("_parsed_space", config)
+    ds = parsed.get("data_sources", {})
+    tables = ds.get("tables", [])
+    metric_views = ds.get("metric_views", [])
+    uc_columns: list[dict] = config.get("_uc_columns", [])
+
+    type_lookup: dict[tuple[str, str], str] = {}
+    for col in uc_columns:
+        if not isinstance(col, dict):
+            continue
+        tbl = str(col.get("table_name") or "").strip()
+        cname = str(col.get("column_name") or "").strip()
+        dtype = str(col.get("data_type") or "").strip()
+        if tbl and cname:
+            type_lookup[(tbl.lower(), cname.lower())] = dtype
+
+    pre_snapshot = copy.deepcopy(parsed)
+    changes: list[dict] = []
+
+    already_dict_count = sum(
+        1
+        for t in tables + metric_views
+        for cc in t.get("column_configs", [])
+        if cc.get("build_value_dictionary")
+    )
+
+    entity_candidates: list[tuple[str, str, str, int]] = []
+
+    def _table_short_name(identifier: str) -> str:
+        parts = identifier.replace("`", "").split(".")
+        return parts[-1] if parts else identifier
+
+    for tbl in tables:
+        identifier = tbl.get("identifier", "")
+        short_name = _table_short_name(identifier)
+        for cc in tbl.get("column_configs", []):
+            col_name = cc.get("column_name", "")
+            if _is_hidden(cc) or not col_name:
+                continue
+            if not cc.get("get_example_values"):
+                cc["get_example_values"] = True
+                changes.append({
+                    "type": "enable_example_values",
+                    "table": identifier,
+                    "column": col_name,
+                })
+            dtype = type_lookup.get((short_name.lower(), col_name.lower()), "")
+            if (
+                dtype.upper().split("(")[0].strip() == "STRING"
+                and not cc.get("build_value_dictionary")
+            ):
+                score = _entity_matching_score(col_name)
+                entity_candidates.append((identifier, col_name, dtype, score))
+
+    for mv in metric_views:
+        identifier = mv.get("identifier", "")
+        short_name = _table_short_name(identifier)
+        for cc in mv.get("column_configs", []):
+            col_name = cc.get("column_name", "")
+            if _is_hidden(cc) or not col_name:
+                continue
+            dtype = type_lookup.get((short_name.lower(), col_name.lower()), "")
+            if _is_measure_column(col_name, dtype):
+                continue
+            if not cc.get("get_example_values"):
+                cc["get_example_values"] = True
+                changes.append({
+                    "type": "enable_example_values",
+                    "table": identifier,
+                    "column": col_name,
+                })
+            if (
+                dtype.upper().split("(")[0].strip() == "STRING"
+                and not cc.get("build_value_dictionary")
+            ):
+                score = _entity_matching_score(col_name)
+                entity_candidates.append((identifier, col_name, dtype, score))
+
+    entity_candidates.sort(key=lambda x: -x[3])
+    slots_available = MAX_VALUE_DICTIONARY_COLUMNS - already_dict_count
+    selected = entity_candidates[:max(slots_available, 0)]
+
+    for identifier, col_name, _dtype, _score in selected:
+        tbl_dict = _find_table_in_config(parsed, identifier)
+        if not tbl_dict:
+            continue
+        cc = _find_or_create_column_config(tbl_dict, col_name)
+        cc["build_value_dictionary"] = True
+        if not cc.get("get_example_values"):
+            cc["get_example_values"] = True
+        changes.append({
+            "type": "enable_value_dictionary",
+            "table": identifier,
+            "column": col_name,
+        })
+
+    if not changes:
+        logger.info("Prompt matching auto-config: no changes needed (already configured)")
+        return {
+            "applied": [],
+            "patched_objects": [],
+            "pre_snapshot": pre_snapshot,
+            "post_snapshot": parsed,
+            "format_assistance_count": 0,
+            "entity_matching_count": 0,
+        }
+
+    sort_genie_config(parsed)
+    _enforce_instruction_limit(parsed)
+    patch_space_config(w, space_id, parsed)
+
+    fa_count = sum(1 for c in changes if c["type"] == "enable_example_values")
+    em_count = sum(1 for c in changes if c["type"] == "enable_value_dictionary")
+    patched_objects = sorted({c["table"] for c in changes})
+
+    logger.info(
+        "Prompt matching auto-config: enabled format assistance on %d columns, "
+        "entity matching on %d STRING columns (%d/%d dictionary slots used)",
+        fa_count, em_count, already_dict_count + em_count, MAX_VALUE_DICTIONARY_COLUMNS,
+    )
+
+    return {
+        "applied": changes,
+        "patched_objects": patched_objects,
+        "pre_snapshot": pre_snapshot,
+        "post_snapshot": copy.deepcopy(parsed),
+        "format_assistance_count": fa_count,
+        "entity_matching_count": em_count,
+    }
+
+
+def _find_table_in_config(config: dict, table_id: str) -> dict | None:
+    """Find a table or metric view in data_sources by identifier."""
+    ds = config.get("data_sources", {})
+    for source_list in [ds.get("tables", []), ds.get("metric_views", [])]:
+        for t in source_list:
+            if t.get("identifier") == table_id:
+                return t
+    return None
+
+
+def _find_or_create_column_config(table_dict: dict, column_name: str) -> dict:
+    """Find an existing column_config or create one."""
+    for cc in table_dict.get("column_configs", []):
+        if cc.get("column_name") == column_name:
+            return cc
+    new_cc = {"column_name": column_name}
+    table_dict.setdefault("column_configs", []).append(new_cc)
+    return new_cc
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -116,6 +366,9 @@ def proposals_to_patches(proposals: list[dict]) -> list[dict]:
     Each proposal has an ``asi`` dict with ``failure_type``, ``blame_set``,
     ``counterfactual_fixes``.  Maps to concrete ``patch_type`` via
     ``_LEVER_TO_PATCH_TYPE``.
+
+    For structured column proposals (Levers 1/2) carrying ``column_description``
+    and/or ``column_synonyms``, emits separate patches for each field.
     """
     patches: list[dict] = []
     for p in proposals:
@@ -125,8 +378,8 @@ def proposals_to_patches(proposals: list[dict]) -> list[dict]:
         failure_type = asi.get(
             "failure_type", p.get("lever_type", "other")
         )
-        lever = p.get("lever", 6)
-        patch_type = _LEVER_TO_PATCH_TYPE.get(
+        lever = p.get("lever", 5)
+        patch_type = p.get("patch_type") or _LEVER_TO_PATCH_TYPE.get(
             (failure_type, lever),
             _LEVER_TO_PATCH_TYPE.get((failure_type, 1), "add_instruction"),
         )
@@ -137,19 +390,66 @@ def proposals_to_patches(proposals: list[dict]) -> list[dict]:
             fixes = [fixes]
         new_text = p.get("proposed_value") or (fixes[0] if fixes else p.get("change_description", ""))
 
-        patches.append(
-            {
-                "type": patch_type,
-                "target": target,
-                "new_text": new_text,
-                "old_text": "",
+        col_desc = p.get("column_description")
+        col_syns = p.get("column_synonyms")
+        tbl_id = p.get("table", "")
+        col_name = p.get("column", "")
+
+        if (col_desc is not None or col_syns is not None) and tbl_id and col_name:
+            base = {
                 "lever": lever,
                 "risk_level": classify_risk(patch_type),
                 "predicted_affected_questions": p.get("questions_fixed", 0),
                 "grounded_in": p.get("grounded_in", []),
                 "source_proposal_id": p.get("proposal_id", ""),
+                "table": tbl_id,
+                "column": col_name,
             }
-        )
+            if col_desc is not None and isinstance(col_desc, list) and col_desc:
+                patches.append({
+                    **base,
+                    "type": "update_column_description",
+                    "target": tbl_id,
+                    "new_text": col_desc[0] if len(col_desc) == 1 else "\n".join(col_desc),
+                    "old_text": "",
+                })
+            if col_syns is not None and isinstance(col_syns, list) and col_syns:
+                patches.append({
+                    **base,
+                    "type": "add_column_synonym",
+                    "target": tbl_id,
+                    "new_text": col_syns[0] if len(col_syns) == 1 else "",
+                    "old_text": "",
+                    "synonyms": col_syns,
+                })
+            continue
+
+        patch_dict: dict = {
+            "type": patch_type,
+            "target": target,
+            "new_text": new_text,
+            "old_text": "",
+            "lever": lever,
+            "risk_level": classify_risk(patch_type),
+            "predicted_affected_questions": p.get("questions_fixed", 0),
+            "grounded_in": p.get("grounded_in", []),
+            "source_proposal_id": p.get("proposal_id", ""),
+        }
+        if tbl_id:
+            patch_dict["table"] = tbl_id
+        if col_name:
+            patch_dict["column"] = col_name
+        if "join_spec" in p:
+            patch_dict["join_spec"] = p["join_spec"]
+        if "example_question" in p:
+            patch_dict["example_question"] = p["example_question"]
+        if "example_sql" in p:
+            patch_dict["example_sql"] = p["example_sql"]
+        if "parameters" in p:
+            patch_dict["parameters"] = p["parameters"]
+        if "usage_guidance" in p:
+            patch_dict["usage_guidance"] = p["usage_guidance"]
+        patches.append(patch_dict)
     return patches
 
 
@@ -198,6 +498,37 @@ def render_patch(patch: dict, space_id: str, space_config: dict) -> dict:
         return action(
             json.dumps({"op": "remove", "section": "instructions", "old_text": old_text}),
             json.dumps({"op": "add", "section": "instructions", "new_text": old_text}),
+        )
+
+    # ── Example SQL (preferred over text instructions) ────────────
+    if patch_type == "add_example_sql":
+        eq = patch.get("example_question", "")
+        es = patch.get("example_sql", "")
+        cmd_dict: dict = {"op": "add", "section": "example_question_sqls", "question": eq, "sql": es}
+        params = patch.get("parameters", [])
+        if params:
+            cmd_dict["parameters"] = params
+        guidance = patch.get("usage_guidance", "")
+        if guidance:
+            cmd_dict["usage_guidance"] = guidance
+        return action(
+            json.dumps(cmd_dict),
+            json.dumps({"op": "remove", "section": "example_question_sqls", "question": eq}),
+        )
+    if patch_type == "update_example_sql":
+        eq = patch.get("example_question", "")
+        old_sql = patch.get("old_text", "")
+        new_sql = patch.get("new_text", patch.get("example_sql", ""))
+        return action(
+            json.dumps({"op": "update", "section": "example_question_sqls", "question": eq, "old_sql": old_sql, "new_sql": new_sql}),
+            json.dumps({"op": "update", "section": "example_question_sqls", "question": eq, "old_sql": new_sql, "new_sql": old_sql}),
+        )
+    if patch_type == "remove_example_sql":
+        eq = patch.get("example_question", old_text)
+        es = patch.get("example_sql", "")
+        return action(
+            json.dumps({"op": "remove", "section": "example_question_sqls", "question": eq}),
+            json.dumps({"op": "add", "section": "example_question_sqls", "question": eq, "sql": es}),
         )
 
     # ── Descriptions ──────────────────────────────────────────────
@@ -255,19 +586,25 @@ def render_patch(patch: dict, space_id: str, space_config: dict) -> dict:
     # ── Join Specifications (Lever 4) ─────────────────────────────
     if patch_type == "add_join_spec":
         join_spec = patch.get("join_spec", patch.get("value", {}))
+        lt = _join_spec_left_id(join_spec) or patch.get("left_table", "")
+        rt = _join_spec_right_id(join_spec) or patch.get("right_table", "")
         return action(
             json.dumps({"op": "add", "section": "join_specs", "join_spec": join_spec}),
-            json.dumps({"op": "remove", "section": "join_specs", "left_table": join_spec.get("left_table_name", ""), "right_table": join_spec.get("right_table_name", "")}),
+            json.dumps({"op": "remove", "section": "join_specs", "left_table": lt, "right_table": rt}),
         )
     if patch_type == "update_join_spec":
         join_spec = patch.get("join_spec", patch.get("value", {}))
+        lt = _join_spec_left_id(join_spec) or patch.get("left_table", "")
+        rt = _join_spec_right_id(join_spec) or patch.get("right_table", "")
         return action(
-            json.dumps({"op": "update", "section": "join_specs", "left_table": patch.get("left_table", ""), "right_table": patch.get("right_table", ""), "join_spec": join_spec}),
-            json.dumps({"op": "update", "section": "join_specs", "left_table": patch.get("left_table", ""), "right_table": patch.get("right_table", ""), "join_spec": patch.get("previous_join_spec", {})}),
+            json.dumps({"op": "update", "section": "join_specs", "left_table": lt, "right_table": rt, "join_spec": join_spec}),
+            json.dumps({"op": "update", "section": "join_specs", "left_table": lt, "right_table": rt, "join_spec": patch.get("previous_join_spec", {})}),
         )
     if patch_type == "remove_join_spec":
+        lt = patch.get("left_table", "")
+        rt = patch.get("right_table", "")
         return action(
-            json.dumps({"op": "remove", "section": "join_specs", "left_table": patch.get("left_table", ""), "right_table": patch.get("right_table", "")}),
+            json.dumps({"op": "remove", "section": "join_specs", "left_table": lt, "right_table": rt}),
             json.dumps({"op": "add", "section": "join_specs", "join_spec": patch.get("previous_join_spec", {})}),
         )
 
@@ -398,26 +735,6 @@ def render_patch(patch: dict, space_id: str, space_config: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _find_table_in_config(config: dict, table_id: str) -> dict | None:
-    """Find a table or metric view in data_sources by identifier."""
-    ds = config.get("data_sources", {})
-    for source_list in [ds.get("tables", []), ds.get("metric_views", [])]:
-        for t in source_list:
-            if t.get("identifier") == table_id:
-                return t
-    return None
-
-
-def _find_or_create_column_config(table_dict: dict, column_name: str) -> dict:
-    """Find an existing column_config or create one."""
-    for cc in table_dict.get("column_configs", []):
-        if cc.get("column_name") == column_name:
-            return cc
-    new_cc = {"column_name": column_name}
-    table_dict.setdefault("column_configs", []).append(new_cc)
-    return new_cc
-
-
 def _apply_action_to_config(config: dict, action: dict) -> bool:
     """Apply a single rendered action to a Genie Space config dict in-place.
 
@@ -456,6 +773,66 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
             _set_general_instructions(config, current.replace(old_text, "").strip())
             return True
 
+    # ── Example SQL Queries (preferred over text instructions) ────
+    if section == "example_question_sqls":
+        eqs = config.setdefault("instructions", {}).setdefault(
+            "example_question_sqls", []
+        )
+        question_text = cmd.get("question", "")
+        if op == "add":
+            if not question_text:
+                return False
+            sql_text = cmd.get("sql", "")
+            import uuid as _uuid
+
+            new_entry: dict = {
+                "id": str(_uuid.uuid4()).replace("-", "")[:24],
+                "question": [question_text],
+                "sql": [sql_text],
+            }
+            params = cmd.get("parameters", [])
+            if params:
+                api_params = []
+                for p in params:
+                    if not isinstance(p, dict):
+                        continue
+                    param_entry: dict = {"name": p.get("name", "")}
+                    if p.get("type_hint"):
+                        param_entry["type_hint"] = p["type_hint"]
+                    dv = p.get("default_value", "")
+                    if dv:
+                        if isinstance(dv, dict):
+                            param_entry["default_value"] = dv
+                        else:
+                            param_entry["default_value"] = {"values": [str(dv)]}
+                    api_params.append(param_entry)
+                if api_params:
+                    new_entry["parameters"] = api_params
+            guidance = cmd.get("usage_guidance", "")
+            if guidance:
+                new_entry["usage_guidance"] = (
+                    [guidance] if isinstance(guidance, str) else guidance
+                )
+            eqs.append(new_entry)
+            return True
+        if op == "update":
+            for entry in eqs:
+                eq = entry.get("question", [])
+                q_str = eq[0] if isinstance(eq, list) and eq else str(eq)
+                if q_str == question_text:
+                    new_sql = cmd.get("new_sql", "")
+                    entry["sql"] = [new_sql]
+                    return True
+            return False
+        if op == "remove":
+            for i, entry in enumerate(eqs):
+                eq = entry.get("question", [])
+                q_str = eq[0] if isinstance(eq, list) and eq else str(eq)
+                if q_str == question_text:
+                    eqs.pop(i)
+                    return True
+            return False
+
     # ── Column Configs (descriptions, visibility, discovery) ──────
     if section == "column_configs":
         table_id = cmd.get("table", "")
@@ -491,9 +868,14 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
             return True
 
         if op == "add" and "value" in cmd:
-            cc["description"] = [cmd["value"]] if isinstance(cmd["value"], str) else cmd["value"]
+            val = cmd["value"]
+            if val is None or val == "" or val == []:
+                return True
+            cc["description"] = [val] if isinstance(val, str) else val
             return True
         if op == "update" and "new_text" in cmd:
+            if not cmd["new_text"]:
+                return True
             desc = cc.get("description", [])
             joined = "\n".join(desc) if isinstance(desc, list) else str(desc)
             old_t = cmd.get("old_text", "")
@@ -549,7 +931,7 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
         if op == "remove":
             lt, rt = cmd.get("left_table", ""), cmd.get("right_table", "")
             for i, s in enumerate(specs):
-                if s.get("left_table_name") == lt and s.get("right_table_name") == rt:
+                if _join_spec_left_id(s) == lt and _join_spec_right_id(s) == rt:
                     specs.pop(i)
                     return True
             return False
@@ -557,7 +939,7 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
             lt, rt = cmd.get("left_table", ""), cmd.get("right_table", "")
             new_spec = cmd.get("join_spec", {})
             for i, s in enumerate(specs):
-                if s.get("left_table_name") == lt and s.get("right_table_name") == rt:
+                if _join_spec_left_id(s) == lt and _join_spec_right_id(s) == rt:
                     specs[i] = new_spec
                     return True
             return False
@@ -729,7 +1111,7 @@ def apply_patch_set(
     for idx in sorted_indices:
         patch = patches[idx]
         risk = classify_risk(patch.get("type", ""))
-        lever = patch.get("lever", 6)
+        lever = patch.get("lever", 5)
         scope = _resolve_scope(lever, apply_mode)
 
         rendered = render_patch(patch, space_id, config)
@@ -753,6 +1135,7 @@ def apply_patch_set(
                 patched_objects.add(target)
 
     sort_genie_config(config)
+    _enforce_instruction_limit(config)
 
     if w is not None and applied:
         try:
@@ -848,7 +1231,7 @@ def verify_dual_persistence(applied_patches: list[dict]) -> list[dict]:
                 "patch_type": patch.get("type", ""),
                 "target": entry.get("action", {}).get("target", ""),
                 "genie_config_applied": True,
-                "uc_artifact_applied": patch.get("lever", 6) <= 3,
+                "uc_artifact_applied": patch.get("lever", 5) <= 3,
             }
         )
     return results

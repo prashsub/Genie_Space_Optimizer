@@ -275,6 +275,58 @@ def format_asi_markdown(
     )
 
 
+def _parse_asi_from_rationale(rationale: str) -> dict:
+    """Extract the ASI JSON payload embedded in a ``format_asi_markdown`` rationale."""
+    if not rationale:
+        return {}
+    try:
+        start = rationale.index("```json\n") + len("```json\n")
+        end = rationale.index("\n```", start)
+        return json.loads(rationale[start:end])
+    except (ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _extract_assessments_from_traces(results_df) -> dict[int, dict[str, dict]]:
+    """Pull scorer rationale + metadata from the trace column before it is stripped.
+
+    Returns ``{row_index: {judge_name: {"rationale": str, "metadata": dict}}}``.
+    Falls back gracefully if traces/assessments are unavailable.
+    """
+    out: dict[int, dict[str, dict]] = {}
+    if "trace" not in results_df.columns:
+        return out
+    for row_idx, (_, row) in enumerate(results_df.iterrows()):
+        trace = row.get("trace")
+        if trace is None:
+            continue
+        assessments = None
+        for attr_chain in [("data", "assessments"), ("info", "assessments")]:
+            obj = trace
+            for attr in attr_chain:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                assessments = obj
+                break
+        if not assessments:
+            continue
+        row_data: dict[str, dict] = {}
+        for a in assessments:
+            name = getattr(a, "name", "") or ""
+            rationale_raw = getattr(a, "rationale", "") or ""
+            meta = getattr(a, "metadata", None)
+            if not isinstance(meta, dict):
+                meta = {}
+            if not meta:
+                meta = _parse_asi_from_rationale(rationale_raw)
+            if name:
+                row_data[name] = {"rationale": rationale_raw, "metadata": meta}
+        out[row_idx] = row_data
+    return out
+
+
 def normalize_scores(scores: dict[str, float]) -> dict[str, float]:
     """Convert 0-1 scale → 0-100 scale; leave 0-100 unchanged."""
     normalized: dict[str, float] = {}
@@ -965,18 +1017,8 @@ def register_scorers_with_experiment(
             logger.info("[Scorer Registration] Registered %s", name)
         except ValueError as ve:
             if "already been registered" in str(ve):
-                try:
-                    reg = s.update(name=name)
-                    registered[name] = reg
-                    logger.info("[Scorer Registration] Updated existing %s", name)
-                except Exception as update_exc:
-                    failures.append((name, update_exc))
-                    logger.warning(
-                        "[Scorer Registration] Failed to update %s: %s: %s",
-                        name,
-                        type(update_exc).__name__,
-                        str(update_exc)[:400],
-                    )
+                registered[name] = name
+                logger.info("[Scorer Registration] %s already registered — skipping", name)
             else:
                 failures.append((name, ve))
                 logger.warning(
@@ -1745,15 +1787,32 @@ def run_evaluation(
         }
         rows_for_output: list[dict] = []
 
+        _STRIP_COLS = {"trace", "trace_id"}
         if hasattr(eval_result, "tables") and "eval_results" in eval_result.tables:
             results_df = eval_result.tables["eval_results"]
-            for _, row in results_df.iterrows():
+
+            assessment_map = _extract_assessments_from_traces(results_df)
+
+            for row_idx, (_, row) in enumerate(results_df.iterrows()):
                 row_dict = {}
                 for col in results_df.columns:
+                    if col in _STRIP_COLS:
+                        continue
                     val = row[col]
                     if hasattr(val, "item"):
                         val = val.item()
+                    if not isinstance(val, (str, int, float, bool, type(None), list, dict)):
+                        val = str(val)
                     row_dict[col] = val
+
+                for judge_name, adata in assessment_map.get(row_idx, {}).items():
+                    rat_key = f"{judge_name}/rationale"
+                    meta_key = f"{judge_name}/metadata"
+                    if rat_key not in row_dict and adata.get("rationale"):
+                        row_dict[rat_key] = adata["rationale"]
+                    if meta_key not in row_dict and adata.get("metadata"):
+                        row_dict[meta_key] = adata["metadata"]
+
                 rows_for_output.append(row_dict)
 
                 rc = row.get(
@@ -2031,14 +2090,28 @@ def run_repeatability_evaluation(
         repeatability_pct = repeatability_raw * 100 if repeatability_raw <= 1.0 else repeatability_raw
 
         rows_for_output: list[dict] = []
+        _STRIP_COLS_REP = {"trace", "trace_id"}
         if hasattr(eval_result, "tables") and "eval_results" in eval_result.tables:
-            for _, row in eval_result.tables["eval_results"].iterrows():
+            rep_df = eval_result.tables["eval_results"]
+            rep_assessment_map = _extract_assessments_from_traces(rep_df)
+            for row_idx, (_, row) in enumerate(rep_df.iterrows()):
                 row_dict = {}
-                for col in eval_result.tables["eval_results"].columns:
+                for col in rep_df.columns:
+                    if col in _STRIP_COLS_REP:
+                        continue
                     val = row[col]
                     if hasattr(val, "item"):
                         val = val.item()
+                    if not isinstance(val, (str, int, float, bool, type(None), list, dict)):
+                        val = str(val)
                     row_dict[col] = val
+                for judge_name, adata in rep_assessment_map.get(row_idx, {}).items():
+                    rat_key = f"{judge_name}/rationale"
+                    meta_key = f"{judge_name}/metadata"
+                    if rat_key not in row_dict and adata.get("rationale"):
+                        row_dict[rat_key] = adata["rationale"]
+                    if meta_key not in row_dict and adata.get("metadata"):
+                        row_dict[meta_key] = adata["metadata"]
                 rows_for_output.append(row_dict)
 
         mlflow.log_metric("repeatability_pct", repeatability_pct)
@@ -2071,17 +2144,25 @@ def extract_reference_sqls(eval_result: dict) -> dict[str, str]:
     """Extract ``{question_id: generated_sql}`` from an evaluation output.
 
     Used to build *reference_sqls* for subsequent repeatability evaluations.
+    Handles both flat column names (``inputs/question_id``) and nested
+    dicts (``request.kwargs.question_id``, ``response.response``).
     """
     ref: dict[str, str] = {}
     rows = eval_result.get("rows", [])
     for row in rows:
+        _req = row.get("request") or {}
+        _req_kwargs = _req.get("kwargs", {}) if isinstance(_req, dict) else {}
+        _resp = row.get("response") or {}
         qid = (
             row.get("inputs/question_id")
             or (row.get("inputs", {}) or {}).get("question_id", "")
+            or _req_kwargs.get("question_id", "")
+            or row.get("question_id", "")
         )
         sql = (
             row.get("outputs/response")
             or (row.get("outputs", {}) or {}).get("response", "")
+            or (_resp.get("response", "") if isinstance(_resp, dict) else "")
         )
         if qid:
             ref[str(qid)] = str(sql or "")
@@ -2163,12 +2244,17 @@ def extract_genie_space_benchmarks(
             "source": "genie_space",
         })
 
-    sq = parsed_space.get("sample_questions", [])
-    for q_item in (sq if isinstance(sq, list) else []):
-        if isinstance(q_item, dict):
-            question = str(q_item.get("question", q_item.get("text", ""))).strip()
-        else:
-            question = str(q_item).strip()
+    bench_section = parsed_space.get("benchmarks", {})
+    if not isinstance(bench_section, dict):
+        bench_section = {}
+    bench_questions = bench_section.get("questions", [])
+    for bq in (bench_questions if isinstance(bench_questions, list) else []):
+        if not isinstance(bq, dict):
+            continue
+        q_raw = bq.get("question", [])
+        if isinstance(q_raw, list):
+            q_raw = q_raw[0] if q_raw else ""
+        question = str(q_raw).strip()
         if not question:
             continue
         q_lower = question.lower()
@@ -2176,11 +2262,34 @@ def extract_genie_space_benchmarks(
             continue
         seen_questions.add(q_lower)
 
+        expected_sql = ""
+        answers = bq.get("answer", [])
+        if isinstance(answers, list):
+            for ans in answers:
+                if isinstance(ans, dict) and ans.get("format") == "SQL":
+                    content = ans.get("content", [])
+                    if isinstance(content, list):
+                        expected_sql = "".join(str(c) for c in content).strip()
+                    elif isinstance(content, str):
+                        expected_sql = content.strip()
+                    break
+
+        if expected_sql:
+            is_valid, err = validate_ground_truth_sql(
+                expected_sql, spark, catalog=catalog, gold_schema=schema,
+            )
+            if not is_valid:
+                logger.warning(
+                    "Genie space benchmark question failed SQL validation: %s — %s",
+                    question[:60], err,
+                )
+                expected_sql = ""
+
         benchmarks.append({
             "question": question,
-            "expected_sql": "",
-            "expected_asset": "TABLE",
-            "category": "sample_question",
+            "expected_sql": expected_sql,
+            "expected_asset": detect_asset_type(expected_sql) if expected_sql else "TABLE",
+            "category": "curated",
             "required_tables": [],
             "required_columns": [],
             "expected_facts": [],
@@ -2188,8 +2297,8 @@ def extract_genie_space_benchmarks(
         })
 
     logger.info(
-        "Extracted %d benchmarks from Genie space config "
-        "(%d with SQL, %d question-only)",
+        "Extracted %d curated benchmarks from Genie space config "
+        "(%d with SQL, %d without SQL)",
         len(benchmarks),
         sum(1 for b in benchmarks if b["expected_sql"]),
         sum(1 for b in benchmarks if not b["expected_sql"]),

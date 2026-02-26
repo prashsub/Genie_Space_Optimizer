@@ -79,7 +79,7 @@ def sample_run():
         "completed_at": now,
         "job_run_id": "67890",
         "max_iterations": 5,
-        "levers": [1, 2, 3, 4, 5, 6],
+        "levers": [1, 2, 3, 4, 5],
         "apply_mode": "genie_config",
         "best_iteration": 3,
         "best_accuracy": 92.5,

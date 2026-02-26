@@ -134,7 +134,7 @@ def _log(event: str, **payload) -> None:
 # MAGIC | `domain` | text | `""` | Domain name (e.g. `revenue_property`) for experiment path and prompts |
 # MAGIC | `experiment_name` | text | `""` | Optional MLflow experiment path; auto-resolved if empty |
 # MAGIC | `max_iterations` | text | `"5"` | Max lever iterations before stopping |
-# MAGIC | `levers` | text | `"[1,2,3,4,5,6]"` | JSON array of lever numbers to try |
+# MAGIC | `levers` | text | `"[1,2,3,4,5]"` | JSON array of lever numbers to try |
 # MAGIC | `apply_mode` | text | `"genie_config"` | Where patches apply: `genie_config` \| `uc_artifact` \| `both` |
 # MAGIC | `deploy_target` | text | `""` | DABs target for post-optimization deploy (optional) |
 # MAGIC
@@ -149,7 +149,7 @@ dbutils.widgets.text("schema", "")
 dbutils.widgets.text("domain", "")
 dbutils.widgets.text("experiment_name", "")
 dbutils.widgets.text("max_iterations", "5")
-dbutils.widgets.text("levers", "[1,2,3,4,5,6]")
+dbutils.widgets.text("levers", "[1,2,3,4,5]")
 dbutils.widgets.text("apply_mode", "genie_config")
 dbutils.widgets.text("deploy_target", "")
 dbutils.widgets.text("triggered_by", "")
@@ -161,7 +161,7 @@ schema = dbutils.widgets.get("schema")
 domain = dbutils.widgets.get("domain")
 experiment_name = dbutils.widgets.get("experiment_name") or None
 max_iterations = int(dbutils.widgets.get("max_iterations") or "5")
-levers = json.loads(dbutils.widgets.get("levers") or "[1,2,3,4,5,6]")
+levers = json.loads(dbutils.widgets.get("levers") or "[1,2,3,4,5]")
 apply_mode = dbutils.widgets.get("apply_mode") or "genie_config"
 deploy_target = dbutils.widgets.get("deploy_target") or None
 triggered_by = dbutils.widgets.get("triggered_by") or ""

@@ -268,6 +268,8 @@ def run_preflight(
         if routine_name:
             routine_samples.append(routine_name)
 
+    config["_uc_columns"] = uc_columns_dicts
+
     referenced_schemas = sorted(
         {f"{c}.{s}" for c, s, _ in genie_table_refs if c and s}
     ) if genie_table_refs else []

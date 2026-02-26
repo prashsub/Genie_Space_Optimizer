@@ -26,7 +26,7 @@ def populated_spark(mock_spark):
                 "space_id": "space-abc",
                 "domain": "revenue",
                 "status": "IN_PROGRESS",
-                "levers": "[1,2,3,4,5,6]",
+                "levers": "[1,2,3,4,5]",
                 "config_snapshot": '{"tables": []}',
                 "max_iterations": 5,
                 "best_iteration": 1,

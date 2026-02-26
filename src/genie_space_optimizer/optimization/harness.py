@@ -28,6 +28,7 @@ from genie_space_optimizer.common.config import (
     APPLY_MODE,
     DEFAULT_LEVER_ORDER,
     DEFAULT_THRESHOLDS,
+    ENABLE_PROMPT_MATCHING_AUTO_APPLY,
     INLINE_EVAL_DELAY,
     LEVER_NAMES,
     MAX_ITERATIONS,
@@ -38,6 +39,7 @@ from genie_space_optimizer.common.config import (
 from genie_space_optimizer.optimization.applier import (
     _get_general_instructions,
     apply_patch_set,
+    auto_apply_prompt_matching,
     proposals_to_patches,
     rollback,
 )
@@ -59,6 +61,7 @@ from genie_space_optimizer.optimization.models import (
 from genie_space_optimizer.optimization.optimizer import (
     cluster_failures,
     detect_regressions,
+    enrich_metadata_with_uc_types,
     generate_metadata_proposals,
 )
 from genie_space_optimizer.optimization.preflight import run_preflight
@@ -305,6 +308,87 @@ def _run_baseline(
         raise
 
 
+# ── Stage 2.5: PROMPT MATCHING AUTO-CONFIG ──────────────────────────
+
+
+def _run_prompt_matching_setup(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    config: dict,
+    catalog: str,
+    schema: str,
+) -> dict:
+    """Stage 2.5: Enable format assistance and entity matching as best practice.
+
+    Runs between baseline eval and lever loop.  Deterministic (no LLM).
+    Returns summary dict with counts of changes applied.
+    """
+    from genie_space_optimizer.common.genie_client import fetch_space_config
+
+    write_stage(
+        spark, run_id, "PROMPT_MATCHING_SETUP", "STARTED",
+        task_key="prompt_matching_setup", catalog=catalog, schema=schema,
+    )
+
+    try:
+        apply_log = auto_apply_prompt_matching(w, space_id, config)
+
+        applied = apply_log.get("applied", [])
+        fa_count = apply_log.get("format_assistance_count", 0)
+        em_count = apply_log.get("entity_matching_count", 0)
+
+        for idx, entry in enumerate(applied):
+            write_patch(
+                spark, run_id, 0, 0, idx,
+                {
+                    "patch_type": entry.get("type", "unknown"),
+                    "scope": "genie_config",
+                    "risk_level": "low",
+                    "target_object": f"{entry.get('table', '')}.{entry.get('column', '')}",
+                    "patch": entry,
+                    "command": None,
+                    "rollback": None,
+                    "proposal_id": "prompt_matching_auto_config",
+                },
+                catalog, schema,
+            )
+
+        if applied:
+            refreshed = fetch_space_config(w, space_id)
+            config["_parsed_space"] = refreshed.get("_parsed_space", refreshed)
+
+        write_stage(
+            spark, run_id, "PROMPT_MATCHING_SETUP", "COMPLETE",
+            task_key="prompt_matching_setup",
+            detail={
+                "format_assistance_enabled": fa_count,
+                "entity_matching_enabled": em_count,
+                "total_changes": len(applied),
+                "patched_objects": apply_log.get("patched_objects", []),
+            },
+            catalog=catalog, schema=schema,
+        )
+
+        return {
+            "format_assistance_count": fa_count,
+            "entity_matching_count": em_count,
+            "total_changes": len(applied),
+        }
+
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("PROMPT_MATCHING_SETUP FAILED for run %s", run_id)
+        write_stage(
+            spark, run_id, "PROMPT_MATCHING_SETUP", "FAILED",
+            task_key="prompt_matching_setup",
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        return {"format_assistance_count": 0, "entity_matching_count": 0, "total_changes": 0}
+
+
 # ── Stage 3: LEVER LOOP ─────────────────────────────────────────────
 
 
@@ -366,6 +450,10 @@ def _run_lever_loop(
     scorers = make_all_scorers(w, spark, catalog, schema)
     uc_schema = f"{catalog}.{schema}"
     metadata_snapshot = config.get("_parsed_space", config)
+
+    uc_columns = config.get("_uc_columns", [])
+    if uc_columns:
+        enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
     baseline_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
     reference_sqls: dict[str, str] = {}
@@ -429,9 +517,13 @@ def _run_lever_loop(
 
         eval_result_for_clustering = {"rows": failure_rows}
         clusters = cluster_failures(eval_result_for_clustering, metadata_snapshot)
-        cluster_summary = [(c["cluster_id"], c["affected_judge"], c.get("asi_failure_type"), len(c["question_ids"])) for c in clusters[:8]]
+        cluster_summary = [(c["cluster_id"], c["affected_judge"], c.get("root_cause"), c.get("asi_failure_type"), len(c["question_ids"])) for c in clusters[:8]]
         logger.info("Lever %d: %d clusters — %s", lever, len(clusters), cluster_summary)
         print(f"[DEBUG] Lever {lever}: {len(clusters)} clusters — {cluster_summary}")
+        from genie_space_optimizer.optimization.optimizer import _map_to_lever, _JUDGE_TO_LEVER
+        for c in clusters[:5]:
+            mapped = _map_to_lever(c["root_cause"], asi_failure_type=c.get("asi_failure_type"), blame_set=c.get("asi_blame_set"), judge=c.get("affected_judge"))
+            print(f"[DEBUG]   Cluster {c['cluster_id']}: judge={c['affected_judge']}, root_cause={c['root_cause']} → lever {mapped}")
 
         proposals = generate_metadata_proposals(
             clusters, metadata_snapshot,
@@ -468,6 +560,11 @@ def _run_lever_loop(
         time.sleep(PROPAGATION_WAIT_SECONDS)
 
         # ── Slice gate ────────────────────────────────────────────
+        import mlflow
+        try:
+            mlflow.end_run()
+        except Exception:
+            pass
         slice_benchmarks = filter_benchmarks_by_scope(
             benchmarks, "slice", patched_objects,
         )
@@ -510,6 +607,10 @@ def _run_lever_loop(
                 continue
 
         # ── P0 gate ───────────────────────────────────────────────
+        try:
+            mlflow.end_run()
+        except Exception:
+            pass
         p0_benchmarks = filter_benchmarks_by_scope(benchmarks, "p0")
         if p0_benchmarks:
             _ensure_sql_context(spark, catalog, schema)
@@ -539,6 +640,10 @@ def _run_lever_loop(
                 continue
 
         # ── Full evaluation ───────────────────────────────────────
+        try:
+            mlflow.end_run()
+        except Exception:
+            pass
         write_stage(
             spark, run_id, f"LEVER_{lever}_EVAL", "STARTED",
             task_key="lever_loop", lever=lever, iteration=iteration_counter,
@@ -1261,6 +1366,13 @@ def optimize_genie_space(
                 convergence_reason="baseline_meets_thresholds",
             )
         else:
+            # Stage 2.5: Prompt Matching Auto-Config
+            if ENABLE_PROMPT_MATCHING_AUTO_APPLY:
+                _run_prompt_matching_setup(
+                    w, spark, run_id_str, space_id, config, catalog, schema,
+                )
+                time.sleep(PROPAGATION_WAIT_SECONDS)
+
             # Stage 3: Lever Loop
             loop_out = _run_lever_loop(
                 w, spark, run_id_str, space_id, domain, benchmarks, exp_name,

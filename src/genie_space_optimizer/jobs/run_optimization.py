@@ -39,7 +39,7 @@ dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("schema", "")
 dbutils.widgets.text("domain", "default")
 dbutils.widgets.text("apply_mode", "genie_config")
-dbutils.widgets.text("levers", "[1,2,3,4,5,6]")
+dbutils.widgets.text("levers", "[1,2,3,4,5]")
 dbutils.widgets.text("max_iterations", "5")
 dbutils.widgets.text("triggered_by", "")
 
@@ -49,7 +49,7 @@ catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 domain = dbutils.widgets.get("domain") or "default"
 apply_mode = dbutils.widgets.get("apply_mode") or "genie_config"
-levers = json.loads(dbutils.widgets.get("levers") or "[1,2,3,4,5,6]")
+levers = json.loads(dbutils.widgets.get("levers") or "[1,2,3,4,5]")
 max_iterations = int(dbutils.widgets.get("max_iterations") or "5")
 triggered_by = dbutils.widgets.get("triggered_by") or None
 

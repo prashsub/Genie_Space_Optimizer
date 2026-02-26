@@ -267,11 +267,85 @@ Update ML config in `src/ml/config/*.py`.
 
 **When to use:** Asset routing issues, ambiguous term definitions, or as a last resort after levers 1-5.
 
+### Instruction Type Priority Hierarchy
+
+Lever 6 follows a strict priority hierarchy per [Databricks best practices](https://learn.microsoft.com/en-us/azure/databricks/genie/best-practices). Always use the highest-priority type that can address the issue:
+
+| Priority | Type | When to Use | Patch Types |
+|----------|------|-------------|-------------|
+| 1 (highest) | **SQL expressions** | Define business metrics, filters, dimensions (e.g., `revenue`, `active_customers`) | Delegated to levers 1-5 |
+| 2 | **Example SQL queries** | Teach Genie to handle ambiguous, multi-part, or complex question patterns | `add_example_sql`, `update_example_sql`, `remove_example_sql` |
+| 3 (last resort) | **Text instructions** | Clarification prompts, formatting rules, cross-cutting behavioral guidance only when SQL cannot address the need | `add_instruction`, `update_instruction`, `remove_instruction` |
+
+**Key principle:** Structured definitions through SQL are more reliable and maintainable than plain text guidance.
+
+### Choosing the Right Type
+
+**Use SQL expressions (levers 1-5) when:**
+- The fix is a column-level semantic definition (metric, filter, dimension)
+- A synonym, description, or value dictionary would resolve the ambiguity
+
+**Use example SQL queries when:**
+- Hard-to-interpret, multi-part, or complex questions need a SQL pattern
+- Genie needs to learn the correct asset routing for a question type
+- A representative Q+SQL pair would teach Genie the right pattern
+
+**Use text instructions ONLY when:**
+- SQL expressions and example SQL cannot address the need
+- You need clarification behavior ("when users ask X without specifying Y, ask...")
+- You need cross-cutting formatting rules ("always round to 2 decimals")
+- You need behavioral guidance that is not expressible as SQL
+
+### Example SQL Queries
+
+Example SQL queries are stored in `instructions.example_question_sqls[]` inside `serialized_space`. Each entry has the structure:
+
+**Simple (non-parameterized):**
+```json
+{
+  "id": "unique_id",
+  "question": ["What is the total revenue by country?"],
+  "sql": ["SELECT country, SUM(revenue) FROM sales GROUP BY country"],
+  "usage_guidance": ["Use when asked about revenue breakdown by geography."]
+}
+```
+
+**Parameterized (produces trusted asset responses):**
+```json
+{
+  "id": "unique_id",
+  "question": ["Stores where days of supply is less than or equal to 10."],
+  "sql": ["SELECT * FROM catalog.schema.fact_inventory_snapshot\nWHERE days_of_supply <= :days_of_supply"],
+  "parameters": [
+    {
+      "name": "days_of_supply",
+      "type_hint": "INTEGER",
+      "default_value": { "values": ["10"] }
+    }
+  ],
+  "usage_guidance": ["Use this when asked about days of supply being low."]
+}
+```
+
+**When to use parameters:**
+- Use named parameter markers (`:param_name`) when the query filters on a value the user is likely to vary (thresholds, date ranges, categories, entity names)
+- Parameterized queries produce **trusted asset** responses in Genie, meaning the response is marked as verified
+- Each parameter needs: `name` (matching `:param_name` in SQL), `type_hint` (STRING, INTEGER, DATE, or DECIMAL), and `default_value` with a `values` array
+- See [Use parameters in SQL queries](https://learn.microsoft.com/en-us/azure/databricks/genie/query-params)
+
+**Rules for example SQL:**
+- The question must be a realistic user prompt matching the failure pattern
+- The SQL must be correct, executable, and consistent with existing instructions
+- Do NOT duplicate an existing example SQL question
+- Use example SQL to demonstrate correct asset routing (MV vs TVF vs table)
+- Always include `usage_guidance` describing when Genie should match the query
+- Prefer parameterized queries over hardcoded values when the filter value varies
+
 > **`description` vs `serialized_space`:** The Genie Space has two instruction-related fields:
 > - **`description`** — top-level field, updated via `PATCH {"description": "..."}`. Visible in the Space UI header.
 > - **`text_instructions`** — inside `serialized_space.instructions.text_instructions[]`, updated via `PATCH {"serialized_space": "<json>"}`. These are the structured routing rules Genie actually follows.
 >
-> When optimizing routing (Lever 6), update `text_instructions` inside `serialized_space`, not `description`. Both fields are separate — `description` is NOT inside `serialized_space`.
+> When optimizing routing (Lever 6), update `text_instructions` or `example_question_sqls` inside `serialized_space`, not `description`. Both fields are separate — `description` is NOT inside `serialized_space`.
 
 > **For robust API operations**, see `genie-space-export-import-api` skill and its `import_genie_space.py` script, which handles JSON validation, error recovery, and field-level format requirements. The inline code below is a quick alternative for optimization-loop iterations.
 
@@ -287,7 +361,15 @@ SPACE_ID = "01f0f1a3c2dc1c8897de11d27ca2cb6f"
 with open(f"src/genie/{domain}_genie_export.json", "r") as f:
     config = json.load(f)
 
-# 2. Update instructions
+# 2a. Add example SQL (preferred over text instructions)
+example_sqls = config.setdefault("instructions", {}).setdefault("example_question_sqls", [])
+example_sqls.append({
+    "id": "unique_id_here",
+    "question": ["What is the total spend by workspace?"],
+    "sql": ["SELECT workspace_name, SUM(cost) as total_cost FROM cost_data GROUP BY workspace_name ORDER BY total_cost DESC"]
+})
+
+# 2b. Update text instructions (only as last resort)
 instructions = """You are a cost intelligence analyst. Follow these STRICT rules:
 
 === ASSET ROUTING ===
@@ -344,7 +426,7 @@ with open(f"src/genie/{domain}_genie_export.json", "w") as f:
     json.dump(templated, f, indent=2)
 ```
 
-### Instruction Writing Best Practices
+### Text Instruction Writing Best Practices
 
 | Practice | Example |
 |----------|---------|
@@ -353,6 +435,37 @@ with open(f"src/genie/{domain}_genie_export.json", "w") as f:
 | Define ambiguous terms | "'underperforming' = below median revenue" |
 | Set defaults | "No date → last 7 days" |
 | Specify formatting | "Currency: $, 2 decimals" |
+
+### Text Instruction Specificity Rules
+
+> **Critical:** Text instructions must be clear and specific. Vague instructions reduce effectiveness, especially in longer conversations.
+
+**Structure every text instruction with these components:**
+
+1. **Trigger condition** — What topics or scenarios require the instruction
+2. **Missing details** — What information must be present
+3. **Required action** — What Genie must do
+4. **Example** — A concrete example of the expected behavior
+
+**GOOD:**
+```
+"When users ask about sales metrics without specifying product name or sales channel,
+ask: To proceed with sales analysis, specify your product name and sales channel."
+```
+
+**BAD:**
+```
+"Ask clarification questions when asked about sales."
+```
+
+### Avoiding Conflicting Instructions
+
+> **Critical:** Ensure consistency across ALL instruction types. If a text instruction specifies rounding decimals to two digits, then example SQL queries must also round to two digits.
+
+**Rules:**
+1. Before adding any instruction, review existing example SQL and text instructions for conflicts
+2. Example SQL and text instructions must be semantically consistent
+3. When in doubt, prefer example SQL over text instructions (more precise and verifiable)
 
 ### Instruction Specificity Rules (Overcorrection Prevention)
 
