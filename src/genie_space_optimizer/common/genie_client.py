@@ -254,11 +254,23 @@ def sort_genie_config(config: dict) -> dict:
 def patch_space_config(w: WorkspaceClient, space_id: str, config: dict) -> dict:
     """PATCH a Genie Space with updated serialized_space config.
 
-    Strips non-exportable fields and sorts arrays before sending.
-    Returns the raw API response.
+    Strips non-exportable fields, sorts arrays, and validates the payload
+    structure before sending.  Returns the raw API response.
     """
+    from .genie_schema import validate_serialized_space
+
     clean = strip_non_exportable_fields(config)
     clean = sort_genie_config(clean)
+
+    ok, errors = validate_serialized_space(clean)
+    if not ok:
+        logger.error(
+            "Config validation failed before PATCH for space %s: %s",
+            space_id,
+            errors,
+        )
+        raise ValueError(f"Genie config validation failed: {errors}")
+
     payload = {"serialized_space": json.dumps(clean)}
     raw_resp = w.api_client.do("PATCH", f"/api/2.0/genie/spaces/{space_id}", body=payload)
     if isinstance(raw_resp, dict):

@@ -93,6 +93,37 @@ def _join_spec_right_id(spec: dict) -> str:
     return spec.get("right_table_name", "")
 
 
+def _validate_join_spec_entry(entry: dict) -> bool:
+    """Validate a join spec dict conforms to the Genie API schema.
+
+    Skips validation for legacy format (``left_table_name`` / ``right_table_name``)
+    which is only used internally and gets transformed before the final PATCH.
+    """
+    if "left_table_name" in entry or "right_table_name" in entry:
+        return True
+
+    from genie_space_optimizer.common.genie_schema import JoinSpec
+
+    try:
+        JoinSpec.model_validate(entry)
+        return True
+    except Exception:
+        logger.warning("Invalid join spec rejected: %s", entry)
+        return False
+
+
+def _validate_example_sql_entry(entry: dict) -> bool:
+    """Validate an example_question_sql dict conforms to the Genie API schema."""
+    from genie_space_optimizer.common.genie_schema import ExampleQuestionSql
+
+    try:
+        ExampleQuestionSql.model_validate(entry)
+        return True
+    except Exception:
+        logger.warning("Invalid example SQL entry rejected: %s", entry)
+        return False
+
+
 def _enforce_instruction_limit(config: dict) -> None:
     """Trim text_instructions content so it stays under the API limit."""
     ti = (config.get("instructions") or {}).get("text_instructions", [])
@@ -813,6 +844,8 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
                 new_entry["usage_guidance"] = (
                     [guidance] if isinstance(guidance, str) else guidance
                 )
+            if not _validate_example_sql_entry(new_entry):
+                return False
             eqs.append(new_entry)
             return True
         if op == "update":
@@ -926,6 +959,8 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
         if op == "add":
             js = cmd.get("join_spec", {})
             if js:
+                if not _validate_join_spec_entry(js):
+                    return False
                 specs.append(js)
             return True
         if op == "remove":
@@ -938,6 +973,8 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
         if op == "update":
             lt, rt = cmd.get("left_table", ""), cmd.get("right_table", "")
             new_spec = cmd.get("join_spec", {})
+            if new_spec and not _validate_join_spec_entry(new_spec):
+                return False
             for i, s in enumerate(specs):
                 if _join_spec_left_id(s) == lt and _join_spec_right_id(s) == rt:
                     specs[i] = new_spec
@@ -1137,6 +1174,16 @@ def apply_patch_set(
     sort_genie_config(config)
     _enforce_instruction_limit(config)
 
+    from genie_space_optimizer.common.genie_schema import validate_serialized_space
+
+    config_ok, validation_errors = validate_serialized_space(config)
+    if not config_ok:
+        logger.error(
+            "Post-patch config validation failed for space %s: %s",
+            space_id,
+            validation_errors,
+        )
+
     if w is not None and applied:
         try:
             patch_space_config(w, space_id, config)
@@ -1152,6 +1199,7 @@ def apply_patch_set(
         "rollback_commands": rollback_commands,
         "deploy_target": deploy_target,
         "patched_objects": list(patched_objects),
+        "validation_errors": validation_errors if not config_ok else [],
     }
 
 

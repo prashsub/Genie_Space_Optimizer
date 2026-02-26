@@ -4,6 +4,8 @@ A full-stack Databricks App that automatically optimizes [Genie Spaces](https://
 
 Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 
+> **Quick links:** [Quickstart Guide](QUICKSTART.md) | [E2E Testing Guide](E2E_TESTING_GUIDE.md) | [Code Review](CODE_REVIEW.md) | [Changelog](CHANGELOG.md)
+
 ---
 
 ## How It Works
@@ -42,7 +44,7 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 | 5 | Column Discovery | Example values, value dictionaries, synonyms |
 | 6 | Genie Instructions | Routing rules, disambiguation, default behaviors |
 
-### 7 Quality Dimensions
+### 7 Quality Dimensions (9 Scorers)
 
 | Dimension | Target | What It Measures |
 |-----------|--------|------------------|
@@ -53,6 +55,8 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 | Completeness | 90% | All requested dimensions/measures included |
 | Result Correctness | 85% | Correct final result values |
 | Asset Routing | 95% | Correct asset type (table, metric view, TVF) selected |
+
+Plus **Repeatability** (variance detection across repeated runs) and an **Arbiter** (tiebreaker judge for conflicting scorer verdicts).
 
 ---
 
@@ -79,13 +83,18 @@ Genie_Space_Optimizer/
 ├── databricks.yml                    # Databricks Asset Bundle definition
 ├── app.yml                           # Databricks App entry point (uvicorn)
 ├── resources/
-│   └── genie_optimization_job.yml    # Multi-task job definition (5 tasks)
+│   ├── genie_optimization_job.yml    # Multi-task job definition (5 tasks)
+│   └── grant_app_uc_permissions.py   # Script to grant app SP access to UC schemas
+├── docs/                             # Reference documentation & config samples
 │
 ├── src/genie_space_optimizer/
 │   ├── backend/                      # FastAPI backend
 │   │   ├── app.py                    # App factory (registers routes, serves frontend)
 │   │   ├── models.py                 # Pydantic response models
 │   │   ├── router.py                 # System routes (/version, /current-user)
+│   │   ├── job_launcher.py           # Databricks Jobs submission helper
+│   │   ├── constants.py              # Backend-specific constants
+│   │   ├── utils.py                  # Backend utility functions
 │   │   ├── _spark.py                 # Serverless Spark session factory
 │   │   ├── core/                     # Dependency injection & infrastructure
 │   │   │   ├── dependencies.py       # Dependencies.Client, .UserClient, .Config, etc.
@@ -96,13 +105,15 @@ Genie_Space_Optimizer/
 │   │   └── routes/
 │   │       ├── spaces.py             # GET /spaces, GET /spaces/{id}, POST /spaces/{id}/optimize
 │   │       ├── runs.py               # GET /runs/{id}, GET /runs/{id}/comparison, POST apply/discard
-│   │       └── activity.py           # GET /activity (recent runs feed)
+│   │       ├── activity.py           # GET /activity (recent runs feed)
+│   │       └── settings.py           # GET/POST/DELETE /settings/data-access (UC permissions)
 │   │
 │   ├── ui/                           # React + Vite frontend
 │   │   ├── main.tsx                  # React entry point
 │   │   ├── routes/                   # File-based TanStack Router pages
 │   │   │   ├── __root.tsx            # Root layout (navbar, theme)
 │   │   │   ├── index.tsx             # Dashboard (spaces grid, activity, stats)
+│   │   │   ├── settings.tsx          # Settings page (data access management)
 │   │   │   ├── spaces/$spaceId.tsx   # Space detail & optimization trigger
 │   │   │   ├── runs/$runId.tsx       # Run monitoring (pipeline steps, levers)
 │   │   │   └── runs/$runId/comparison.tsx  # Side-by-side config diff
@@ -112,6 +123,7 @@ Genie_Space_Optimizer/
 │   │   │   ├── PipelineStepCard.tsx  # Pipeline step visualization
 │   │   │   ├── LeverProgress.tsx     # Lever progress bar
 │   │   │   ├── ConfigDiff.tsx        # Configuration comparison viewer
+│   │   │   ├── ResourceLinks.tsx     # Workspace resource links
 │   │   │   └── ui/                   # shadcn/ui components
 │   │   └── lib/
 │   │       ├── api.ts                # Auto-generated OpenAPI client (DO NOT edit)
@@ -120,12 +132,13 @@ Genie_Space_Optimizer/
 │   ├── common/                       # Shared utilities
 │   │   ├── config.py                 # All constants (thresholds, prompts, taxonomy)
 │   │   ├── genie_client.py           # Genie Space API wrapper (list, fetch, patch, query)
+│   │   ├── genie_schema.py           # Genie Space config schema validation
 │   │   ├── uc_metadata.py            # Unity Catalog introspection (columns, tags, routines)
 │   │   └── delta_helpers.py          # Delta table read/write operations
 │   │
 │   ├── optimization/                 # Core optimization engine
 │   │   ├── optimizer.py              # Failure analysis → proposal generation → patch application
-│   │   ├── evaluation.py             # Benchmark generation, 8-judge scoring, MLflow tracking
+│   │   ├── evaluation.py             # Benchmark generation, 9-judge scoring, MLflow tracking
 │   │   ├── applier.py                # Patch application & rollback
 │   │   ├── harness.py                # Full pipeline orchestration
 │   │   ├── preflight.py              # Pre-flight validation
@@ -134,7 +147,7 @@ Genie_Space_Optimizer/
 │   │   ├── repeatability.py          # Repeatability testing & variance classification
 │   │   ├── report.py                 # Run report generation
 │   │   ├── models.py                 # Internal data models
-│   │   └── scorers/                  # 8 quality scorers
+│   │   └── scorers/                  # 9 quality scorers
 │   │       ├── syntax_validity.py
 │   │       ├── schema_accuracy.py
 │   │       ├── logical_accuracy.py
@@ -142,6 +155,7 @@ Genie_Space_Optimizer/
 │   │       ├── completeness.py
 │   │       ├── result_correctness.py
 │   │       ├── asset_routing.py
+│   │       ├── repeatability.py      # Variance detection across repeated runs
 │   │       └── arbiter.py            # Tiebreaker judge
 │   │
 │   └── jobs/                         # Databricks Job entry points
@@ -149,6 +163,7 @@ Genie_Space_Optimizer/
 │       ├── run_baseline.py           # Task 2: baseline evaluation & benchmark generation
 │       ├── run_lever_loop.py         # Task 3: iterative optimization (6 levers × 5 iterations)
 │       ├── run_evaluation_only.py    # Standalone evaluation (called by other tasks)
+│       ├── run_optimization.py       # Single-entry-point optimization runner
 │       ├── run_finalize.py           # Task 4: repeatability tests & final report
 │       └── run_deploy.py             # Task 5: deploy to version control (conditional)
 ```
@@ -169,6 +184,9 @@ All endpoints are prefixed with `/api/genie`.
 | `POST` | `/runs/{run_id}/apply` | `applyOptimization` | Confirm and keep optimized config |
 | `POST` | `/runs/{run_id}/discard` | `discardOptimization` | Rollback to original config |
 | `GET` | `/activity` | `listActivity` | Recent optimization runs feed |
+| `GET` | `/settings/data-access` | `getDataAccess` | List UC data-access grants and auto-detected schemas |
+| `POST` | `/settings/data-access` | `grantDataAccess` | Grant app service principal access to a UC schema |
+| `DELETE` | `/settings/data-access/{grant_id}` | `revokeDataAccess` | Revoke a UC data-access grant |
 | `GET` | `/version` | `getVersion` | App version |
 | `GET` | `/current-user` | `getCurrentUser` | Authenticated user info |
 

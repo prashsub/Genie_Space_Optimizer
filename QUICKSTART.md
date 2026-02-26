@@ -40,7 +40,7 @@ databricks auth env
 ## 2. Clone and Install Dependencies
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/prashsub/Genie_Space_Optimizer.git
 cd Genie_Space_Optimizer
 ```
 
@@ -92,6 +92,14 @@ This provisions:
 
 Wait for the deployment to complete (~2-3 minutes).
 
+### Grant Data Access
+
+After deployment, the app's service principal needs access to your Unity Catalog schemas. You can do this from the **Settings** page in the app, or run the grant script:
+
+```bash
+python resources/grant_app_uc_permissions.py --catalog your_catalog --schema your_schema
+```
+
 ---
 
 ## 5. Open the App
@@ -107,6 +115,10 @@ Or navigate to **Apps** in the Databricks workspace sidebar and click **genie-sp
 ---
 
 ## 6. Optimize Your First Genie Space
+
+### Step 0: Configure Data Access (First Time Only)
+
+Navigate to the **Settings** page (gear icon in the navbar). The app auto-detects available schemas and shows the service principal's current permissions. Click **Grant Access** for each schema your Genie Spaces depend on.
 
 ### Step 1: Browse Your Spaces
 
