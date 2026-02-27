@@ -23,8 +23,10 @@ from genie_space_optimizer.common.uc_metadata import (
     extract_genie_space_table_refs,
     get_columns,
     get_columns_for_tables,
+    get_columns_for_tables_rest,
     get_routines,
     get_routines_for_schemas,
+    get_routines_for_schemas_rest,
     get_tags,
     get_tags_for_tables,
 )
@@ -179,10 +181,24 @@ def run_preflight(
             _actual_source[key] = "prefetched"
             return val
         if isinstance(val, list):
-            logger.info("Prefetched %s is empty, falling back to Spark query", key)
+            logger.info("Prefetched %s is empty, falling back", key)
         return None
 
     _collection_errors: dict[str, str] = {}
+
+    def _rest_collect(fetch_fn: Any, label: str, source_key: str) -> list[dict] | None:
+        """Try REST API first; return None on failure so caller can fall back."""
+        try:
+            print(f"[PREFLIGHT] Attempting REST API for {label}...", flush=True)
+            rows = fetch_fn()
+            if rows:
+                _actual_source[source_key] = "rest_api"
+                print(f"[PREFLIGHT] ✓ REST API returned {len(rows)} {label}", flush=True)
+                return rows
+            print(f"[PREFLIGHT] REST API returned 0 {label}, falling back to Spark", flush=True)
+        except Exception as exc:
+            print(f"[PREFLIGHT] REST API failed for {label}: {type(exc).__name__}: {exc}", flush=True)
+        return None
 
     def _spark_collect(fetch_fn: Any, label: str, source_key: str) -> list[dict]:
         _actual_source[source_key] = "spark"
@@ -191,9 +207,15 @@ def run_preflight(
             _collection_errors[source_key] = err
         return rows
 
+    # Columns & routines: prefetch → REST API → Spark SQL
+    # Tags: prefetch → Spark SQL (no REST API for table_tags)
     if genie_table_refs:
         uc_columns_dicts = (
             _usable_prefetch("uc_columns")
+            or _rest_collect(
+                lambda: get_columns_for_tables_rest(w, genie_table_refs),
+                "columns (genie tables)", "uc_columns",
+            )
             or _spark_collect(
                 lambda: get_columns_for_tables(spark, genie_table_refs),
                 "columns (genie tables)", "uc_columns",
@@ -208,6 +230,10 @@ def run_preflight(
         )
         uc_routines_dicts = (
             _usable_prefetch("uc_routines")
+            or _rest_collect(
+                lambda: get_routines_for_schemas_rest(w, genie_table_refs),
+                "routines (genie schemas)", "uc_routines",
+            )
             or _spark_collect(
                 lambda: get_routines_for_schemas(spark, genie_table_refs),
                 "routines (genie schemas)", "uc_routines",
@@ -339,6 +365,7 @@ def run_preflight(
     pre_count = len(benchmarks)
     filtered_benchmarks: list[dict] = []
     invalid_errors: list[str] = []
+    rejected_details: list[str] = []
     for benchmark, validation in zip(benchmarks, validation_results):
         if validation.get("valid"):
             benchmark["validation_status"] = "valid"
@@ -355,6 +382,13 @@ def run_preflight(
             benchmark["validation_error"] = err or benchmark.get("validation_error")
             if err:
                 invalid_errors.append(err[:200])
+            bid = benchmark.get("id", benchmark.get("question_id", "?"))
+            bq = benchmark.get("question", "?")[:80]
+            logger.warning(
+                "BENCHMARK REJECTED: id=%s question='%s' error=%s",
+                bid, bq, err[:200],
+            )
+            rejected_details.append(f"    - {bid}: \"{bq}\" — {err[:120]}")
     benchmarks = filtered_benchmarks
     if len(benchmarks) < pre_count:
         logger.warning(
@@ -362,6 +396,15 @@ def run_preflight(
             pre_count - len(benchmarks),
             pre_count,
             invalid_errors[:5],
+        )
+        print(
+            f"\n-- BENCHMARK VALIDATION " + "-" * 28 + "\n"
+            f"  Total benchmarks: {pre_count}\n"
+            f"  Valid after validation: {len(benchmarks)}\n"
+            f"  Rejected: {pre_count - len(benchmarks)}\n"
+            f"  Rejected details:\n"
+            + "\n".join(rejected_details[:20]) + "\n"
+            + "-" * 52
         )
 
     if len(benchmarks) < MIN_VALID_BENCHMARKS:
@@ -465,14 +508,23 @@ def _load_or_generate_benchmarks(
     genie_benchmarks = extract_genie_space_benchmarks(
         config, spark, catalog=catalog, schema=schema,
     )
+    curated_with_sql = sum(1 for b in genie_benchmarks if b.get("expected_sql"))
+    curated_question_only = sum(1 for b in genie_benchmarks if not b.get("expected_sql"))
     write_stage(
         spark, run_id, "GENIE_BENCHMARK_EXTRACTION", "COMPLETE",
         task_key="preflight", catalog=catalog, schema=schema,
         detail={
             "genie_space_benchmarks": len(genie_benchmarks),
-            "with_sql": sum(1 for b in genie_benchmarks if b.get("expected_sql")),
-            "question_only": sum(1 for b in genie_benchmarks if not b.get("expected_sql")),
+            "with_sql": curated_with_sql,
+            "question_only": curated_question_only,
         },
+    )
+
+    print(
+        f"\n-- BENCHMARK LOADING " + "-" * 31 + "\n"
+        f"  Target count: {TARGET_BENCHMARK_COUNT}\n"
+        f"  Curated from Genie Space: {len(genie_benchmarks)} "
+        f"({curated_with_sql} with SQL, {curated_question_only} question-only)"
     )
 
     existing = load_benchmarks_from_dataset(spark, uc_schema, domain)
@@ -484,40 +536,120 @@ def _load_or_generate_benchmarks(
             b for b, v in zip(existing, validation_results)
             if v.get("valid")
         ]
-        invalid_count = len(existing) - len(valid_existing)
-        if invalid_count > 0:
+        invalid_existing = [
+            (b, v) for b, v in zip(existing, validation_results)
+            if not v.get("valid")
+        ]
+        invalid_count = len(invalid_existing)
+
+        _rejected_lines: list[str] = []
+        for b, v in invalid_existing:
+            bid = b.get("id", b.get("question_id", "?"))
+            bq = b.get("question", "?")[:80]
+            berr = str(v.get("error", ""))[:120]
+            _rejected_lines.append(f"    - {bid}: \"{bq}\" — {berr}")
             logger.warning(
-                "Persisted benchmarks: %d/%d failed re-validation (stale references). "
-                "Discarding invalid entries before reuse check.",
-                invalid_count, len(existing),
+                "BENCHMARK REJECTED (re-validation): id=%s question='%s' error=%s",
+                bid, bq, berr,
             )
+
+        print(
+            f"  Existing in UC table: {len(existing)}\n"
+            f"  Valid after re-validation: {len(valid_existing)} ({invalid_count} rejected)"
+        )
+        if _rejected_lines:
+            print("  Rejected reasons:\n" + "\n".join(_rejected_lines[:10]))
+
         if len(valid_existing) >= 5:
             curated_questions = {b.get("question", "").lower().strip() for b in genie_benchmarks}
             existing_questions = {b.get("question", "").lower().strip() for b in valid_existing}
             missing_curated = curated_questions - existing_questions
+
+            print(f"  Missing curated: {len(missing_curated)}")
+
             if not missing_curated:
-                logger.info(
-                    "Loaded %d valid existing benchmarks from UC dataset (all %d curated included)",
-                    len(valid_existing), len(genie_benchmarks),
-                )
-                for benchmark in valid_existing:
-                    benchmark.setdefault("provenance", "synthetic")
-                    benchmark.setdefault("validation_status", "valid")
-                    benchmark.setdefault("validation_reason_code", "ok")
-                    benchmark.setdefault("validation_error", None)
-                    benchmark.setdefault("correction_source", "")
-                return valid_existing
+                if len(valid_existing) >= TARGET_BENCHMARK_COUNT:
+                    print(
+                        f"  Decision: REUSE ({len(valid_existing)} valid, target {TARGET_BENCHMARK_COUNT} met)\n"
+                        + "-" * 52
+                    )
+                    logger.info(
+                        "Loaded %d valid existing benchmarks from UC dataset (all %d curated included)",
+                        len(valid_existing), len(genie_benchmarks),
+                    )
+                    for benchmark in valid_existing:
+                        benchmark.setdefault("provenance", "synthetic")
+                        benchmark.setdefault("validation_status", "valid")
+                        benchmark.setdefault("validation_reason_code", "ok")
+                        benchmark.setdefault("validation_error", None)
+                        benchmark.setdefault("correction_source", "")
+                    return valid_existing
+                else:
+                    gap = TARGET_BENCHMARK_COUNT - len(valid_existing)
+                    print(
+                        f"  Decision: TOP-UP ({len(valid_existing)} valid, "
+                        f"need {gap} more to reach target {TARGET_BENCHMARK_COUNT})\n"
+                        + "-" * 52
+                    )
+                    logger.warning(
+                        "Only %d valid benchmarks (target %d). Generating %d more to top up.",
+                        len(valid_existing), TARGET_BENCHMARK_COUNT, gap,
+                    )
+                    for benchmark in valid_existing:
+                        benchmark.setdefault("provenance", "synthetic")
+                        benchmark.setdefault("validation_status", "valid")
+                        benchmark.setdefault("validation_reason_code", "ok")
+                        benchmark.setdefault("validation_error", None)
+                        benchmark.setdefault("correction_source", "")
+
+                    write_stage(
+                        spark, run_id, "BENCHMARK_GENERATION", "STARTED",
+                        task_key="preflight", catalog=catalog, schema=schema,
+                        detail={"reason": "top_up", "existing_valid": len(valid_existing)},
+                    )
+                    new_benchmarks = generate_benchmarks(
+                        w, config, uc_columns, uc_tags, uc_routines,
+                        domain, catalog, schema, spark,
+                        target_count=TARGET_BENCHMARK_COUNT,
+                        genie_space_benchmarks=genie_benchmarks,
+                        existing_benchmarks=valid_existing,
+                    )
+                    write_stage(
+                        spark, run_id, "BENCHMARK_GENERATION", "COMPLETE",
+                        task_key="preflight",
+                        detail={
+                            "total_count": len(new_benchmarks),
+                            "top_up_reason": f"{len(valid_existing)}<{TARGET_BENCHMARK_COUNT}",
+                        },
+                        catalog=catalog, schema=schema,
+                    )
+                    return new_benchmarks
+
+            print(
+                f"  Decision: RE-GENERATE (missing {len(missing_curated)} curated questions)\n"
+                + "-" * 52
+            )
             logger.info(
                 "UC dataset has %d valid benchmarks but missing %d curated Genie space questions. "
                 "Re-generating to include them.",
                 len(valid_existing), len(missing_curated),
             )
         else:
+            print(
+                f"  Decision: RE-GENERATE (only {len(valid_existing)} valid, need >=5)\n"
+                + "-" * 52
+            )
             logger.info(
-                "Only %d valid benchmarks remain after re-validation (need ≥5). "
+                "Only %d valid benchmarks remain after re-validation (need >=5). "
                 "Re-generating from scratch.",
                 len(valid_existing),
             )
+    else:
+        print(
+            f"  Existing in UC table: {len(existing) if existing else 0}\n"
+            f"  Decision: GENERATE (no sufficient existing benchmarks)\n"
+            + "-" * 52
+        )
 
     logger.info(
         "Generating benchmarks: %d curated from Genie space + synthetic to reach %d",

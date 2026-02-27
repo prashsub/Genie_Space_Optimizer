@@ -126,10 +126,14 @@ def run_genie_query(
     question: str,
     max_wait: int = GENIE_MAX_WAIT,
 ) -> dict:
-    """Send a question to Genie and return generated SQL + status.
+    """Send a question to Genie and return generated SQL + result metadata.
 
     Uses adaptive polling (``GENIE_POLL_INITIAL`` → ``GENIE_POLL_MAX``).
-    Returns ``{"status", "sql", "conversation_id", "message_id"}``.
+    Returns ``{"status", "sql", "conversation_id", "message_id",
+    "attachment_id", "statement_id"}``.
+
+    ``statement_id`` can be used with ``fetch_genie_result_df`` to retrieve
+    the query results that Genie already computed (avoiding re-execution).
     """
     try:
         resp = w.genie.start_conversation(space_id=space_id, content=question)
@@ -154,20 +158,59 @@ def run_genie_query(
             poll_interval = min(poll_interval + 1, GENIE_POLL_MAX)
 
         sql = None
+        attachment_id = None
+        statement_id = None
+
         if msg and hasattr(msg, "attachments") and msg.attachments:
             for att in msg.attachments:
                 if hasattr(att, "query") and att.query:
                     sql = att.query.query if hasattr(att.query, "query") else str(att.query)
+                    attachment_id = getattr(att, "id", None) or getattr(att, "attachment_id", None)
+
+        if msg and hasattr(msg, "query_result") and msg.query_result:
+            statement_id = getattr(msg.query_result, "statement_id", None)
+
+        if not statement_id and attachment_id:
+            try:
+                qr = w.genie.get_message_attachment_query_result(
+                    space_id=space_id,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    attachment_id=attachment_id,
+                )
+                statement_id = getattr(qr, "statement_id", None)
+            except Exception:
+                logger.debug("Could not fetch attachment query result for statement_id", exc_info=True)
 
         return {
             "status": status,
             "sql": sql,
             "conversation_id": conversation_id,
             "message_id": message_id,
+            "attachment_id": attachment_id,
+            "statement_id": statement_id,
         }
     except Exception as e:
         logger.exception("Genie query failed for space %s", space_id)
         return {"status": "ERROR", "sql": None, "error": str(e)}
+
+
+def fetch_genie_result_df(w: WorkspaceClient, statement_id: str):
+    """Fetch Genie's query result as a pandas DataFrame using the Statement Execution API.
+
+    Returns ``None`` if the result cannot be retrieved.
+    """
+    import pandas as pd
+
+    try:
+        stmt = w.statement_execution.get_statement(statement_id)
+        if stmt.result and stmt.result.data_array and stmt.manifest and stmt.manifest.schema:
+            col_names = [c.name for c in stmt.manifest.schema.columns]
+            return pd.DataFrame(stmt.result.data_array, columns=col_names)
+        return None
+    except Exception:
+        logger.debug("Could not fetch statement %s results", statement_id, exc_info=True)
+        return None
 
 
 # ── Asset Detection ────────────────────────────────────────────────────

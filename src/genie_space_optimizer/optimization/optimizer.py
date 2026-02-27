@@ -151,6 +151,8 @@ def _resolve_scope(lever: int, apply_mode: str = APPLY_MODE) -> str:
 def _extract_pattern(rationale: str) -> str:
     """Extract a generalizable pattern from a judge rationale string."""
     r = (rationale or "").lower()
+    if not r:
+        return "other"
     if "table" in r and ("wrong" in r or "missing" in r or "incorrect" in r):
         return "wrong_table"
     if "column" in r and ("wrong" in r or "missing" in r):
@@ -163,6 +165,8 @@ def _extract_pattern(rationale: str) -> str:
         return "missing_filter"
     if "asset" in r or "routing" in r:
         return "asset_routing_error"
+    if "instruction" in r or "ambiguous" in r or "unclear" in r:
+        return "missing_instruction"
     return "other"
 
 
@@ -254,7 +258,7 @@ def _classify_sql_diff(ctx: dict) -> str:
     if exp_tables == gen_tables and exp_tables:
         return "wrong_column"
 
-    return "other"
+    return "missing_instruction"
 
 
 def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
@@ -1151,6 +1155,25 @@ def _call_llm_for_proposal(
     except KeyError:
         prompt = prompt_template.format_map(defaultdict(str, format_kwargs))
 
+    _tmpl_name = {1: "LEVER_1_2_COLUMN", 2: "LEVER_1_2_COLUMN", 4: "LEVER_4_JOIN_SPEC", 5: "LEVER_5_INSTRUCTION"}.get(lever, "PROPOSAL_GENERATION")
+    logger.info(
+        "\n"
+        "┌─── OPTIMIZER LLM [%s] INPUT ────────────────────────────────────────\n"
+        "│ Lever: %d | Patch type: %s\n"
+        "│ Prompt template: %s\n"
+        "│ failure_type: %s\n"
+        "│ blame_set: %s\n"
+        "│ affected_questions: %s\n"
+        "│ Prompt length: %d chars\n"
+        "└─────────────────────────────────────────────────────────────────────────",
+        _tmpl_name, lever, patch_type,
+        _tmpl_name,
+        format_kwargs.get("failure_type", "?"),
+        format_kwargs.get("blame_set", "?"),
+        format_kwargs.get("affected_questions", []),
+        len(prompt),
+    )
+
     import time
 
     from databricks.sdk import WorkspaceClient as _WC
@@ -1178,14 +1201,40 @@ def _call_llm_for_proposal(
             if text.startswith("```"):
                 text = re.sub(r"^```(?:json)?\s*", "", text)
                 text = re.sub(r"\s*```$", "", text)
-            return json.loads(text)
+            parsed = json.loads(text)
+            logger.info(
+                "\n"
+                "┌─── OPTIMIZER LLM [%s] RESPONSE ─────────────────────────────────────\n"
+                "│ proposed_value: %s\n"
+                "│ rationale: %s\n"
+                "└─────────────────────────────────────────────────────────────────────────",
+                _tmpl_name,
+                str(parsed.get("proposed_value", ""))[:300],
+                str(parsed.get("rationale", ""))[:300],
+            )
+            return parsed
         except json.JSONDecodeError:
+            logger.info(
+                "\n"
+                "┌─── OPTIMIZER LLM [%s] RESPONSE (non-JSON) ──────────────────────────\n"
+                "│ Raw text: %s\n"
+                "└─────────────────────────────────────────────────────────────────────────",
+                _tmpl_name, text[:500],
+            )
             return {"proposed_value": text, "rationale": "LLM response was not valid JSON"}
         except Exception:
             if attempt < LLM_MAX_RETRIES - 1:
                 time.sleep(2**attempt)
             else:
-                logger.exception("LLM call failed after %d retries", LLM_MAX_RETRIES)
+                logger.exception(
+                    "\n"
+                    "┌─── OPTIMIZER LLM [%s] ERROR ────────────────────────────────────────\n"
+                    "│ Prompt len: %d chars\n"
+                    "│ LLM endpoint: %s\n"
+                    "│ Retries exhausted: %d\n"
+                    "└─────────────────────────────────────────────────────────────────────────",
+                    _tmpl_name, len(prompt), LLM_ENDPOINT, LLM_MAX_RETRIES,
+                )
                 return {
                     "proposed_value": "",
                     "rationale": "LLM call failed",
@@ -1240,6 +1289,16 @@ def _call_llm_for_join_discovery(
     except KeyError:
         prompt = LEVER_4_JOIN_DISCOVERY_PROMPT.format_map(defaultdict(str, format_kwargs))
 
+    logger.info(
+        "\n"
+        "┌─── OPTIMIZER LLM [JOIN_DISCOVERY] INPUT ────────────────────────────────\n"
+        "│ Hints: %d\n"
+        "│ Existing join specs: %d\n"
+        "│ Prompt length: %d chars\n"
+        "└─────────────────────────────────────────────────────────────────────────",
+        len(hints), len(_join_specs), len(prompt),
+    )
+
     import time
 
     from databricks.sdk import WorkspaceClient as _WC
@@ -1269,19 +1328,40 @@ def _call_llm_for_join_discovery(
             result = json.loads(text)
             specs = result.get("join_specs", [])
             rationale = result.get("rationale", "")
-            return [
+            out = [
                 {"join_spec": s, "rationale": rationale}
                 for s in specs
                 if isinstance(s, dict)
             ]
+            logger.info(
+                "\n"
+                "┌─── OPTIMIZER LLM [JOIN_DISCOVERY] RESPONSE ─────────────────────────\n"
+                "│ Join specs returned: %d\n"
+                "│ Rationale: %s\n"
+                "└─────────────────────────────────────────────────────────────────────────",
+                len(out), str(rationale)[:300],
+            )
+            return out
         except json.JSONDecodeError:
-            logger.warning("Discovery LLM returned non-JSON: %s", text[:200])
+            logger.warning(
+                "\n"
+                "┌─── OPTIMIZER LLM [JOIN_DISCOVERY] RESPONSE (non-JSON) ──────────────\n"
+                "│ Raw text: %s\n"
+                "└─────────────────────────────────────────────────────────────────────────",
+                text[:500],
+            )
             return []
         except Exception:
             if attempt < LLM_MAX_RETRIES - 1:
                 time.sleep(2**attempt)
             else:
-                logger.exception("Discovery LLM call failed after %d retries", LLM_MAX_RETRIES)
+                logger.exception(
+                    "\n"
+                    "┌─── OPTIMIZER LLM [JOIN_DISCOVERY] ERROR ────────────────────────────\n"
+                    "│ Prompt len: %d chars | Retries: %d\n"
+                    "└─────────────────────────────────────────────────────────────────────────",
+                    len(prompt), LLM_MAX_RETRIES,
+                )
                 return []
     return []
 
@@ -1403,22 +1483,32 @@ def generate_metadata_proposals(
     target_lever: int | None = None,
     apply_mode: str = APPLY_MODE,
     w: WorkspaceClient | None = None,
+    failed_levers: set[int] | None = None,
 ) -> list[dict]:
     """Generate metadata change proposals from failure clusters.
 
     For each cluster, maps to a lever, calls the LLM to generate a concrete
     ``proposed_value``, resolves scope, and scores by net_impact.
+
+    When *failed_levers* is provided and *target_lever* is 5, clusters whose
+    natural lever is in *failed_levers* are also included so that lever 5
+    (instructions / example SQL) can act as a catch-all.
     """
+    failed_levers = failed_levers or set()
     proposals: list[dict] = []
     for cluster in clusters:
-        lever = _map_to_lever(
+        natural_lever = _map_to_lever(
             cluster["root_cause"],
             asi_failure_type=cluster.get("asi_failure_type"),
             blame_set=cluster.get("asi_blame_set"),
             judge=cluster.get("affected_judge"),
         )
+        lever = natural_lever
         if target_lever is not None and lever != target_lever:
-            continue
+            if target_lever == 5 and natural_lever in failed_levers:
+                lever = 5
+            else:
+                continue
 
         failure_type = cluster.get("asi_failure_type") or cluster.get("root_cause", "other")
         patch_type = _LEVER_TO_PATCH_TYPE.get(

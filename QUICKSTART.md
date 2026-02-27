@@ -232,9 +232,10 @@ DEFAULT_THRESHOLDS = {
 ### Iteration Limits
 
 ```python
-MAX_ITERATIONS = 5           # Max lever loop iterations
-REGRESSION_THRESHOLD = 2.0   # % drop that triggers rollback
-PLATEAU_ITERATIONS = 2       # Consecutive no-improvement before stopping
+MAX_ITERATIONS = 5            # Max lever loop iterations
+REGRESSION_THRESHOLD = 10.0   # % drop that triggers rollback
+SLICE_GATE_TOLERANCE = 15.0   # % tolerance for per-dimension slice gate
+PLATEAU_ITERATIONS = 2        # Consecutive no-improvement before stopping
 ```
 
 ### Benchmark Generation
@@ -246,9 +247,12 @@ TARGET_BENCHMARK_COUNT = 20  # Number of evaluation questions to generate
 ### Rate Limiting
 
 ```python
-RATE_LIMIT_SECONDS = 12      # Delay between Genie API calls
-PROPAGATION_WAIT_SECONDS = 30 # Wait after config patch before evaluation
+RATE_LIMIT_SECONDS = 12                         # Delay between Genie API calls
+PROPAGATION_WAIT_SECONDS = 30                   # Wait after config patch before evaluation
+PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS = 90   # Extra wait for entity matching propagation
 ```
+
+These can also be overridden via environment variables (`GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT`, `GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT_ENTITY_MATCHING`).
 
 ### LLM
 
@@ -276,6 +280,10 @@ You need **CAN_EDIT** permission on the Genie Space. The app filters to spaces y
 ### Delta tables not available
 
 On the first run, Delta state tables are created automatically in the configured catalog/schema. If you see "Delta tables not yet available" warnings, this is normal for first use -- they will appear after the first optimization completes.
+
+### Preflight fails with "information_schema permission" errors
+
+The preflight stage now uses the Unity Catalog **REST API** by default to fetch column and routine metadata, bypassing `system.information_schema` permission requirements. If the REST API fails, it falls back to Spark SQL automatically. If both fail, ensure the app's service principal has `USE CATALOG` and `USE SCHEMA` grants on the target catalog/schema (see the **Settings** page or `resources/grant_app_uc_permissions.py`).
 
 ### Evaluation takes a long time
 

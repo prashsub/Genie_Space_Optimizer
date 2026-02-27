@@ -6,17 +6,41 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
-### Added
-- **Genie schema validation** (`genie_schema.py`) for Genie Space config structure validation
-- Unit tests for schema validation (`test_genie_schema.py`)
+### Added — UC REST API, Scorer Hardening, Harness Improvements
+- **UC metadata REST API** (`uc_metadata.py`): preflight now fetches columns and routines
+  via `WorkspaceClient` REST API by default, falling back to Spark SQL only when needed —
+  eliminates `system.information_schema` permission issues
+- **Arbiter baseline extraction**: harness extracts `genie_correct` arbiter actions from
+  baseline iteration to seed lever loop with known-good signals
+- **Entity matching propagation wait**: new `PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS`
+  config (default 90s) for longer waits after `build_value_dictionary` patches
+- **Evaluation debug mode**: `GENIE_SPACE_OPTIMIZER_EVAL_DEBUG` env var enables verbose
+  evaluation logging; assessment extraction now handles both trace-based and top-level
+  `assessments` column formats (MLflow genai >=2.x compatibility)
+- `fetch_genie_result_df` added to `genie_client.py` for direct result DataFrame retrieval
+- Prompt matching diagnostic logging in harness with change summaries
 
 ### Changed
-- Improved `genie_client.py` with schema-aware operations
-- Refined `applier.py` patch application logic
+- **Tuned convergence thresholds**: `REGRESSION_THRESHOLD` raised from 2.0 → 10.0,
+  `SLICE_GATE_TOLERANCE` raised from 5.0 → 15.0 (less aggressive rollback)
+- **Scorers hardened**: `completeness`, `logical_accuracy`, `schema_accuracy`,
+  `semantic_equivalence`, and `arbiter` scorers now use explicit `LLM_ENDPOINT` config
+  and structured logging for better debugging
+- Preflight uses REST → Spark SQL fallback chain (was Spark-only)
+- Lever loop job (`run_lever_loop.py`) expanded with arbiter action handling
+- `applier.py` improved patch application logic
+- `genie_client.py` enhanced with schema-aware operations
+- Config values (`PROPAGATION_WAIT_SECONDS`, `PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS`)
+  now environment-variable-overridable
 
 ---
 
 ## 2026-02-23
+
+### Added — Documentation Update (`d770458`)
+- Updated `README.md` with settings API endpoints, new modules, and quick links
+- Updated `QUICKSTART.md` with actual repo clone URL and data access setup
+- Created `CHANGELOG.md` with comprehensive history
 
 ### Added — Optimizer & Applier Refinements (`fd42c53`)
 - Expanded optimizer with improved lever handling and proposal generation

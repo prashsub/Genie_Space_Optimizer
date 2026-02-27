@@ -30,8 +30,9 @@
 # MAGIC
 # MAGIC ## Repeatability Testing
 # MAGIC
-# MAGIC Repeatability testing re-queries Genie for each benchmark question multiple times and compares the generated SQL hashes. It matters because:
+# MAGIC Repeatability testing runs exactly **2 evaluation passes** over all benchmarks, re-querying Genie for each question and comparing the generated SQL hashes across invocations. The final repeatability percentage is the **average** of both runs' per-question match rates.
 # MAGIC
+# MAGIC It matters because:
 # MAGIC - Non-deterministic SQL generation can cause flaky evaluations and unreliable optimization decisions.
 # MAGIC - A low repeatability score indicates the model or space configuration may need tuning.
 # MAGIC - Results are written to Delta and included in the final report.

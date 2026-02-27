@@ -68,7 +68,7 @@ Plus **Repeatability** (variance detection across repeated runs) and an **Arbite
 | **Frontend** | React 19, TypeScript, TanStack Router & Query, Vite |
 | **UI Components** | shadcn/ui, Radix UI, Tailwind CSS 4 |
 | **Data** | Delta Lake (state), PostgreSQL (Lakebase), Unity Catalog |
-| **ML/AI** | MLflow 3.4+, Claude Opus 4.6 (via Databricks Foundation Model API) |
+| **ML/AI** | MLflow 3.4+, Claude Opus 4.6 (via Databricks Foundation Model API), MLflow GenAI scorers |
 | **Infrastructure** | Databricks Apps, Databricks Jobs, SQL Warehouse |
 | **SDK** | Databricks SDK 0.40+, Databricks Connect 15+ |
 | **Build** | apx, uv (Python), bun (JavaScript) |
@@ -131,9 +131,9 @@ Genie_Space_Optimizer/
 │   │
 │   ├── common/                       # Shared utilities
 │   │   ├── config.py                 # All constants (thresholds, prompts, taxonomy)
-│   │   ├── genie_client.py           # Genie Space API wrapper (list, fetch, patch, query)
+│   │   ├── genie_client.py           # Genie Space API wrapper (list, fetch, patch, query, result DFs)
 │   │   ├── genie_schema.py           # Genie Space config schema validation
-│   │   ├── uc_metadata.py            # Unity Catalog introspection (columns, tags, routines)
+│   │   ├── uc_metadata.py            # Unity Catalog introspection (REST API + Spark SQL fallback)
 │   │   └── delta_helpers.py          # Delta table read/write operations
 │   │
 │   ├── optimization/                 # Core optimization engine
@@ -236,6 +236,10 @@ Environment variables (set via `databricks.yml`):
 | `GENIE_SPACE_OPTIMIZER_CATALOG` | Unity Catalog name for Delta state tables | `vibe_coding_workshop_catalog` |
 | `GENIE_SPACE_OPTIMIZER_SCHEMA` | Schema name for Delta state tables | `genie_optimization` |
 | `GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID` | SQL Warehouse ID for query execution | (workspace-specific) |
+| `GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT` | Seconds to wait after config patch before re-evaluation | `30` |
+| `GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT_ENTITY_MATCHING` | Extra wait for entity matching propagation | `90` |
+| `GENIE_SPACE_OPTIMIZER_EVAL_DEBUG` | Enable verbose evaluation logging | `true` |
+| `GENIE_SPACE_OPTIMIZER_EVAL_MAX_ATTEMPTS` | Max retry attempts per evaluation query | `4` |
 
 All optimization parameters (thresholds, rate limits, iterations, LLM config) are centralized in `src/genie_space_optimizer/common/config.py` and can be tuned without code changes.
 

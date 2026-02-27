@@ -10,10 +10,9 @@
 # MAGIC
 # MAGIC 1. **Reads upstream values** from the preflight task (`run_id`, `space_id`, `domain`, `catalog`, `schema`, `experiment_name`, `model_id`)
 # MAGIC 2. **Loads benchmarks** from the UC table `{catalog}.{schema}.genie_benchmarks_{domain}`
-# MAGIC 3. **Re-validates benchmarks** (SQL syntax, schema references) and drops invalid ones
-# MAGIC 4. **Runs the 8-judge evaluation** via `mlflow.genai.evaluate()` with retry for transient harness failures
-# MAGIC 5. **Checks thresholds** (syntax_validity, schema_accuracy, logical_accuracy, etc.)
-# MAGIC 6. **Publishes task values** (`scores`, `overall_accuracy`, `thresholds_met`, `model_id`) for lever_loop
+# MAGIC 3. **Runs the 8-judge evaluation** via `mlflow.genai.evaluate()` with retry for transient harness failures — benchmark quarantine (SQL/routine gating) is now integrated inside `run_evaluation()` and shared across all eval scopes (baseline, slice, P0, full)
+# MAGIC 4. **Checks thresholds** (syntax_validity, schema_accuracy, logical_accuracy, etc.)
+# MAGIC 5. **Publishes task values** (`scores`, `overall_accuracy`, `thresholds_met`, `model_id`) for lever_loop
 # MAGIC
 # MAGIC ## 8-Judge Scoring System
 # MAGIC
@@ -57,10 +56,9 @@
 # MAGIC    - `run_id`, `space_id`, `domain`, `catalog`, `schema`, `experiment_name`, `model_id`
 # MAGIC
 # MAGIC 2. **`_run_baseline()`** (in `optimization.harness`) performs:
-# MAGIC    - **Benchmark re-validation** — `validate_benchmarks()` checks SQL validity and schema references; invalid benchmarks are dropped
 # MAGIC    - **Predict function creation** — `make_predict_fn(w, space_id, spark, catalog, schema)` returns a closure that: rate-limits, calls Genie, executes both SQLs, normalizes results, compares hashes
 # MAGIC    - **Scorer assembly** — `make_all_scorers(w, spark, catalog, schema)` returns the 8-judge list for `mlflow.genai.evaluate(scorers=...)`
-# MAGIC    - **Evaluation with retry** — `run_evaluation()` wraps `mlflow.genai.evaluate()` with `_run_evaluate_with_retries()`: up to 4 attempts, exponential backoff, single-worker fallback on retries for transient harness bugs
+# MAGIC    - **Evaluation with retry** — `run_evaluation()` wraps `mlflow.genai.evaluate()` with `_run_evaluate_with_retries()`: up to 4 attempts, exponential backoff, single-worker fallback on retries for transient harness bugs. Benchmark quarantine (SQL/routine gating) is now integrated inside `run_evaluation()` — invalid benchmarks are quarantined within the shared evaluation path rather than as a separate pre-step.
 # MAGIC    - **Threshold checking** — Compares per-judge means against `MLFLOW_THRESHOLDS`; sets `thresholds_met` boolean
 # MAGIC    - **State writes** — Writes iteration 0 to Delta, links scores to model, updates run status
 # MAGIC
@@ -243,7 +241,7 @@ if not benchmarks:
 # MAGIC %md
 # MAGIC ## Run Baseline Evaluation
 # MAGIC
-# MAGIC `_run_baseline()` performs benchmark re-validation, creates the predict function and scorers, runs `mlflow.genai.evaluate()` with retry, checks thresholds, and writes Delta state. On success it returns `scores`, `overall_accuracy`, `thresholds_met`, and `model_id`. On failure it re-raises after logging full details.
+# MAGIC `_run_baseline()` creates the predict function and scorers, runs `mlflow.genai.evaluate()` with retry (benchmark quarantine is integrated inside the evaluation path), checks thresholds, and writes Delta state. On success it returns `scores`, `overall_accuracy`, `thresholds_met`, and `model_id`. On failure it re-raises after logging full details.
 
 # COMMAND ----------
 

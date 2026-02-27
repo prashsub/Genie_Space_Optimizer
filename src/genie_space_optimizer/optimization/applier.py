@@ -300,6 +300,32 @@ def auto_apply_prompt_matching(
     slots_available = MAX_VALUE_DICTIONARY_COLUMNS - already_dict_count
     selected = entity_candidates[:max(slots_available, 0)]
 
+    fa_count_preview = sum(1 for c in changes if c["type"] == "enable_example_values")
+    fa_skipped = sum(
+        1
+        for t in tables + metric_views
+        for cc in t.get("column_configs", [])
+        if cc.get("get_example_values") and not _is_hidden(cc)
+    ) - fa_count_preview
+
+    fa_lines = [f"\n-- FORMAT ASSISTANCE " + "-" * 31]
+    fa_lines.append(f"  Enabled get_example_values on {fa_count_preview} columns")
+    fa_lines.append(f"  Skipped (already enabled): {fa_skipped}")
+    fa_lines.append("-" * 52)
+    logger.info("\n".join(fa_lines))
+
+    em_lines = [f"\n-- ENTITY MATCHING (Value Dictionary) " + "-" * 14]
+    em_lines.append(f"  STRING columns scored for entity matching: {len(entity_candidates)}")
+    for rank, (ident, cname, _dt, sc) in enumerate(entity_candidates[:20], 1):
+        status = "SELECTED" if rank <= len(selected) else "NOT SELECTED (slot limit)"
+        em_lines.append(f"    Rank {rank:2d}: {ident}.{cname:<30s} score={sc}  {status}")
+    em_lines.append(
+        f"  Slots used: {already_dict_count} existing + {len(selected)} new = "
+        f"{already_dict_count + len(selected)} / {MAX_VALUE_DICTIONARY_COLUMNS} max"
+    )
+    em_lines.append("-" * 52)
+    logger.info("\n".join(em_lines))
+
     for identifier, col_name, _dtype, _score in selected:
         tbl_dict = _find_table_in_config(parsed, identifier)
         if not tbl_dict:

@@ -26,12 +26,14 @@ from databricks.sdk import WorkspaceClient
 
 from genie_space_optimizer.common.config import (
     APPLY_MODE,
+    ARBITER_CORRECTION_TRIGGER,
     DEFAULT_LEVER_ORDER,
     DEFAULT_THRESHOLDS,
     ENABLE_PROMPT_MATCHING_AUTO_APPLY,
     INLINE_EVAL_DELAY,
     LEVER_NAMES,
     MAX_ITERATIONS,
+    PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS,
     PROPAGATION_WAIT_SECONDS,
     REGRESSION_THRESHOLD,
     SLICE_GATE_TOLERANCE,
@@ -359,6 +361,17 @@ def _run_prompt_matching_setup(
             refreshed = fetch_space_config(w, space_id)
             config["_parsed_space"] = refreshed.get("_parsed_space", refreshed)
 
+        print(
+            f"\n-- PROMPT MATCHING APPLIED " + "-" * 26 + "\n"
+            f"  Total changes: {len(applied)}\n"
+            f"    Format assistance (get_example_values): {fa_count} columns\n"
+            f"    Entity matching (build_value_dictionary): {em_count} columns\n"
+            f"  Tables patched: {apply_log.get('patched_objects', [])}\n"
+            f"  Genie Space API PATCH sent: {'YES' if applied else 'NO'}\n"
+            f"  Config refreshed: {'YES' if applied else 'N/A'}\n"
+            + "-" * 52
+        )
+
         write_stage(
             spark, run_id, "PROMPT_MATCHING_SETUP", "COMPLETE",
             task_key="prompt_matching_setup",
@@ -390,6 +403,53 @@ def _run_prompt_matching_setup(
 
 
 # ── Stage 3: LEVER LOOP ─────────────────────────────────────────────
+
+
+def _extract_arbiter_actions_from_baseline(
+    spark: SparkSession,
+    run_id: str,
+    catalog: str,
+    schema: str,
+) -> list[dict]:
+    """Extract genie_correct arbiter actions from baseline iteration rows."""
+    baseline_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
+    if not baseline_iter:
+        return []
+
+    rows_json = baseline_iter.get("rows_json")
+    if isinstance(rows_json, str):
+        try:
+            rows_json = json.loads(rows_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if not isinstance(rows_json, list):
+        return []
+
+    actions: list[dict] = []
+    for row in rows_json:
+        av = str(
+            row.get("arbiter/value")
+            or row.get("feedback/arbiter/value")
+            or (row.get("arbiter") if isinstance(row.get("arbiter"), str) else "")
+            or "skipped"
+        ).lower()
+        if av != "genie_correct":
+            continue
+        genie_sql = (
+            row.get("outputs/response")
+            or (row.get("outputs") or {}).get("response", "")
+        )
+        question = (
+            row.get("inputs/question")
+            or (row.get("inputs") or {}).get("question", "")
+        )
+        if genie_sql and question:
+            actions.append({
+                "question": str(question),
+                "new_expected_sql": str(genie_sql),
+                "verdict": "genie_correct",
+            })
+    return actions
 
 
 def _run_lever_loop(
@@ -473,6 +533,43 @@ def _run_lever_loop(
         len(reference_sqls),
     )
 
+    _arbiter_actions = _extract_arbiter_actions_from_baseline(
+        spark, run_id, catalog, schema,
+    )
+    _genie_correct_count = sum(
+        1 for a in _arbiter_actions if a.get("verdict") == "genie_correct"
+    )
+    if _genie_correct_count >= ARBITER_CORRECTION_TRIGGER and _arbiter_actions:
+        from genie_space_optimizer.optimization.benchmarks import apply_benchmark_corrections
+
+        print(
+            f"\n-- ARBITER BENCHMARK CORRECTIONS " + "-" * 19 + "\n"
+            f"  genie_correct count: {_genie_correct_count} "
+            f"(threshold: {ARBITER_CORRECTION_TRIGGER})\n"
+            f"  Corrections to apply: {len(_arbiter_actions)}"
+        )
+        for _ac in _arbiter_actions:
+            print(
+                f"    - \"{_ac['question'][:60]}\" -> {_ac['new_expected_sql'][:80]}"
+            )
+        print("-" * 52)
+
+        correction_result = apply_benchmark_corrections(
+            _arbiter_actions, spark, uc_schema, domain,
+        )
+        print(
+            f"  Applied: {correction_result['applied']}, "
+            f"Skipped: {correction_result['skipped']}"
+        )
+        if correction_result["errors"]:
+            print(f"  Errors: {correction_result['errors'][:3]}")
+        print("-" * 52)
+    elif _genie_correct_count > 0:
+        print(
+            f"\n-- ARBITER: {_genie_correct_count} genie_correct verdicts "
+            f"(below threshold {ARBITER_CORRECTION_TRIGGER}, no corrections applied)"
+        )
+
     for lever in levers:
         if lever <= start_lever:
             continue
@@ -489,6 +586,14 @@ def _run_lever_loop(
         levers_attempted.append(lever)
         lever_name = LEVER_NAMES.get(lever, f"Lever {lever}")
 
+        print(
+            f"\n{'=' * 62}\n"
+            f"  LEVER {lever}: {lever_name} -- Iteration {iteration_counter}\n"
+            f"  Best accuracy: {best_accuracy:.1f}% | "
+            f"Thresholds met: {all_thresholds_met(best_scores, thresholds)}\n"
+            f"{'=' * 62}"
+        )
+
         write_stage(
             spark, run_id, f"LEVER_{lever}_STARTED", "STARTED",
             task_key="lever_loop", lever=lever, iteration=iteration_counter,
@@ -496,43 +601,88 @@ def _run_lever_loop(
         )
 
         failure_rows = _get_failure_rows(spark, run_id, catalog, schema)
-        logger.info(
-            "Lever %d: loaded %d rows for clustering", lever, len(failure_rows),
-        )
-        if lever == levers[0]:
-            print(f"[DEBUG] Lever {lever}: loaded {len(failure_rows)} rows for clustering")
-            if failure_rows:
-                sample = failure_rows[0]
-                feedback_cols = [
-                    k for k in sample.keys()
-                    if "feedback" in k.lower() or k.endswith("/value")
-                ]
-                print(f"[DEBUG] Sample row keys ({len(sample)} total):")
-                print(f"[DEBUG]   feedback_cols={feedback_cols[:10]}")
-                print(f"[DEBUG]   all_keys={sorted(sample.keys())[:25]}")
-                for fc in feedback_cols[:5]:
-                    print(f"[DEBUG]   {fc} = {sample.get(fc)!r}")
+
+        arbiter_counts: dict[str, int] = {}
+        arbiter_excluded: list[str] = []
+        filtered_failure_rows: list[dict] = []
+        for row in failure_rows:
+            av = str(
+                row.get("arbiter/value")
+                or row.get("feedback/arbiter/value")
+                or (row.get("arbiter") if isinstance(row.get("arbiter"), str) else "")
+                or "skipped"
+            ).lower()
+            arbiter_counts[av] = arbiter_counts.get(av, 0) + 1
+            if av == "genie_correct":
+                qid = (
+                    row.get("inputs/question_id")
+                    or (row.get("inputs") or {}).get("question_id", "?")
+                )
+                arbiter_excluded.append(str(qid))
             else:
-                print("[DEBUG] No failure rows loaded!")
+                filtered_failure_rows.append(row)
 
-        eval_result_for_clustering = {"rows": failure_rows}
+        print(
+            f"\n-- FAILURE ROWS: {len(failure_rows)} loaded for clustering\n"
+            f"  Arbiter verdicts: {arbiter_counts}"
+        )
+        if arbiter_excluded:
+            print(
+                f"\n-- ARBITER FILTER " + "-" * 34 + "\n"
+                f"  Excluded {len(arbiter_excluded)} questions (arbiter: genie_correct)\n"
+                f"  Question IDs: {arbiter_excluded}\n"
+                f"  Remaining failure rows: {len(filtered_failure_rows)}\n"
+                + "-" * 52
+            )
+
+        eval_result_for_clustering = {"rows": filtered_failure_rows}
         clusters = cluster_failures(eval_result_for_clustering, metadata_snapshot)
-        cluster_summary = [(c["cluster_id"], c["affected_judge"], c.get("root_cause"), c.get("asi_failure_type"), len(c["question_ids"])) for c in clusters[:8]]
-        logger.info("Lever %d: %d clusters — %s", lever, len(clusters), cluster_summary)
-        print(f"[DEBUG] Lever {lever}: {len(clusters)} clusters — {cluster_summary}")
-        from genie_space_optimizer.optimization.optimizer import _map_to_lever, _JUDGE_TO_LEVER
-        for c in clusters[:5]:
-            mapped = _map_to_lever(c["root_cause"], asi_failure_type=c.get("asi_failure_type"), blame_set=c.get("asi_blame_set"), judge=c.get("affected_judge"))
-            print(f"[DEBUG]   Cluster {c['cluster_id']}: judge={c['affected_judge']}, root_cause={c['root_cause']} → lever {mapped}")
 
+        from genie_space_optimizer.optimization.optimizer import _map_to_lever
+
+        cluster_lines = [f"\n-- FAILURE CLUSTERS ({len(clusters)} total) " + "-" * 30]
+        for ci, c in enumerate(clusters, 1):
+            mapped = _map_to_lever(
+                c["root_cause"],
+                asi_failure_type=c.get("asi_failure_type"),
+                blame_set=c.get("asi_blame_set"),
+                judge=c.get("affected_judge"),
+            )
+            cluster_lines.append(
+                f"  Cluster {ci}: judge={c['affected_judge']} | "
+                f"root_cause={c['root_cause']} | mapped_lever={mapped}"
+            )
+            cluster_lines.append(f"    Blame: {c.get('asi_blame_set', c.get('blame_set', []))}")
+            cluster_lines.append(f"    Questions: {c['question_ids']}")
+            cluster_lines.append(
+                f"    ASI failure type: {c.get('asi_failure_type', 'n/a')}"
+            )
+        cluster_lines.append("-" * 52)
+        print("\n".join(cluster_lines))
+
+        _failed_lever_set = set(levers_rolled_back)
         proposals = generate_metadata_proposals(
             clusters, metadata_snapshot,
             target_lever=lever, apply_mode=apply_mode, w=w,
+            failed_levers=_failed_lever_set,
         )
-        logger.info("Lever %d: %d proposals generated", lever, len(proposals))
-        print(f"[DEBUG] Lever {lever}: {len(proposals)} proposals generated")
+
+        proposal_lines = [f"\n-- PROPOSALS ({len(proposals)} total) " + "-" * 34]
+        for pi, p in enumerate(proposals, 1):
+            proposal_lines.append(
+                f"  Proposal {pi}: {p.get('type', p.get('patch_type', '?'))}"
+            )
+            target = p.get("target", p.get("target_object", ""))
+            if target:
+                proposal_lines.append(f"    Target: {target}")
+            rationale = p.get("rationale", "")
+            if rationale:
+                proposal_lines.append(f"    Rationale: {str(rationale)[:200]}")
+        proposal_lines.append("-" * 52)
+        print("\n".join(proposal_lines))
 
         if not proposals:
+            print(f"\n-- No proposals for {lever_name} -- SKIPPING lever")
             logger.info("No proposals for %s — skipping", lever_name)
             write_stage(
                 spark, run_id, f"LEVER_{lever}_STARTED", "SKIPPED",
@@ -556,8 +706,29 @@ def _run_lever_loop(
 
         patched_objects = apply_log.get("patched_objects", [])
 
-        logger.info("Waiting %ds for propagation", PROPAGATION_WAIT_SECONDS)
-        time.sleep(PROPAGATION_WAIT_SECONDS)
+        noise_floor = 100.0 / max(len(benchmarks), 1)
+
+        has_dict_changes = any(
+            (entry.get("patch", {}) or {}).get("build_value_dictionary")
+            or (entry.get("action", {}) or {}).get("type") in (
+                "enable_value_dictionary", "build_value_dictionary",
+            )
+            for entry in apply_log.get("applied", [])
+        )
+        wait_time = (
+            PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS if has_dict_changes
+            else PROPAGATION_WAIT_SECONDS
+        )
+        print(
+            f"\n-- PROPAGATION WAIT " + "-" * 32 + "\n"
+            f"  Lever {lever}: {len(apply_log.get('applied', []))} patches applied\n"
+            f"  Patched objects: {patched_objects}\n"
+            f"  Value dictionary changes: {'YES' if has_dict_changes else 'NO'}\n"
+            f"  Wait time: {wait_time}s"
+            + (" (extended for value dictionary rebuild)" if has_dict_changes else "")
+            + "\n" + "-" * 52
+        )
+        time.sleep(wait_time)
 
         # ── Slice gate ────────────────────────────────────────────
         import mlflow
@@ -584,12 +755,22 @@ def _run_lever_loop(
                 reference_sqls=reference_sqls if reference_sqls else None,
             )
             slice_scores = slice_result.get("scores", {})
+            effective_slice_tol = max(SLICE_GATE_TOLERANCE, noise_floor + 2.0)
             slice_drops = detect_regressions(
-                slice_scores, best_scores, threshold=SLICE_GATE_TOLERANCE,
+                slice_scores, best_scores, threshold=effective_slice_tol,
             )
+
             if slice_drops:
-                logger.warning(
-                    "Slice gate FAILED for lever %d: %s", lever, slice_drops,
+                _score_changes = ", ".join(
+                    f"{d['judge']} {best_scores.get(d['judge'], 0):.1f}->{slice_scores.get(d['judge'], 0):.1f} ({d['drop']:+.1f})"
+                    for d in slice_drops
+                )
+                print(
+                    f"\n-- SLICE GATE: FAIL " + "-" * 32 + "\n"
+                    f"  Benchmarks evaluated: {len(slice_benchmarks)}\n"
+                    f"  Regressions: {_score_changes}\n"
+                    f"  Action: ROLLBACK\n"
+                    + "-" * 52
                 )
                 rollback(apply_log, w, space_id, metadata_snapshot)
                 mark_patches_rolled_back(
@@ -605,6 +786,17 @@ def _run_lever_loop(
                     catalog=catalog, schema=schema,
                 )
                 continue
+            else:
+                _score_changes = ", ".join(
+                    f"{j} {best_scores.get(j, 0):.1f}->{slice_scores.get(j, 0):.1f}"
+                    for j in sorted(slice_scores)
+                )
+                print(
+                    f"\n-- SLICE GATE: PASS " + "-" * 32 + "\n"
+                    f"  Benchmarks evaluated: {len(slice_benchmarks)}\n"
+                    f"  Score changes: {_score_changes}\n"
+                    + "-" * 52
+                )
 
         # ── P0 gate ───────────────────────────────────────────────
         try:
@@ -623,7 +815,13 @@ def _run_lever_loop(
             )
             p0_failures = p0_result.get("failures", [])
             if p0_failures:
-                logger.warning("P0 gate FAILED: %d P0 questions failing", len(p0_failures))
+                print(
+                    f"\n-- P0 GATE: FAIL " + "-" * 34 + "\n"
+                    f"  P0 questions failing: {len(p0_failures)}\n"
+                    f"  Failed IDs: {p0_failures}\n"
+                    f"  Action: ROLLBACK\n"
+                    + "-" * 52
+                )
                 rollback(apply_log, w, space_id, metadata_snapshot)
                 mark_patches_rolled_back(
                     spark, run_id, iteration_counter,
@@ -638,6 +836,13 @@ def _run_lever_loop(
                     catalog=catalog, schema=schema,
                 )
                 continue
+            else:
+                print(
+                    f"\n-- P0 GATE: PASS " + "-" * 34 + "\n"
+                    f"  P0 benchmarks evaluated: {len(p0_benchmarks)}\n"
+                    f"  P0 failures: 0\n"
+                    + "-" * 52
+                )
 
         # ── Full evaluation ───────────────────────────────────────
         try:
@@ -676,12 +881,23 @@ def _run_lever_loop(
             lever=lever, eval_scope="full", model_id=new_model_id,
         )
 
+        effective_regression_tol = max(REGRESSION_THRESHOLD, noise_floor)
         regressions = detect_regressions(
-            full_scores, best_scores, threshold=REGRESSION_THRESHOLD,
+            full_scores, best_scores, threshold=effective_regression_tol,
         )
 
         if regressions:
-            logger.warning("Full eval regression for lever %d: %s", lever, regressions)
+            _reg_details = ", ".join(
+                f"{r['judge']} {best_scores.get(r['judge'], 0):.1f}->{full_scores.get(r['judge'], 0):.1f} ({r['drop']:+.1f})"
+                for r in regressions
+            )
+            print(
+                f"\n-- FULL EVAL: FAIL (REGRESSION) " + "-" * 20 + "\n"
+                f"  Accuracy: {best_accuracy:.1f}% -> {full_accuracy:.1f}%\n"
+                f"  Regressions: {_reg_details}\n"
+                f"  Action: ROLLBACK\n"
+                + "-" * 52
+            )
             rollback(apply_log, w, space_id, metadata_snapshot)
             mark_patches_rolled_back(
                 spark, run_id, iteration_counter,
@@ -698,6 +914,19 @@ def _run_lever_loop(
             continue
 
         # ── Accept lever ──────────────────────────────────────────
+        _score_delta = ", ".join(
+            f"{j} {best_scores.get(j, 0):.1f}->{full_scores.get(j, 0):.1f}"
+            for j in sorted(full_scores)
+        )
+        print(
+            f"\n-- FULL EVAL: PASS -- ACCEPTED " + "-" * 21 + "\n"
+            f"  Accuracy: {best_accuracy:.1f}% -> {full_accuracy:.1f}% "
+            f"({full_accuracy - best_accuracy:+.1f}%)\n"
+            f"  Score changes: {_score_delta}\n"
+            f"  Result: LEVER {lever} ACCEPTED\n"
+            + "=" * 52
+        )
+
         levers_accepted.append(lever)
         best_scores = full_scores
         best_accuracy = full_accuracy

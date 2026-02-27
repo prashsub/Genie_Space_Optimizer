@@ -8,6 +8,8 @@ to `optimize_genie_space()`.
 
 from __future__ import annotations
 
+import os
+
 # ── 1. Quality Thresholds ───────────────────────────────────────────────
 
 DEFAULT_THRESHOLDS = {
@@ -35,7 +37,10 @@ MLFLOW_THRESHOLDS = {
 # ── 2. Rate Limits and Timing ──────────────────────────────────────────
 
 RATE_LIMIT_SECONDS = 12
-PROPAGATION_WAIT_SECONDS = 30
+PROPAGATION_WAIT_SECONDS = int(os.getenv("GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT", "30"))
+PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS = int(
+    os.getenv("GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT_ENTITY_MATCHING", "90")
+)
 GENIE_POLL_INITIAL = 3
 GENIE_POLL_MAX = 10
 GENIE_MAX_WAIT = 120
@@ -49,8 +54,8 @@ INLINE_EVAL_DELAY = 12
 # ── 3. Iteration and Convergence ───────────────────────────────────────
 
 MAX_ITERATIONS = 5
-SLICE_GATE_TOLERANCE = 5.0
-REGRESSION_THRESHOLD = 2.0
+SLICE_GATE_TOLERANCE = 15.0
+REGRESSION_THRESHOLD = 10.0
 PLATEAU_ITERATIONS = 2
 ARBITER_CORRECTION_TRIGGER = 3
 REPEATABILITY_EXTRA_QUERIES = 2

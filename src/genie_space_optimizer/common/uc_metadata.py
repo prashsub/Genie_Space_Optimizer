@@ -1,8 +1,15 @@
 """
-Unity Catalog introspection queries.
+Unity Catalog introspection helpers.
 
-All ``information_schema`` queries used during preflight and model
-versioning. Every function takes a ``spark`` session as its first argument.
+Provides two ways to fetch metadata:
+
+1. **REST API** (preferred) – uses ``WorkspaceClient`` directly, bypasses
+   Spark Connect, and avoids ``system.information_schema`` permission issues.
+2. **Spark SQL** (legacy fallback) – queries ``{catalog}.information_schema``
+   via a Spark session.
+
+Preflight should prefer the REST variants; the Spark functions are kept for
+backwards-compatibility and edge cases where the SDK is unavailable.
 """
 
 from __future__ import annotations
@@ -11,6 +18,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from databricks.sdk import WorkspaceClient
     from pyspark.sql import DataFrame, SparkSession
 
 logger = logging.getLogger(__name__)
@@ -58,6 +66,90 @@ def get_unique_schemas(
         if cat and sch:
             pairs[(cat, sch)] = None
     return list(pairs.keys())
+
+
+# ---------------------------------------------------------------------------
+# REST API helpers (preferred – no Spark, no information_schema permission)
+# ---------------------------------------------------------------------------
+
+
+def get_columns_for_tables_rest(
+    w: "WorkspaceClient",
+    refs: list[tuple[str, str, str]],
+) -> list[dict]:
+    """Fetch column metadata via the Unity Catalog REST API.
+
+    Calls ``w.tables.get()`` per table and extracts column info from the
+    ``TableInfo.columns`` list.  Returns dicts with keys matching the Spark
+    query output: ``table_name``, ``column_name``, ``data_type``, ``comment``.
+    """
+    rows: list[dict] = []
+    failed: list[str] = []
+    for cat, sch, tbl in refs:
+        if not (cat and sch and tbl):
+            continue
+        full_name = f"{cat}.{sch}.{tbl}"
+        try:
+            table_info = w.tables.get(full_name=full_name)
+        except Exception as exc:
+            failed.append(f"{full_name}: {type(exc).__name__}: {exc}")
+            continue
+        if not table_info.columns:
+            continue
+        for col in table_info.columns:
+            rows.append({
+                "table_name": tbl,
+                "column_name": getattr(col, "name", ""),
+                "data_type": getattr(col, "type_text", ""),
+                "comment": getattr(col, "comment", None) or "",
+            })
+    summary = (
+        f"[UC_METADATA] REST get_columns_for_tables_rest: "
+        f"{len(refs)} refs, {len(refs) - len(failed)} succeeded, {len(rows)} column rows"
+    )
+    print(summary, flush=True)
+    if failed:
+        for f in failed:
+            print(f"[UC_METADATA]   FAILED: {f}", flush=True)
+    return rows
+
+
+def get_routines_for_schemas_rest(
+    w: "WorkspaceClient",
+    refs: list[tuple[str, str, str]],
+) -> list[dict]:
+    """Fetch function/routine metadata via the Unity Catalog REST API.
+
+    Calls ``w.functions.list()`` per unique (catalog, schema) and returns
+    dicts matching the Spark output: ``routine_name``, ``routine_type``,
+    ``routine_definition``, ``return_type``, ``routine_schema``.
+    """
+    schemas = get_unique_schemas(refs)
+    rows: list[dict] = []
+    for cat, sch in schemas:
+        try:
+            for fn in w.functions.list(catalog_name=cat, schema_name=sch):
+                rows.append({
+                    "routine_name": getattr(fn, "name", ""),
+                    "routine_type": getattr(fn, "routine_type", None)
+                    or getattr(fn, "function_type", ""),
+                    "routine_definition": getattr(fn, "routine_definition", "") or "",
+                    "return_type": (
+                        getattr(fn, "data_type", None)
+                        or getattr(fn, "return_type", None)
+                        or ""
+                    ),
+                    "routine_schema": sch,
+                })
+        except Exception as exc:
+            print(f"[UC_METADATA] REST functions.list failed for {cat}.{sch}: {type(exc).__name__}: {exc}", flush=True)
+    print(f"[UC_METADATA] REST get_routines_for_schemas_rest: {len(schemas)} schemas, {len(rows)} routines", flush=True)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Spark SQL helpers (legacy fallback)
+# ---------------------------------------------------------------------------
 
 
 def get_columns_for_tables(

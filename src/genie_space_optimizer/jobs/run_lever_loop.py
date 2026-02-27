@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC ## Purpose
 # MAGIC
-# MAGIC Task 3 is the **optimization engine** of the Genie Space Optimizer. It iteratively improves a Genie Space by applying targeted metadata patches across **6 levers**, evaluating each change through a **3-gate pattern**, and rolling back any patch that causes regression.
+# MAGIC Task 3 is the **optimization engine** of the Genie Space Optimizer. It iteratively improves a Genie Space by applying targeted metadata patches across **5 levers**, evaluating each change through a **3-gate pattern**, and rolling back any patch that causes regression.
 # MAGIC
 # MAGIC ## Lever Loop Overview
 # MAGIC
@@ -23,7 +23,9 @@
 # MAGIC | 2 | **Metric Views** | MV measures, dimensions, YAML definitions | `update_mv_measure`, `add_mv_dimension`, `update_mv_yaml` | Medium–High |
 # MAGIC | 3 | **Table-Valued Functions** | TVF SQL, parameters, signatures | `update_tvf_sql`, `add_tvf_parameter`, `add_tvf` | Medium–High |
 # MAGIC | 4 | **Join Specifications** | Table relationships, join columns (reactive + column-name discovery) | `add_join_spec`, `update_join_spec`, `remove_join_spec` | Medium |
-# MAGIC | 5 | **Genie Space Instructions** | Routing rules, disambiguation, default behaviors | `add_instruction`, `update_instruction` | Low–Medium |
+# MAGIC | 5 | **Genie Space Instructions** | Routing rules, disambiguation, default behaviors, example SQL queries | `add_example_sql`, `update_example_sql`, `add_instruction`, `update_instruction` | Low–Medium |
+# MAGIC
+# MAGIC **Lever 5 priority hierarchy:** SQL expressions > example SQL > text instructions. Most Lever 5 failures are routed to `add_example_sql` (preferred), with text instructions used only as a last resort when example SQL cannot address the need.
 # MAGIC
 # MAGIC Format assistance and entity matching are applied automatically between baseline and the lever loop (Stage 2.5).
 # MAGIC Levers 1–3 are governed by `apply_mode` (genie_config, uc_artifact, or both). Levers 4–5 always write to Genie Space config.
@@ -51,7 +53,7 @@
 # MAGIC ### 1. Slice Gate
 # MAGIC - **Scope:** Only benchmarks that touch the **patched objects** (tables, MVs, TVFs)
 # MAGIC - **Purpose:** Quick sanity check — did our changes break the things we touched?
-# MAGIC - **Pass condition:** No regression vs. best scores (within `SLICE_GATE_TOLERANCE`)
+# MAGIC - **Pass condition:** No regression vs. best scores (within noise-floor-adjusted `SLICE_GATE_TOLERANCE`)
 # MAGIC - **On failure:** Rollback patches, mark lever as rolled back, continue to next lever
 # MAGIC
 # MAGIC ### 2. P0 Gate
@@ -63,13 +65,33 @@
 # MAGIC ### 3. Full Evaluation
 # MAGIC - **Scope:** All benchmarks
 # MAGIC - **Purpose:** Final acceptance — does the patch improve or at least maintain overall quality?
-# MAGIC - **Pass condition:** No regression vs. best scores (within `REGRESSION_THRESHOLD`)
+# MAGIC - **Pass condition:** No regression vs. best scores (within noise-floor-adjusted `REGRESSION_THRESHOLD`)
 # MAGIC - **On failure:** Rollback patches, mark lever as rolled back, continue to next lever
-# MAGIC - **On success:** Accept lever, update best_scores/best_model_id, write iteration to Delta
+# MAGIC - **On success:** Accept lever, update best_scores/best_model_id, write iteration to Delta, register instruction version snapshot, update reference SQLs
 # MAGIC
 # MAGIC ### Rollback Mechanism
 # MAGIC
 # MAGIC When any gate fails, `rollback(apply_log, w, space_id, metadata_snapshot)` reverses all applied patches. The space returns to its pre-lever state. Patches are marked as rolled back in Delta for audit.
+# MAGIC
+# MAGIC ### Arbiter Benchmark Corrections (Pre-Loop)
+# MAGIC
+# MAGIC Before iterating levers, the harness runs `_extract_arbiter_actions_from_baseline()` to find baseline evaluation rows where the arbiter verdict was `genie_correct` — meaning Genie's SQL was actually correct and the benchmark's expected SQL was wrong. When the number of `genie_correct` verdicts meets or exceeds `ARBITER_CORRECTION_TRIGGER` (default 3), the harness calls `apply_benchmark_corrections()` to rewrite those benchmarks' `expected_sql` to match Genie's correct SQL. This prevents the optimizer from chasing false failures caused by stale or incorrect gold SQL.
+# MAGIC
+# MAGIC ### Arbiter Verdict Filtering in Failure Clustering
+# MAGIC
+# MAGIC During each lever iteration, the harness loads failure rows from the latest evaluation and filters out any rows with an arbiter verdict of `genie_correct` before passing them to `cluster_failures()`. This ensures the optimizer only proposes metadata fixes for questions where Genie is genuinely wrong, not questions where the arbiter determined Genie was already correct.
+# MAGIC
+# MAGIC ### Reference SQL Tracking
+# MAGIC
+# MAGIC The harness extracts `reference_sqls` (a mapping of question to SQL) from the baseline iteration. These reference SQLs are passed to every evaluation call (slice, P0, full) for cross-iteration SQL consistency tracking. When a lever is accepted, the reference SQLs are updated with the new evaluation results. This enables repeatability scoring to detect when Genie's SQL output changes between iterations.
+# MAGIC
+# MAGIC ### Noise Floor Adjustment for Gate Tolerances
+# MAGIC
+# MAGIC To prevent false regression signals on small benchmark sets, the harness computes a noise floor: `noise_floor = 100.0 / max(len(benchmarks), 1)`. This represents the score impact of a single question flip. Gate tolerances are adjusted:
+# MAGIC - **Slice gate:** `effective_tolerance = max(SLICE_GATE_TOLERANCE, noise_floor + 2.0)`
+# MAGIC - **Full eval:** `effective_threshold = max(REGRESSION_THRESHOLD, noise_floor)`
+# MAGIC
+# MAGIC For example, with 10 benchmarks the noise floor is 10.0%, so the full eval threshold becomes `max(10.0, 10.0) = 10.0%` instead of the default 10.0%, while the slice gate tolerance becomes `max(15.0, 12.0) = 15.0%`.
 # MAGIC
 # MAGIC ### SQL Context (USE CATALOG / USE SCHEMA)
 # MAGIC
@@ -101,6 +123,7 @@
 # COMMAND ----------
 
 import json
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -108,9 +131,21 @@ from typing import Any, cast
 from databricks.sdk import WorkspaceClient
 from pyspark.sql import SparkSession
 
+from genie_space_optimizer.common.config import (
+    ENABLE_PROMPT_MATCHING_AUTO_APPLY,
+    PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS,
+    PROPAGATION_WAIT_SECONDS,
+)
 from genie_space_optimizer.common.genie_client import fetch_space_config
+from genie_space_optimizer.common.uc_metadata import (
+    extract_genie_space_table_refs,
+    get_columns_for_tables_rest,
+)
 from genie_space_optimizer.optimization.evaluation import load_benchmarks_from_dataset
-from genie_space_optimizer.optimization.harness import _run_lever_loop
+from genie_space_optimizer.optimization.harness import (
+    _run_lever_loop,
+    _run_prompt_matching_setup,
+)
 
 dbutils = cast(Any, globals().get("dbutils"))
 
@@ -233,12 +268,101 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Stage 2.5: Prompt Matching Auto-Config
+# MAGIC
+# MAGIC Before the lever loop, apply format assistance and entity matching as a best-practice hygiene step.
+# MAGIC This enables `get_example_values` on all visible columns and `build_value_dictionary` on prioritized
+# MAGIC STRING columns (up to the 120-column cap), skipping metric view measure columns.
+# MAGIC
+# MAGIC After applying changes, a propagation wait allows the Genie Space to rebuild its index:
+# MAGIC - **With entity matching changes:** `PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS` (default 90s) — extended wait for value dictionary rebuild
+# MAGIC - **Without entity matching changes:** `PROPAGATION_WAIT_SECONDS` (default 30s)
+# MAGIC
+# MAGIC The same two-tier propagation wait applies per-lever in the lever loop when patches include value dictionary changes.
+
+# COMMAND ----------
+
+if ENABLE_PROMPT_MATCHING_AUTO_APPLY:
+    _banner("Stage 2.5: Prompt Matching Auto-Config")
+    try:
+        table_refs = extract_genie_space_table_refs(config)
+        uc_columns = get_columns_for_tables_rest(w, table_refs) if table_refs else []
+        config["_uc_columns"] = uc_columns
+
+        _tables = config.get("tables", [])
+        _total_cols = sum(len(t.get("column_configs", [])) for t in _tables)
+        _visible_cols = sum(
+            1 for t in _tables for c in t.get("column_configs", [])
+            if not c.get("hidden")
+        )
+        _hidden_cols = _total_cols - _visible_cols
+        _string_cols = sum(
+            1 for c in uc_columns
+            if str(c.get("data_type", "")).upper() == "STRING"
+        )
+        _fa_existing = sum(
+            1 for t in _tables for c in t.get("column_configs", [])
+            if c.get("get_example_values")
+        )
+        _vd_existing = sum(
+            1 for t in _tables for c in t.get("column_configs", [])
+            if c.get("build_value_dictionary")
+        )
+        print(
+            f"\n{'=' * 62}\n"
+            f"  STAGE 2.5: Prompt Matching Auto-Config\n"
+            f"{'=' * 62}\n"
+            f"\n-- GENIE SPACE INVENTORY " + "-" * 27 + "\n"
+            f"  Tables: {len(_tables)} ({', '.join(t.get('name', t.get('identifier', '?')) for t in _tables[:10])})\n"
+            f"  Total columns: {_total_cols} (visible: {_visible_cols}, hidden: {_hidden_cols})\n"
+            f"  UC column metadata: {len(uc_columns)} columns fetched across {len(table_refs)} tables\n"
+            f"  STRING columns eligible for entity matching: {_string_cols}\n"
+            f"  Columns already with format assistance: {_fa_existing}\n"
+            f"  Columns already with value dictionary: {_vd_existing} of 120 max slots\n"
+            + "-" * 52
+        )
+
+        pm_result = _run_prompt_matching_setup(w, spark, run_id, space_id, config, catalog, schema)
+        _log(
+            "Prompt matching complete",
+            format_assistance=pm_result.get("format_assistance_count", 0),
+            entity_matching=pm_result.get("entity_matching_count", 0),
+            total_changes=pm_result.get("total_changes", 0),
+        )
+        if pm_result.get("total_changes", 0) > 0:
+            has_entity_matching = pm_result.get("entity_matching_count", 0) > 0
+            wait_time = (
+                PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS if has_entity_matching
+                else PROPAGATION_WAIT_SECONDS
+            )
+            print(
+                f"\n-- PROPAGATION WAIT " + "-" * 32 + "\n"
+                f"  Changes applied: {pm_result.get('total_changes', 0)}\n"
+                f"  Entity matching changes: {pm_result.get('entity_matching_count', 0)}\n"
+                f"  Wait time: {wait_time}s"
+                + (" (extended for value dictionary rebuild)" if has_entity_matching else "")
+                + "\n" + "-" * 52
+            )
+            time.sleep(wait_time)
+            config = fetch_space_config(w, space_id)
+            _log("Config refreshed after prompt matching")
+    except Exception as exc:
+        _banner("Prompt Matching FAILED (non-fatal, continuing to lever loop)")
+        _log("Prompt matching error", error_type=type(exc).__name__, error_message=str(exc))
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Running the Lever Loop
 # MAGIC
 # MAGIC `_run_lever_loop()` orchestrates the full optimization:
+# MAGIC - Extracts arbiter corrections from baseline and applies benchmark rewrites when threshold is met
+# MAGIC - Filters `genie_correct` arbiter verdicts from failure rows before clustering
+# MAGIC - Tracks reference SQLs from baseline for cross-iteration consistency scoring
 # MAGIC - Sets SQL context (`USE CATALOG` / `USE SCHEMA`) before evaluations
-# MAGIC - Iterates levers, applies patches, runs 3-gate evaluation
+# MAGIC - Iterates levers, applies patches, runs 3-gate evaluation (slice → P0 → full) with noise-floor-adjusted tolerances
 # MAGIC - Rolls back on any gate failure
+# MAGIC - On lever acceptance: updates best scores, registers instruction version snapshot, refreshes reference SQLs
 # MAGIC - Supports resume from Delta if the task retries mid-loop
 # MAGIC
 # MAGIC Returns: `scores`, `accuracy`, `model_id`, `iteration_counter`, `best_iteration`, `levers_attempted`, `levers_accepted`, `levers_rolled_back`.
@@ -312,7 +436,13 @@ dbutils.notebook.exit(json.dumps(debug_info, default=str))
 # MAGIC
 # MAGIC Task 3 (Lever Loop) is the core optimization stage. It:
 # MAGIC - Skips when baseline already meets thresholds
-# MAGIC - Iterates through 6 levers (Tables & Columns → Metric Views → TVFs → Join Specs → Column Discovery → Instructions)
-# MAGIC - Applies patches, evaluates via slice → P0 → full gates, rolls back on regression
+# MAGIC - Applies prompt matching (format assistance + entity matching) as a best-practice hygiene step (Stage 2.5), with extended propagation wait for entity matching changes
+# MAGIC - Applies arbiter benchmark corrections when `genie_correct` verdicts exceed the trigger threshold
+# MAGIC - Filters `genie_correct` arbiter verdicts from failure rows before clustering to avoid chasing false failures
+# MAGIC - Tracks reference SQLs from baseline for cross-iteration consistency scoring
+# MAGIC - Iterates through 5 levers (Tables & Columns → Metric Views → TVFs → Join Specs → Instructions)
+# MAGIC - Lever 5 prioritizes example SQL over text instructions (SQL expressions > example SQL > text)
+# MAGIC - Applies patches, evaluates via slice → P0 → full gates with noise-floor-adjusted tolerances, rolls back on regression
+# MAGIC - On lever acceptance: registers instruction version snapshot and updates reference SQLs
 # MAGIC - Sets `USE CATALOG` / `USE SCHEMA` before each evaluation to avoid catalog/schema resolution errors
 # MAGIC - Publishes scores, model_id, iteration counts, and lever outcomes for finalize and deploy

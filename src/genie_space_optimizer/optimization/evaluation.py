@@ -56,6 +56,7 @@ from genie_space_optimizer.common.config import (
 )
 from genie_space_optimizer.common.genie_client import (
     detect_asset_type,
+    fetch_genie_result_df,
     resolve_sql,
     run_genie_query,
     sanitize_sql,
@@ -74,6 +75,7 @@ LLM_SOURCE = AssessmentSource(
 )
 
 EVAL_SCOPES = {"full", "slice", "p0", "held_out"}
+EVAL_DEBUG = os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_DEBUG", "true").lower() in {"1", "true", "yes", "on"}
 EVAL_MAX_ATTEMPTS = int(os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_MAX_ATTEMPTS", "4"))
 EVAL_RETRY_SLEEP_SECONDS = int(os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_RETRY_SLEEP_SECONDS", "10"))
 EVAL_SINGLE_WORKER_FALLBACK = os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_RETRY_WORKERS", "1")
@@ -288,37 +290,67 @@ def _parse_asi_from_rationale(rationale: str) -> dict:
 
 
 def _extract_assessments_from_traces(results_df) -> dict[int, dict[str, dict]]:
-    """Pull scorer rationale + metadata from the trace column before it is stripped.
+    """Pull scorer rationale + metadata from trace or assessments columns.
 
     Returns ``{row_index: {judge_name: {"rationale": str, "metadata": dict}}}``.
-    Falls back gracefully if traces/assessments are unavailable.
+
+    Checks three sources in order:
+    1. ``trace.data.assessments`` / ``trace.info.assessments`` (legacy path)
+    2. Top-level ``assessments`` column (MLflow genai >=2.x puts Feedback
+       objects here directly)
+    3. Falls back gracefully if nothing is available.
     """
     out: dict[int, dict[str, dict]] = {}
-    if "trace" not in results_df.columns:
+
+    has_trace = "trace" in results_df.columns
+    has_assessments = "assessments" in results_df.columns
+
+    if not has_trace and not has_assessments:
         return out
+
     for row_idx, (_, row) in enumerate(results_df.iterrows()):
-        trace = row.get("trace")
-        if trace is None:
-            continue
         assessments = None
-        for attr_chain in [("data", "assessments"), ("info", "assessments")]:
-            obj = trace
-            for attr in attr_chain:
-                obj = getattr(obj, attr, None)
-                if obj is None:
-                    break
-            if obj is not None:
-                assessments = obj
-                break
+
+        if has_trace:
+            trace = row.get("trace")
+            if trace is not None:
+                for attr_chain in [("data", "assessments"), ("info", "assessments")]:
+                    obj = trace
+                    for attr in attr_chain:
+                        obj = getattr(obj, attr, None)
+                        if obj is None:
+                            break
+                    if obj is not None:
+                        assessments = obj
+                        break
+
+        if not assessments and has_assessments:
+            raw = row.get("assessments")
+            if isinstance(raw, list):
+                assessments = raw
+            elif raw is not None and hasattr(raw, "__iter__"):
+                try:
+                    assessments = list(raw)
+                except Exception:
+                    pass
+
         if not assessments:
             continue
+
         row_data: dict[str, dict] = {}
         for a in assessments:
-            name = getattr(a, "name", "") or ""
-            rationale_raw = getattr(a, "rationale", "") or ""
-            meta = getattr(a, "metadata", None)
-            if not isinstance(meta, dict):
-                meta = {}
+            if isinstance(a, dict):
+                name = a.get("name", "") or ""
+                rationale_raw = a.get("rationale", "") or ""
+                meta = a.get("metadata")
+                if not isinstance(meta, dict):
+                    meta = {}
+            else:
+                name = getattr(a, "name", "") or ""
+                rationale_raw = getattr(a, "rationale", "") or ""
+                meta = getattr(a, "metadata", None)
+                if not isinstance(meta, dict):
+                    meta = {}
             if not meta:
                 meta = _parse_asi_from_rationale(rationale_raw)
             if name:
@@ -471,6 +503,8 @@ def _extract_sqlstate(message: str) -> str | None:
 def _classify_sql_validation_error(message: str) -> str:
     """Classify SQL validation failures into stable reason codes."""
     lowered = (message or "").lower()
+    if "metric_view_join_not_supported" in lowered:
+        return "metric_view_join"
     if "insufficient_permissions" in lowered or "permission denied" in lowered:
         return "permission_blocked"
     if "does not have execute on routine" in lowered:
@@ -486,6 +520,9 @@ def _classify_sql_validation_error(message: str) -> str:
     return "sql_compile_error"
 
 
+_MV_JOIN_RE = re.compile(r"\bJOIN\b", re.IGNORECASE)
+
+
 def _precheck_benchmarks_for_eval(
     *,
     benchmarks: list[dict],
@@ -493,6 +530,7 @@ def _precheck_benchmarks_for_eval(
     catalog: str,
     gold_schema: str,
     known_functions: set[str],
+    metric_view_names: set[str] | None = None,
 ) -> tuple[list[dict], list[dict[str, Any]], dict[str, int]]:
     """Apply strict SQL + routine checks before entering mlflow.genai.evaluate()."""
     valid: list[dict] = []
@@ -503,6 +541,7 @@ def _precheck_benchmarks_for_eval(
         "unresolved_column_count": 0,
         "bad_join_key_count": 0,
     }
+    mv_names_lower = {n.lower().split(".")[-1] for n in (metric_view_names or set())}
 
     for idx, benchmark in enumerate(benchmarks):
         question = str(benchmark.get("question") or "").strip()
@@ -536,6 +575,26 @@ def _precheck_benchmarks_for_eval(
                 reason_counts["unresolved_column_count"] += 1
             if reason == "bad_join_key":
                 reason_counts["bad_join_key_count"] += 1
+            continue
+
+        expected_asset = str(benchmark.get("expected_asset", "")).upper()
+        uses_measure = "MEASURE(" in resolved_sql.upper()
+        refs_metric_view = any(
+            mv in resolved_sql.lower() for mv in mv_names_lower
+        ) if mv_names_lower else False
+        is_mv_context = expected_asset == "MV" or uses_measure or refs_metric_view
+        if is_mv_context and _MV_JOIN_RE.search(resolved_sql):
+            quarantined.append(
+                {
+                    "question_id": qid,
+                    "question": question,
+                    "reason": "metric_view_join",
+                    "sqlstate": None,
+                    "error": "Metric view / MEASURE() benchmarks cannot use JOINs (METRIC_VIEW_JOIN_NOT_SUPPORTED)",
+                    "expected_sql": resolved_sql[:1500],
+                }
+            )
+            reason_counts["invalid_benchmark_count"] += 1
             continue
 
         called_functions = _extract_sql_function_calls(resolved_sql, catalog, gold_schema)
@@ -583,10 +642,14 @@ def make_predict_fn(
 
     @mlflow.trace
     def genie_predict_fn(question: str, expected_sql: str = "", **kwargs) -> dict:
-        """Query Genie, execute both SQLs, return response + comparison.
+        """Query Genie, fetch its results via Statement API, execute only GT SQL.
 
-        Steps: rate-limit → Genie call → sanitize → resolve GT SQL →
-               dual-execute → normalize → compare hashes.
+        Steps: rate-limit → Genie call → fetch Genie result via statement_id →
+               resolve & execute GT SQL → normalize → compare hashes.
+
+        We never re-execute Genie's SQL ourselves.  Genie runs queries on its
+        own SQL warehouse; re-executing via Spark Connect can hit different
+        limitations (e.g. METRIC_VIEW_JOIN_NOT_SUPPORTED).
         """
         try:
             mlflow.update_current_trace(
@@ -617,90 +680,99 @@ def make_predict_fn(
             result = run_genie_query(w, space_id, question)
             genie_sql = sanitize_sql(result.get("sql") or "")
             gt_sql = resolve_sql(expected_sql, catalog, schema)
+            statement_id = result.get("statement_id")
 
             if genie_sql and gt_sql:
                 try:
                     _set_sql_context(spark, catalog, schema)
+
                     called_functions = _extract_sql_function_calls(gt_sql, catalog, schema)
-                    called_functions.update(_extract_sql_function_calls(genie_sql, catalog, schema))
-                    missing_functions = sorted(f for f in called_functions if f not in known_functions)
-                    if missing_functions:
+                    missing_gt_functions = sorted(f for f in called_functions if f not in known_functions)
+                    if missing_gt_functions:
                         comparison["error"] = (
-                            "Missing function(s) in schema "
-                            f"{catalog}.{schema}: {', '.join(missing_functions)}"
+                            "Missing function(s) in GT SQL for schema "
+                            f"{catalog}.{schema}: {', '.join(missing_gt_functions)}"
                         )
                         comparison["error_type"] = "permission_blocked"
                     else:
-                        compile_failed = False
-                        for _label, _sql in [("ground_truth", gt_sql), ("genie", genie_sql)]:
-                            try:
-                                spark.sql(f"EXPLAIN {_sql}")
-                            except Exception as explain_exc:
-                                explain_msg = str(explain_exc)
-                                comparison["error"] = (
-                                    f"{_label} SQL compilation failed: {explain_msg[:400]}"
-                                )
-                                comparison["error_type"] = (
-                                    "infrastructure"
-                                    if _label == "ground_truth"
-                                    else "query_execution"
-                                )
-                                comparison["sqlstate"] = _extract_sqlstate(explain_msg)
-                                compile_failed = True
-                                break
+                        try:
+                            spark.sql(f"EXPLAIN {gt_sql}")
+                        except Exception as explain_exc:
+                            explain_msg = str(explain_exc)
+                            comparison["error"] = f"ground_truth SQL compilation failed: {explain_msg[:400]}"
+                            comparison["error_type"] = "infrastructure"
+                            comparison["sqlstate"] = _extract_sqlstate(explain_msg)
 
-                        if not compile_failed:
+                        if not comparison["error"]:
                             gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
-                            genie_df = normalize_result_df(spark.sql(genie_sql).toPandas())
-                            gt_hash = hashlib.md5(
-                                gt_df.to_csv(index=False).encode()
-                            ).hexdigest()[:8]
-                            genie_hash = hashlib.md5(
-                                genie_df.to_csv(index=False).encode()
-                            ).hexdigest()[:8]
-                            exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
-                            hash_match = gt_hash == genie_hash
-                            gt_sig = result_signature(gt_df)
-                            genie_sig = result_signature(genie_df)
-                            sig_match = (
-                                gt_sig["schema_hash"] == genie_sig["schema_hash"]
-                                and gt_sig["row_count"] == genie_sig["row_count"]
-                            )
 
-                            if exact_match:
-                                match_type = "exact"
-                            elif hash_match:
-                                match_type = "hash"
-                            elif sig_match:
-                                match_type = "signature"
+                            genie_df = None
+                            if statement_id:
+                                raw_genie_df = fetch_genie_result_df(w, statement_id)
+                                genie_df = normalize_result_df(raw_genie_df)
+
+                            if genie_df is None or genie_df.empty:
+                                comparison["error"] = (
+                                    "Could not retrieve Genie query results"
+                                    + (f" (statement_id={statement_id})" if statement_id else " (no statement_id)")
+                                )
+                                comparison["error_type"] = "genie_result_unavailable"
+                                comparison["gt_rows"] = len(gt_df)
+                                comparison["gt_sample"] = gt_df.head(5).to_csv(index=False)
                             else:
-                                match_type = "mismatch"
+                                gt_hash = hashlib.md5(
+                                    gt_df.to_csv(index=False).encode()
+                                ).hexdigest()[:8]
+                                genie_hash = hashlib.md5(
+                                    genie_df.to_csv(index=False).encode()
+                                ).hexdigest()[:8]
+                                exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
+                                hash_match = gt_hash == genie_hash
+                                gt_sig = result_signature(gt_df)
+                                genie_sig = result_signature(genie_df)
+                                sig_match = (
+                                    gt_sig["schema_hash"] == genie_sig["schema_hash"]
+                                    and gt_sig["row_count"] == genie_sig["row_count"]
+                                )
 
-                            comparison = {
-                                "match": exact_match or hash_match,
-                                "match_type": match_type,
-                                "gt_rows": len(gt_df),
-                                "genie_rows": len(genie_df),
-                                "gt_hash": gt_hash,
-                                "genie_hash": genie_hash,
-                                "gt_signature": gt_sig,
-                                "genie_signature": genie_sig,
-                                "error": None,
-                            }
+                                if exact_match:
+                                    match_type = "exact"
+                                elif hash_match:
+                                    match_type = "hash"
+                                elif sig_match:
+                                    match_type = "signature"
+                                else:
+                                    match_type = "mismatch"
+
+                                comparison = {
+                                    "match": exact_match or hash_match,
+                                    "match_type": match_type,
+                                    "gt_rows": len(gt_df),
+                                    "genie_rows": len(genie_df),
+                                    "gt_hash": gt_hash,
+                                    "genie_hash": genie_hash,
+                                    "gt_signature": gt_sig,
+                                    "genie_signature": genie_sig,
+                                    "gt_sample": gt_df.head(5).to_csv(index=False),
+                                    "genie_sample": genie_df.head(5).to_csv(index=False),
+                                    "error": None,
+                                }
                 except Exception as exc:
                     err_msg = str(exc)
                     comparison["error"] = err_msg[:500]
-                    comparison["error_type"] = (
-                        "infrastructure"
-                        if _is_infrastructure_sql_error(err_msg)
-                        else "query_execution"
-                    )
+                    if _is_infrastructure_sql_error(err_msg):
+                        comparison["error_type"] = "infrastructure"
+                    else:
+                        comparison["error_type"] = "query_execution"
                     comparison["sqlstate"] = _extract_sqlstate(err_msg)
             else:
-                comparison["error"] = "Missing SQL for comparison"
-                comparison["error_type"] = "missing_expected_sql"
+                if not genie_sql:
+                    comparison["error"] = "Genie did not return SQL"
+                    comparison["error_type"] = "no_genie_sql"
+                elif not gt_sql:
+                    comparison["error"] = "Missing expected SQL for comparison"
+                    comparison["error_type"] = "missing_expected_sql"
         except Exception as exc:
-            # Never raise from predict_fn: MLflow harness should always receive a row.
             err_msg = str(exc)
             comparison["error"] = err_msg[:500]
             comparison["error_type"] = (
@@ -708,12 +780,44 @@ def make_predict_fn(
             )
             comparison["sqlstate"] = _extract_sqlstate(err_msg)
 
-        return {
+        output = {
             "response": genie_sql,
             "status": result.get("status", "ERROR"),
             "conversation_id": result.get("conversation_id", ""),
             "comparison": comparison,
         }
+
+        if EVAL_DEBUG:
+            qid = kwargs.get("question_id", "?")
+            cmp = comparison
+            logger.info(
+                "\n"
+                "═══ EVAL [Q:%s] ═══════════════════════════════════════════════\n"
+                "  Question: \"%s\"\n"
+                "  Status:   %s\n"
+                "  Genie SQL:\n"
+                "    %s\n"
+                "  GT SQL:\n"
+                "    %s\n"
+                "  Comparison: match=%s | type=%s | gt_rows=%s | genie_rows=%s\n"
+                "              gt_hash=%s | genie_hash=%s\n"
+                "  Error:      %s\n"
+                "═══════════════════════════════════════════════════════════════",
+                qid,
+                question,
+                output["status"],
+                genie_sql or "(none)",
+                gt_sql or "(none)",
+                cmp.get("match"),
+                cmp.get("match_type", "n/a"),
+                cmp.get("gt_rows", "?"),
+                cmp.get("genie_rows", "?"),
+                cmp.get("gt_hash", "n/a"),
+                cmp.get("genie_hash", "n/a"),
+                cmp.get("error") or "(none)",
+            )
+
+        return output
 
     return genie_predict_fn
 
@@ -1534,6 +1638,141 @@ def _drop_benchmark_table(spark: SparkSession, uc_table_name: str) -> None:
         logger.warning("Could not drop benchmark table %s (may not exist)", uc_table_name, exc_info=True)
 
 
+_JUDGE_ORDER = [
+    "syntax_validity", "schema_accuracy", "logical_accuracy",
+    "semantic_equivalence", "completeness", "asset_routing",
+    "result_correctness", "arbiter",
+]
+
+
+def _print_eval_summary(
+    rows: list[dict],
+    scores_100: dict[str, float],
+    thresholds_passed: bool,
+    failure_ids: list[str],
+    iteration: int,
+    eval_scope: str,
+    total_questions: int,
+) -> None:
+    """Print a nicely formatted per-question evaluation summary to stdout."""
+    lines: list[str] = []
+    lines.append("")
+    header = (
+        f"  EVALUATION SUMMARY — Iteration {iteration} | "
+        f"Scope: {eval_scope} | Questions: {total_questions}"
+    )
+    width = max(len(header) + 4, 78)
+    lines.append("=" * width)
+    lines.append(header)
+    lines.append("=" * width)
+
+    for qi, row in enumerate(rows, 1):
+        qid = (
+            row.get("inputs/question_id")
+            or (row.get("inputs") or {}).get("question_id", "")
+            or f"q{qi}"
+        )
+        question = (
+            row.get("inputs/question")
+            or (row.get("inputs") or {}).get("question", "")
+        )
+        genie_sql = (
+            row.get("outputs/response")
+            or (row.get("outputs") or {}).get("response", "")
+            or "(none)"
+        )
+        status = (
+            row.get("outputs/status")
+            or (row.get("outputs") or {}).get("status", "?")
+        )
+        gt_sql = (
+            row.get("expectations/expected_response")
+            or (row.get("expectations") or {}).get("expected_response", "")
+            or "(none)"
+        )
+
+        cmp = (row.get("outputs") or {}).get("comparison", {})
+        if not cmp:
+            cmp_raw = row.get("outputs/comparison", {})
+            cmp = cmp_raw if isinstance(cmp_raw, dict) else {}
+
+        match_str = "YES" if cmp.get("match") else "NO"
+        match_type = cmp.get("match_type", "n/a")
+
+        lines.append("")
+        lines.append(f"--- Q{qi}: {qid} " + "-" * max(0, width - len(f"--- Q{qi}: {qid} ") - 1))
+        lines.append(f"| Question:  \"{question}\"")
+        lines.append(f"|")
+        lines.append(f"| Genie SQL:")
+        lines.append(f"|   {genie_sql}")
+        lines.append(f"| Genie Status: {status}")
+        lines.append(f"|")
+        lines.append(f"| Ground Truth SQL:")
+        lines.append(f"|   {gt_sql}")
+        lines.append(f"|")
+        lines.append(
+            f"| Result Comparison: Match: {match_str} ({match_type}) | "
+            f"GT rows: {cmp.get('gt_rows', '?')} | Genie rows: {cmp.get('genie_rows', '?')}"
+        )
+        if cmp.get("gt_hash") or cmp.get("genie_hash"):
+            lines.append(
+                f"|   GT hash: {cmp.get('gt_hash', 'n/a')} | "
+                f"Genie hash: {cmp.get('genie_hash', 'n/a')}"
+            )
+        if cmp.get("error"):
+            lines.append(f"|   Error: {cmp['error']}")
+        lines.append(f"|")
+        lines.append(f"| Judge Verdicts:")
+
+        for judge in _JUDGE_ORDER:
+            val = row.get(f"{judge}/value", row.get(judge, ""))
+            val_str = str(val) if val else "n/a"
+            rationale = row.get(f"{judge}/rationale", "")
+            if isinstance(rationale, str) and rationale:
+                short_rat = rationale.split("\n")[0][:120]
+            else:
+                short_rat = ""
+
+            if val_str.lower() in ("yes", "true", "1", "1.0", "skipped"):
+                verdict_label = "PASS" if val_str.lower() != "skipped" else val_str
+            elif val_str.lower() in ("no", "false", "0", "0.0"):
+                verdict_label = "FAIL"
+            elif val_str in ("genie_correct", "both_correct"):
+                verdict_label = val_str
+            elif val_str in ("ground_truth_correct", "neither_correct"):
+                verdict_label = val_str
+            else:
+                verdict_label = val_str or "n/a"
+
+            rat_suffix = f"  -- {short_rat}" if short_rat and verdict_label not in ("PASS", "n/a") else ""
+            lines.append(f"|   {judge:<24s} {verdict_label}{rat_suffix}")
+
+        lines.append("-" * width)
+
+    lines.append("")
+    lines.append("--- SCORE SUMMARY " + "-" * max(0, width - 19))
+    for judge in _JUDGE_ORDER:
+        score = scores_100.get(judge)
+        if score is None:
+            continue
+        threshold = DEFAULT_THRESHOLDS.get(judge, 0.0)
+        passed = score >= threshold
+        marker = "" if passed else "  <<<"
+        lines.append(
+            f"|   {judge:<24s} {score:6.1f}  (threshold: {threshold:.1f})  "
+            f"{'PASS' if passed else 'FAIL'}{marker}"
+        )
+    overall = scores_100.get("result_correctness", 0.0)
+    lines.append(f"|")
+    lines.append(f"|   Overall accuracy: {overall:.1f}%")
+    lines.append(f"|   Thresholds met: {'YES' if thresholds_passed else 'NO'}")
+    if failure_ids:
+        lines.append(f"|   Failed questions: {failure_ids}")
+    lines.append("-" * width)
+
+    print("\n".join(lines))
+
+
 def run_evaluation(
     space_id: str,
     experiment_name: str,
@@ -1552,6 +1791,7 @@ def run_evaluation(
     warehouse_id: str = "",
     patched_objects: list[str] | None = None,
     reference_sqls: dict[str, str] | None = None,
+    metric_view_names: set[str] | None = None,
 ) -> dict:
     """Run ``mlflow.genai.evaluate()`` and return structured results.
 
@@ -1592,6 +1832,7 @@ def run_evaluation(
                 catalog=catalog,
                 gold_schema=gold_schema,
                 known_functions=known_functions,
+                metric_view_names=metric_view_names,
             )
         else:
             filtered = list(scope_filtered)
@@ -1785,9 +2026,10 @@ def run_evaluation(
             "neither_correct": 0,
             "skipped": 0,
         }
+        arbiter_actions: list[dict[str, str]] = []
         rows_for_output: list[dict] = []
 
-        _STRIP_COLS = {"trace", "trace_id"}
+        _STRIP_COLS = {"trace", "trace_id", "assessments", "spans", "trace_metadata"}
         if hasattr(eval_result, "tables") and "eval_results" in eval_result.tables:
             results_df = eval_result.tables["eval_results"]
 
@@ -1831,6 +2073,22 @@ def run_evaluation(
                     arbiter_verdicts[av] += 1
                 else:
                     arbiter_verdicts["skipped"] += 1
+
+                if av == "genie_correct":
+                    _gc_sql = (
+                        row.get("outputs/response")
+                        or (row.get("outputs") or {}).get("response", "")
+                    )
+                    _gc_question = (
+                        row.get("inputs/question")
+                        or (row.get("inputs") or {}).get("question", "")
+                    )
+                    if _gc_sql and _gc_question:
+                        arbiter_actions.append({
+                            "question": str(_gc_question),
+                            "new_expected_sql": str(_gc_sql),
+                            "verdict": "genie_correct",
+                        })
 
         question_failure_artifacts: list[dict[str, Any]] = []
         for row in rows_for_output:
@@ -1942,7 +2200,7 @@ def run_evaluation(
             "failure_question_ids": failure_ids,
             "remaining_failures": failure_ids,
             "arbiter_verdicts": arbiter_verdicts,
-            "arbiter_actions": [],
+            "arbiter_actions": arbiter_actions,
             "model_id": model_id,
             "rows": rows_for_output,
             "invalid_benchmark_count": precheck_counts["invalid_benchmark_count"],
@@ -1958,6 +2216,13 @@ def run_evaluation(
         output["overall_accuracy"],
         "PASS" if thresholds_passed else "FAIL",
     )
+
+    if EVAL_DEBUG:
+        _print_eval_summary(
+            rows_for_output, scores_100, thresholds_passed,
+            failure_ids, iteration, eval_scope, len(filtered),
+        )
+
     return output
 
 
@@ -2090,7 +2355,7 @@ def run_repeatability_evaluation(
         repeatability_pct = repeatability_raw * 100 if repeatability_raw <= 1.0 else repeatability_raw
 
         rows_for_output: list[dict] = []
-        _STRIP_COLS_REP = {"trace", "trace_id"}
+        _STRIP_COLS_REP = {"trace", "trace_id", "assessments", "spans", "trace_metadata"}
         if hasattr(eval_result, "tables") and "eval_results" in eval_result.tables:
             rep_df = eval_result.tables["eval_results"]
             rep_assessment_map = _extract_assessments_from_traces(rep_df)
@@ -2683,6 +2948,7 @@ def generate_benchmarks(
     spark: SparkSession,
     target_count: int = TARGET_BENCHMARK_COUNT,
     genie_space_benchmarks: list[dict] | None = None,
+    existing_benchmarks: list[dict] | None = None,
 ) -> list[dict]:
     """Generate benchmark questions via LLM from Genie Space context.
 
@@ -2696,10 +2962,18 @@ def generate_benchmarks(
       7. Validate each expected_sql via EXPLAIN + table existence check
       8. Send remaining invalid benchmarks to correction LLM (bounded retries)
       9. Persist provenance + validation metadata per benchmark record
+
+    Args:
+        existing_benchmarks: Previously validated benchmarks to keep. When
+            provided, these are carried forward and the generation targets
+            only the gap (``target_count - len(existing_benchmarks)``).
     """
     curated = genie_space_benchmarks or []
+    _existing = existing_benchmarks or []
     curated_questions = {b.get("question", "").lower().strip() for b in curated}
-    synthetic_target = max(target_count - len(curated), 5)
+    existing_questions = {b.get("question", "").lower().strip() for b in _existing}
+    curated_questions |= existing_questions
+    synthetic_target = max(target_count - len(curated) - len(_existing), 5)
     allowlist = _build_metadata_allowlist(
         config=config,
         uc_columns=uc_columns,
@@ -2718,11 +2992,12 @@ def generate_benchmarks(
 
     ctx = _build_schema_contexts(config, uc_columns, uc_routines)
 
+    all_existing = list(curated) + list(_existing)
     existing_questions_context = ""
-    if curated:
+    if all_existing:
         existing_questions_context = (
             "\n\n## Already Covered Questions (do NOT duplicate these)\n"
-            + "\n".join(f"- {b.get('question', '')}" for b in curated)
+            + "\n".join(f"- {b.get('question', '')}" for b in all_existing)
         )
 
     prompt = BENCHMARK_GENERATION_PROMPT.format(
@@ -2938,7 +3213,7 @@ def generate_benchmarks(
             [b.get("question", "")[:50] for b in invalid_benchmarks[:3]],
         )
 
-    all_benchmarks: list[dict] = []
+    all_benchmarks: list[dict] = list(_existing)
 
     for idx, b in enumerate(curated):
         question_id = f"{domain}_gs_{idx + 1:03d}"

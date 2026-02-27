@@ -35,7 +35,7 @@
 # MAGIC   └──────┬──────┘
 # MAGIC          │ taskValues: run_id, space_id, catalog, schema, domain, experiment_name,
 # MAGIC          │             experiment_id, model_id, benchmark_count, max_iterations,
-# MAGIC          │             levers, apply_mode, deploy_target
+# MAGIC          │             levers, apply_mode, deploy_target, triggered_by
 # MAGIC          ▼
 # MAGIC   ┌─────────────┐
 # MAGIC   │  baseline   │  Task 2: Run full evaluation on iteration 0
@@ -137,6 +137,7 @@ def _log(event: str, **payload) -> None:
 # MAGIC | `levers` | text | `"[1,2,3,4,5]"` | JSON array of lever numbers to try |
 # MAGIC | `apply_mode` | text | `"genie_config"` | Where patches apply: `genie_config` \| `uc_artifact` \| `both` |
 # MAGIC | `deploy_target` | text | `""` | DABs target for post-optimization deploy (optional) |
+# MAGIC | `triggered_by` | text | `""` | Identity or context of who/what triggered the run (e.g. user email, app backend) |
 # MAGIC
 # MAGIC **Validation:** Empty `run_id`, `space_id`, `catalog`, or `schema` will cause downstream failures. The harness does not validate here; failures surface during `_run_preflight`.
 
@@ -229,7 +230,7 @@ _log("State tables verified", catalog=catalog, schema=schema)
 # MAGIC 2. **UC metadata** — `get_columns`, `get_tags`, `get_routines` for `catalog.schema`. Best-effort; continues if some fail (e.g. limited permissions).
 # MAGIC 3. **Experiment resolution** — Pick MLflow experiment path from `triggered_by` or `/Shared/genie-optimization/{domain}`.
 # MAGIC 4. **Benchmarks** — Load from UC evaluation dataset if ≥5 exist; otherwise LLM-generated via `generate_benchmarks`.
-# MAGIC 5. **Benchmark validation** — `validate_benchmarks` runs `EXPLAIN` on each query; invalid ones are discarded.
+# MAGIC 5. **Benchmark validation** — Initial SQL validation via `EXPLAIN`; invalid benchmarks are discarded. Note: the primary quarantine path (SQL/routine gating) now also runs inside `run_evaluation()` itself, shared across all eval scopes (baseline, slice, P0, full).
 # MAGIC 6. **Evaluation dataset** — `create_evaluation_dataset` syncs benchmarks to MLflow.
 # MAGIC 7. **Judge prompts** — `register_judge_prompts` registers prompts for ASI judges (idempotent).
 # MAGIC 8. **Model creation** — `create_genie_model_version` creates iteration 0 LoggedModel with config + UC metadata.
@@ -280,6 +281,7 @@ except Exception as exc:
 # MAGIC | `experiment_name`, `experiment_id`, `model_id` | baseline, lever_loop, finalize |
 # MAGIC | `benchmark_count` | baseline (validates benchmark load) |
 # MAGIC | `max_iterations`, `levers`, `apply_mode`, `deploy_target` | lever_loop, finalize, deploy |
+# MAGIC | `triggered_by` | lever_loop (for context/audit) |
 
 # COMMAND ----------
 
