@@ -139,7 +139,7 @@ Click **Optimize** to kick off the pipeline. This submits a multi-task Databrick
 | Stage | Duration | What Happens |
 |-------|----------|-------------|
 | Preflight | ~1 min | Validates config, collects UC metadata |
-| Baseline Eval | ~5-15 min | Generates 20 benchmark questions, runs through Genie, scores with 8 LLM judges |
+| Baseline Eval | ~5-15 min | Generates 20 benchmark questions, runs through Genie, scores with 9 LLM judges |
 | Lever Loop | ~10-30 min | Iterates through 6 optimization levers (up to 5 iterations each) |
 | Finalize | ~5-10 min | Repeatability testing, final scoring, report generation |
 | Deploy | ~1 min | (Optional) Deploys optimized config to version control |
@@ -172,7 +172,27 @@ When the pipeline completes (status: `CONVERGED`, `STALLED`, or `MAX_ITERATIONS`
 
 ---
 
-## 7. Local Development
+## 7. Programmatic API (Headless Trigger)
+
+You can trigger optimization runs programmatically without the UI, using the `/trigger` endpoint:
+
+```bash
+# Trigger optimization
+curl -X POST https://<app-url>/api/genie/trigger \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"space_id": "<genie-space-id>"}'
+
+# Poll status
+curl https://<app-url>/api/genie/trigger/status/<run_id> \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+This is useful for CI/CD pipelines or scheduled optimization workflows.
+
+---
+
+## 8. Local Development
 
 For making changes to the app itself:
 
@@ -209,7 +229,7 @@ apx dev stop
 
 ---
 
-## 8. Key Configuration Knobs
+## 9. Key Configuration Knobs
 
 All tunable parameters are in `src/genie_space_optimizer/common/config.py`:
 
@@ -287,7 +307,7 @@ The preflight stage now uses the Unity Catalog **REST API** by default to fetch 
 
 ### Evaluation takes a long time
 
-Each benchmark question requires a round-trip to the Genie API (with rate limiting at 12s intervals) plus LLM judge evaluation. For 20 questions with 8 judges, expect ~15 minutes for a full evaluation pass. You can reduce `TARGET_BENCHMARK_COUNT` in `config.py` for faster iteration during testing.
+Each benchmark question requires a round-trip to the Genie API (with rate limiting and exponential backoff on 429 rate limits) plus LLM judge evaluation. For 20 questions with 9 judges, expect ~15 minutes for a full evaluation pass. You can reduce `TARGET_BENCHMARK_COUNT` in `config.py` for faster iteration during testing.
 
 ### Score didn't improve
 

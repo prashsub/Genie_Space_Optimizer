@@ -14,6 +14,7 @@ from .routes import spaces as _spaces  # noqa: F401
 from .routes import runs as _runs  # noqa: F401
 from .routes import activity as _activity  # noqa: F401
 from .routes import settings as _settings  # noqa: F401
+from .routes import trigger as _trigger  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from genie_space_optimizer.optimization.evaluation import (
+    _compute_arbiter_adjusted_accuracy,
     all_thresholds_met,
     normalize_result_df,
     normalize_scores,
@@ -50,6 +51,7 @@ class TestAllThresholdsMet:
             "logical_accuracy": 91.0,
             "semantic_equivalence": 91.0,
             "completeness": 91.0,
+            "response_quality": 50.0,
             "result_correctness": 86.0,
             "asset_routing": 96.0,
         }
@@ -62,6 +64,7 @@ class TestAllThresholdsMet:
             "logical_accuracy": 91.0,
             "semantic_equivalence": 91.0,
             "completeness": 91.0,
+            "response_quality": 50.0,
             "result_correctness": 80.0,  # below 85
             "asset_routing": 96.0,
         }
@@ -81,8 +84,10 @@ class TestAllThresholdsMet:
 
 
 class TestNormalizeResultDf:
-    def test_none_returns_none(self):
-        assert normalize_result_df(None) is None
+    def test_none_returns_empty_df(self):
+        result = normalize_result_df(None)
+        assert isinstance(result, pd.DataFrame)
+        assert result.empty
 
     def test_empty_df_returns_empty(self):
         df = pd.DataFrame()
@@ -143,3 +148,149 @@ class TestResultSignature:
         df1 = pd.DataFrame({"x": [10]})
         df2 = pd.DataFrame({"y": [10]})
         assert result_signature(df1)["schema_hash"] != result_signature(df2)["schema_hash"]
+
+
+class TestComputeArbiterAdjustedAccuracy:
+    """Tests for arbiter-adjusted overall accuracy computation."""
+
+    def test_empty_rows(self):
+        accuracy, correct, failures, _excluded = _compute_arbiter_adjusted_accuracy([])
+        assert accuracy == 0.0
+        assert correct == 0
+        assert failures == []
+
+    def test_all_correct(self):
+        rows = [
+            {"result_correctness/value": "yes", "arbiter/value": "skipped",
+             "inputs/question_id": "q1"},
+            {"result_correctness/value": "yes", "arbiter/value": "skipped",
+             "inputs/question_id": "q2"},
+        ]
+        accuracy, correct, failures, _excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert accuracy == 100.0
+        assert correct == 2
+        assert failures == []
+
+    def test_all_failed(self):
+        rows = [
+            {"result_correctness/value": "no", "arbiter/value": "ground_truth_correct",
+             "inputs/question_id": "q1"},
+            {"result_correctness/value": "no", "arbiter/value": "neither_correct",
+             "inputs/question_id": "q2"},
+        ]
+        accuracy, correct, failures, _excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert accuracy == 0.0
+        assert correct == 0
+        assert set(failures) == {"q1", "q2"}
+
+    def test_arbiter_genie_correct_overrides_failure(self):
+        """result_correctness=no but arbiter=genie_correct → counted as correct."""
+        rows = [
+            {"result_correctness/value": "yes", "arbiter/value": "skipped",
+             "inputs/question_id": "q1"},
+            {"result_correctness/value": "no", "arbiter/value": "genie_correct",
+             "inputs/question_id": "q2"},
+            {"result_correctness/value": "no", "arbiter/value": "ground_truth_correct",
+             "inputs/question_id": "q3"},
+        ]
+        accuracy, correct, failures, _excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert correct == 2
+        assert accuracy == pytest.approx(66.67, abs=0.01)
+        assert failures == ["q3"]
+
+    def test_arbiter_both_correct_overrides_failure(self):
+        """result_correctness=no but arbiter=both_correct → counted as correct."""
+        rows = [
+            {"result_correctness/value": "no", "arbiter/value": "both_correct",
+             "inputs/question_id": "q1"},
+            {"result_correctness/value": "no", "arbiter/value": "ground_truth_correct",
+             "inputs/question_id": "q2"},
+        ]
+        accuracy, correct, failures, _excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert correct == 1
+        assert accuracy == 50.0
+        assert failures == ["q2"]
+
+    def test_rc_no_arbiter_skipped_is_failure(self):
+        """result_correctness=no + arbiter=skipped → failure."""
+        rows = [
+            {"result_correctness/value": "no", "arbiter/value": "skipped",
+             "inputs/question_id": "q1"},
+        ]
+        accuracy, correct, failures, _excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert correct == 0
+        assert accuracy == 0.0
+        assert failures == ["q1"]
+
+    def test_mixed_scenario(self):
+        """Realistic mix of verdicts."""
+        rows = [
+            {"result_correctness/value": "yes", "arbiter/value": "skipped",
+             "inputs/question_id": "q1"},
+            {"result_correctness/value": "yes", "arbiter/value": "skipped",
+             "inputs/question_id": "q2"},
+            {"result_correctness/value": "no", "arbiter/value": "genie_correct",
+             "inputs/question_id": "q3"},
+            {"result_correctness/value": "no", "arbiter/value": "both_correct",
+             "inputs/question_id": "q4"},
+            {"result_correctness/value": "no", "arbiter/value": "ground_truth_correct",
+             "inputs/question_id": "q5"},
+            {"result_correctness/value": "no", "arbiter/value": "neither_correct",
+             "inputs/question_id": "q6"},
+        ]
+        accuracy, correct, failures, _excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert correct == 4
+        assert accuracy == pytest.approx(66.67, abs=0.01)
+        assert set(failures) == {"q5", "q6"}
+
+    def test_excluded_rows_not_in_denominator(self):
+        """Excluded rows are removed from the denominator."""
+        rows = [
+            {"result_correctness/value": "yes", "arbiter/value": "skipped",
+             "inputs/question_id": "q1"},
+            {"result_correctness/value": "yes", "arbiter/value": "skipped",
+             "inputs/question_id": "q2"},
+            {"result_correctness/value": "no", "arbiter/value": "ground_truth_correct",
+             "inputs/question_id": "q3"},
+            {"result_correctness/value": "excluded", "arbiter/value": "skipped",
+             "inputs/question_id": "q4"},
+        ]
+        accuracy, correct, failures, excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert excluded == 1
+        assert correct == 2
+        assert accuracy == pytest.approx(66.67, abs=0.01)
+        assert failures == ["q3"]
+
+    def test_all_excluded_returns_zero(self):
+        """All rows excluded → 0% accuracy, no failures."""
+        rows = [
+            {"result_correctness/value": "excluded", "arbiter/value": "skipped",
+             "inputs/question_id": "q1"},
+            {"result_correctness/value": "excluded", "arbiter/value": "skipped",
+             "inputs/question_id": "q2"},
+        ]
+        accuracy, correct, failures, excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert excluded == 2
+        assert correct == 0
+        assert accuracy == 0.0
+        assert failures == []
+
+    def test_mixed_with_exclusions(self):
+        """Realistic mix including exclusions."""
+        rows = [
+            {"result_correctness/value": "yes", "arbiter/value": "skipped",
+             "inputs/question_id": "q1"},
+            {"result_correctness/value": "excluded", "arbiter/value": "skipped",
+             "inputs/question_id": "q2"},
+            {"result_correctness/value": "no", "arbiter/value": "genie_correct",
+             "inputs/question_id": "q3"},
+            {"result_correctness/value": "excluded", "arbiter/value": "skipped",
+             "inputs/question_id": "q4"},
+            {"result_correctness/value": "no", "arbiter/value": "ground_truth_correct",
+             "inputs/question_id": "q5"},
+        ]
+        accuracy, correct, failures, excluded = _compute_arbiter_adjusted_accuracy(rows)
+        assert excluded == 2
+        assert correct == 2
+        assert accuracy == pytest.approx(66.67, abs=0.01)
+        assert failures == ["q5"]

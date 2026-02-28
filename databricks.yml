@@ -13,9 +13,6 @@ variables:
   deploy_profile:
     default: "genie-test"
 
-include:
-  - resources/genie_optimization_job.yml
-
 sync:
   include:
     - .build

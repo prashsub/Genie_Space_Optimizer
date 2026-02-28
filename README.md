@@ -19,7 +19,7 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 │  │ Analysis │   │ Eval     │   │  Loop    │   │ & Report │       │
 │  └──────────┘   └──────────┘   └──────────┘   └──────────┘       │
 │       │              │              │               │              │
-│  Config scan    8 LLM judges   6 levers ×5     Repeatability      │
+│  Config scan    9 LLM judges   6 levers ×5     Repeatability      │
 │  UC metadata    20 benchmarks  iterations       Final scores       │
 │  Validation     7 dimensions   Auto-rollback    Deploy (opt.)      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -28,8 +28,8 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 ### Optimization Pipeline (5 Steps)
 
 1. **Configuration Analysis** -- Scans the Genie Space config, counts tables/instructions/sample questions, and validates structure.
-2. **Metadata Collection** -- Queries Unity Catalog `information_schema` for columns, data types, tags, routines, and table descriptions.
-3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM, runs them through Genie, and scores responses across 7 quality dimensions using 8 LLM judges.
+2. **Metadata Collection** -- Queries Unity Catalog via REST API (with Spark SQL fallback) for columns, data types, tags, routines, and table descriptions.
+3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges.
 4. **Configuration Generation (Lever Loop)** -- Iterates through 6 optimization levers (up to 5 iterations), applying targeted patches. Each patch is evaluated; regressions trigger automatic rollback.
 5. **Optimized Evaluation & Repeatability** -- Final evaluation of the optimized config, including repeatability testing to ensure consistent results.
 
@@ -56,7 +56,7 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 | Result Correctness | 85% | Correct final result values |
 | Asset Routing | 95% | Correct asset type (table, metric view, TVF) selected |
 
-Plus **Repeatability** (variance detection across repeated runs) and an **Arbiter** (tiebreaker judge for conflicting scorer verdicts).
+Plus **Response Quality** (LLM analysis accuracy), **Repeatability** (variance detection across repeated runs), and an **Arbiter** (tiebreaker judge for conflicting scorer verdicts).
 
 ---
 
@@ -83,7 +83,6 @@ Genie_Space_Optimizer/
 ├── databricks.yml                    # Databricks Asset Bundle definition
 ├── app.yml                           # Databricks App entry point (uvicorn)
 ├── resources/
-│   ├── genie_optimization_job.yml    # Multi-task job definition (5 tasks)
 │   └── grant_app_uc_permissions.py   # Script to grant app SP access to UC schemas
 ├── docs/                             # Reference documentation & config samples
 │
@@ -106,7 +105,8 @@ Genie_Space_Optimizer/
 │   │       ├── spaces.py             # GET /spaces, GET /spaces/{id}, POST /spaces/{id}/optimize
 │   │       ├── runs.py               # GET /runs/{id}, GET /runs/{id}/comparison, POST apply/discard
 │   │       ├── activity.py           # GET /activity (recent runs feed)
-│   │       └── settings.py           # GET/POST/DELETE /settings/data-access (UC permissions)
+│   │       ├── settings.py           # GET/POST/DELETE /settings/data-access (UC permissions)
+│   │       └── trigger.py            # POST /trigger, GET /trigger/status (programmatic API)
 │   │
 │   ├── ui/                           # React + Vite frontend
 │   │   ├── main.tsx                  # React entry point
@@ -132,13 +132,13 @@ Genie_Space_Optimizer/
 │   ├── common/                       # Shared utilities
 │   │   ├── config.py                 # All constants (thresholds, prompts, taxonomy)
 │   │   ├── genie_client.py           # Genie Space API wrapper (list, fetch, patch, query, result DFs)
-│   │   ├── genie_schema.py           # Genie Space config schema validation
+│   │   ├── genie_schema.py           # Genie Space config schema validation (lenient + strict modes)
 │   │   ├── uc_metadata.py            # Unity Catalog introspection (REST API + Spark SQL fallback)
 │   │   └── delta_helpers.py          # Delta table read/write operations
 │   │
 │   ├── optimization/                 # Core optimization engine
 │   │   ├── optimizer.py              # Failure analysis → proposal generation → patch application
-│   │   ├── evaluation.py             # Benchmark generation, 9-judge scoring, MLflow tracking
+│   │   ├── evaluation.py             # Benchmark generation, 9-judge scoring, robust JSON parsing, MLflow tracking
 │   │   ├── applier.py                # Patch application & rollback
 │   │   ├── harness.py                # Full pipeline orchestration
 │   │   ├── preflight.py              # Pre-flight validation
@@ -147,12 +147,13 @@ Genie_Space_Optimizer/
 │   │   ├── repeatability.py          # Repeatability testing & variance classification
 │   │   ├── report.py                 # Run report generation
 │   │   ├── models.py                 # Internal data models
-│   │   └── scorers/                  # 9 quality scorers
+│   │   └── scorers/                  # 10 quality scorers
 │   │       ├── syntax_validity.py
 │   │       ├── schema_accuracy.py
 │   │       ├── logical_accuracy.py
 │   │       ├── semantic_equivalence.py
 │   │       ├── completeness.py
+│   │       ├── response_quality.py   # NL analysis accuracy judge
 │   │       ├── result_correctness.py
 │   │       ├── asset_routing.py
 │   │       ├── repeatability.py      # Variance detection across repeated runs
@@ -187,6 +188,8 @@ All endpoints are prefixed with `/api/genie`.
 | `GET` | `/settings/data-access` | `getDataAccess` | List UC data-access grants and auto-detected schemas |
 | `POST` | `/settings/data-access` | `grantDataAccess` | Grant app service principal access to a UC schema |
 | `DELETE` | `/settings/data-access/{grant_id}` | `revokeDataAccess` | Revoke a UC data-access grant |
+| `POST` | `/trigger` | `triggerOptimization` | Trigger optimization programmatically (headless API) |
+| `GET` | `/trigger/status/{run_id}` | `getTriggerStatus` | Poll status of a triggered optimization run |
 | `GET` | `/version` | `getVersion` | App version |
 | `GET` | `/current-user` | `getCurrentUser` | Authenticated user info |
 
@@ -215,8 +218,7 @@ The `databricks.yml` bundle provisions:
 - **Databricks App** -- Serves the full-stack web application with OBO (on-behalf-of) user authentication
 - **PostgreSQL Database** (Lakebase) -- `CU_1` capacity instance
 - **SQL Warehouse** -- For statement execution and UC metadata queries
-- **Multi-task Job** (`genie_optimization_job`) -- 5-task pipeline with conditional execution and auto-retry
-- **Standalone Evaluation Job** (`genie_evaluation_job`) -- Triggered by optimization tasks for isolated evaluation
+- **Optimization Job** -- Triggered on-demand via UI or `/trigger` API; runs preflight → baseline → lever loop → finalize pipeline
 
 ### Required API Scopes
 

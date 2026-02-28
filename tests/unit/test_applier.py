@@ -354,7 +354,7 @@ class TestAutoApplyPromptMatching:
                 "column_configs": [
                     {"column_name": "order_id"},
                     {"column_name": "status"},
-                    {"column_name": "amount", "get_example_values": True},
+                    {"column_name": "amount", "enable_format_assistance": True},
                 ],
             }],
             uc_columns=[
@@ -456,7 +456,7 @@ class TestAutoApplyPromptMatching:
             tables=[{
                 "identifier": "cat.sch.t",
                 "column_configs": [
-                    {"column_name": "c1", "get_example_values": True, "build_value_dictionary": True},
+                    {"column_name": "c1", "enable_format_assistance": True, "enable_entity_matching": True},
                 ],
             }],
             uc_columns=[

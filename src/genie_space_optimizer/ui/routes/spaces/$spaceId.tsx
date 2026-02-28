@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import {
   useGetSpaceDetailSuspense,
-  useStartOptimization,
+  useTriggerOptimization,
 } from "@/lib/api";
 import selector from "@/lib/selector";
 import { Button } from "@/components/ui/button";
@@ -69,7 +69,7 @@ function SpaceDetail() {
     params: { space_id: spaceId },
     ...selector(),
   });
-  const startOpt = useStartOptimization();
+  const triggerOpt = useTriggerOptimization();
   const [applyMode, setApplyMode] = useState<"genie_config" | "both">(
     "genie_config",
   );
@@ -104,17 +104,15 @@ function SpaceDetail() {
   )?.runId;
 
   function handleOptimize() {
-    startOpt.mutate(
+    triggerOpt.mutate(
       {
-        params: {
-          space_id: spaceId,
-          apply_mode: applyMode,
-        },
+        params: {},
+        data: { space_id: spaceId, apply_mode: applyMode },
       },
       {
         onSuccess: (res) => {
-          const runId = res.data?.runId ?? (res as { runId?: string }).runId;
-          const jobUrl = res.data?.jobUrl ?? (res as { jobUrl?: string }).jobUrl;
+          const runId = res.data?.runId;
+          const jobUrl = res.data?.jobUrl;
           if (runId) {
             if (jobUrl) {
               toast.success("Optimization started", {
@@ -187,12 +185,12 @@ function SpaceDetail() {
           <div>
             <Button
               onClick={handleOptimize}
-              disabled={startOpt.isPending || hasActiveRun}
+              disabled={triggerOpt.isPending || hasActiveRun}
               className="bg-db-red hover:bg-db-red/90"
               title={hasActiveRun ? "An optimization run is already in progress" : undefined}
             >
               <Rocket className="mr-2 h-4 w-4" />
-              {startOpt.isPending
+              {triggerOpt.isPending
                 ? "Starting…"
                 : hasActiveRun
                   ? "Optimization In Progress"

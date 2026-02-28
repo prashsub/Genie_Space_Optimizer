@@ -1,5 +1,5 @@
 """
-Scorer assembly — 8 judges for Genie Space evaluation.
+Scorer assembly — 9 judges for Genie Space evaluation.
 
 Scorers that depend on runtime context (``spark``, ``WorkspaceClient``)
 expose ``_make_*`` factory functions.  Use ``make_all_scorers()`` to get
@@ -29,7 +29,7 @@ def make_all_scorers(
     schema: str,
     loaded_prompts: dict[str, str] | None = None,
 ) -> list:
-    """Assemble all 8 scorers with bound runtime context.
+    """Assemble all 9 scorers with bound runtime context.
 
     Returns an ordered list suitable for passing to
     ``mlflow.genai.evaluate(scorers=...)``.
@@ -37,6 +37,7 @@ def make_all_scorers(
     from .arbiter import _make_arbiter_scorer
     from .completeness import _make_completeness_judge
     from .logical_accuracy import _make_logical_accuracy_judge
+    from .response_quality import _make_response_quality_judge
     from .schema_accuracy import _make_schema_accuracy_judge
     from .semantic_equivalence import _make_semantic_equivalence_judge
     from .syntax_validity import _make_syntax_validity_scorer
@@ -47,6 +48,7 @@ def make_all_scorers(
         _make_logical_accuracy_judge(w, catalog, schema),
         _make_semantic_equivalence_judge(w, catalog, schema),
         _make_completeness_judge(w, catalog, schema),
+        _make_response_quality_judge(w, catalog, schema),
         asset_routing_scorer,
         result_correctness_scorer,
         _make_arbiter_scorer(w, catalog, schema, loaded_prompts),
@@ -72,4 +74,5 @@ __all__ = [
     "result_correctness_scorer",
     "make_all_scorers",
     "make_repeatability_scorers",
+    "make_response_quality_judge",
 ]

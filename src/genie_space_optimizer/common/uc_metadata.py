@@ -147,6 +147,47 @@ def get_routines_for_schemas_rest(
     return rows
 
 
+def get_tags_for_tables_rest(
+    w: "WorkspaceClient",
+    refs: list[tuple[str, str, str]],
+) -> list[dict]:
+    """Fetch table tags via the Entity Tag Assignments REST API.
+
+    Calls ``w.entity_tag_assignments.list(entity_type="tables", ...)`` per
+    table and returns dicts with keys matching the Spark
+    ``information_schema.table_tags`` output: ``catalog_name``,
+    ``schema_name``, ``table_name``, ``tag_name``, ``tag_value``.
+    """
+    rows: list[dict] = []
+    failed: list[str] = []
+    for cat, sch, tbl in refs:
+        if not (cat and sch and tbl):
+            continue
+        full_name = f"{cat}.{sch}.{tbl}"
+        try:
+            for tag in w.entity_tag_assignments.list(
+                entity_type="tables", entity_name=full_name
+            ):
+                rows.append({
+                    "catalog_name": cat,
+                    "schema_name": sch,
+                    "table_name": tbl,
+                    "tag_name": getattr(tag, "tag_key", ""),
+                    "tag_value": getattr(tag, "tag_value", "") or "",
+                })
+        except Exception as exc:
+            failed.append(f"{full_name}: {type(exc).__name__}: {exc}")
+    summary = (
+        f"[UC_METADATA] REST get_tags_for_tables_rest: "
+        f"{len(refs)} refs, {len(refs) - len(failed)} succeeded, {len(rows)} tag rows"
+    )
+    print(summary, flush=True)
+    if failed:
+        for f in failed:
+            print(f"[UC_METADATA]   FAILED: {f}", flush=True)
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Spark SQL helpers (legacy fallback)
 # ---------------------------------------------------------------------------

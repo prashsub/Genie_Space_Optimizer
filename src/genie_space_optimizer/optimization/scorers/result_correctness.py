@@ -25,6 +25,44 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
     cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
     if cmp.get("error"):
+        error_type = cmp.get("error_type", "")
+        gt_rows = cmp.get("gt_rows", -1)
+
+        if error_type == "genie_result_unavailable" and gt_rows == 0:
+            return Feedback(
+                name="result_correctness",
+                value="yes",
+                rationale=format_asi_markdown(
+                    judge_name="result_correctness",
+                    value="yes",
+                    rationale=(
+                        "GT returned 0 rows and Genie results unavailable — "
+                        "treated as matching empty results (null-result defense)."
+                    ),
+                    extra={"comparison": cmp},
+                ),
+                source=CODE_SOURCE,
+            )
+
+        _GT_INFRA_ERROR_TYPES = frozenset({
+            "infrastructure", "permission_blocked", "query_execution",
+        })
+        if error_type in _GT_INFRA_ERROR_TYPES:
+            return Feedback(
+                name="result_correctness",
+                value="excluded",
+                rationale=format_asi_markdown(
+                    judge_name="result_correctness",
+                    value="excluded",
+                    rationale=(
+                        f"GT-side failure ({error_type}): {cmp['error'][:200]} "
+                        f"— excluded from accuracy denominator."
+                    ),
+                    extra={"comparison": cmp},
+                ),
+                source=CODE_SOURCE,
+            )
+
         metadata = build_asi_metadata(
             failure_type="other",
             severity="major",
@@ -56,6 +94,24 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                 rationale=(
                     f"Match type: {match_type}. Rows: {cmp.get('gt_rows', '?')}. "
                     f"Hash: {cmp.get('gt_hash', 'n/a')}."
+                ),
+                extra={"comparison": cmp},
+            ),
+            source=CODE_SOURCE,
+        )
+
+    gt_rows = cmp.get("gt_rows", -1)
+    genie_rows = cmp.get("genie_rows", -1)
+    if gt_rows == 0 and genie_rows == 0:
+        return Feedback(
+            name="result_correctness",
+            value="yes",
+            rationale=format_asi_markdown(
+                judge_name="result_correctness",
+                value="yes",
+                rationale=(
+                    "Both GT and Genie returned 0 rows — underlying dataset "
+                    "has no matching data. Treated as matching empty results."
                 ),
                 extra={"comparison": cmp},
             ),

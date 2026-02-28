@@ -1,4 +1,4 @@
-"""Space endpoints: list, detail, and optimization trigger."""
+"""Space endpoints: list and detail."""
 
 from __future__ import annotations
 
@@ -172,7 +172,7 @@ def _fetch_uc_metadata_obo(
     catalog: str,
     schema_name: str,
     genie_table_refs: list[tuple[str, str, str]] | None = None,
-) -> dict[str, list[dict]]:
+) -> dict[str, list[dict] | None]:
     """Fetch UC metadata via OBO user's SQL permissions.
 
     If ``genie_table_refs`` is provided (from ``extract_genie_space_table_refs``),
@@ -205,7 +205,7 @@ def _fetch_uc_metadata_obo(
         ),
     }
 
-    result: dict[str, list[dict]] = {}
+    result: dict[str, list[dict] | None] = {}
     for key, statement in queries.items():
         try:
             result[key] = _sql_rows(
@@ -215,10 +215,10 @@ def _fetch_uc_metadata_obo(
             )
         except Exception as exc:
             logger.warning("OBO metadata fetch failed for %s: %s", key, exc)
-            result[key] = []
+            result[key] = None
     logger.info(
         "OBO metadata prefetch (schema fallback): %s",
-        {k: len(v) for k, v in result.items()},
+        {k: (len(v) if v is not None else "FAILED") for k, v in result.items()},
     )
     return result
 
@@ -228,7 +228,7 @@ def _fetch_uc_metadata_obo_for_tables(
     *,
     warehouse_id: str,
     refs: list[tuple[str, str, str]],
-) -> dict[str, list[dict]]:
+) -> dict[str, list[dict] | None]:
     """Fetch UC metadata scoped to specific Genie space table references."""
     from genie_space_optimizer.common.uc_metadata import get_unique_schemas
 
@@ -260,7 +260,7 @@ def _fetch_uc_metadata_obo_for_tables(
             f"WHERE routine_schema = '{sch}'"
         )
 
-    result: dict[str, list[dict]] = {}
+    result: dict[str, list[dict] | None] = {}
     query_map = {
         "uc_columns": " UNION ALL ".join(col_unions) if col_unions else None,
         "uc_tags": " UNION ALL ".join(tag_unions) if tag_unions else None,
@@ -274,10 +274,10 @@ def _fetch_uc_metadata_obo_for_tables(
             result[key] = _sql_rows(ws, warehouse_id=warehouse_id, statement=statement)
         except Exception as exc:
             logger.warning("OBO metadata fetch failed for %s (genie tables): %s", key, exc)
-            result[key] = []
+            result[key] = None
     logger.info(
         "OBO metadata prefetch (genie tables): %s",
-        {k: len(v) for k, v in result.items()},
+        {k: (len(v) if v is not None else "FAILED") for k, v in result.items()},
     )
     return result
 
@@ -577,23 +577,19 @@ def _check_sp_data_access(
     return missing
 
 
-@router.post(
-    "/spaces/{space_id}/optimize",
-    response_model=OptimizeResponse,
-    operation_id="startOptimization",
-)
-def start_optimization(
+def do_start_optimization(
     space_id: str,
-    ws: Dependencies.UserClient,
-    sp_ws: Dependencies.Client,
-    config: Dependencies.Config,
-    headers: Dependencies.Headers,
+    ws: WorkspaceClient,
+    sp_ws: WorkspaceClient,
+    config,
+    headers,
     apply_mode: str = "genie_config",
-):
-    """Create a QUEUED run in Delta and dynamically submit a serverless optimization job.
+) -> OptimizeResponse:
+    """Core optimization trigger logic shared by the UI route and the API trigger route.
 
-    Uses OBO for Genie domain inference, SP for job submission.
-    User identity comes from forwarded headers.
+    Creates a QUEUED run in Delta and dynamically submits a serverless
+    optimization job.  Uses OBO for Genie domain inference, SP for job
+    submission.  User identity comes from forwarded headers.
     """
     from genie_space_optimizer.common.genie_client import fetch_space_config
     from genie_space_optimizer.optimization.state import (
@@ -662,10 +658,6 @@ def start_optimization(
 
     genie_refs = extract_genie_space_table_refs(space_snapshot) if space_snapshot else []
 
-    # OBO prefetch first -- runs as the triggering user and is the most
-    # reliable path for fetching UC metadata the SP may not yet have
-    # grants for.  Separated from the access check so one cannot prevent
-    # the other.
     try:
         obo_uc_metadata = _fetch_uc_metadata_obo(
             ws,
@@ -674,13 +666,11 @@ def start_optimization(
             schema_name=config.schema_name,
             genie_table_refs=genie_refs or None,
         )
-        if space_snapshot and obo_uc_metadata and any(obo_uc_metadata.values()):
+        if space_snapshot and obo_uc_metadata:
             space_snapshot["_prefetched_uc_metadata"] = obo_uc_metadata
     except Exception:
         logger.warning("OBO UC metadata prefetch failed for run %s", run_id, exc_info=True)
 
-    # SP data-access check -- advisory: log a warning when grants are
-    # missing from the app ledger but never silently swallow the error.
     try:
         missing = _check_sp_data_access(spark, config.catalog, config.schema_name, genie_refs, sp_ws)
         if missing:

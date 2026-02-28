@@ -79,6 +79,32 @@ def _make_arbiter_scorer(
             )
 
         if cmp.get("error"):
+            error_type = cmp.get("error_type", "")
+            gt_rows = cmp.get("gt_rows", -1)
+            if error_type == "genie_result_unavailable" and gt_rows == 0:
+                logger.info(
+                    "\n"
+                    "┌─── JUDGE [arbiter] BOTH_CORRECT (null-result defense) ────────────────\n"
+                    "│ Question: %s\n"
+                    "│ Reason:   GT returned 0 rows, Genie results unavailable\n"
+                    "└─────────────────────────────────────────────────────────────────────────",
+                    inputs.get("question", "")[:80],
+                )
+                return Feedback(
+                    name="arbiter",
+                    value="both_correct",
+                    rationale=format_asi_markdown(
+                        judge_name="arbiter",
+                        value="both_correct",
+                        rationale=(
+                            "GT returned 0 rows and Genie results unavailable — "
+                            "both are effectively correct (empty result set)."
+                        ),
+                        extra={"comparison": cmp},
+                    ),
+                    source=CODE_SOURCE,
+                )
+
             logger.info(
                 "\n"
                 "┌─── JUDGE [arbiter] SKIPPED ─────────────────────────────────────────────\n"

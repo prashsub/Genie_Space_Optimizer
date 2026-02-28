@@ -14,10 +14,14 @@ from typing import Any, cast
 
 from databricks.sdk import WorkspaceClient
 
+from databricks.sdk.errors.platform import ResourceExhausted
+
 from .config import (
     GENIE_MAX_WAIT,
     GENIE_POLL_INITIAL,
     GENIE_POLL_MAX,
+    GENIE_RATE_LIMIT_BASE_DELAY,
+    GENIE_RATE_LIMIT_RETRIES,
     NON_EXPORTABLE_FIELDS,
 )
 
@@ -134,65 +138,90 @@ def run_genie_query(
 
     ``statement_id`` can be used with ``fetch_genie_result_df`` to retrieve
     the query results that Genie already computed (avoiding re-execution).
+
+    Retries with exponential backoff on ``ResourceExhausted`` (HTTP 429)
+    and ``TimeoutError`` from the SDK's own retry layer.
     """
-    try:
-        resp = w.genie.start_conversation(space_id=space_id, content=question)
-        conversation_id = resp.conversation_id
-        message_id = resp.message_id
+    for rate_attempt in range(GENIE_RATE_LIMIT_RETRIES + 1):
+        try:
+            resp = w.genie.start_conversation(space_id=space_id, content=question)
+            conversation_id = resp.conversation_id
+            message_id = resp.message_id
 
-        poll_interval = GENIE_POLL_INITIAL
-        start = time.time()
-        msg = None
-        status = "UNKNOWN"
+            poll_interval = GENIE_POLL_INITIAL
+            start = time.time()
+            msg = None
+            status = "UNKNOWN"
 
-        while time.time() - start < max_wait:
-            time.sleep(poll_interval)
-            msg = w.genie.get_message(
-                space_id=space_id,
-                conversation_id=conversation_id,
-                message_id=message_id,
-            )
-            status = str(msg.status) if hasattr(msg, "status") else "UNKNOWN"
-            if any(s in status for s in ["COMPLETED", "FAILED", "CANCELLED"]):
-                break
-            poll_interval = min(poll_interval + 1, GENIE_POLL_MAX)
-
-        sql = None
-        attachment_id = None
-        statement_id = None
-
-        if msg and hasattr(msg, "attachments") and msg.attachments:
-            for att in msg.attachments:
-                if hasattr(att, "query") and att.query:
-                    sql = att.query.query if hasattr(att.query, "query") else str(att.query)
-                    attachment_id = getattr(att, "id", None) or getattr(att, "attachment_id", None)
-
-        if msg and hasattr(msg, "query_result") and msg.query_result:
-            statement_id = getattr(msg.query_result, "statement_id", None)
-
-        if not statement_id and attachment_id:
-            try:
-                qr = w.genie.get_message_attachment_query_result(
+            while time.time() - start < max_wait:
+                time.sleep(poll_interval)
+                msg = w.genie.get_message(
                     space_id=space_id,
                     conversation_id=conversation_id,
                     message_id=message_id,
-                    attachment_id=attachment_id,
                 )
-                statement_id = getattr(qr, "statement_id", None)
-            except Exception:
-                logger.debug("Could not fetch attachment query result for statement_id", exc_info=True)
+                status = str(msg.status) if hasattr(msg, "status") else "UNKNOWN"
+                if any(s in status for s in ["COMPLETED", "FAILED", "CANCELLED"]):
+                    break
+                poll_interval = min(poll_interval + 1, GENIE_POLL_MAX)
 
-        return {
-            "status": status,
-            "sql": sql,
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-            "attachment_id": attachment_id,
-            "statement_id": statement_id,
-        }
-    except Exception as e:
-        logger.exception("Genie query failed for space %s", space_id)
-        return {"status": "ERROR", "sql": None, "error": str(e)}
+            sql = None
+            attachment_id = None
+            statement_id = None
+            analysis_text = None
+
+            if msg and hasattr(msg, "attachments") and msg.attachments:
+                for att in msg.attachments:
+                    if hasattr(att, "query") and att.query:
+                        sql = att.query.query if hasattr(att.query, "query") else str(att.query)
+                        attachment_id = getattr(att, "id", None) or getattr(att, "attachment_id", None)
+                    if hasattr(att, "text") and att.text:
+                        text_content = getattr(att.text, "content", None)
+                        if text_content and text_content.strip():
+                            analysis_text = text_content.strip()
+
+            if msg and hasattr(msg, "query_result") and msg.query_result:
+                statement_id = getattr(msg.query_result, "statement_id", None)
+
+            if not statement_id and attachment_id:
+                try:
+                    qr = w.genie.get_message_attachment_query_result(
+                        space_id=space_id,
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        attachment_id=attachment_id,
+                    )
+                    statement_id = getattr(qr, "statement_id", None)
+                except Exception:
+                    logger.debug("Could not fetch attachment query result for statement_id", exc_info=True)
+
+            return {
+                "status": status,
+                "sql": sql,
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "attachment_id": attachment_id,
+                "statement_id": statement_id,
+                "analysis_text": analysis_text,
+            }
+        except (ResourceExhausted, TimeoutError) as e:
+            if rate_attempt < GENIE_RATE_LIMIT_RETRIES:
+                delay = GENIE_RATE_LIMIT_BASE_DELAY * (2 ** rate_attempt)
+                logger.warning(
+                    "Genie rate-limited (attempt %d/%d), retrying in %ds: %s",
+                    rate_attempt + 1,
+                    GENIE_RATE_LIMIT_RETRIES,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+                continue
+            logger.exception("Genie query failed after %d rate-limit retries for space %s", GENIE_RATE_LIMIT_RETRIES, space_id)
+            return {"status": "ERROR", "sql": None, "error": str(e)}
+        except Exception as e:
+            logger.exception("Genie query failed for space %s", space_id)
+            return {"status": "ERROR", "sql": None, "error": str(e)}
+    return {"status": "ERROR", "sql": None, "error": "exhausted rate-limit retries"}
 
 
 def fetch_genie_result_df(w: WorkspaceClient, statement_id: str):
@@ -205,8 +234,10 @@ def fetch_genie_result_df(w: WorkspaceClient, statement_id: str):
     try:
         stmt = w.statement_execution.get_statement(statement_id)
         if stmt.result and stmt.result.data_array and stmt.manifest and stmt.manifest.schema:
-            col_names = [c.name for c in stmt.manifest.schema.columns]
-            return pd.DataFrame(stmt.result.data_array, columns=col_names)
+            cols = stmt.manifest.schema.columns
+            if cols:
+                col_names = [c.name for c in cols]
+                return pd.DataFrame(stmt.result.data_array, columns=col_names)  # type: ignore[arg-type]
         return None
     except Exception:
         logger.debug("Could not fetch statement %s results", statement_id, exc_info=True)
@@ -257,6 +288,35 @@ def sanitize_sql(sql: str) -> str:
 # ── Config Mutation ────────────────────────────────────────────────────
 
 
+def _migrate_column_configs_v1_to_v2(config: dict) -> dict:
+    """Migrate v1 column config fields to v2 and strip non-exportable column fields.
+
+    The Genie Space export API v2 renamed:
+      - ``get_example_values``    -> ``enable_format_assistance``
+      - ``build_value_dictionary`` -> ``enable_entity_matching``
+
+    Also removes ``data_type`` which is not part of the ColumnConfig proto.
+    """
+    _V1_TO_V2 = {
+        "get_example_values": "enable_format_assistance",
+        "build_value_dictionary": "enable_entity_matching",
+    }
+    _STRIP_FIELDS = {"data_type"}
+
+    ds = config.get("data_sources", {})
+    for key in ("tables", "metric_views"):
+        for tbl in ds.get(key, []):
+            for cc in tbl.get("column_configs", []):
+                for old_key, new_key in _V1_TO_V2.items():
+                    if old_key in cc:
+                        if new_key not in cc:
+                            cc[new_key] = cc[old_key]
+                        del cc[old_key]
+                for field in _STRIP_FIELDS:
+                    cc.pop(field, None)
+    return config
+
+
 def strip_non_exportable_fields(config: dict) -> dict:
     """Remove read-only server-managed fields before PATCH requests.
 
@@ -264,14 +324,18 @@ def strip_non_exportable_fields(config: dict) -> dict:
     metadata fields that are NOT part of the ``GenieSpaceExport`` protobuf.
     Including them in the PATCH payload causes ``InvalidParameterValue``.
     """
-    return {k: v for k, v in config.items() if k not in NON_EXPORTABLE_FIELDS}
+    cleaned = {k: v for k, v in config.items() if k not in NON_EXPORTABLE_FIELDS}
+    return _migrate_column_configs_v1_to_v2(cleaned)
 
 
 def sort_genie_config(config: dict) -> dict:
-    """Sort arrays in a Genie config for deterministic comparison.
+    """Sort all arrays in a Genie config to satisfy API sort requirements.
 
-    The Genie API rejects unsorted data in certain array fields.
+    The Genie API rejects unsorted data. Each collection must be sorted
+    by the key documented at:
+    https://docs.databricks.com/aws/en/genie/conversation-api#sorting-requirements
     """
+    # ── data_sources.tables / metric_views  (by identifier) ──────
     if "data_sources" in config:
         for key in ["tables", "metric_views"]:
             if key in config["data_sources"]:
@@ -279,18 +343,53 @@ def sort_genie_config(config: dict) -> dict:
                     config["data_sources"][key],
                     key=lambda x: x.get("identifier", ""),
                 )
+                for tbl in config["data_sources"][key]:
+                    if "column_configs" in tbl and tbl["column_configs"]:
+                        tbl["column_configs"] = sorted(
+                            tbl["column_configs"],
+                            key=lambda x: x.get("column_name", ""),
+                        )
+
+    # ── config.sample_questions  (by id) ─────────────────────────
+    if "config" in config:
+        sqs = config["config"].get("sample_questions")
+        if sqs:
+            config["config"]["sample_questions"] = sorted(
+                sqs, key=lambda x: x.get("id", "")
+            )
+
+    # ── instructions ─────────────────────────────────────────────
     if "instructions" in config:
-        if "sql_functions" in config["instructions"]:
-            config["instructions"]["sql_functions"] = sorted(
-                config["instructions"]["sql_functions"],
+        inst = config["instructions"]
+
+        if "sql_functions" in inst:
+            inst["sql_functions"] = sorted(
+                inst["sql_functions"],
                 key=lambda x: (x.get("id", ""), x.get("identifier", "")),
             )
-        for key in ["text_instructions", "example_question_sqls"]:
-            if key in config["instructions"]:
-                config["instructions"][key] = sorted(
-                    config["instructions"][key],
-                    key=lambda x: x.get("id", ""),
-                )
+        for key in ["text_instructions", "example_question_sqls", "join_specs"]:
+            if key in inst:
+                inst[key] = sorted(inst[key], key=lambda x: x.get("id", ""))
+
+        # sql_snippets sub-arrays (by id)
+        snippets = inst.get("sql_snippets")
+        if isinstance(snippets, dict):
+            for snippet_key in ["filters", "expressions", "measures"]:
+                if snippet_key in snippets and snippets[snippet_key]:
+                    snippets[snippet_key] = sorted(
+                        snippets[snippet_key],
+                        key=lambda x: x.get("id", ""),
+                    )
+
+    # ── benchmarks.questions  (by id) ────────────────────────────
+    if "benchmarks" in config:
+        questions = config["benchmarks"].get("questions", [])
+        if questions:
+            config["benchmarks"]["questions"] = sorted(
+                questions,
+                key=lambda x: x.get("id", ""),
+            )
+
     return config
 
 
@@ -305,7 +404,7 @@ def patch_space_config(w: WorkspaceClient, space_id: str, config: dict) -> dict:
     clean = strip_non_exportable_fields(config)
     clean = sort_genie_config(clean)
 
-    ok, errors = validate_serialized_space(clean)
+    ok, errors = validate_serialized_space(clean, strict=True)
     if not ok:
         logger.error(
             "Config validation failed before PATCH for space %s: %s",
@@ -319,3 +418,85 @@ def patch_space_config(w: WorkspaceClient, space_id: str, config: dict) -> dict:
     if isinstance(raw_resp, dict):
         return raw_resp
     return {}
+
+
+# ── Benchmark Publishing ──────────────────────────────────────────────
+
+GENIE_MAX_BENCHMARK_QUESTIONS = 500
+
+
+def _benchmarks_to_genie_format(benchmarks: list[dict]) -> list[dict]:
+    """Convert optimizer benchmark dicts to Genie-native ``benchmarks.questions`` format.
+
+    Prioritises curated/P0 benchmarks first, then fills with synthetic.
+    """
+    curated: list[dict] = []
+    synthetic: list[dict] = []
+    for b in benchmarks:
+        source = b.get("source", "")
+        priority = b.get("priority", "")
+        if source == "genie_space" or priority == "P0":
+            curated.append(b)
+        else:
+            synthetic.append(b)
+
+    ordered = curated + synthetic
+
+    genie_questions: list[dict] = []
+    seen: set[str] = set()
+    for b in ordered:
+        question = str(b.get("question", "")).strip()
+        if not question:
+            continue
+        q_lower = question.lower()
+        if q_lower in seen:
+            continue
+        seen.add(q_lower)
+
+        entry: dict[str, Any] = {"question": [question]}
+        expected_sql = str(b.get("expected_sql", "")).strip()
+        if expected_sql:
+            entry["answer"] = [{"format": "SQL", "content": [expected_sql]}]
+        genie_questions.append(entry)
+
+    return genie_questions
+
+
+def publish_benchmarks_to_genie_space(
+    w: WorkspaceClient,
+    space_id: str,
+    benchmarks: list[dict],
+    max_questions: int = GENIE_MAX_BENCHMARK_QUESTIONS,
+) -> int:
+    """Write optimizer benchmarks into the Genie Space's native benchmarks section.
+
+    Fetches the current space config, converts benchmarks to Genie-native
+    format, merges them into ``serialized_space.benchmarks.questions``, and
+    PATCHes the space via the existing ``updateSpace`` API.
+
+    Returns the number of benchmark questions published.
+    """
+    config = fetch_space_config(w, space_id)
+    parsed = config.get("_parsed_space", {})
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    genie_questions = _benchmarks_to_genie_format(benchmarks)
+    if len(genie_questions) > max_questions:
+        logger.warning(
+            "Truncating benchmarks from %d to %d (Genie space limit)",
+            len(genie_questions),
+            max_questions,
+        )
+        genie_questions = genie_questions[:max_questions]
+
+    parsed["benchmarks"] = {"questions": genie_questions}
+
+    patch_space_config(w, space_id, parsed)
+
+    logger.info(
+        "Published %d benchmark questions to Genie space %s",
+        len(genie_questions),
+        space_id,
+    )
+    return len(genie_questions)

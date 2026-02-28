@@ -108,6 +108,43 @@ def _extract_response_text(outputs: Union[dict, Any]) -> str:
     return ""
 
 
+def _extract_json(content: str) -> dict:
+    """Extract a JSON object from LLM response text that may contain non-JSON wrapping.
+
+    Handles common LLM output patterns:
+    - Pure JSON
+    - JSON wrapped in markdown code fences
+    - JSON preceded/followed by prose ("Here are my suggestions: {...}")
+    - Multiple JSON objects (takes first)
+    """
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+        content = content.rsplit("```", 1)[0].strip()
+
+    _saved_err: json.JSONDecodeError | None = None
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        _saved_err = exc
+
+    if _saved_err is not None and hasattr(_saved_err, "pos") and _saved_err.msg.startswith("Extra data"):
+        try:
+            return json.loads(content[: _saved_err.pos])
+        except json.JSONDecodeError:
+            pass
+
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    raise _saved_err
+
+
 def _call_llm_for_scoring(
     w: WorkspaceClient,
     prompt: str,
@@ -130,16 +167,85 @@ def _call_llm_for_scoring(
             content = getattr(message, "content", None)
             if not content or not content.strip():
                 raise ValueError(f"Empty LLM response on attempt {attempt + 1}")
-            content = content.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-                content = content.rsplit("```", 1)[0]
-            return json.loads(content)
+            return _extract_json(content)
         except Exception as e:
             last_err = e
             if attempt < max_retries - 1:
                 time.sleep(2**attempt)
     raise last_err  # type: ignore[misc]
+
+
+def _rewrite_measure_refs(
+    sql: str,
+    metric_view_measures: dict[str, set[str]],
+) -> str:
+    """Wrap bare metric view measure names in ORDER BY with MEASURE().
+
+    Only applies when the SQL references a metric view in its FROM clause.
+    ``metric_view_measures`` maps lowercased short table names to sets of
+    lowercased measure column names.
+    """
+    if not metric_view_measures or not sql:
+        return sql
+
+    from_tables: list[str] = []
+    for m in re.finditer(r"\bFROM\s+([\w.`]+)", sql, re.IGNORECASE):
+        from_tables.append(m.group(1).replace("`", "").split(".")[-1].lower())
+
+    relevant_measures: set[str] = set()
+    for tbl in from_tables:
+        if tbl in metric_view_measures:
+            relevant_measures |= metric_view_measures[tbl]
+
+    if not relevant_measures:
+        return sql
+
+    order_match = re.search(r"\bORDER\s+BY\b", sql, re.IGNORECASE)
+    if not order_match:
+        return sql
+
+    prefix = sql[: order_match.end()]
+    tail = sql[order_match.end() :]
+
+    def _wrap(m: re.Match) -> str:
+        col = m.group(1)
+        if col.lower() in relevant_measures:
+            return f"MEASURE({col})"
+        return col
+
+    already_measured = re.compile(r"\bMEASURE\s*\(", re.IGNORECASE)
+    rewritten_tail = re.sub(
+        r"\b([A-Za-z_]\w*)\b(?!\s*\()",
+        lambda m: m.group(0) if already_measured.search(sql[max(0, order_match.end() + m.start() - 10) : order_match.end() + m.start()]) else _wrap(m),
+        tail,
+    )
+    return prefix + rewritten_tail
+
+
+def build_metric_view_measures(config: dict) -> dict[str, set[str]]:
+    """Build {lowered_short_name: {measure_col, ...}} from the parsed Genie config."""
+    parsed = config.get("_parsed_space", config)
+    ds = parsed.get("data_sources", {})
+    if not isinstance(ds, dict):
+        return {}
+    mvs = ds.get("metric_views", [])
+    result: dict[str, set[str]] = {}
+    for mv in mvs:
+        identifier = mv.get("identifier", "")
+        short_name = identifier.split(".")[-1].lower() if identifier else ""
+        if not short_name:
+            continue
+        measures: set[str] = set()
+        for cc in mv.get("column_configs", []):
+            col_name = cc.get("column_name", "")
+            if not col_name:
+                continue
+            col_type = str(cc.get("column_type", "")).lower()
+            if col_type == "measure" or cc.get("is_measure"):
+                measures.add(col_name.lower())
+        if measures:
+            result[short_name] = measures
+    return result
 
 
 def normalize_result_df(df: pd.DataFrame | None) -> pd.DataFrame:
@@ -389,6 +495,65 @@ def all_thresholds_met(
     return True
 
 
+# ── Arbiter-Adjusted Accuracy ──────────────────────────────────────────
+
+_ARBITER_CORRECT_VERDICTS = frozenset({"genie_correct", "both_correct"})
+
+
+def _compute_arbiter_adjusted_accuracy(
+    rows: list[dict],
+) -> tuple[float, int, list[str], int]:
+    """Compute overall accuracy that accounts for arbiter overrides.
+
+    A row is considered correct if:
+      - ``result_correctness`` == "yes" (results matched), OR
+      - ``result_correctness`` == "no" AND arbiter verdict is
+        ``genie_correct`` or ``both_correct``
+
+    Rows where ``result_correctness`` == "excluded" (GT-side infrastructure
+    failures) are removed from the denominator entirely.
+
+    Returns ``(accuracy_pct, correct_count, failure_ids, excluded_count)``.
+    """
+    if not rows:
+        return 0.0, 0, [], 0
+
+    total = 0
+    correct = 0
+    excluded = 0
+    failure_ids: list[str] = []
+    for row in rows:
+        rc = str(
+            row.get("result_correctness/value", row.get("result_correctness", ""))
+        ).lower()
+
+        if rc == "excluded":
+            excluded += 1
+            continue
+
+        total += 1
+        av = str(
+            row.get("arbiter/value", row.get("arbiter", "skipped"))
+        ).lower()
+
+        is_correct = rc in ("yes", "true", "1", "1.0") or (
+            rc in ("no", "false", "0", "0.0") and av in _ARBITER_CORRECT_VERDICTS
+        )
+
+        if is_correct:
+            correct += 1
+        else:
+            qid = row.get(
+                "inputs/question_id",
+                row.get("inputs", {}).get("question_id", ""),
+            )
+            if qid:
+                failure_ids.append(str(qid))
+
+    accuracy_pct = round((correct / total) * 100, 2) if total > 0 else 0.0
+    return accuracy_pct, correct, failure_ids, excluded
+
+
 # ── Benchmark Filtering ─────────────────────────────────────────────────
 
 
@@ -531,6 +696,7 @@ def _precheck_benchmarks_for_eval(
     gold_schema: str,
     known_functions: set[str],
     metric_view_names: set[str] | None = None,
+    metric_view_measures: dict[str, set[str]] | None = None,
 ) -> tuple[list[dict], list[dict[str, Any]], dict[str, int]]:
     """Apply strict SQL + routine checks before entering mlflow.genai.evaluate()."""
     valid: list[dict] = []
@@ -542,6 +708,7 @@ def _precheck_benchmarks_for_eval(
         "bad_join_key_count": 0,
     }
     mv_names_lower = {n.lower().split(".")[-1] for n in (metric_view_names or set())}
+    _mv_measures = metric_view_measures or {}
 
     for idx, benchmark in enumerate(benchmarks):
         question = str(benchmark.get("question") or "").strip()
@@ -552,6 +719,8 @@ def _precheck_benchmarks_for_eval(
             continue
 
         resolved_sql = resolve_sql(sql, catalog=catalog, gold_schema=gold_schema)
+        if _mv_measures:
+            resolved_sql = _rewrite_measure_refs(resolved_sql, _mv_measures)
         try:
             _set_sql_context(spark, catalog, gold_schema)
             spark.sql(f"EXPLAIN {resolved_sql}")
@@ -632,13 +801,17 @@ def make_predict_fn(
     spark: SparkSession,
     catalog: str,
     schema: str,
+    metric_view_measures: dict[str, set[str]] | None = None,
 ):
     """Return a predict function with bound workspace/spark context.
 
     The returned closure is suitable for ``mlflow.genai.evaluate(predict_fn=...)``.
+    ``metric_view_measures`` maps lowercased metric view short names to sets
+    of measure column names — used to auto-rewrite ORDER BY for GT SQL.
     """
 
     known_functions = _load_known_functions(spark, catalog, schema)
+    _mv_measures = metric_view_measures or {}
 
     @mlflow.trace
     def genie_predict_fn(question: str, expected_sql: str = "", **kwargs) -> dict:
@@ -680,91 +853,110 @@ def make_predict_fn(
             result = run_genie_query(w, space_id, question)
             genie_sql = sanitize_sql(result.get("sql") or "")
             gt_sql = resolve_sql(expected_sql, catalog, schema)
+            if _mv_measures and gt_sql:
+                gt_sql = _rewrite_measure_refs(gt_sql, _mv_measures)
             statement_id = result.get("statement_id")
 
             if genie_sql and gt_sql:
-                try:
-                    _set_sql_context(spark, catalog, schema)
+                _genie_sql_norm = genie_sql.strip().lower()
+                _gt_sql_norm = gt_sql.strip().lower()
 
-                    called_functions = _extract_sql_function_calls(gt_sql, catalog, schema)
-                    missing_gt_functions = sorted(f for f in called_functions if f not in known_functions)
-                    if missing_gt_functions:
-                        comparison["error"] = (
-                            "Missing function(s) in GT SQL for schema "
-                            f"{catalog}.{schema}: {', '.join(missing_gt_functions)}"
-                        )
-                        comparison["error_type"] = "permission_blocked"
-                    else:
-                        try:
-                            spark.sql(f"EXPLAIN {gt_sql}")
-                        except Exception as explain_exc:
-                            explain_msg = str(explain_exc)
-                            comparison["error"] = f"ground_truth SQL compilation failed: {explain_msg[:400]}"
-                            comparison["error_type"] = "infrastructure"
-                            comparison["sqlstate"] = _extract_sqlstate(explain_msg)
+                if _genie_sql_norm and _gt_sql_norm and _genie_sql_norm == _gt_sql_norm:
+                    comparison = {
+                        "match": True,
+                        "match_type": "identical_sql",
+                        "gt_rows": None,
+                        "genie_rows": None,
+                        "gt_hash": None,
+                        "genie_hash": None,
+                        "gt_signature": None,
+                        "genie_signature": None,
+                        "error": None,
+                        "identical_sql": True,
+                    }
+                else:
+                    try:
+                        _set_sql_context(spark, catalog, schema)
 
-                        if not comparison["error"]:
-                            gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
+                        called_functions = _extract_sql_function_calls(gt_sql, catalog, schema)
+                        missing_gt_functions = sorted(f for f in called_functions if f not in known_functions)
+                        if missing_gt_functions:
+                            comparison["error"] = (
+                                "Missing function(s) in GT SQL for schema "
+                                f"{catalog}.{schema}: {', '.join(missing_gt_functions)}"
+                            )
+                            comparison["error_type"] = "permission_blocked"
+                        else:
+                            try:
+                                spark.sql(f"EXPLAIN {gt_sql}")
+                            except Exception as explain_exc:
+                                explain_msg = str(explain_exc)
+                                comparison["error"] = f"ground_truth SQL compilation failed: {explain_msg[:400]}"
+                                comparison["error_type"] = "infrastructure"
+                                comparison["sqlstate"] = _extract_sqlstate(explain_msg)
 
-                            genie_df = None
-                            if statement_id:
-                                raw_genie_df = fetch_genie_result_df(w, statement_id)
-                                genie_df = normalize_result_df(raw_genie_df)
+                            if not comparison["error"]:
+                                gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
 
-                            if genie_df is None or genie_df.empty:
-                                comparison["error"] = (
-                                    "Could not retrieve Genie query results"
-                                    + (f" (statement_id={statement_id})" if statement_id else " (no statement_id)")
-                                )
-                                comparison["error_type"] = "genie_result_unavailable"
-                                comparison["gt_rows"] = len(gt_df)
-                                comparison["gt_sample"] = gt_df.head(5).to_csv(index=False)
-                            else:
-                                gt_hash = hashlib.md5(
-                                    gt_df.to_csv(index=False).encode()
-                                ).hexdigest()[:8]
-                                genie_hash = hashlib.md5(
-                                    genie_df.to_csv(index=False).encode()
-                                ).hexdigest()[:8]
-                                exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
-                                hash_match = gt_hash == genie_hash
-                                gt_sig = result_signature(gt_df)
-                                genie_sig = result_signature(genie_df)
-                                sig_match = (
-                                    gt_sig["schema_hash"] == genie_sig["schema_hash"]
-                                    and gt_sig["row_count"] == genie_sig["row_count"]
-                                )
+                                genie_df = None
+                                if statement_id:
+                                    raw_genie_df = fetch_genie_result_df(w, statement_id)
+                                    genie_df = normalize_result_df(raw_genie_df)
 
-                                if exact_match:
-                                    match_type = "exact"
-                                elif hash_match:
-                                    match_type = "hash"
-                                elif sig_match:
-                                    match_type = "signature"
+                                if genie_df is None or genie_df.empty:
+                                    comparison["error"] = (
+                                        "Could not retrieve Genie query results"
+                                        + (f" (statement_id={statement_id})" if statement_id else " (no statement_id)")
+                                    )
+                                    comparison["error_type"] = "genie_result_unavailable"
+                                    comparison["gt_rows"] = len(gt_df)
+                                    comparison["gt_sample"] = gt_df.head(5).to_csv(index=False)
                                 else:
-                                    match_type = "mismatch"
+                                    gt_hash = hashlib.md5(
+                                        gt_df.to_csv(index=False).encode()
+                                    ).hexdigest()[:8]
+                                    genie_hash = hashlib.md5(
+                                        genie_df.to_csv(index=False).encode()
+                                    ).hexdigest()[:8]
+                                    exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
+                                    hash_match = gt_hash == genie_hash
+                                    gt_sig = result_signature(gt_df)
+                                    genie_sig = result_signature(genie_df)
+                                    sig_match = (
+                                        gt_sig["schema_hash"] == genie_sig["schema_hash"]
+                                        and gt_sig["row_count"] == genie_sig["row_count"]
+                                    )
 
-                                comparison = {
-                                    "match": exact_match or hash_match,
-                                    "match_type": match_type,
-                                    "gt_rows": len(gt_df),
-                                    "genie_rows": len(genie_df),
-                                    "gt_hash": gt_hash,
-                                    "genie_hash": genie_hash,
-                                    "gt_signature": gt_sig,
-                                    "genie_signature": genie_sig,
-                                    "gt_sample": gt_df.head(5).to_csv(index=False),
-                                    "genie_sample": genie_df.head(5).to_csv(index=False),
-                                    "error": None,
-                                }
-                except Exception as exc:
-                    err_msg = str(exc)
-                    comparison["error"] = err_msg[:500]
-                    if _is_infrastructure_sql_error(err_msg):
-                        comparison["error_type"] = "infrastructure"
-                    else:
-                        comparison["error_type"] = "query_execution"
-                    comparison["sqlstate"] = _extract_sqlstate(err_msg)
+                                    if exact_match:
+                                        match_type = "exact"
+                                    elif hash_match:
+                                        match_type = "hash"
+                                    elif sig_match:
+                                        match_type = "signature"
+                                    else:
+                                        match_type = "mismatch"
+
+                                    comparison = {
+                                        "match": exact_match or hash_match,
+                                        "match_type": match_type,
+                                        "gt_rows": len(gt_df),
+                                        "genie_rows": len(genie_df),
+                                        "gt_hash": gt_hash,
+                                        "genie_hash": genie_hash,
+                                        "gt_signature": gt_sig,
+                                        "genie_signature": genie_sig,
+                                        "gt_sample": gt_df.head(5).to_csv(index=False),
+                                        "genie_sample": genie_df.head(5).to_csv(index=False),
+                                        "error": None,
+                                    }
+                    except Exception as exc:
+                        err_msg = str(exc)
+                        comparison["error"] = err_msg[:500]
+                        if _is_infrastructure_sql_error(err_msg):
+                            comparison["error_type"] = "infrastructure"
+                        else:
+                            comparison["error_type"] = "query_execution"
+                        comparison["sqlstate"] = _extract_sqlstate(err_msg)
             else:
                 if not genie_sql:
                     comparison["error"] = "Genie did not return SQL"
@@ -785,6 +977,7 @@ def make_predict_fn(
             "status": result.get("status", "ERROR"),
             "conversation_id": result.get("conversation_id", ""),
             "comparison": comparison,
+            "analysis_text": result.get("analysis_text"),
         }
 
         if EVAL_DEBUG:
@@ -802,6 +995,7 @@ def make_predict_fn(
                 "  Comparison: match=%s | type=%s | gt_rows=%s | genie_rows=%s\n"
                 "              gt_hash=%s | genie_hash=%s\n"
                 "  Error:      %s\n"
+                "  Analysis:   %s\n"
                 "═══════════════════════════════════════════════════════════════",
                 qid,
                 question,
@@ -815,6 +1009,7 @@ def make_predict_fn(
                 cmp.get("gt_hash", "n/a"),
                 cmp.get("genie_hash", "n/a"),
                 cmp.get("error") or "(none)",
+                str(output.get("analysis_text") or "(none)")[:200],
             )
 
         return output
@@ -1306,7 +1501,7 @@ def _patch_mlflow_harness_none_trace() -> None:
                 return []
             return _orig_get_new_expectations(eval_item)
 
-        _harness_mod._get_new_expectations = _safe_get_new_expectations
+        _harness_mod._get_new_expectations = _safe_get_new_expectations  # type: ignore[assignment]
         patched.append("_get_new_expectations")
     except Exception:
         logger.warning("Could not patch _get_new_expectations", exc_info=True)
@@ -1339,7 +1534,7 @@ def _patch_mlflow_harness_none_trace() -> None:
                 return _orig_batch_link(args[0], **kwargs)
             return _orig_batch_link(**kwargs)
 
-        _trace_utils_mod.batch_link_traces_to_run = _safe_batch_link_traces_to_run
+        _trace_utils_mod.batch_link_traces_to_run = _safe_batch_link_traces_to_run  # type: ignore[assignment]
 
         # Aggressively patch every module that imported the function directly,
         # scanning sys.modules to catch all references regardless of import style.
@@ -1640,16 +1835,35 @@ def _drop_benchmark_table(spark: SparkSession, uc_table_name: str) -> None:
 
 _JUDGE_ORDER = [
     "syntax_validity", "schema_accuracy", "logical_accuracy",
-    "semantic_equivalence", "completeness", "asset_routing",
-    "result_correctness", "arbiter",
+    "semantic_equivalence", "completeness", "response_quality",
+    "asset_routing", "result_correctness", "arbiter",
 ]
+
+
+def _get_nested(row: dict, *paths: str, default: Any = "") -> Any:
+    """Try multiple key paths (both flattened and nested dict forms)."""
+    for path in paths:
+        if "/" in path:
+            val = row.get(path)
+            if val not in (None, "", {}, []):
+                return val
+            parts = path.split("/", 1)
+            parent = row.get(parts[0])
+            if isinstance(parent, dict) and len(parts) == 2:
+                val = parent.get(parts[1])
+                if val not in (None, "", {}, []):
+                    return val
+        else:
+            val = row.get(path)
+            if val not in (None, "", {}, []):
+                return val
+    return default
 
 
 def _print_eval_summary(
     rows: list[dict],
     scores_100: dict[str, float],
     thresholds_passed: bool,
-    failure_ids: list[str],
     iteration: int,
     eval_scope: str,
     total_questions: int,
@@ -1666,35 +1880,68 @@ def _print_eval_summary(
     lines.append(header)
     lines.append("=" * width)
 
+    if rows:
+        first_keys = sorted(rows[0].keys())
+        lines.append(f"[DEBUG] First row keys: {first_keys[:30]}")
+
     for qi, row in enumerate(rows, 1):
+        _request = row.get("request", {})
+        if isinstance(_request, str):
+            try:
+                _request = json.loads(_request)
+            except (json.JSONDecodeError, ValueError):
+                _request = {}
+        if not isinstance(_request, dict):
+            _request = {}
+
+        _response = row.get("response", {})
+        if isinstance(_response, str):
+            try:
+                _response = json.loads(_response)
+            except (json.JSONDecodeError, ValueError):
+                _response = {}
+        if not isinstance(_response, dict):
+            _response = {}
+
         qid = (
-            row.get("inputs/question_id")
-            or (row.get("inputs") or {}).get("question_id", "")
+            _request.get("question_id")
+            or _get_nested(row, "inputs/question_id", "question_id")
             or f"q{qi}"
         )
         question = (
-            row.get("inputs/question")
-            or (row.get("inputs") or {}).get("question", "")
+            _request.get("question")
+            or _get_nested(row, "inputs/question", "question")
+            or ""
         )
         genie_sql = (
-            row.get("outputs/response")
-            or (row.get("outputs") or {}).get("response", "")
+            _response.get("response")
+            or _get_nested(row, "outputs/response")
             or "(none)"
         )
         status = (
-            row.get("outputs/status")
-            or (row.get("outputs") or {}).get("status", "?")
+            _response.get("status")
+            or _get_nested(row, "outputs/status", "status")
+            or row.get("state", "?")
         )
         gt_sql = (
-            row.get("expectations/expected_response")
-            or (row.get("expectations") or {}).get("expected_response", "")
+            _request.get("expected_sql")
+            or _get_nested(
+                row, "expectations/expected_response", "expected_response",
+                "inputs/expected_sql", "expected_sql",
+            )
             or "(none)"
         )
 
-        cmp = (row.get("outputs") or {}).get("comparison", {})
+        cmp = _response.get("comparison", {})
+        if not isinstance(cmp, dict):
+            cmp = {}
         if not cmp:
-            cmp_raw = row.get("outputs/comparison", {})
-            cmp = cmp_raw if isinstance(cmp_raw, dict) else {}
+            outputs_val = row.get("outputs")
+            if isinstance(outputs_val, dict):
+                cmp = outputs_val.get("comparison", {})
+            if not cmp:
+                cmp_raw = row.get("outputs/comparison", {})
+                cmp = cmp_raw if isinstance(cmp_raw, dict) else {}
 
         match_str = "YES" if cmp.get("match") else "NO"
         match_type = cmp.get("match_type", "n/a")
@@ -1706,6 +1953,15 @@ def _print_eval_summary(
         lines.append(f"| Genie SQL:")
         lines.append(f"|   {genie_sql}")
         lines.append(f"| Genie Status: {status}")
+
+        analysis = (
+            _response.get("analysis_text")
+            or _get_nested(row, "outputs/analysis_text")
+            or None
+        )
+        if analysis:
+            lines.append(f"| Genie Analysis: {str(analysis)[:200]}")
+
         lines.append(f"|")
         lines.append(f"| Ground Truth SQL:")
         lines.append(f"|   {gt_sql}")
@@ -1721,6 +1977,14 @@ def _print_eval_summary(
             )
         if cmp.get("error"):
             lines.append(f"|   Error: {cmp['error']}")
+        if cmp.get("gt_sample"):
+            lines.append("|   GT Result Sample (first 5 rows):")
+            for sample_line in str(cmp["gt_sample"]).strip().split("\n")[:6]:
+                lines.append(f"|     {sample_line}")
+        if cmp.get("genie_sample"):
+            lines.append("|   Genie Result Sample (first 5 rows):")
+            for sample_line in str(cmp["genie_sample"]).strip().split("\n")[:6]:
+                lines.append(f"|     {sample_line}")
         lines.append(f"|")
         lines.append(f"| Judge Verdicts:")
 
@@ -1762,12 +2026,17 @@ def _print_eval_summary(
             f"|   {judge:<24s} {score:6.1f}  (threshold: {threshold:.1f})  "
             f"{'PASS' if passed else 'FAIL'}{marker}"
         )
-    overall = scores_100.get("result_correctness", 0.0)
+    adj_accuracy, _adj_correct, adj_failures, adj_excluded = (
+        _compute_arbiter_adjusted_accuracy(rows)
+    )
+    rc_raw = scores_100.get("result_correctness", 0.0)
     lines.append(f"|")
-    lines.append(f"|   Overall accuracy: {overall:.1f}%")
+    lines.append(f"|   Overall accuracy: {adj_accuracy:.1f}%  (result_correctness raw: {rc_raw:.1f}%)")
+    if adj_excluded:
+        lines.append(f"|   Excluded (GT infra): {adj_excluded}")
     lines.append(f"|   Thresholds met: {'YES' if thresholds_passed else 'NO'}")
-    if failure_ids:
-        lines.append(f"|   Failed questions: {failure_ids}")
+    if adj_failures:
+        lines.append(f"|   Failed questions: {adj_failures}")
     lines.append("-" * width)
 
     print("\n".join(lines))
@@ -1792,6 +2061,7 @@ def run_evaluation(
     patched_objects: list[str] | None = None,
     reference_sqls: dict[str, str] | None = None,
     metric_view_names: set[str] | None = None,
+    metric_view_measures: dict[str, set[str]] | None = None,
 ) -> dict:
     """Run ``mlflow.genai.evaluate()`` and return structured results.
 
@@ -1833,6 +2103,7 @@ def run_evaluation(
                 gold_schema=gold_schema,
                 known_functions=known_functions,
                 metric_view_names=metric_view_names,
+                metric_view_measures=metric_view_measures,
             )
         else:
             filtered = list(scope_filtered)
@@ -2018,7 +2289,6 @@ def run_evaluation(
         thresholds_passed = all_thresholds_met(scores_100)
         mlflow.log_metric("thresholds_passed", 1.0 if thresholds_passed else 0.0)
 
-        failure_ids: list[str] = []
         arbiter_verdicts: dict[str, int] = {
             "genie_correct": 0,
             "ground_truth_correct": 0,
@@ -2055,18 +2325,18 @@ def run_evaluation(
                     if meta_key not in row_dict and adata.get("metadata"):
                         row_dict[meta_key] = adata["metadata"]
 
-                rows_for_output.append(row_dict)
+                for col_name in list(row_dict.keys()):
+                    if col_name.endswith("/rationale"):
+                        jname = col_name.rsplit("/rationale", 1)[0]
+                        if jname.startswith("feedback/"):
+                            jname = jname[len("feedback/"):]
+                        mkey = f"{jname}/metadata"
+                        if mkey not in row_dict:
+                            parsed = _parse_asi_from_rationale(str(row_dict.get(col_name, "")))
+                            if parsed:
+                                row_dict[mkey] = parsed
 
-                rc = row.get(
-                    "result_correctness/value", row.get("result_correctness", "")
-                )
-                if str(rc).lower() in ("no", "false", "0", "0.0"):
-                    qid = row.get(
-                        "inputs/question_id",
-                        row.get("inputs", {}).get("question_id", ""),
-                    )
-                    if qid:
-                        failure_ids.append(str(qid))
+                rows_for_output.append(row_dict)
 
                 av = str(row.get("arbiter/value", row.get("arbiter", "skipped")))
                 if av in arbiter_verdicts:
@@ -2153,7 +2423,9 @@ def run_evaluation(
                 + " | ".join(infra_errors[:3]),
             )
 
-        overall_accuracy = per_judge.get("result_correctness", 0.0)
+        arbiter_adjusted_accuracy, arbiter_adjusted_correct, failure_ids, excluded_count = (
+            _compute_arbiter_adjusted_accuracy(rows_for_output)
+        )
         row_unresolved_column_count = sum(
             1
             for artifact in question_failure_artifacts
@@ -2189,9 +2461,9 @@ def run_evaluation(
             "run_name": run_name,
             "experiment_id": exp.experiment_id if exp else "",
             "iteration": iteration,
-            "overall_accuracy": scores_100.get("result_correctness", overall_accuracy * 100),
+            "overall_accuracy": arbiter_adjusted_accuracy,
             "total_questions": len(filtered),
-            "correct_count": len(filtered) - len(failure_ids),
+            "correct_count": arbiter_adjusted_correct,
             "scores": scores_100,
             "thresholds_met": thresholds_passed,
             "thresholds_passed": thresholds_passed,
@@ -2207,6 +2479,7 @@ def run_evaluation(
             "permission_blocked_count": permission_blocked_count,
             "unresolved_column_count": unresolved_column_count,
             "harness_retry_count": harness_retry_count,
+            "excluded_count": excluded_count,
             "quarantined_benchmarks": quarantined_benchmarks,
         }
 
@@ -2220,7 +2493,7 @@ def run_evaluation(
     if EVAL_DEBUG:
         _print_eval_summary(
             rows_for_output, scores_100, thresholds_passed,
-            failure_ids, iteration, eval_scope, len(filtered),
+            iteration, eval_scope, len(filtered),
         )
 
     return output
@@ -2377,6 +2650,18 @@ def run_repeatability_evaluation(
                         row_dict[rat_key] = adata["rationale"]
                     if meta_key not in row_dict and adata.get("metadata"):
                         row_dict[meta_key] = adata["metadata"]
+
+                for col_name in list(row_dict.keys()):
+                    if col_name.endswith("/rationale"):
+                        jname = col_name.rsplit("/rationale", 1)[0]
+                        if jname.startswith("feedback/"):
+                            jname = jname[len("feedback/"):]
+                        mkey = f"{jname}/metadata"
+                        if mkey not in row_dict:
+                            parsed = _parse_asi_from_rationale(str(row_dict.get(col_name, "")))
+                            if parsed:
+                                row_dict[mkey] = parsed
+
                 rows_for_output.append(row_dict)
 
         mlflow.log_metric("repeatability_pct", repeatability_pct)

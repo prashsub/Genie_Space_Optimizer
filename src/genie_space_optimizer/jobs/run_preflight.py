@@ -242,15 +242,33 @@ _log("State tables verified", catalog=catalog, schema=schema)
 
 try:
     _banner("Running _run_preflight")
+    _log("Starting preflight", space_id=space_id, catalog=catalog, schema=schema)
     preflight_out = _run_preflight(
         w, spark, run_id, space_id, catalog, schema, domain, experiment_name,
     )
+    _benchmarks = preflight_out["benchmarks"]
+    _config = preflight_out.get("config", {})
+    _parsed = _config.get("_parsed_space", _config)
+    _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
+
     _log(
         "Preflight complete",
-        benchmark_count=len(preflight_out["benchmarks"]),
+        benchmark_count=len(_benchmarks),
         model_id=preflight_out["model_id"],
         experiment_name=preflight_out["experiment_name"],
         experiment_id=preflight_out.get("experiment_id", ""),
+        table_count=len(_ds.get("tables", [])),
+        metric_view_count=len(_ds.get("metric_views", [])),
+        function_count=len(_ds.get("functions", [])),
+        uc_column_count=len(_config.get("_uc_columns", [])),
+    )
+
+    _log(
+        "Benchmark summary",
+        total=len(_benchmarks),
+        with_sql=sum(1 for b in _benchmarks if b.get("expected_sql")),
+        question_only=sum(1 for b in _benchmarks if not b.get("expected_sql")),
+        sample_questions=[b.get("question", "")[:80] for b in _benchmarks[:5]],
     )
 except Exception as exc:
     _banner("Preflight FAILED")

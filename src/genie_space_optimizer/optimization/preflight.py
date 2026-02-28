@@ -19,6 +19,7 @@ from genie_space_optimizer.common.config import (
     TARGET_BENCHMARK_COUNT,
 )
 from genie_space_optimizer.common.genie_client import fetch_space_config
+from genie_space_optimizer.common.genie_schema import validate_serialized_space
 from genie_space_optimizer.common.uc_metadata import (
     extract_genie_space_table_refs,
     get_columns,
@@ -29,6 +30,7 @@ from genie_space_optimizer.common.uc_metadata import (
     get_routines_for_schemas_rest,
     get_tags,
     get_tags_for_tables,
+    get_tags_for_tables_rest,
 )
 from genie_space_optimizer.optimization.benchmarks import validate_benchmarks
 from genie_space_optimizer.optimization.applier import _get_general_instructions
@@ -65,9 +67,18 @@ def _collect_or_empty(fetch_fn: Any, label: str) -> tuple[list[dict], str | None
             )
         return rows, None
     except Exception as exc:
-        logger.warning(
-            "Skipping %s metadata: %s: %s", label, type(exc).__name__, exc,
+        err_str = str(exc)
+        is_permission = "INSUFFICIENT_PERMISSIONS" in err_str or "permission" in err_str.lower()
+        level_fn = print if is_permission else logger.warning
+        level_fn(
+            f"[PREFLIGHT] {'PERMISSION DENIED' if is_permission else 'SKIPPED'} "
+            f"for {label}: {type(exc).__name__}: {err_str[:300]}"
         )
+        if is_permission:
+            print(
+                f"[PREFLIGHT]   This is non-fatal — {label} metadata will be empty. "
+                "Tags are informational and not required for optimization."
+            )
         return [], f"{type(exc).__name__}: {exc}"
 
 
@@ -158,6 +169,52 @@ def run_preflight(
         config = fetch_space_config(w, space_id)
         logger.info("Fetched config for space %s", space_id)
 
+    # ── Schema validation (lenient: structural checks only) ────
+    _parsed = config.get("_parsed_space", config)
+    _schema_ok, _schema_errors = validate_serialized_space(
+        _parsed if isinstance(_parsed, dict) else config
+    )
+    if not _schema_ok:
+        logger.warning(
+            "Space config has structural issues for %s: %s", space_id, _schema_errors
+        )
+
+    # ── Diagnostic Block 1: Genie Space Inventory ──
+    _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
+    _inv_tables = _ds.get("tables", [])
+    _inv_mvs = _ds.get("metric_views", [])
+    _inv_funcs = _ds.get("functions", [])
+    _inv_instructions = _parsed.get("instructions", {}).get("text_instructions", [])
+    _inv_instr_count = sum(
+        len(ti.get("content", [])) if isinstance(ti.get("content"), list) else (1 if ti.get("content") else 0)
+        for ti in _inv_instructions
+    )
+    _configured_cols = sum(len(t.get("column_configs", [])) for t in _inv_tables + _inv_mvs)
+    print(
+        f"\n{'=' * 60}\n"
+        f"  PREFLIGHT — GENIE SPACE INVENTORY\n"
+        f"{'=' * 60}\n"
+        f"  Space ID:         {space_id}\n"
+        f"  Tables:           {len(_inv_tables)}\n"
+        f"  Metric Views:     {len(_inv_mvs)}\n"
+        f"  Functions (TVF):  {len(_inv_funcs)}\n"
+        f"  Instructions:     {_inv_instr_count}\n"
+        f"  Configured cols:  {_configured_cols}  (column_configs with desc/FA/VD; UC columns collected later)\n"
+        f"{'-' * 60}"
+    )
+    for t in _inv_tables[:10]:
+        _tid = t.get("identifier", "?")
+        _tcols = len(t.get("column_configs", []))
+        print(f"    TABLE: {_tid} ({_tcols} configured cols)")
+    for mv in _inv_mvs[:10]:
+        _mid = mv.get("identifier", "?")
+        _mcols = len(mv.get("column_configs", []))
+        print(f"    METRIC VIEW: {_mid} ({_mcols} configured cols)")
+    for fn in _inv_funcs[:10]:
+        _fid = fn.get("identifier", "?")
+        print(f"    FUNCTION: {_fid}")
+    print(f"{'-' * 60}\n")
+
     # OBO-first: jobs run as the triggering user, so Spark can query
     # information_schema for user catalogs directly.  Prefetched metadata
     # from the backend OBO call is kept as a cache optimisation only.
@@ -175,13 +232,22 @@ def run_preflight(
     _actual_source: dict[str, str] = {}
 
     def _usable_prefetch(key: str) -> list | None:
-        """Return prefetched list only when non-empty; empty lists are treated as cache misses."""
-        val = _pf.get(key)
-        if isinstance(val, list) and val:
-            _actual_source[key] = "prefetched"
-            return val
+        """Return prefetched data when available.
+
+        - Key missing or value is ``None``: query failed upstream → fall back.
+        - Key present with ``[]``: query succeeded but returned no rows → valid empty result, no fallback needed.
+        """
+        if key not in _pf:
+            return None
+        val = _pf[key]
+        if val is None:
+            logger.info("Prefetched %s failed upstream, falling back", key)
+            return None
         if isinstance(val, list):
-            logger.info("Prefetched %s is empty, falling back", key)
+            _actual_source[key] = "prefetched"
+            if not val:
+                logger.info("Prefetched %s is empty (0 rows) — accepted, no fallback needed", key)
+            return val
         return None
 
     _collection_errors: dict[str, str] = {}
@@ -207,8 +273,7 @@ def run_preflight(
             _collection_errors[source_key] = err
         return rows
 
-    # Columns & routines: prefetch → REST API → Spark SQL
-    # Tags: prefetch → Spark SQL (no REST API for table_tags)
+    # Columns, routines & tags: prefetch → REST API → Spark SQL
     if genie_table_refs:
         uc_columns_dicts = (
             _usable_prefetch("uc_columns")
@@ -223,6 +288,10 @@ def run_preflight(
         )
         uc_tags_dicts = (
             _usable_prefetch("uc_tags")
+            or _rest_collect(
+                lambda: get_tags_for_tables_rest(w, genie_table_refs),
+                "tags (genie tables)", "uc_tags",
+            )
             or _spark_collect(
                 lambda: get_tags_for_tables(spark, genie_table_refs),
                 "tags (genie tables)", "uc_tags",
@@ -257,10 +326,38 @@ def run_preflight(
     uc_tags_dicts = uc_tags_dicts if isinstance(uc_tags_dicts, list) else []
     uc_routines_dicts = uc_routines_dicts if isinstance(uc_routines_dicts, list) else []
 
+    if not uc_tags_dicts:
+        print(
+            "[PREFLIGHT] Tags: 0 found — this is OK. "
+            "Tags are informational metadata only and not required for optimization. "
+            "Optimization will proceed using column and routine metadata.",
+            flush=True,
+        )
+
     logger.info(
         "UC metadata: %d columns, %d tags, %d routines",
         len(uc_columns_dicts), len(uc_tags_dicts), len(uc_routines_dicts),
     )
+
+    # ── Diagnostic Block 2: UC Metadata Collection Summary ──
+    _uc_table_names = {
+        str(c.get("table_name") or "").strip().lower()
+        for c in uc_columns_dicts if isinstance(c, dict) and c.get("table_name")
+    }
+    print(
+        f"\n{'=' * 60}\n"
+        f"  PREFLIGHT — UC METADATA COLLECTION SUMMARY\n"
+        f"{'=' * 60}\n"
+        f"  UC Columns:   {len(uc_columns_dicts):>5}  (covering {len(_uc_table_names)} tables, source: {_actual_source.get('uc_columns', 'unknown')})\n"
+        f"  Genie config: {_configured_cols:>5}  column_configs entries (descriptions/FA/VD)\n"
+        f"  Tags:         {len(uc_tags_dicts):>5}  (source: {_actual_source.get('uc_tags', 'unknown')})\n"
+        f"  Routines:     {len(uc_routines_dicts):>5}  (source: {_actual_source.get('uc_routines', 'unknown')})"
+    )
+    if _collection_errors:
+        print("  Collection errors:")
+        for k, v in _collection_errors.items():
+            print(f"    {k}: {v[:200]}")
+    print(f"{'-' * 60}")
     column_samples: list[str] = []
     for col in uc_columns_dicts[:12]:
         if not isinstance(col, dict):
@@ -397,15 +494,46 @@ def run_preflight(
             pre_count,
             invalid_errors[:5],
         )
+        _err_categories: dict[str, int] = {}
+        for err in invalid_errors:
+            low = err.lower()
+            if "unresolved_column" in low:
+                cat = "UNRESOLVED_COLUMN"
+            elif "table_or_view_not_found" in low or "does not exist" in low:
+                cat = "MISSING_TABLE/VIEW"
+            elif "tvf" in low or "table_valued_function" in low:
+                cat = "TVF_ERROR"
+            elif "syntax" in low or "parse" in low:
+                cat = "SYNTAX_ERROR"
+            elif "permission" in low:
+                cat = "PERMISSION_ERROR"
+            else:
+                cat = "OTHER"
+            _err_categories[cat] = _err_categories.get(cat, 0) + 1
+
         print(
-            f"\n-- BENCHMARK VALIDATION " + "-" * 28 + "\n"
+            f"\n{'=' * 60}\n"
+            f"  PREFLIGHT — BENCHMARK VALIDATION\n"
+            f"{'=' * 60}\n"
             f"  Total benchmarks: {pre_count}\n"
             f"  Valid after validation: {len(benchmarks)}\n"
-            f"  Rejected: {pre_count - len(benchmarks)}\n"
-            f"  Rejected details:\n"
-            + "\n".join(rejected_details[:20]) + "\n"
-            + "-" * 52
+            f"  Rejected: {pre_count - len(benchmarks)}"
         )
+        if _err_categories:
+            print("  Error categories:")
+            for cat, cnt in sorted(_err_categories.items(), key=lambda x: -x[1]):
+                print(f"    {cat}: {cnt}")
+        print("  Rejected details:")
+        print("\n".join(rejected_details[:20]))
+        if len(benchmarks) > 0:
+            print("  Valid benchmark questions:")
+            for vb in benchmarks[:15]:
+                _vbq = str(vb.get("question", ""))[:80]
+                _vbid = vb.get("id", vb.get("question_id", "?"))
+                print(f"    [{_vbid}] {_vbq}")
+            if len(benchmarks) > 15:
+                print(f"    ... and {len(benchmarks) - 15} more")
+        print(f"{'-' * 60}")
 
     if len(benchmarks) < MIN_VALID_BENCHMARKS:
         logger.warning(
@@ -455,6 +583,20 @@ def run_preflight(
         uc_columns=uc_columns_dicts,
         uc_tags=uc_tags_dicts,
         uc_routines=uc_routines_dicts,
+    )
+
+    # ── Diagnostic Block 5: Experiment and Model Setup ──
+    print(
+        f"\n{'=' * 60}\n"
+        f"  PREFLIGHT — EXPERIMENT & MODEL SETUP\n"
+        f"{'=' * 60}\n"
+        f"  Experiment:       {experiment_name}\n"
+        f"  Experiment ID:    {experiment_id}\n"
+        f"  Model version:    {model_id}\n"
+        f"  Judge prompts:    {len(prompt_registrations)} registered\n"
+        f"  Eval dataset:     synced ({len(benchmarks)} benchmarks)\n"
+        f"  Instructions:     {'registered' if initial_instructions else 'none to register'}\n"
+        f"{'-' * 60}\n"
     )
 
     _instr_items = (

@@ -88,6 +88,32 @@ class OptimizeResponse(BaseModel):
     jobUrl: str | None = None
 
 
+# ── Trigger API Models ──────────────────────────────────────────────────
+
+
+class TriggerRequest(BaseModel):
+    space_id: str
+    apply_mode: str = "genie_config"
+
+
+class TriggerResponse(BaseModel):
+    runId: str
+    jobRunId: str
+    jobUrl: str | None = None
+    status: str
+
+
+class RunStatusResponse(SafeModel):
+    runId: str
+    status: str
+    spaceId: str
+    startedAt: str | None = None
+    completedAt: str | None = None
+    baselineScore: float | None = None
+    optimizedScore: float | None = None
+    convergenceReason: str | None = None
+
+
 # ── Pipeline Models ─────────────────────────────────────────────────────
 
 

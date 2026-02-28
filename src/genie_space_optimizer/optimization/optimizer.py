@@ -358,6 +358,11 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
                         judge_meta = json.loads(judge_meta) if isinstance(judge_meta, str) else {}
                     except (json.JSONDecodeError, TypeError):
                         judge_meta = {}
+                if not judge_meta:
+                    from genie_space_optimizer.optimization.evaluation import (
+                        _parse_asi_from_rationale,
+                    )
+                    judge_meta = _parse_asi_from_rationale(rationale)
                 asi_failure_type = (
                     judge_meta.get("failure_type")
                     or row.get(f"metadata/{judge}/failure_type")
@@ -636,7 +641,8 @@ def discover_join_candidates(metadata_snapshot: dict) -> list[dict]:
             if (ident_a, ident_b) in existing_pairs:
                 continue
 
-            pair_key = tuple(sorted((ident_a, ident_b)))
+            _a, _b = sorted((ident_a, ident_b))
+            pair_key = (_a, _b)
             if pair_key in seen_pairs:
                 continue
 
@@ -1088,7 +1094,7 @@ def _call_llm_for_proposal(
         1
         for t in metadata_snapshot.get("tables", [])
         for c in t.get("column_configs", [])
-        if c.get("build_value_dictionary")
+        if c.get("enable_entity_matching")
     )
 
     sql_diffs = _format_sql_diffs(cluster)
@@ -1156,27 +1162,23 @@ def _call_llm_for_proposal(
         prompt = prompt_template.format_map(defaultdict(str, format_kwargs))
 
     _tmpl_name = {1: "LEVER_1_2_COLUMN", 2: "LEVER_1_2_COLUMN", 4: "LEVER_4_JOIN_SPEC", 5: "LEVER_5_INSTRUCTION"}.get(lever, "PROPOSAL_GENERATION")
-    logger.info(
-        "\n"
-        "┌─── OPTIMIZER LLM [%s] INPUT ────────────────────────────────────────\n"
-        "│ Lever: %d | Patch type: %s\n"
-        "│ Prompt template: %s\n"
-        "│ failure_type: %s\n"
-        "│ blame_set: %s\n"
-        "│ affected_questions: %s\n"
-        "│ Prompt length: %d chars\n"
-        "└─────────────────────────────────────────────────────────────────────────",
-        _tmpl_name, lever, patch_type,
-        _tmpl_name,
-        format_kwargs.get("failure_type", "?"),
-        format_kwargs.get("blame_set", "?"),
-        format_kwargs.get("affected_questions", []),
-        len(prompt),
+    _W = 78
+    _hdr = f"┌─── LLM Call [{_tmpl_name}] " + "─" * max(0, _W - 18 - len(_tmpl_name))
+    _ftr = "└" + "─" * (_W - 1)
+
+    print(
+        f"\n{_hdr}\n"
+        f"│ {'Patch type:':<24s} {patch_type}\n"
+        f"│ {'Failure type:':<24s} {format_kwargs.get('failure_type', '?')}\n"
+        f"│ {'Blame set:':<24s} {format_kwargs.get('blame_set', '?')}\n"
+        f"│ {'Questions:':<24s} {len(format_kwargs.get('affected_questions', []))}\n"
+        f"│ {'Prompt length:':<24s} {len(prompt):,} chars\n│"
     )
 
     import time
 
     from databricks.sdk import WorkspaceClient as _WC
+    from genie_space_optimizer.optimization.evaluation import _extract_json
 
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
@@ -1184,9 +1186,19 @@ def _call_llm_for_proposal(
             w = _WC()
             response = w.serving_endpoints.query(
                 name=LLM_ENDPOINT,
-                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+                messages=[
+                    ChatMessage(
+                        role=ChatMessageRole.SYSTEM,
+                        content=(
+                            "You are a JSON-only responder. Your ENTIRE response must be a single "
+                            "valid JSON object. Do not include any analysis, markdown, commentary, "
+                            "or explanation outside the JSON. Start your response with '{' and end "
+                            "with '}'."
+                        ),
+                    ),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
                 temperature=LLM_TEMPERATURE,
-                max_tokens=1024,
             )
             choices = getattr(response, "choices", None) or []
             if not choices:
@@ -1196,44 +1208,39 @@ def _call_llm_for_proposal(
             content = getattr(message, "content", None)
             if not content:
                 raise ValueError("LLM response content is empty")
-            text = str(content)
-            text = text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\s*", "", text)
-                text = re.sub(r"\s*```$", "", text)
-            parsed = json.loads(text)
-            logger.info(
-                "\n"
-                "┌─── OPTIMIZER LLM [%s] RESPONSE ─────────────────────────────────────\n"
-                "│ proposed_value: %s\n"
-                "│ rationale: %s\n"
-                "└─────────────────────────────────────────────────────────────────────────",
-                _tmpl_name,
-                str(parsed.get("proposed_value", ""))[:300],
-                str(parsed.get("rationale", ""))[:300],
+            text = str(content).strip()
+            parsed = _extract_json(text)
+            print(
+                f"│ Attempt {attempt + 1}/{LLM_MAX_RETRIES}:{'':9s} OK -- parsed JSON\n"
+                f"│ {'Proposed value:':<24s} {str(parsed.get('proposed_value', ''))[:300]}\n"
+                f"│ {'Rationale:':<24s} {str(parsed.get('rationale', ''))[:300]}\n"
+                f"│ {'Result:':<24s} OK\n"
+                f"{_ftr}"
             )
             return parsed
         except json.JSONDecodeError:
-            logger.info(
-                "\n"
-                "┌─── OPTIMIZER LLM [%s] RESPONSE (non-JSON) ──────────────────────────\n"
-                "│ Raw text: %s\n"
-                "└─────────────────────────────────────────────────────────────────────────",
-                _tmpl_name, text[:500],
+            if attempt < LLM_MAX_RETRIES - 1:
+                print(f"│ Attempt {attempt + 1}/{LLM_MAX_RETRIES}:{'':9s} non-JSON (retrying...)")
+                time.sleep(2**attempt)
+                continue
+            print(
+                f"│ Attempt {attempt + 1}/{LLM_MAX_RETRIES}:{'':9s} non-JSON -- retries exhausted\n"
+                f"│ Raw text (500 chars): {text[:500]}\n"
+                f"│\n"
+                f"│ {'Result:':<24s} FALLBACK (raw text kept as proposed_value)\n"
+                f"{_ftr}"
             )
-            return {"proposed_value": text, "rationale": "LLM response was not valid JSON"}
+            return {"proposed_value": text, "rationale": "LLM response was not valid JSON after all retries"}
         except Exception:
             if attempt < LLM_MAX_RETRIES - 1:
+                print(f"│ Attempt {attempt + 1}/{LLM_MAX_RETRIES}:{'':9s} error (retrying...)")
                 time.sleep(2**attempt)
             else:
-                logger.exception(
-                    "\n"
-                    "┌─── OPTIMIZER LLM [%s] ERROR ────────────────────────────────────────\n"
-                    "│ Prompt len: %d chars\n"
-                    "│ LLM endpoint: %s\n"
-                    "│ Retries exhausted: %d\n"
-                    "└─────────────────────────────────────────────────────────────────────────",
-                    _tmpl_name, len(prompt), LLM_ENDPOINT, LLM_MAX_RETRIES,
+                logger.exception("LLM [%s] call failed after %d retries", _tmpl_name, LLM_MAX_RETRIES)
+                print(
+                    f"│ Attempt {attempt + 1}/{LLM_MAX_RETRIES}:{'':9s} error -- retries exhausted\n"
+                    f"│ {'Result:':<24s} FAILED\n"
+                    f"{_ftr}"
                 )
                 return {
                     "proposed_value": "",
@@ -1477,6 +1484,42 @@ def _describe_fix(cluster: dict) -> str:
     )
 
 
+def _deduplicate_clusters(clusters: list[dict]) -> list[dict]:
+    """Merge clusters with identical (root_cause, question_ids) into one representative.
+
+    Keeps the cluster with the highest confidence and tracks all merged judge
+    names so attribution is not lost.
+    """
+    seen: dict[tuple, dict] = {}
+    for c in clusters:
+        key = (c.get("root_cause", ""), tuple(sorted(c.get("question_ids", []))))
+        if key not in seen or c.get("confidence", 0) > seen[key].get("confidence", 0):
+            merged = dict(c)
+            merged.setdefault("merged_judges", [])
+            seen[key] = merged
+        seen[key]["merged_judges"].append(c.get("affected_judge", ""))
+    return list(seen.values())
+
+
+def _deduplicate_proposals(proposals: list[dict]) -> list[dict]:
+    """Remove proposals with identical proposed_value, keeping highest net_impact."""
+    seen: dict[tuple, int] = {}
+    out: list[dict] = []
+    for p in proposals:
+        val = (p.get("proposed_value") or "").strip()
+        ptype = p.get("patch_type", "")
+        if ptype in ("add_example_sql", "add_instruction") and val:
+            key = (ptype, val)
+            if key in seen:
+                existing_idx = seen[key]
+                if p.get("net_impact", 0) > out[existing_idx].get("net_impact", 0):
+                    out[existing_idx] = p
+                continue
+            seen[key] = len(out)
+        out.append(p)
+    return out
+
+
 def generate_metadata_proposals(
     clusters: list[dict],
     metadata_snapshot: dict,
@@ -1495,6 +1538,13 @@ def generate_metadata_proposals(
     (instructions / example SQL) can act as a catch-all.
     """
     failed_levers = failed_levers or set()
+    _pre_dedup = len(clusters)
+    clusters = _deduplicate_clusters(clusters)
+    if len(clusters) < _pre_dedup:
+        logger.info(
+            "Cluster dedup: %d -> %d (merged %d duplicates)",
+            _pre_dedup, len(clusters), _pre_dedup - len(clusters),
+        )
     proposals: list[dict] = []
     for cluster in clusters:
         natural_lever = _map_to_lever(
@@ -1663,6 +1713,13 @@ def generate_metadata_proposals(
                     },
                 })
 
+    _pre_dedup_p = len(proposals)
+    proposals = _deduplicate_proposals(proposals)
+    if len(proposals) < _pre_dedup_p:
+        logger.info(
+            "Proposal dedup: %d -> %d (removed %d duplicates)",
+            _pre_dedup_p, len(proposals), _pre_dedup_p - len(proposals),
+        )
     proposals.sort(key=lambda p: p["net_impact"], reverse=True)
     return proposals
 

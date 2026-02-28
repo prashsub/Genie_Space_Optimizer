@@ -4,25 +4,111 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import pytest
 
 from genie_space_optimizer.common.genie_schema import (
+    BenchmarkQuestion,
     ColumnConfig,
     ExampleQuestionSql,
     JoinSpec,
     SerializedSpace,
+    SqlSnippetExpression,
+    SqlSnippetFilter,
+    SqlSnippetMeasure,
+    SqlSnippets,
     TextInstruction,
+    generate_genie_id,
     validate_serialized_space,
 )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+_ID_A = "a" * 32
+_ID_B = "b" * 32
+_ID_C = "c" * 32
+_ID_D = "d" * 32
+_ID_E = "e" * 32
+_ID_F = "f" * 32
+
 
 def _minimal_valid_config() -> dict:
-    """Smallest config that passes validation."""
+    """Smallest config that passes lenient validation."""
     return {"data_sources": {"tables": []}}
+
+
+def _minimal_strict_config() -> dict:
+    """Smallest config that passes strict validation."""
+    return {
+        "version": 2,
+        "data_sources": {"tables": []},
+    }
+
+
+def _full_strict_config() -> dict:
+    """A comprehensive config that passes strict validation."""
+    return {
+        "version": 2,
+        "config": {
+            "sample_questions": [
+                {"id": _ID_A, "question": ["How much revenue?"]},
+                {"id": _ID_B, "question": ["Show top customers"]},
+            ]
+        },
+        "data_sources": {
+            "tables": [
+                {
+                    "identifier": "cat.sch.customers",
+                    "description": ["Customer data"],
+                    "column_configs": [
+                        {"column_name": "customer_id", "description": ["Unique ID"]},
+                        {"column_name": "name", "enable_entity_matching": True},
+                    ],
+                },
+                {
+                    "identifier": "cat.sch.orders",
+                    "column_configs": [
+                        {"column_name": "amount"},
+                        {"column_name": "order_date", "enable_format_assistance": True},
+                    ],
+                },
+            ],
+            "metric_views": [
+                {"identifier": "cat.sch.revenue_mv"},
+            ],
+        },
+        "instructions": {
+            "text_instructions": [
+                {"id": _ID_C, "content": ["Use net revenue always."]}
+            ],
+            "example_question_sqls": [
+                {
+                    "id": _ID_D,
+                    "question": ["Top 10 stores?"],
+                    "sql": ["SELECT * FROM cat.sch.orders LIMIT 10"],
+                }
+            ],
+            "join_specs": [
+                {
+                    "id": _ID_E,
+                    "left": {"identifier": "cat.sch.orders", "alias": "o"},
+                    "right": {"identifier": "cat.sch.customers", "alias": "c"},
+                    "sql": ["o.customer_id = c.customer_id"],
+                }
+            ],
+            "sql_snippets": {
+                "filters": [
+                    {
+                        "id": _ID_F,
+                        "sql": ["amount > 1000"],
+                        "display_name": "high value",
+                    }
+                ],
+            },
+        },
+    }
 
 
 def _reference_config() -> dict | None:
@@ -38,7 +124,7 @@ def _reference_config() -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# validate_serialized_space — full config
+# validate_serialized_space — lenient mode (default)
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -77,6 +163,7 @@ class TestValidateSerializedSpace:
         assert ok is True
 
     def test_full_structure_with_all_sections(self):
+        """Lenient mode accepts short IDs and unsorted arrays."""
         config = {
             "version": 2,
             "config": {
@@ -132,6 +219,17 @@ class TestValidateSerializedSpace:
                         "sql": ["`fact`.`key` = `dim`.`key`"],
                     }
                 ],
+                "sql_snippets": {
+                    "filters": [
+                        {"id": "f1", "sql": ["x > 1"], "display_name": "big"}
+                    ],
+                    "expressions": [
+                        {"id": "e1", "alias": "yr", "sql": ["YEAR(d)"], "display_name": "year"}
+                    ],
+                    "measures": [
+                        {"id": "m1", "alias": "rev", "sql": ["SUM(a)"], "display_name": "revenue"}
+                    ],
+                },
             },
         }
         ok, errors = validate_serialized_space(config)
@@ -231,7 +329,7 @@ class TestJoinSpec:
         )
         assert js.sql == ["c.id = d.id"]
 
-    def test_id_optional(self):
+    def test_id_optional_in_lenient(self):
         js = JoinSpec.model_validate(
             {
                 "left": {"identifier": "a.b.c", "alias": "c"},
@@ -250,6 +348,20 @@ class TestJoinSpec:
                     "sql": ["c.id = d.id"],
                 }
             )
+
+    def test_comment_and_instruction(self):
+        js = JoinSpec.model_validate(
+            {
+                "id": _ID_A,
+                "left": {"identifier": "a.b.c", "alias": "c"},
+                "right": {"identifier": "a.b.d", "alias": "d"},
+                "sql": ["c.id = d.id"],
+                "comment": "Join on id",
+                "instruction": "Use for detail queries",
+            }
+        )
+        assert js.comment == ["Join on id"]
+        assert js.instruction == ["Use for detail queries"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -309,6 +421,22 @@ class TestExampleQuestionSql:
         assert eq.parameters[0].name == "v"
         assert eq.parameters[0].default_value.values == ["10"]
 
+    def test_parameter_with_description(self):
+        eq = ExampleQuestionSql.model_validate(
+            {
+                "id": "eq1",
+                "question": ["Q?"],
+                "sql": ["SELECT * WHERE x = :v"],
+                "parameters": [
+                    {
+                        "name": "v",
+                        "description": "The region to filter by",
+                    }
+                ],
+            }
+        )
+        assert eq.parameters[0].description == ["The region to filter by"]
+
     def test_usage_guidance_str_coerced(self):
         eq = ExampleQuestionSql.model_validate(
             {
@@ -346,6 +474,106 @@ class TestTextInstruction:
             {"id": "ti1", "content": "plain string"}
         )
         assert ti.content == ["plain string"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SQL Snippets
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSqlSnippets:
+    def test_filter_valid(self):
+        f = SqlSnippetFilter.model_validate(
+            {"id": "f1", "sql": ["x > 1"], "display_name": "big"}
+        )
+        assert f.id == "f1"
+        assert f.sql == ["x > 1"]
+
+    def test_expression_valid(self):
+        e = SqlSnippetExpression.model_validate(
+            {"id": "e1", "alias": "yr", "sql": ["YEAR(d)"], "display_name": "year"}
+        )
+        assert e.alias == "yr"
+
+    def test_measure_valid(self):
+        m = SqlSnippetMeasure.model_validate(
+            {"id": "m1", "alias": "rev", "sql": ["SUM(a)"], "display_name": "revenue"}
+        )
+        assert m.alias == "rev"
+
+    def test_filter_missing_sql(self):
+        with pytest.raises(Exception):
+            SqlSnippetFilter.model_validate({"id": "f1"})
+
+    def test_expression_missing_alias(self):
+        with pytest.raises(Exception):
+            SqlSnippetExpression.model_validate({"id": "e1", "sql": ["YEAR(d)"]})
+
+    def test_measure_missing_alias(self):
+        with pytest.raises(Exception):
+            SqlSnippetMeasure.model_validate({"id": "m1", "sql": ["SUM(a)"]})
+
+    def test_snippets_container(self):
+        s = SqlSnippets.model_validate(
+            {
+                "filters": [{"id": "f1", "sql": ["x > 1"]}],
+                "expressions": [],
+                "measures": [],
+            }
+        )
+        assert len(s.filters) == 1
+        assert s.expressions == []
+
+    def test_str_coercion(self):
+        f = SqlSnippetFilter.model_validate(
+            {"id": "f1", "sql": "x > 1", "synonyms": "big", "comment": "filter large"}
+        )
+        assert f.sql == ["x > 1"]
+        assert f.synonyms == ["big"]
+        assert f.comment == ["filter large"]
+
+    def test_in_full_config(self):
+        config = {
+            "data_sources": {"tables": []},
+            "instructions": {
+                "sql_snippets": {
+                    "filters": [{"id": "f1", "sql": ["x > 1"]}],
+                    "expressions": [{"id": "e1", "alias": "yr", "sql": ["YEAR(d)"]}],
+                    "measures": [{"id": "m1", "alias": "rev", "sql": ["SUM(a)"]}],
+                }
+            },
+        }
+        ok, errors = validate_serialized_space(config)
+        assert ok is True, f"Config with sql_snippets failed: {errors}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Benchmark questions
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestBenchmarkQuestion:
+    def test_valid_with_id(self):
+        bq = BenchmarkQuestion.model_validate(
+            {
+                "id": _ID_A,
+                "question": ["What is avg order?"],
+                "answer": [{"format": "SQL", "content": ["SELECT AVG(a) FROM t"]}],
+            }
+        )
+        assert bq.id == _ID_A
+
+    def test_id_optional_in_lenient(self):
+        bq = BenchmarkQuestion.model_validate(
+            {"question": ["What is avg order?"]}
+        )
+        assert bq.id is None
+
+    def test_question_str_coerced(self):
+        bq = BenchmarkQuestion.model_validate(
+            {"id": _ID_A, "question": "bare string"}
+        )
+        assert bq.question == ["bare string"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -396,3 +624,455 @@ class TestTypeMismatches:
             }
         )
         assert ok is False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# generate_genie_id
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestGenerateGenieId:
+    def test_format(self):
+        gid = generate_genie_id()
+        assert re.fullmatch(r"[0-9a-f]{32}", gid), f"Bad ID: {gid}"
+
+    def test_uniqueness(self):
+        ids = {generate_genie_id() for _ in range(100)}
+        assert len(ids) == 100
+
+    def test_time_prefix_nondecreasing(self):
+        """The first 16 chars (time component) should be non-decreasing."""
+        ids = [generate_genie_id() for _ in range(50)]
+        prefixes = [gid[:16] for gid in ids]
+        assert prefixes == sorted(prefixes)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — full config passes
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictFullConfig:
+    def test_minimal_strict_passes(self):
+        ok, errors = validate_serialized_space(_minimal_strict_config(), strict=True)
+        assert ok is True, f"Minimal strict failed: {errors}"
+
+    def test_full_strict_passes(self):
+        ok, errors = validate_serialized_space(_full_strict_config(), strict=True)
+        assert ok is True, f"Full strict failed: {errors}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — ID format
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictIdFormat:
+    def test_short_id_rejected(self):
+        config = _minimal_strict_config()
+        config["config"] = {"sample_questions": [{"id": "q1", "question": ["Q?"]}]}
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("32-char" in e for e in errors)
+
+    def test_uppercase_id_rejected(self):
+        config = _minimal_strict_config()
+        config["config"] = {
+            "sample_questions": [{"id": "A" * 32, "question": ["Q?"]}]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("32-char" in e for e in errors)
+
+    def test_hyphenated_uuid_rejected(self):
+        config = _minimal_strict_config()
+        config["config"] = {
+            "sample_questions": [
+                {"id": "a1b2c3d4-e5f6-0000-0000-00000000000a", "question": ["Q?"]}
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+
+    def test_valid_hex_id_accepted(self):
+        config = _minimal_strict_config()
+        config["config"] = {
+            "sample_questions": [{"id": _ID_A, "question": ["Q?"]}]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is True, f"Valid hex ID rejected: {errors}"
+
+    def test_instruction_ids_validated(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "text_instructions": [{"id": "short", "content": ["text"]}]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("text_instructions" in e for e in errors)
+
+    def test_join_spec_missing_id_strict(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "join_specs": [
+                {
+                    "left": {"identifier": "a.b.c", "alias": "c"},
+                    "right": {"identifier": "a.b.d", "alias": "d"},
+                    "sql": ["c.id = d.id"],
+                }
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("join_specs" in e and "required" in e for e in errors)
+
+    def test_snippet_ids_validated(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "sql_snippets": {
+                "filters": [{"id": "bad", "sql": ["x > 1"]}]
+            }
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("sql_snippets.filters" in e for e in errors)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — sorting
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictSorting:
+    def test_unsorted_tables_rejected(self):
+        config = _minimal_strict_config()
+        config["data_sources"] = {
+            "tables": [
+                {"identifier": "cat.sch.z_table"},
+                {"identifier": "cat.sch.a_table"},
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("not sorted" in e for e in errors)
+
+    def test_sorted_tables_accepted(self):
+        config = _minimal_strict_config()
+        config["data_sources"] = {
+            "tables": [
+                {"identifier": "cat.sch.a_table"},
+                {"identifier": "cat.sch.z_table"},
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is True, f"Sorted tables rejected: {errors}"
+
+    def test_unsorted_column_configs_rejected(self):
+        config = _minimal_strict_config()
+        config["data_sources"] = {
+            "tables": [
+                {
+                    "identifier": "cat.sch.t",
+                    "column_configs": [
+                        {"column_name": "z_col"},
+                        {"column_name": "a_col"},
+                    ],
+                }
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("column_configs" in e and "not sorted" in e for e in errors)
+
+    def test_unsorted_sample_questions_rejected(self):
+        config = _minimal_strict_config()
+        config["config"] = {
+            "sample_questions": [
+                {"id": _ID_B, "question": ["Q2"]},
+                {"id": _ID_A, "question": ["Q1"]},
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("sample_questions" in e and "not sorted" in e for e in errors)
+
+    def test_unsorted_benchmarks_rejected(self):
+        config = _minimal_strict_config()
+        config["benchmarks"] = {
+            "questions": [
+                {
+                    "id": _ID_B,
+                    "question": ["Q2"],
+                    "answer": [{"format": "SQL", "content": ["SELECT 1"]}],
+                },
+                {
+                    "id": _ID_A,
+                    "question": ["Q1"],
+                    "answer": [{"format": "SQL", "content": ["SELECT 2"]}],
+                },
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("benchmarks.questions" in e and "not sorted" in e for e in errors)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — uniqueness
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictUniqueness:
+    def test_duplicate_question_ids_rejected(self):
+        config = _minimal_strict_config()
+        config["config"] = {
+            "sample_questions": [
+                {"id": _ID_A, "question": ["Q1"]},
+            ]
+        }
+        config["benchmarks"] = {
+            "questions": [
+                {
+                    "id": _ID_A,
+                    "question": ["Q2"],
+                    "answer": [{"format": "SQL", "content": ["SELECT 1"]}],
+                }
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("Duplicate question ID" in e for e in errors)
+
+    def test_duplicate_instruction_ids_rejected(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "text_instructions": [{"id": _ID_A, "content": ["text"]}],
+            "example_question_sqls": [
+                {"id": _ID_A, "question": ["Q?"], "sql": ["SELECT 1"]}
+            ],
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("Duplicate instruction ID" in e for e in errors)
+
+    def test_duplicate_column_config_rejected(self):
+        config = _minimal_strict_config()
+        config["data_sources"] = {
+            "tables": [
+                {
+                    "identifier": "cat.sch.t",
+                    "column_configs": [
+                        {"column_name": "col1"},
+                        {"column_name": "col1"},
+                    ],
+                }
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("Duplicate column config" in e for e in errors)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — size and length limits
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictSizeLimits:
+    def test_string_exceeding_limit_rejected(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "text_instructions": [
+                {"id": _ID_A, "content": ["x" * 25_001]}
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("string length" in e for e in errors)
+
+    def test_multiple_text_instructions_rejected(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "text_instructions": [
+                {"id": _ID_A, "content": ["Instruction 1"]},
+                {"id": _ID_B, "content": ["Instruction 2"]},
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("at most 1" in e for e in errors)
+
+    def test_single_text_instruction_accepted(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "text_instructions": [
+                {"id": _ID_A, "content": ["Just one"]}
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is True, f"Single text instruction rejected: {errors}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — table identifier format
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictTableIdentifiers:
+    def test_two_level_rejected(self):
+        config = _minimal_strict_config()
+        config["data_sources"] = {"tables": [{"identifier": "schema.table"}]}
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("three-level" in e for e in errors)
+
+    def test_one_level_rejected(self):
+        config = _minimal_strict_config()
+        config["data_sources"] = {"tables": [{"identifier": "just_table"}]}
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+
+    def test_three_level_accepted(self):
+        config = _minimal_strict_config()
+        config["data_sources"] = {"tables": [{"identifier": "cat.sch.tbl"}]}
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is True, f"Three-level identifier rejected: {errors}"
+
+    def test_backtick_three_level_accepted(self):
+        config = _minimal_strict_config()
+        config["data_sources"] = {"tables": [{"identifier": "`cat`.`sch`.`tbl`"}]}
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is True, f"Backtick three-level rejected: {errors}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — benchmark answers
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictBenchmarkAnswers:
+    def test_missing_answer_rejected(self):
+        config = _minimal_strict_config()
+        config["benchmarks"] = {
+            "questions": [
+                {"id": _ID_A, "question": ["Q?"]}
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("exactly 1 answer" in e for e in errors)
+
+    def test_wrong_format_rejected(self):
+        config = _minimal_strict_config()
+        config["benchmarks"] = {
+            "questions": [
+                {
+                    "id": _ID_A,
+                    "question": ["Q?"],
+                    "answer": [{"format": "TEXT", "content": ["some text"]}],
+                }
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("format must be 'SQL'" in e for e in errors)
+
+    def test_valid_benchmark_accepted(self):
+        config = _minimal_strict_config()
+        config["benchmarks"] = {
+            "questions": [
+                {
+                    "id": _ID_A,
+                    "question": ["Q?"],
+                    "answer": [{"format": "SQL", "content": ["SELECT 1"]}],
+                }
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is True, f"Valid benchmark rejected: {errors}"
+
+    def test_benchmark_missing_id_rejected(self):
+        config = _minimal_strict_config()
+        config["benchmarks"] = {
+            "questions": [
+                {
+                    "question": ["Q?"],
+                    "answer": [{"format": "SQL", "content": ["SELECT 1"]}],
+                }
+            ]
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("id is required" in e for e in errors)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — version
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictVersion:
+    def test_missing_version_rejected(self):
+        ok, errors = validate_serialized_space(
+            {"data_sources": {"tables": []}}, strict=True
+        )
+        assert ok is False
+        assert any("version" in e for e in errors)
+
+    def test_invalid_version_rejected(self):
+        ok, errors = validate_serialized_space(
+            {"version": 99, "data_sources": {"tables": []}}, strict=True
+        )
+        assert ok is False
+        assert any("version" in e and "1 or 2" in e for e in errors)
+
+    def test_version_1_accepted(self):
+        ok, errors = validate_serialized_space(
+            {"version": 1, "data_sources": {"tables": []}}, strict=True
+        )
+        assert ok is True
+
+    def test_version_2_accepted(self):
+        ok, errors = validate_serialized_space(
+            {"version": 2, "data_sources": {"tables": []}}, strict=True
+        )
+        assert ok is True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strict mode — sql_snippets sql must not be empty
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStrictSnippetSqlNotEmpty:
+    def test_empty_filter_sql_rejected(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "sql_snippets": {
+                "filters": [{"id": _ID_A, "sql": []}]
+            }
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("sql must not be empty" in e for e in errors)
+
+    def test_blank_filter_sql_rejected(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "sql_snippets": {
+                "filters": [{"id": _ID_A, "sql": [""]}]
+            }
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("sql must not be empty" in e for e in errors)
+
+    def test_valid_filter_sql_accepted(self):
+        config = _minimal_strict_config()
+        config["instructions"] = {
+            "sql_snippets": {
+                "filters": [{"id": _ID_A, "sql": ["x > 1"]}]
+            }
+        }
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is True, f"Valid snippet SQL rejected: {errors}"

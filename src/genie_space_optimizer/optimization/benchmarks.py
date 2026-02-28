@@ -82,25 +82,38 @@ def load_benchmarks_from_dataset(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _extract_table_references(sql: str) -> list[str]:
-    """Extract fully-qualified table references (catalog.schema.table) from SQL."""
+def _extract_table_references(sql: str) -> list[tuple[str, bool]]:
+    """Extract fully-qualified table references (catalog.schema.table) from SQL.
+
+    Returns a list of ``(fqn, is_tvf)`` tuples.  *is_tvf* is ``True`` when
+    the reference is immediately followed by ``(`` in the SQL, indicating
+    a table-valued function call.
+    """
     import re
     pattern = re.compile(
         r"(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+"
         r"(`[^`]+`\.`[^`]+`\.`[^`]+`"
-        r"|[A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*)",
+        r"|[A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*)"
+        r"(\s*\()?",
         re.IGNORECASE,
     )
-    refs: list[str] = []
+    seen: dict[str, bool] = {}
     for match in pattern.finditer(sql):
         ref = match.group(1).replace("`", "")
-        if ref:
-            refs.append(ref)
-    return list(dict.fromkeys(refs))
+        has_paren = bool(match.group(2) and match.group(2).strip())
+        if ref and ref not in seen:
+            seen[ref] = has_paren
+    return [(ref, is_tvf) for ref, is_tvf in seen.items()]
 
 
-def _verify_table_exists(spark: Any, fqn: str) -> tuple[bool, str]:
-    """Check whether a table/view/metric-view exists via SELECT ... LIMIT 0."""
+def _verify_table_exists(spark: Any, fqn: str, is_tvf: bool = False) -> tuple[bool, str]:
+    """Check whether a table/view/metric-view exists via SELECT ... LIMIT 0.
+
+    TVF references (``is_tvf=True``) are assumed valid since they cannot be
+    verified with table-style SELECT syntax.
+    """
+    if is_tvf:
+        return True, ""
     try:
         spark.sql(f"SELECT * FROM {_quote_identifier_fqn(fqn)} LIMIT 0")
         return True, ""
@@ -142,11 +155,23 @@ def validate_ground_truth_sql(
         _set_sql_context(spark, catalog, gold_schema)
         spark.sql(f"EXPLAIN {resolved}")
     except Exception as e:
-        return False, str(e)
+        err_msg = str(e)
+        if "UNRESOLVED_COLUMN" in err_msg:
+            import re as _re
+            col_match = _re.search(r"name `([^`]+)`", err_msg)
+            suggest_match = _re.search(r"Did you mean one of the following\? \[([^\]]+)\]", err_msg)
+            col_name = col_match.group(1) if col_match else "?"
+            suggestion = suggest_match.group(1) if suggest_match else "?"
+            return False, (
+                f"UNRESOLVED_COLUMN: `{col_name}` — "
+                f"suggestion: {suggestion} "
+                f"(hint: use MEASURE({col_name}) for metric view measures in ORDER BY)"
+            )
+        return False, err_msg
 
     table_refs = _extract_table_references(resolved)
-    for ref in table_refs:
-        exists, err = _verify_table_exists(spark, ref)
+    for ref, is_tvf in table_refs:
+        exists, err = _verify_table_exists(spark, ref, is_tvf=is_tvf)
         if not exists:
             return False, err
 

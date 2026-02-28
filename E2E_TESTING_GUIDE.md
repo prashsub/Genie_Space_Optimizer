@@ -61,7 +61,7 @@ The app does NOT look up a pre-deployed job by name. Instead, `job_launcher.py`:
 5 Delta tables in `{catalog}.{schema}`:
 - `genie_opt_runs` -- one row per optimization run (status, scores, config snapshot)
 - `genie_opt_stages` -- per-stage transitions (PREFLIGHT_STARTED, LEVER_1_EVAL_DONE, etc.)
-- `genie_opt_iterations` -- per-iteration evaluation results (7 dimensions)
+- `genie_opt_iterations` -- per-iteration evaluation results (8 judges: 7 quality dimensions + arbiter)
 - `genie_opt_patches` -- individual patches (type, lever, old/new values, rolled_back flag)
 - `genie_eval_asi_results` -- failure assessments from LLM judges
 
@@ -297,7 +297,7 @@ Click "Start Optimization" on the space detail page.
 7. Generates a new `run_id` (UUID)
 8. Fetches space config snapshot via best-available client
 9. Prefetches UC metadata via OBO SQL (columns, tags, routines scoped to Genie space tables)
-10. Creates `QUEUED` run in Delta with config snapshot
+10. Creates `QUEUED` run in Delta with config snapshot and `triggered_by` (current user email)
 11. Calls `submit_optimization()` which:
     - Finds/builds the project wheel
     - Uploads wheel + job notebooks to `/Workspace/Shared/genie-space-optimizer/`
@@ -382,15 +382,16 @@ After successful optimization start, browser navigates to `/runs/{runId}`.
 | 1 | Configuration Analysis | `preflight` (first half) | 30s - 2min |
 | 2 | Metadata Collection | `preflight` (second half) | 30s - 2min |
 | 3 | Baseline Evaluation | `baseline_eval` | 5 - 20min |
-| 4 | Configuration Generation | `lever_loop` | 10 - 45min |
-| 5 | Optimized Evaluation | `finalize` | 5 - 15min |
+| 3.5 | Prompt Matching Auto-Config | `lever_loop` (Stage 2.5, before levers) | 30s - 3min |
+| 4 | Configuration Generation | `lever_loop` (5-lever iteration) | 10 - 45min |
+| 5 | Optimized Evaluation | `finalize` (2 repeatability runs + model promotion) | 5 - 15min |
 
 ### Lever Status Lifecycle
 
 ```
-pending → running → evaluating → accepted (patch improved score)
-                               → rolled_back (patch caused regression > 2%)
-                               → skipped (no applicable patches)
+pending → running → evaluating → accepted (patch passed 3-gate evaluation)
+                               → rolled_back (patch caused regression > noise-floor-adjusted threshold, default 10%)
+                               → skipped (no applicable patches, or all failures filtered by arbiter)
                                → failed (exception during evaluation)
 ```
 
@@ -447,7 +448,7 @@ Click "View Results" button → navigates to `/runs/{runId}/comparison`.
 }
 ```
 
-### 7 Quality Dimensions
+### 8 Evaluation Judges (7 Quality Dimensions + Arbiter)
 
 | Dimension Key | Display Name | Target Threshold |
 |--------------|-------------|-----------------|
@@ -458,6 +459,9 @@ Click "View Results" button → navigates to `/runs/{runId}/comparison`.
 | `completeness` | Completeness | 90% |
 | `result_correctness` | Result Correctness | 85% |
 | `asset_routing` | Asset Routing | 95% |
+| `arbiter` | Arbiter (tie-breaker) | N/A (advisory; verdicts: `genie_correct`, `ground_truth_correct`, `both_correct`, `neither_correct`) |
+
+The arbiter judge does not contribute to the overall quality score but its `genie_correct` verdicts drive two mechanisms: (1) benchmark correction before the lever loop (rewriting stale gold SQL), and (2) failure row filtering (excluding `genie_correct` questions from failure clustering so levers don't chase false negatives).
 
 ### Config Diff Tabs
 
@@ -615,7 +619,21 @@ WHERE run_id = '<run_id>' AND iteration = 0
 
 #### Task 3: `lever_loop`
 
-**What it does:** Iterates through 6 optimization levers (Tables & Columns, Metric Views, TVFs, Joins, Column Discovery, Instructions). For each lever: analyzes failures, generates patches via LLM, applies patches to Genie config, evaluates, rolls back if regression > 2%.
+**What it does:** Runs in three phases:
+
+1. **Stage 2.5: Prompt Matching Auto-Config** — Before the lever loop, applies format assistance (`get_example_values`) on all visible columns and entity matching (`build_value_dictionary`) on prioritized STRING columns (up to 120-column cap). This is a deterministic, no-LLM step. Propagation wait: 90s if entity matching changes were applied, 30s otherwise.
+
+2. **Arbiter Benchmark Corrections** — Extracts `genie_correct` arbiter verdicts from baseline evaluation. When the count meets `ARBITER_CORRECTION_TRIGGER` (default 3), rewrites those benchmarks' `expected_sql` to match Genie's correct SQL via `apply_benchmark_corrections()`. This prevents chasing false failures from stale gold SQL.
+
+3. **5-Lever Optimization Loop** — Iterates through 5 levers (Tables & Columns, Metric Views, TVFs, Join Specifications, Genie Space Instructions). For each lever:
+   - Loads failure rows and filters out `genie_correct` arbiter verdicts before clustering
+   - Clusters failures, generates proposals via LLM, converts to patches
+   - Applies patches in risk order (low → medium → high)
+   - Propagation wait: 90s if value dictionary changes, 30s otherwise
+   - Runs **3-gate evaluation** (slice → P0 → full) with noise-floor-adjusted tolerances
+   - Rolls back if any gate detects regression beyond the effective threshold (default `REGRESSION_THRESHOLD=10.0%`, adjusted upward for small benchmark sets)
+   - On acceptance: updates best scores, registers instruction version snapshot, refreshes reference SQLs
+   - Lever 5 prioritizes example SQL (`add_example_sql`) over text instructions per the LEVER_5_INSTRUCTION_PROMPT priority hierarchy
 
 | Error Pattern | Likely Cause | Resolution |
 |--------------|-------------|------------|
@@ -626,6 +644,7 @@ WHERE run_id = '<run_id>' AND iteration = 0
 | Patch application error | Invalid patch command generated by LLM | Patch is rolled back, lever is skipped. Check `genie_opt_patches` table for the failed patch. |
 | `SQL context lost` | Spark session reset between evaluations | Built-in `_ensure_sql_context()` should prevent this. If persists, check Spark Connect stability. |
 | Timeout (>5400s in DAB / >7200s in launcher) | Many levers x many iterations | Reduce `MAX_ITERATIONS` in config or limit levers via `levers` parameter |
+| Arbiter corrections applied but scores worsen | Benchmark gold SQL was actually correct | Check `genie_correct` verdicts in `genie_eval_asi_results`; manually verify questionable benchmarks |
 
 **Diagnostic query (check lever outcomes):**
 ```sql
@@ -643,21 +662,42 @@ WHERE run_id = '<run_id>'
 ORDER BY lever, patch_index
 ```
 
+**Diagnostic query (check arbiter verdicts for benchmark corrections):**
+```sql
+SELECT question_id, arbiter_verdict, question_text
+FROM <catalog>.<schema>.genie_eval_asi_results
+WHERE run_id = '<run_id>' AND iteration = 0 AND arbiter_verdict = 'genie_correct'
+```
+
 #### Task 4: `finalize`
 
-**What it does:** Runs repeatability testing (re-asks questions to check consistency), promotes best model in MLflow, writes final stage records.
+**What it does:** Runs exactly **2 repeatability evaluation passes** (re-asks all benchmark questions to check SQL consistency), averages the results, promotes the best model in MLflow, generates a summary report, and writes the final terminal stage records.
+
+The finalize task uses a **heartbeat + soft timeout** mechanism:
+- Emits `FINALIZE_HEARTBEAT` stage events every 30s (configurable via `GENIE_SPACE_OPTIMIZER_FINALIZE_HEARTBEAT_SECONDS`) so stale-run reconciliation doesn't prematurely mark the run as dead.
+- Enforces a soft timeout of 6600s (configurable via `GENIE_SPACE_OPTIMIZER_FINALIZE_TIMEOUT_SECONDS`). If exceeded, raises `TimeoutError` and records `finalize_timeout` as the convergence reason.
 
 | Error Pattern | Likely Cause | Resolution |
 |--------------|-------------|------------|
 | Repeatability % very low (<50%) | Genie gives inconsistent SQL for same question | Not a code bug -- indicates the Genie Space config is non-deterministic. Report to Genie team. |
 | MLflow model promotion failure | Best model not loadable or experiment missing | Check MLflow experiment manually; ensure experiment was created in preflight |
-| Timeout (>1800s in DAB / >7200s in launcher) | Repeatability testing with many benchmarks | Increase timeout |
+| `finalize_timeout` convergence reason | Finalize exceeded soft timeout (default 6600s) | Increase `GENIE_SPACE_OPTIMIZER_FINALIZE_TIMEOUT_SECONDS` env var, or reduce benchmark count |
+| `finalize_error` convergence reason | Unhandled exception during finalize | Check error_message in `genie_opt_stages` for the FINALIZE_TERMINAL stage |
+| Timeout (>1800s in DAB / >7200s in launcher) | Repeatability testing with many benchmarks | Increase DAB/launcher job timeout, and/or the soft timeout env var |
 
 **Diagnostic query (check finalize result):**
 ```sql
 SELECT status, best_accuracy, best_repeatability, best_iteration, convergence_reason
 FROM <catalog>.<schema>.genie_opt_runs
 WHERE run_id = '<run_id>'
+```
+
+**Diagnostic query (check finalize heartbeats and phases):**
+```sql
+SELECT stage, status, detail_json, error_message, duration_seconds
+FROM <catalog>.<schema>.genie_opt_stages
+WHERE run_id = '<run_id>' AND stage IN ('FINALIZE_STARTED', 'FINALIZE_HEARTBEAT', 'FINALIZE_TERMINAL', 'REPEATABILITY_TEST')
+ORDER BY started_at
 ```
 
 #### Task 5: `deploy_check` + `deploy`
@@ -683,16 +723,19 @@ The `convergence_reason` on a run tells you exactly what happened:
 
 | Value | Meaning |
 |-------|---------|
-| `converged` | All quality thresholds met |
-| `stalled` | Score plateaued for 2+ iterations |
-| `max_iterations_reached` | Hit 5 iteration limit |
-| `baseline_meets_thresholds` | No optimization needed |
+| `threshold_met` | All quality thresholds met (CONVERGED) |
+| `no_further_improvement` | No levers improved score enough (STALLED) |
+| `max_iterations` | Hit 5 iteration limit (MAX_ITERATIONS) |
+| `baseline_meets_thresholds` | No optimization needed — baseline already converged |
+| `finalize_timeout` | Finalize exceeded soft timeout (default 6600s, FAILED) |
+| `finalize_error` | Unhandled exception during finalize (FAILED) |
 | `error_in_PREFLIGHT_STARTED` | Preflight task crashed |
-| `error_in_BASELINE_EVAL_STARTED` | Baseline evaluation crashed |
+| `error_in_BASELINE_EVAL` | Baseline evaluation crashed |
 | `error_in_LEVER_{N}_*` | Lever N task crashed |
 | `error_in_FINALIZE_*` | Finalize task crashed |
 | `job_submission_error: {detail}` | Job couldn't be submitted |
 | `job_terminated_without_state_update:failed` | Job crashed before writing terminal state |
+| `job_{lifecycle}_detected_on_poll:{result_state}` | Run poller detected job termination (e.g. `job_terminated_detected_on_poll:failed`) |
 | `job_run_lookup_failed` | Couldn't check job status (API error) |
 | `stale_queued_no_job_run` | QUEUED for >10 min with no job_run_id |
 | `user_discarded` | User clicked Discard |
@@ -865,14 +908,17 @@ databricks apps logs genie-space-optimizer -p <profile>
 
 - [ ] Preflight completes: config fetched, benchmarks generated, experiment created
 - [ ] Baseline eval completes: scores recorded in `genie_opt_iterations` with iteration=0
-- [ ] Lever loop completes (or skips if thresholds met): patches in `genie_opt_patches`
-- [ ] Finalize completes: repeatability tested, run status set to terminal
+- [ ] Lever loop Stage 2.5: prompt matching auto-config applied (format assistance + entity matching)
+- [ ] Lever loop arbiter corrections: applied if ≥3 `genie_correct` verdicts in baseline
+- [ ] Lever loop 5-lever iteration completes (or skips if thresholds met): patches in `genie_opt_patches`
+- [ ] Finalize completes: 2 repeatability runs averaged, model promoted, run status set to terminal
+- [ ] Finalize heartbeats visible in `genie_opt_stages` (FINALIZE_HEARTBEAT events)
 - [ ] Deploy skipped (deploy_target empty): deploy_check condition evaluates to false
 
 ### Comparison
 
 - [ ] `GET /api/genie/runs/{id}/comparison` returns 200 with scores and configs
-- [ ] Per-dimension scores show all 7 dimensions
+- [ ] Per-dimension scores show all 7 quality dimensions (+ arbiter if applicable)
 - [ ] Original and optimized configs differ (if patches were applied)
 - [ ] Improvement percentage calculated correctly
 

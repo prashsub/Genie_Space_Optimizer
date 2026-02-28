@@ -6,7 +6,43 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
-### Added — UC REST API, Scorer Hardening, Harness Improvements
+### Added — Trigger API, Response Quality Scorer, Schema Validation v2
+- **Programmatic trigger API** (`trigger.py`): new `POST /trigger` and
+  `GET /trigger/status/{run_id}` endpoints for headless optimization — enables
+  CI/CD and scheduled workflows without the UI
+- **Response quality scorer** (`response_quality.py`): 9th judge that evaluates
+  whether Genie's natural language analysis accurately describes the SQL query
+  and answers the user's question; returns `unknown` when NL response is absent
+- **Genie schema validation v2** (`genie_schema.py`): dual-mode validation —
+  lenient (structural/type checks) and strict (32-char hex IDs, sort order,
+  uniqueness, size limits per Databricks API spec); `generate_genie_id()` helper
+  for time-ordered UUID generation
+- **Robust LLM JSON parsing** (`_extract_json` in `evaluation.py`): handles
+  markdown fences, prose-wrapped JSON, trailing data, and nested objects
+- **Genie API rate limiting**: `genie_client.py` now retries on `ResourceExhausted`
+  (HTTP 429) and `TimeoutError` with exponential backoff; configurable via
+  `GENIE_RATE_LIMIT_BASE_DELAY` and `GENIE_RATE_LIMIT_RETRIES`
+- UC metadata: additional REST API helpers for tags retrieval
+- Expanded unit tests: schema validation (+686 lines), evaluation, scorers, optimizer
+
+### Changed
+- **Job definition moved inline**: `resources/genie_optimization_job.yml` removed;
+  job is now defined directly in `databricks.yml`
+- Scorer assembly bumped from 8 → 9 judges (response quality added between
+  completeness and asset routing)
+- `applier.py` refactored with improved patch sequencing and validation
+- `benchmarks.py` enhanced benchmark generation with better question diversity
+- `optimizer.py` expanded failure analysis and proposal generation
+- Frontend: space detail page updated for trigger API integration
+
+### Removed
+- `resources/genie_optimization_job.yml` (migrated into `databricks.yml`)
+
+---
+
+## 2026-02-23
+
+### Added — UC REST API, Scorer Hardening, Harness Improvements (`74f1eb4`)
 - **UC metadata REST API** (`uc_metadata.py`): preflight now fetches columns and routines
   via `WorkspaceClient` REST API by default, falling back to Spark SQL only when needed —
   eliminates `system.information_schema` permission issues
@@ -19,23 +55,8 @@ All notable changes to the Genie Space Optimizer are documented here.
   `assessments` column formats (MLflow genai >=2.x compatibility)
 - `fetch_genie_result_df` added to `genie_client.py` for direct result DataFrame retrieval
 - Prompt matching diagnostic logging in harness with change summaries
-
-### Changed
-- **Tuned convergence thresholds**: `REGRESSION_THRESHOLD` raised from 2.0 → 10.0,
-  `SLICE_GATE_TOLERANCE` raised from 5.0 → 15.0 (less aggressive rollback)
-- **Scorers hardened**: `completeness`, `logical_accuracy`, `schema_accuracy`,
-  `semantic_equivalence`, and `arbiter` scorers now use explicit `LLM_ENDPOINT` config
-  and structured logging for better debugging
-- Preflight uses REST → Spark SQL fallback chain (was Spark-only)
-- Lever loop job (`run_lever_loop.py`) expanded with arbiter action handling
-- `applier.py` improved patch application logic
-- `genie_client.py` enhanced with schema-aware operations
-- Config values (`PROPAGATION_WAIT_SECONDS`, `PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS`)
-  now environment-variable-overridable
-
----
-
-## 2026-02-23
+- Tuned convergence: `REGRESSION_THRESHOLD` 2.0 → 10.0, `SLICE_GATE_TOLERANCE` 5.0 → 15.0
+- Scorers hardened with explicit `LLM_ENDPOINT` config and structured logging
 
 ### Added — Documentation Update (`d770458`)
 - Updated `README.md` with settings API endpoints, new modules, and quick links

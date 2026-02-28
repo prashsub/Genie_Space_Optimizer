@@ -18,6 +18,7 @@ DEFAULT_THRESHOLDS = {
     "logical_accuracy": 90.0,
     "semantic_equivalence": 90.0,
     "completeness": 90.0,
+    "response_quality": 0.0,
     "result_correctness": 85.0,
     "asset_routing": 95.0,
 }
@@ -30,6 +31,7 @@ MLFLOW_THRESHOLDS = {
     "logical_accuracy/mean": 0.90,
     "semantic_equivalence/mean": 0.90,
     "completeness/mean": 0.90,
+    "response_quality/mean": 0.0,
     "result_correctness/mean": 0.85,
     "asset_routing/mean": 0.95,
 }
@@ -37,6 +39,8 @@ MLFLOW_THRESHOLDS = {
 # ── 2. Rate Limits and Timing ──────────────────────────────────────────
 
 RATE_LIMIT_SECONDS = 12
+GENIE_RATE_LIMIT_RETRIES = 3
+GENIE_RATE_LIMIT_BASE_DELAY = 30
 PROPAGATION_WAIT_SECONDS = int(os.getenv("GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT", "30"))
 PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS = int(
     os.getenv("GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT_ENTITY_MATCHING", "90")
@@ -202,6 +206,9 @@ PROPOSAL_GENERATION_PROMPT = (
 )
 
 LEVER_1_2_COLUMN_PROMPT = (
+    'IMPORTANT: Your response must be ONLY a JSON object with the schema shown at the end.\n'
+    'Do not write analysis or commentary -- put your reasoning in the "rationale" field.\n'
+    '\n'
     'You are a Databricks Genie Space metadata expert. Your job is to fix column\n'
     'descriptions and synonyms so that Genie generates correct SQL for user questions.\n'
     '\n'
@@ -505,7 +512,7 @@ DEFAULT_LEVER_ORDER = [1, 2, 3, 4, 5]
 
 MAX_VALUE_DICTIONARY_COLUMNS = 120
 """Maximum number of string columns per Genie Space that can have
-build_value_dictionary=true. Enforced by auto_apply_prompt_matching()."""
+enable_entity_matching=true. Enforced by auto_apply_prompt_matching()."""
 
 ENABLE_PROMPT_MATCHING_AUTO_APPLY = True
 """When True, format assistance and entity matching are applied as a

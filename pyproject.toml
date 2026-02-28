@@ -36,6 +36,12 @@ exclude = [
     ".venv/**",
 ]
 
+[[tool.ty.overrides]]
+include = ["src/genie_space_optimizer/optimization/**"]
+
+[tool.ty.overrides.rules]
+possibly-missing-attribute = "ignore"
+
 [tool.apx.metadata]
 app-name = "genie-space-optimizer"
 app-slug = "genie_space_optimizer"

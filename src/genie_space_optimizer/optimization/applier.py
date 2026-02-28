@@ -25,47 +25,18 @@ from genie_space_optimizer.common.config import (
     MAX_VALUE_DICTIONARY_COLUMNS,
     MEASURE_NAME_PREFIXES,
     MEDIUM_RISK_PATCHES,
-    NON_EXPORTABLE_FIELDS,
     NUMERIC_DATA_TYPES,
     PATCH_TYPES,
     _LEVER_TO_PATCH_TYPE,
 )
-from genie_space_optimizer.common.genie_client import patch_space_config
+from genie_space_optimizer.common.genie_client import (
+    patch_space_config,
+    sort_genie_config,
+    strip_non_exportable_fields,
+)
 from genie_space_optimizer.optimization.optimizer import _resolve_scope
 
 logger = logging.getLogger(__name__)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 1. Config Helpers
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def strip_non_exportable_fields(config: dict) -> dict:
-    """Remove fields that should not be included in PATCH requests."""
-    return {k: v for k, v in config.items() if k not in NON_EXPORTABLE_FIELDS}
-
-
-def sort_genie_config(config: dict) -> dict:
-    """Sort arrays in a Genie config for deterministic comparison."""
-    if "data_sources" in config:
-        for key in ["tables", "metric_views"]:
-            if key in config.get("data_sources", {}):
-                config["data_sources"][key] = sorted(
-                    config["data_sources"][key],
-                    key=lambda x: x.get("identifier", ""),
-                )
-    if "instructions" in config:
-        inst = config["instructions"]
-        if "sql_functions" in inst:
-            inst["sql_functions"] = sorted(
-                inst["sql_functions"],
-                key=lambda x: (x.get("id", ""), x.get("identifier", "")),
-            )
-        for key in ["text_instructions", "example_question_sqls"]:
-            if key in inst:
-                inst[key] = sorted(inst[key], key=lambda x: x.get("id", ""))
-    return config
 
 
 _MAX_INSTRUCTION_CHARS = 24_500  # Genie Space API enforces 25 000; leave margin
@@ -205,6 +176,44 @@ def _entity_matching_score(column_name: str) -> int:
     return 1
 
 
+def _ensure_column_configs_from_uc(
+    tables_and_mvs: list[dict], uc_columns: list[dict],
+) -> int:
+    """Populate column_configs from UC metadata for columns not yet present.
+
+    The Genie Space API only returns column_configs for explicitly configured
+    columns. For unconfigured spaces every table has column_configs: [].
+    This bootstraps entries so that format assistance and entity matching
+    loops have something to iterate over.
+
+    Returns the number of new column_config entries created.
+    """
+    table_cols: dict[str, list[str]] = {}
+    for col in uc_columns:
+        if not isinstance(col, dict):
+            continue
+        tbl = str(col.get("table_name") or "").strip().lower()
+        cname = str(col.get("column_name") or "").strip()
+        if tbl and cname:
+            table_cols.setdefault(tbl, []).append(cname)
+
+    created = 0
+    for tbl_dict in tables_and_mvs:
+        identifier = tbl_dict.get("identifier", "")
+        short_name = identifier.replace("`", "").rsplit(".", 1)[-1].lower()
+        existing_names = {
+            cc.get("column_name", "").lower()
+            for cc in tbl_dict.get("column_configs", [])
+        }
+        for col_name in table_cols.get(short_name, []):
+            if col_name.lower() not in existing_names:
+                tbl_dict.setdefault("column_configs", []).append(
+                    {"column_name": col_name}
+                )
+                created += 1
+    return created
+
+
 def auto_apply_prompt_matching(
     w: WorkspaceClient,
     space_id: str,
@@ -224,6 +233,10 @@ def auto_apply_prompt_matching(
     metric_views = ds.get("metric_views", [])
     uc_columns: list[dict] = config.get("_uc_columns", [])
 
+    bootstrapped = _ensure_column_configs_from_uc(tables + metric_views, uc_columns)
+    if bootstrapped:
+        print(f"  [PROMPT MATCHING] Bootstrapped {bootstrapped} column_config entries from UC metadata")
+
     type_lookup: dict[tuple[str, str], str] = {}
     for col in uc_columns:
         if not isinstance(col, dict):
@@ -241,7 +254,7 @@ def auto_apply_prompt_matching(
         1
         for t in tables + metric_views
         for cc in t.get("column_configs", [])
-        if cc.get("build_value_dictionary")
+        if cc.get("enable_entity_matching")
     )
 
     entity_candidates: list[tuple[str, str, str, int]] = []
@@ -257,8 +270,8 @@ def auto_apply_prompt_matching(
             col_name = cc.get("column_name", "")
             if _is_hidden(cc) or not col_name:
                 continue
-            if not cc.get("get_example_values"):
-                cc["get_example_values"] = True
+            if not cc.get("enable_format_assistance"):
+                cc["enable_format_assistance"] = True
                 changes.append({
                     "type": "enable_example_values",
                     "table": identifier,
@@ -267,7 +280,7 @@ def auto_apply_prompt_matching(
             dtype = type_lookup.get((short_name.lower(), col_name.lower()), "")
             if (
                 dtype.upper().split("(")[0].strip() == "STRING"
-                and not cc.get("build_value_dictionary")
+                and not cc.get("enable_entity_matching")
             ):
                 score = _entity_matching_score(col_name)
                 entity_candidates.append((identifier, col_name, dtype, score))
@@ -282,8 +295,8 @@ def auto_apply_prompt_matching(
             dtype = type_lookup.get((short_name.lower(), col_name.lower()), "")
             if _is_measure_column(col_name, dtype):
                 continue
-            if not cc.get("get_example_values"):
-                cc["get_example_values"] = True
+            if not cc.get("enable_format_assistance"):
+                cc["enable_format_assistance"] = True
                 changes.append({
                     "type": "enable_example_values",
                     "table": identifier,
@@ -291,7 +304,7 @@ def auto_apply_prompt_matching(
                 })
             if (
                 dtype.upper().split("(")[0].strip() == "STRING"
-                and not cc.get("build_value_dictionary")
+                and not cc.get("enable_entity_matching")
             ):
                 score = _entity_matching_score(col_name)
                 entity_candidates.append((identifier, col_name, dtype, score))
@@ -305,14 +318,14 @@ def auto_apply_prompt_matching(
         1
         for t in tables + metric_views
         for cc in t.get("column_configs", [])
-        if cc.get("get_example_values") and not _is_hidden(cc)
+        if cc.get("enable_format_assistance") and not _is_hidden(cc)
     ) - fa_count_preview
 
     fa_lines = [f"\n-- FORMAT ASSISTANCE " + "-" * 31]
-    fa_lines.append(f"  Enabled get_example_values on {fa_count_preview} columns")
+    fa_lines.append(f"  Enabled format assistance on {fa_count_preview} columns")
     fa_lines.append(f"  Skipped (already enabled): {fa_skipped}")
     fa_lines.append("-" * 52)
-    logger.info("\n".join(fa_lines))
+    print("\n".join(fa_lines))
 
     em_lines = [f"\n-- ENTITY MATCHING (Value Dictionary) " + "-" * 14]
     em_lines.append(f"  STRING columns scored for entity matching: {len(entity_candidates)}")
@@ -324,16 +337,16 @@ def auto_apply_prompt_matching(
         f"{already_dict_count + len(selected)} / {MAX_VALUE_DICTIONARY_COLUMNS} max"
     )
     em_lines.append("-" * 52)
-    logger.info("\n".join(em_lines))
+    print("\n".join(em_lines))
 
     for identifier, col_name, _dtype, _score in selected:
         tbl_dict = _find_table_in_config(parsed, identifier)
         if not tbl_dict:
             continue
         cc = _find_or_create_column_config(tbl_dict, col_name)
-        cc["build_value_dictionary"] = True
-        if not cc.get("get_example_values"):
-            cc["get_example_values"] = True
+        cc["enable_entity_matching"] = True
+        if not cc.get("enable_format_assistance"):
+            cc["enable_format_assistance"] = True
         changes.append({
             "type": "enable_value_dictionary",
             "table": identifier,
@@ -359,10 +372,10 @@ def auto_apply_prompt_matching(
     em_count = sum(1 for c in changes if c["type"] == "enable_value_dictionary")
     patched_objects = sorted({c["table"] for c in changes})
 
-    logger.info(
-        "Prompt matching auto-config: enabled format assistance on %d columns, "
-        "entity matching on %d STRING columns (%d/%d dictionary slots used)",
-        fa_count, em_count, already_dict_count + em_count, MAX_VALUE_DICTIONARY_COLUMNS,
+    print(
+        f"Prompt matching auto-config: enabled format assistance on {fa_count} columns, "
+        f"entity matching on {em_count} STRING columns "
+        f"({already_dict_count + em_count}/{MAX_VALUE_DICTIONARY_COLUMNS} dictionary slots used)"
     )
 
     return {
@@ -668,23 +681,23 @@ def render_patch(patch: dict, space_id: str, space_config: dict) -> dict:
     # ── Column Discovery Settings (Lever 5) ───────────────────────
     if patch_type == "enable_example_values":
         return action(
-            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "get_example_values": True}),
-            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "get_example_values": False}),
+            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "enable_format_assistance": True}),
+            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "enable_format_assistance": False}),
         )
     if patch_type == "disable_example_values":
         return action(
-            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "get_example_values": False}),
-            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "get_example_values": True}),
+            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "enable_format_assistance": False}),
+            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "enable_format_assistance": True}),
         )
     if patch_type == "enable_value_dictionary":
         return action(
-            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "build_value_dictionary": True}),
-            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "build_value_dictionary": False}),
+            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "enable_entity_matching": True}),
+            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "enable_entity_matching": False}),
         )
     if patch_type == "disable_value_dictionary":
         return action(
-            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "build_value_dictionary": False}),
-            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "build_value_dictionary": True}),
+            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "enable_entity_matching": False}),
+            json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "enable_entity_matching": True}),
         )
     if patch_type == "add_column_synonym":
         synonyms = patch.get("synonyms", [new_text] if new_text else [])
@@ -840,10 +853,10 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
             if not question_text:
                 return False
             sql_text = cmd.get("sql", "")
-            import uuid as _uuid
+            from genie_space_optimizer.common.genie_schema import generate_genie_id
 
             new_entry: dict = {
-                "id": str(_uuid.uuid4()).replace("-", "")[:24],
+                "id": generate_genie_id(),
                 "question": [question_text],
                 "sql": [sql_text],
             }
@@ -904,11 +917,11 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
         if "visible" in cmd:
             cc["exclude"] = not cmd["visible"]
             return True
-        if "get_example_values" in cmd:
-            cc["get_example_values"] = cmd["get_example_values"]
+        if "enable_format_assistance" in cmd:
+            cc["enable_format_assistance"] = cmd["enable_format_assistance"]
             return True
-        if "build_value_dictionary" in cmd:
-            cc["build_value_dictionary"] = cmd["build_value_dictionary"]
+        if "enable_entity_matching" in cmd:
+            cc["enable_entity_matching"] = cmd["enable_entity_matching"]
             return True
         if "old_alias" in cmd:
             new_alias = cmd.get("new_alias", "")
@@ -1202,13 +1215,24 @@ def apply_patch_set(
 
     from genie_space_optimizer.common.genie_schema import validate_serialized_space
 
-    config_ok, validation_errors = validate_serialized_space(config)
+    config_ok, validation_errors = validate_serialized_space(config, strict=True)
     if not config_ok:
         logger.error(
             "Post-patch config validation failed for space %s: %s",
             space_id,
             validation_errors,
         )
+        return {
+            "space_id": space_id,
+            "pre_snapshot": pre_snapshot,
+            "post_snapshot": copy.deepcopy(config),
+            "applied": applied,
+            "queued_high": queued_high,
+            "rollback_commands": rollback_commands,
+            "deploy_target": deploy_target,
+            "patched_objects": list(patched_objects),
+            "validation_errors": validation_errors,
+        }
 
     if w is not None and applied:
         try:
@@ -1225,7 +1249,7 @@ def apply_patch_set(
         "rollback_commands": rollback_commands,
         "deploy_target": deploy_target,
         "patched_objects": list(patched_objects),
-        "validation_errors": validation_errors if not config_ok else [],
+        "validation_errors": [],
     }
 
 

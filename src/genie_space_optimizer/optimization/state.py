@@ -231,11 +231,23 @@ def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None
     for table, col, col_def in migrations:
         fqn = _fqn(catalog, schema, table)
         try:
+            existing = {
+                row["col_name"].lower()
+                for row in spark.sql(f"DESCRIBE TABLE {fqn}").collect()
+            }
+        except Exception:
+            existing = set()
+
+        if col.lower() in existing:
+            print(f"  [SKIP] {fqn}.{col} already exists")
+            continue
+
+        try:
             spark.sql(f"ALTER TABLE {fqn} ADD COLUMN {col} {col_def}")
-            logger.info("  [MIGRATED] Added %s.%s", fqn, col)
+            print(f"  [MIGRATED] Added {fqn}.{col}")
         except Exception as exc:
             if "already exists" in str(exc).lower():
-                logger.debug("  [SKIP] %s.%s already exists", fqn, col)
+                print(f"  [SKIP] {fqn}.{col} already exists")
             else:
                 logger.warning("  [WARN] Could not add %s.%s: %s", fqn, col, exc)
 

@@ -49,6 +49,20 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
                 "even if SQL syntax differs. Weight this heavily in your assessment.\n"
             )
 
+        empty_data_note = ""
+        if cmp.get("gt_rows", -1) == 0:
+            empty_data_note = (
+                "\nIMPORTANT: The ground-truth query returned 0 rows, meaning "
+                "the underlying dataset currently has no matching data for this "
+                "question. When both queries would return empty results, minor "
+                "SQL differences (e.g. filter thresholds) have no practical impact. "
+                "Focus your assessment on whether the SQL structure and intent are "
+                "correct rather than penalizing differences that only matter when "
+                "data exists. If the SQL is structurally sound but differs in a "
+                "threshold or filter value that doesn't affect empty results, lean "
+                "toward PASS.\n"
+            )
+
         prompt = (
             "You are a SQL completeness expert evaluating SQL for a Databricks Genie Space.\n"
             "Determine if the generated SQL fully answers the user's question without "
@@ -56,7 +70,7 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
             f"User question: {question}\n"
             f"Expected SQL: {gt_sql}\n"
             f"Generated SQL: {genie_sql}\n"
-            f"{cmp_summary}\n"
+            f"{cmp_summary}{empty_data_note}\n"
             'Respond with JSON only: {"complete": true/false, "failure_type": "<missing_column|missing_filter|missing_temporal_filter|missing_aggregation|partial_answer>", '
             '"blame_set": ["<missing_element>"], '
             '"rationale": "<brief explanation>"}\n'
@@ -165,6 +179,8 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
         base_confidence = 0.95
         if cmp.get("match"):
             base_confidence = 0.5
+        elif cmp.get("gt_rows", -1) == 0 and cmp.get("error"):
+            base_confidence = 0.3
         elif cmp.get("error"):
             base_confidence = 0.6
 

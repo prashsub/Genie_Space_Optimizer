@@ -32,6 +32,7 @@ export interface DataAccessGrant {
     grantedBy: string;
     id: string;
     schema_name?: string;
+    source?: string;
     status?: string;
 }
 export interface DataAccessGrantRequest {
@@ -71,11 +72,6 @@ export interface Name {
     family_name?: string | null;
     given_name?: string | null;
 }
-export interface OptimizeResponse {
-    jobRunId: string;
-    jobUrl?: string | null;
-    runId: string;
-}
 export interface PipelineLink {
     category: string;
     label: string;
@@ -83,6 +79,7 @@ export interface PipelineLink {
 }
 export type PipelineRun = unknown;
 export type PipelineStep = unknown;
+export type RunStatusResponse = unknown;
 export type RunSummary = unknown;
 export interface SpaceConfiguration {
     instructions: string;
@@ -114,6 +111,16 @@ export interface TableInfo {
     name: string;
     rowCount?: number | null;
     schema_name: string;
+}
+export interface TriggerRequest {
+    apply_mode?: string;
+    space_id: string;
+}
+export interface TriggerResponse {
+    jobRunId: string;
+    jobUrl?: string | null;
+    runId: string;
+    status: string;
 }
 export interface User {
     active?: boolean | null;
@@ -968,9 +975,7 @@ export function useGetSpaceDetailSuspense<TData = {
         ...options?.query
     });
 }
-export interface StartOptimizationParams {
-    space_id: string;
-    apply_mode?: string;
+export interface TriggerOptimizationParams {
     "X-Forwarded-Host"?: string | null;
     "X-Forwarded-Preferred-Username"?: string | null;
     "X-Forwarded-User"?: string | null;
@@ -978,16 +983,78 @@ export interface StartOptimizationParams {
     "X-Request-Id"?: string | null;
     "X-Forwarded-Access-Token"?: string | null;
 }
-export const startOptimization = async (params: StartOptimizationParams, options?: RequestInit): Promise<{
-    data: OptimizeResponse;
+export const triggerOptimization = async (data: TriggerRequest, params?: TriggerOptimizationParams, options?: RequestInit): Promise<{
+    data: TriggerResponse;
 }> =>{
-    const searchParams = new URLSearchParams();
-    if (params?.apply_mode != null) searchParams.set("apply_mode", String(params?.apply_mode));
-    const queryString = searchParams.toString();
-    const url = queryString ? `/api/genie/spaces/${params.space_id}/optimize?${queryString}` : `/api/genie/spaces/${params.space_id}/optimize`;
-    const res = await fetch(url, {
+    const res = await fetch("/api/genie/trigger", {
         ...options,
         method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            ...(params?.["X-Forwarded-Host"] != null && {
+                "X-Forwarded-Host": params["X-Forwarded-Host"]
+            }),
+            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
+                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
+            }),
+            ...(params?.["X-Forwarded-User"] != null && {
+                "X-Forwarded-User": params["X-Forwarded-User"]
+            }),
+            ...(params?.["X-Forwarded-Email"] != null && {
+                "X-Forwarded-Email": params["X-Forwarded-Email"]
+            }),
+            ...(params?.["X-Request-Id"] != null && {
+                "X-Request-Id": params["X-Request-Id"]
+            }),
+            ...(params?.["X-Forwarded-Access-Token"] != null && {
+                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
+            }),
+            ...options?.headers
+        },
+        body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export function useTriggerOptimization(options?: {
+    mutation?: UseMutationOptions<{
+        data: TriggerResponse;
+    }, ApiError, {
+        params: TriggerOptimizationParams;
+        data: TriggerRequest;
+    }>;
+}) {
+    return useMutation({
+        mutationFn: (vars)=>triggerOptimization(vars.data, vars.params),
+        ...options?.mutation
+    });
+}
+export interface GetTriggerStatusParams {
+    run_id: string;
+    "X-Forwarded-Host"?: string | null;
+    "X-Forwarded-Preferred-Username"?: string | null;
+    "X-Forwarded-User"?: string | null;
+    "X-Forwarded-Email"?: string | null;
+    "X-Request-Id"?: string | null;
+    "X-Forwarded-Access-Token"?: string | null;
+}
+export const getTriggerStatus = async (params: GetTriggerStatusParams, options?: RequestInit): Promise<{
+    data: RunStatusResponse;
+}> =>{
+    const res = await fetch(`/api/genie/trigger/status/${params.run_id}`, {
+        ...options,
+        method: "GET",
         headers: {
             ...(params?.["X-Forwarded-Host"] != null && {
                 "X-Forwarded-Host": params["X-Forwarded-Host"]
@@ -1024,16 +1091,38 @@ export const startOptimization = async (params: StartOptimizationParams, options
         data: await res.json()
     };
 };
-export function useStartOptimization(options?: {
-    mutation?: UseMutationOptions<{
-        data: OptimizeResponse;
-    }, ApiError, {
-        params: StartOptimizationParams;
-    }>;
+export const getTriggerStatusKey = (params?: GetTriggerStatusParams)=>{
+    return [
+        "/api/genie/trigger/status/{run_id}",
+        params
+    ] as const;
+};
+export function useGetTriggerStatus<TData = {
+    data: RunStatusResponse;
+}>(options: {
+    params: GetTriggerStatusParams;
+    query?: Omit<UseQueryOptions<{
+        data: RunStatusResponse;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
 }) {
-    return useMutation({
-        mutationFn: (vars)=>startOptimization(vars.params),
-        ...options?.mutation
+    return useQuery({
+        queryKey: getTriggerStatusKey(options.params),
+        queryFn: ()=>getTriggerStatus(options.params),
+        ...options?.query
+    });
+}
+export function useGetTriggerStatusSuspense<TData = {
+    data: RunStatusResponse;
+}>(options: {
+    params: GetTriggerStatusParams;
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: RunStatusResponse;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: getTriggerStatusKey(options.params),
+        queryFn: ()=>getTriggerStatus(options.params),
+        ...options?.query
     });
 }
 export const version = async (options?: RequestInit): Promise<{

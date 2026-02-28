@@ -271,7 +271,7 @@ _log(
 # MAGIC ## Stage 2.5: Prompt Matching Auto-Config
 # MAGIC
 # MAGIC Before the lever loop, apply format assistance and entity matching as a best-practice hygiene step.
-# MAGIC This enables `get_example_values` on all visible columns and `build_value_dictionary` on prioritized
+# MAGIC This enables `enable_format_assistance` on all visible columns and `enable_entity_matching` on prioritized
 # MAGIC STRING columns (up to the 120-column cap), skipping metric view measure columns.
 # MAGIC
 # MAGIC After applying changes, a propagation wait allows the Genie Space to rebuild its index:
@@ -289,7 +289,9 @@ if ENABLE_PROMPT_MATCHING_AUTO_APPLY:
         uc_columns = get_columns_for_tables_rest(w, table_refs) if table_refs else []
         config["_uc_columns"] = uc_columns
 
-        _tables = config.get("tables", [])
+        _parsed = config.get("_parsed_space", {})
+        _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
+        _tables = _ds.get("tables", []) + _ds.get("metric_views", [])
         _total_cols = sum(len(t.get("column_configs", [])) for t in _tables)
         _visible_cols = sum(
             1 for t in _tables for c in t.get("column_configs", [])
@@ -302,11 +304,11 @@ if ENABLE_PROMPT_MATCHING_AUTO_APPLY:
         )
         _fa_existing = sum(
             1 for t in _tables for c in t.get("column_configs", [])
-            if c.get("get_example_values")
+            if c.get("enable_format_assistance")
         )
         _vd_existing = sum(
             1 for t in _tables for c in t.get("column_configs", [])
-            if c.get("build_value_dictionary")
+            if c.get("enable_entity_matching")
         )
         print(
             f"\n{'=' * 62}\n"

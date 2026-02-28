@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 
+from collections import Counter
+
 from databricks.sdk import WorkspaceClient
 
 from genie_space_optimizer.common.config import (
@@ -93,6 +95,27 @@ FINALIZE_TIMEOUT_SECONDS = int(
 FINALIZE_HEARTBEAT_SECONDS = int(
     os.getenv("GENIE_SPACE_OPTIMIZER_FINALIZE_HEARTBEAT_SECONDS", "30"),
 )
+
+
+_W = 78
+
+def _section(title: str, char: str = "=") -> str:
+    pad = max(0, _W - len(title) - 4)
+    return f"\n{char * 2} {title} {char * pad}"
+
+
+def _kv(key: str, value: object, indent: int = 2) -> str:
+    return f"{' ' * indent}{'| ' if indent == 0 else '|  '}{key + ':':<28s} {value}"
+
+
+def _bar(char: str = "-") -> str:
+    return char * _W
+
+
+def _scorecard(scores: dict[str, float], prefix: str = "|  ") -> str:
+    parts = [f"{j}={v:.1f}" for j, v in sorted(scores.items())]
+    line = "  ".join(parts)
+    return f"{prefix}Scores:  {line}"
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -335,6 +358,16 @@ def _run_prompt_matching_setup(
     )
 
     try:
+        _parsed = config.get("_parsed_space", {})
+        _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
+        _tbl_count = len(_ds.get("tables", []))
+        _mv_count = len(_ds.get("metric_views", []))
+        print(
+            f"\n[PROMPT MATCHING] Starting auto-config — "
+            f"tables: {_tbl_count}, metric_views: {_mv_count}, "
+            f"total data sources: {_tbl_count + _mv_count}"
+        )
+
         apply_log = auto_apply_prompt_matching(w, space_id, config)
 
         applied = apply_log.get("applied", [])
@@ -364,8 +397,8 @@ def _run_prompt_matching_setup(
         print(
             f"\n-- PROMPT MATCHING APPLIED " + "-" * 26 + "\n"
             f"  Total changes: {len(applied)}\n"
-            f"    Format assistance (get_example_values): {fa_count} columns\n"
-            f"    Entity matching (build_value_dictionary): {em_count} columns\n"
+            f"    Format assistance (enable_format_assistance): {fa_count} columns\n"
+            f"    Entity matching (enable_entity_matching): {em_count} columns\n"
             f"  Tables patched: {apply_log.get('patched_objects', [])}\n"
             f"  Genie Space API PATCH sent: {'YES' if applied else 'NO'}\n"
             f"  Config refreshed: {'YES' if applied else 'N/A'}\n"
@@ -506,7 +539,9 @@ def _run_lever_loop(
     levers_rolled_back: list[int] = []
 
     _ensure_sql_context(spark, catalog, schema)
-    predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
+    from genie_space_optimizer.optimization.evaluation import build_metric_view_measures
+    _mv_measures = build_metric_view_measures(config)
+    predict_fn = make_predict_fn(w, space_id, spark, catalog, schema, metric_view_measures=_mv_measures)
     scorers = make_all_scorers(w, spark, catalog, schema)
     uc_schema = f"{catalog}.{schema}"
     metadata_snapshot = config.get("_parsed_space", config)
@@ -587,11 +622,11 @@ def _run_lever_loop(
         lever_name = LEVER_NAMES.get(lever, f"Lever {lever}")
 
         print(
-            f"\n{'=' * 62}\n"
-            f"  LEVER {lever}: {lever_name} -- Iteration {iteration_counter}\n"
-            f"  Best accuracy: {best_accuracy:.1f}% | "
-            f"Thresholds met: {all_thresholds_met(best_scores, thresholds)}\n"
-            f"{'=' * 62}"
+            _section(f"LEVER {lever}: {lever_name} -- Iteration {iteration_counter}") + "\n"
+            + _kv("Best accuracy", f"{best_accuracy:.1f}%") + "\n"
+            + _kv("Thresholds met", all_thresholds_met(best_scores, thresholds)) + "\n"
+            + _scorecard(best_scores) + "\n"
+            + _bar("=")
         )
 
         write_stage(
@@ -622,25 +657,29 @@ def _run_lever_loop(
             else:
                 filtered_failure_rows.append(row)
 
-        print(
-            f"\n-- FAILURE ROWS: {len(failure_rows)} loaded for clustering\n"
-            f"  Arbiter verdicts: {arbiter_counts}"
-        )
+        _arbiter_summary = "  ".join(f"{k}={v}" for k, v in sorted(arbiter_counts.items()))
+        _fa_lines = [
+            _section("Failure Analysis", "-"),
+            _kv("Total rows loaded", len(failure_rows)),
+            _kv("Arbiter verdicts", _arbiter_summary),
+        ]
         if arbiter_excluded:
-            print(
-                f"\n-- ARBITER FILTER " + "-" * 34 + "\n"
-                f"  Excluded {len(arbiter_excluded)} questions (arbiter: genie_correct)\n"
-                f"  Question IDs: {arbiter_excluded}\n"
-                f"  Remaining failure rows: {len(filtered_failure_rows)}\n"
-                + "-" * 52
-            )
+            _fa_lines.append(_kv("Excluded (genie_correct)", f"{len(arbiter_excluded)} question(s)"))
+        _fa_lines.append(_kv("Rows for clustering", len(filtered_failure_rows)))
+        _fa_lines.append(_bar("-"))
+        print("\n".join(_fa_lines))
 
         eval_result_for_clustering = {"rows": filtered_failure_rows}
         clusters = cluster_failures(eval_result_for_clustering, metadata_snapshot)
 
         from genie_space_optimizer.optimization.optimizer import _map_to_lever
 
-        cluster_lines = [f"\n-- FAILURE CLUSTERS ({len(clusters)} total) " + "-" * 30]
+        cluster_lines = [_section(f"Failure Clusters ({len(clusters)} total)", "-"), "|"]
+        _root_cause_counter: Counter[str] = Counter()
+        _lever_counter: Counter[int] = Counter()
+        _all_cluster_qids: set[str] = set()
+        _clusters_with_asi = 0
+        _clusters_with_blame = 0
         for ci, c in enumerate(clusters, 1):
             mapped = _map_to_lever(
                 c["root_cause"],
@@ -648,16 +687,37 @@ def _run_lever_loop(
                 blame_set=c.get("asi_blame_set"),
                 judge=c.get("affected_judge"),
             )
-            cluster_lines.append(
-                f"  Cluster {ci}: judge={c['affected_judge']} | "
-                f"root_cause={c['root_cause']} | mapped_lever={mapped}"
-            )
-            cluster_lines.append(f"    Blame: {c.get('asi_blame_set', c.get('blame_set', []))}")
-            cluster_lines.append(f"    Questions: {c['question_ids']}")
-            cluster_lines.append(
-                f"    ASI failure type: {c.get('asi_failure_type', 'n/a')}"
-            )
-        cluster_lines.append("-" * 52)
+            blame = c.get("asi_blame_set", c.get("blame_set", []))
+            qids = c["question_ids"]
+            asi_ft = c.get("asi_failure_type", "n/a")
+            cluster_lines.append(f"|  Cluster {ci} / {len(clusters)}")
+            cluster_lines.append(f"|    {'Judge:':<24s} {c['affected_judge']}")
+            cluster_lines.append(f"|    {'Root cause:':<24s} {c['root_cause']}")
+            cluster_lines.append(f"|    {'ASI failure type:':<24s} {asi_ft}")
+            cluster_lines.append(f"|    {'Mapped lever:':<24s} {mapped}")
+            blame_str = ", ".join(blame) if isinstance(blame, list) and blame else str(blame) if blame else "(none)"
+            cluster_lines.append(f"|    {'Blame:':<24s} {blame_str}")
+            cluster_lines.append(f"|    Questions ({len(qids)}):")
+            for qid in qids:
+                cluster_lines.append(f"|      {qid}")
+            cluster_lines.append("|")
+            _root_cause_counter[c["root_cause"]] += 1
+            _lever_counter[mapped] += 1
+            _all_cluster_qids.update(qids)
+            if asi_ft and asi_ft != "n/a":
+                _clusters_with_asi += 1
+            if blame and blame != []:
+                _clusters_with_blame += 1
+
+        _lever_summary = ", ".join(f"lever {k} = {v}" for k, v in sorted(_lever_counter.items()))
+        _top_causes = ", ".join(f"{k} ({v})" for k, v in _root_cause_counter.most_common(5))
+        cluster_lines.append("|  --- Summary ---")
+        cluster_lines.append(f"|    {'Clusters by lever:':<24s} {_lever_summary}")
+        cluster_lines.append(f"|    {'Unique questions:':<24s} {len(_all_cluster_qids)}")
+        cluster_lines.append(f"|    {'Top root causes:':<24s} {_top_causes}")
+        cluster_lines.append(f"|    {'Clusters with ASI:':<24s} {_clusters_with_asi} of {len(clusters)}")
+        cluster_lines.append(f"|    {'Clusters with blame:':<24s} {_clusters_with_blame} of {len(clusters)}")
+        cluster_lines.append(_bar("-"))
         print("\n".join(cluster_lines))
 
         _failed_lever_set = set(levers_rolled_back)
@@ -667,22 +727,38 @@ def _run_lever_loop(
             failed_levers=_failed_lever_set,
         )
 
-        proposal_lines = [f"\n-- PROPOSALS ({len(proposals)} total) " + "-" * 34]
+        _n_valid = 0
+        _n_failed = 0
+        proposal_lines = [_section(f"Proposals ({len(proposals)} total)", "-"), "|"]
         for pi, p in enumerate(proposals, 1):
-            proposal_lines.append(
-                f"  Proposal {pi}: {p.get('type', p.get('patch_type', '?'))}"
-            )
-            target = p.get("target", p.get("target_object", ""))
-            if target:
-                proposal_lines.append(f"    Target: {target}")
-            rationale = p.get("rationale", "")
-            if rationale:
-                proposal_lines.append(f"    Rationale: {str(rationale)[:200]}")
-        proposal_lines.append("-" * 52)
+            cluster_id = p.get("cluster_id", "?")
+            ptype = p.get("type", p.get("patch_type", "?"))
+            target = p.get("target", p.get("target_object", "")) or "(none)"
+            rationale = str(p.get("rationale", ""))
+            is_failed = "not valid JSON" in rationale or "non-JSON" in rationale.lower()
+            status = "FAILED (non-JSON)" if is_failed else "OK"
+            if is_failed:
+                _n_failed += 1
+            else:
+                _n_valid += 1
+
+            proposal_lines.append(f"|  Proposal {pi} / {len(proposals)}  [from cluster {cluster_id}]")
+            proposal_lines.append(f"|    {'Type:':<24s} {ptype}")
+            proposal_lines.append(f"|    {'Target:':<24s} {target}")
+            proposal_lines.append(f"|    {'Rationale:':<24s} {rationale[:200]}")
+            proposal_lines.append(f"|    {'Status:':<24s} {status}")
+            proposal_lines.append("|")
+
+        proposal_lines.append("|  --- Summary ---")
+        proposal_lines.append(f"|    {'Valid proposals:':<24s} {_n_valid} of {len(proposals)}")
+        if _n_failed:
+            proposal_lines.append(f"|    {'Failed (non-JSON):':<24s} {_n_failed}")
+        proposal_lines.append(f"|    Proceeding with {_n_valid} patch(es)")
+        proposal_lines.append(_bar("-"))
         print("\n".join(proposal_lines))
 
         if not proposals:
-            print(f"\n-- No proposals for {lever_name} -- SKIPPING lever")
+            print(_section(f"No proposals for {lever_name} -- SKIPPING lever", "-"))
             logger.info("No proposals for %s — skipping", lever_name)
             write_stage(
                 spark, run_id, f"LEVER_{lever}_STARTED", "SKIPPED",
@@ -709,9 +785,9 @@ def _run_lever_loop(
         noise_floor = 100.0 / max(len(benchmarks), 1)
 
         has_dict_changes = any(
-            (entry.get("patch", {}) or {}).get("build_value_dictionary")
+            (entry.get("patch", {}) or {}).get("enable_entity_matching")
             or (entry.get("action", {}) or {}).get("type") in (
-                "enable_value_dictionary", "build_value_dictionary",
+                "enable_value_dictionary", "enable_entity_matching",
             )
             for entry in apply_log.get("applied", [])
         )
@@ -719,14 +795,14 @@ def _run_lever_loop(
             PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS if has_dict_changes
             else PROPAGATION_WAIT_SECONDS
         )
+        _wait_note = " (extended for value dictionary rebuild)" if has_dict_changes else ""
         print(
-            f"\n-- PROPAGATION WAIT " + "-" * 32 + "\n"
-            f"  Lever {lever}: {len(apply_log.get('applied', []))} patches applied\n"
-            f"  Patched objects: {patched_objects}\n"
-            f"  Value dictionary changes: {'YES' if has_dict_changes else 'NO'}\n"
-            f"  Wait time: {wait_time}s"
-            + (" (extended for value dictionary rebuild)" if has_dict_changes else "")
-            + "\n" + "-" * 52
+            _section("Propagation Wait", "-") + "\n"
+            + _kv("Lever", f"{lever}: {len(apply_log.get('applied', []))} patches applied") + "\n"
+            + _kv("Patched objects", ", ".join(str(o) for o in patched_objects) if patched_objects else "(none)") + "\n"
+            + _kv("Value dict changes", "YES" if has_dict_changes else "NO") + "\n"
+            + _kv("Wait time", f"{wait_time}s{_wait_note}") + "\n"
+            + _bar("-")
         )
         time.sleep(wait_time)
 
@@ -766,11 +842,11 @@ def _run_lever_loop(
                     for d in slice_drops
                 )
                 print(
-                    f"\n-- SLICE GATE: FAIL " + "-" * 32 + "\n"
-                    f"  Benchmarks evaluated: {len(slice_benchmarks)}\n"
-                    f"  Regressions: {_score_changes}\n"
-                    f"  Action: ROLLBACK\n"
-                    + "-" * 52
+                    _section("SLICE GATE: FAIL", "-") + "\n"
+                    + _kv("Benchmarks evaluated", len(slice_benchmarks)) + "\n"
+                    + _kv("Regressions", _score_changes) + "\n"
+                    + _kv("Action", "ROLLBACK") + "\n"
+                    + _bar("-")
                 )
                 rollback(apply_log, w, space_id, metadata_snapshot)
                 mark_patches_rolled_back(
@@ -792,10 +868,10 @@ def _run_lever_loop(
                     for j in sorted(slice_scores)
                 )
                 print(
-                    f"\n-- SLICE GATE: PASS " + "-" * 32 + "\n"
-                    f"  Benchmarks evaluated: {len(slice_benchmarks)}\n"
-                    f"  Score changes: {_score_changes}\n"
-                    + "-" * 52
+                    _section("SLICE GATE: PASS", "-") + "\n"
+                    + _kv("Benchmarks evaluated", len(slice_benchmarks)) + "\n"
+                    + _kv("Score changes", _score_changes) + "\n"
+                    + _bar("-")
                 )
 
         # ── P0 gate ───────────────────────────────────────────────
@@ -816,11 +892,11 @@ def _run_lever_loop(
             p0_failures = p0_result.get("failures", [])
             if p0_failures:
                 print(
-                    f"\n-- P0 GATE: FAIL " + "-" * 34 + "\n"
-                    f"  P0 questions failing: {len(p0_failures)}\n"
-                    f"  Failed IDs: {p0_failures}\n"
-                    f"  Action: ROLLBACK\n"
-                    + "-" * 52
+                    _section("P0 GATE: FAIL", "-") + "\n"
+                    + _kv("P0 questions failing", len(p0_failures)) + "\n"
+                    + _kv("Failed IDs", ", ".join(str(f) for f in p0_failures)) + "\n"
+                    + _kv("Action", "ROLLBACK") + "\n"
+                    + _bar("-")
                 )
                 rollback(apply_log, w, space_id, metadata_snapshot)
                 mark_patches_rolled_back(
@@ -838,10 +914,10 @@ def _run_lever_loop(
                 continue
             else:
                 print(
-                    f"\n-- P0 GATE: PASS " + "-" * 34 + "\n"
-                    f"  P0 benchmarks evaluated: {len(p0_benchmarks)}\n"
-                    f"  P0 failures: 0\n"
-                    + "-" * 52
+                    _section("P0 GATE: PASS", "-") + "\n"
+                    + _kv("P0 benchmarks evaluated", len(p0_benchmarks)) + "\n"
+                    + _kv("P0 failures", 0) + "\n"
+                    + _bar("-")
                 )
 
         # ── Full evaluation ───────────────────────────────────────
@@ -892,11 +968,11 @@ def _run_lever_loop(
                 for r in regressions
             )
             print(
-                f"\n-- FULL EVAL: FAIL (REGRESSION) " + "-" * 20 + "\n"
-                f"  Accuracy: {best_accuracy:.1f}% -> {full_accuracy:.1f}%\n"
-                f"  Regressions: {_reg_details}\n"
-                f"  Action: ROLLBACK\n"
-                + "-" * 52
+                _section("FULL EVAL: FAIL (REGRESSION)", "-") + "\n"
+                + _kv("Accuracy", f"{best_accuracy:.1f}% -> {full_accuracy:.1f}%") + "\n"
+                + _kv("Regressions", _reg_details) + "\n"
+                + _kv("Action", "ROLLBACK") + "\n"
+                + _bar("-")
             )
             rollback(apply_log, w, space_id, metadata_snapshot)
             mark_patches_rolled_back(
@@ -919,12 +995,11 @@ def _run_lever_loop(
             for j in sorted(full_scores)
         )
         print(
-            f"\n-- FULL EVAL: PASS -- ACCEPTED " + "-" * 21 + "\n"
-            f"  Accuracy: {best_accuracy:.1f}% -> {full_accuracy:.1f}% "
-            f"({full_accuracy - best_accuracy:+.1f}%)\n"
-            f"  Score changes: {_score_delta}\n"
-            f"  Result: LEVER {lever} ACCEPTED\n"
-            + "=" * 52
+            _section("FULL EVAL: PASS -- ACCEPTED", "=") + "\n"
+            + _kv("Accuracy", f"{best_accuracy:.1f}% -> {full_accuracy:.1f}% ({full_accuracy - best_accuracy:+.1f}%)") + "\n"
+            + _kv("Score changes", _score_delta) + "\n"
+            + _kv("Result", f"LEVER {lever} ACCEPTED") + "\n"
+            + _bar("=")
         )
 
         levers_accepted.append(lever)
@@ -1217,6 +1292,47 @@ def _run_finalize(
         _emit_heartbeat("generate_report", force=True)
         report_path = generate_report(spark, run_id, domain, catalog, schema)
 
+        # Publish benchmarks to the Genie Space's native benchmarks section
+        # so they appear in the Genie UI and can be used for UI-based eval runs.
+        benchmark_publish_count = 0
+        _check_timeout("publish_benchmarks")
+        _emit_heartbeat("publish_benchmarks", force=True)
+        if benchmarks:
+            try:
+                from genie_space_optimizer.common.genie_client import (
+                    publish_benchmarks_to_genie_space,
+                )
+
+                benchmark_publish_count = publish_benchmarks_to_genie_space(
+                    w, space_id, benchmarks,
+                )
+                write_stage(
+                    spark, run_id, "BENCHMARK_PUBLISH", "COMPLETE",
+                    task_key="finalize",
+                    detail={"published_count": benchmark_publish_count},
+                    catalog=catalog, schema=schema,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to publish benchmarks to Genie space %s — "
+                    "optimization results are still valid",
+                    space_id,
+                    exc_info=True,
+                )
+                write_stage(
+                    spark, run_id, "BENCHMARK_PUBLISH", "FAILED",
+                    task_key="finalize",
+                    error_message="Benchmark publish failed (non-fatal)",
+                    catalog=catalog, schema=schema,
+                )
+        else:
+            write_stage(
+                spark, run_id, "BENCHMARK_PUBLISH", "SKIPPED",
+                task_key="finalize",
+                detail={"reason": "no_benchmarks_available"},
+                catalog=catalog, schema=schema,
+            )
+
         _check_timeout("resolve_terminal_status")
         converged = all_thresholds_met(prev_scores, thresholds)
         if converged:
@@ -1269,6 +1385,7 @@ def _run_finalize(
             "report_path": report_path,
             "promoted_model": promoted_model,
             "terminal_reason": terminal_reason,
+            "benchmark_publish_count": benchmark_publish_count,
             "elapsed_seconds": round(_elapsed_seconds(), 1),
             "heartbeat_count": heartbeat_count,
         }

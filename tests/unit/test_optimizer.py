@@ -73,8 +73,8 @@ class TestClusterFailures:
             assert "root_cause" in c
             assert "question_ids" in c
 
-    def test_singletons_excluded(self):
-        """Clusters with only 1 question should be excluded (< 2 threshold)."""
+    def test_singletons_included(self):
+        """Single-question clusters are kept so even lone failures are actionable."""
         eval_results = {
             "eval_results": [
                 {
@@ -85,14 +85,64 @@ class TestClusterFailures:
             ]
         }
         clusters = cluster_failures(eval_results, {})
-        for c in clusters:
-            assert len(c["question_ids"]) >= 2
+        assert len(clusters) >= 1
+        assert any("q1" in c["question_ids"] for c in clusters)
 
     def test_clusters_sorted_by_size(self, sample_eval_results):
         clusters = cluster_failures(sample_eval_results, {})
         if len(clusters) > 1:
             for i in range(len(clusters) - 1):
                 assert len(clusters[i]["question_ids"]) >= len(clusters[i + 1]["question_ids"])
+
+    def test_asi_failure_type_extracted_from_rationale(self):
+        """When rows lack explicit metadata, cluster_failures should parse
+        the embedded JSON from format_asi_markdown rationale strings."""
+        import json
+
+        asi_payload = json.dumps(
+            {
+                "judge": "schema_accuracy",
+                "verdict": "Fail",
+                "raw_value": "no",
+                "failure_type": "wrong_table",
+                "severity": "major",
+                "wrong_clause": "FROM invoices",
+                "blame_set": ["invoices"],
+                "confidence": 0.95,
+                "rationale": "Used invoices instead of orders",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        rationale_with_json = (
+            "### schema_accuracy\n"
+            "**Verdict:** Fail\n\n"
+            "Used invoices instead of orders\n\n"
+            f"```json\n{asi_payload}\n```"
+        )
+
+        eval_results = {
+            "rows": [
+                {
+                    "inputs/question_id": "q1",
+                    "feedback/schema_accuracy/value": "no",
+                    "feedback/schema_accuracy/rationale": rationale_with_json,
+                },
+                {
+                    "inputs/question_id": "q2",
+                    "feedback/schema_accuracy/value": "no",
+                    "feedback/schema_accuracy/rationale": rationale_with_json,
+                },
+            ]
+        }
+        clusters = cluster_failures(eval_results, {})
+        schema_clusters = [
+            c for c in clusters if c["affected_judge"] == "schema_accuracy"
+        ]
+        assert len(schema_clusters) >= 1
+        c = schema_clusters[0]
+        assert c["asi_failure_type"] == "wrong_table"
+        assert c["asi_blame_set"] is not None
 
 
 class TestDetectRegressions:
