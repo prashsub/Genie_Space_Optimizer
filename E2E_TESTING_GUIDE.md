@@ -17,10 +17,12 @@ This guide is written for an LLM agent that will execute a full end-to-end test 
 9. [Journey 7: Apply or Discard Changes](#9-journey-7-apply-or-discard-changes)
 10. [Journey 8: Post-Action Verification](#10-journey-8-post-action-verification)
 11. [Journey 9: Navigation Paths](#11-journey-9-navigation-paths)
-12. [Troubleshooting Databricks Job Failures](#12-troubleshooting-databricks-job-failures)
-13. [Edge Cases and Failure Scenarios](#13-edge-cases-and-failure-scenarios)
-14. [Issue Reporting Template](#14-issue-reporting-template)
-15. [Full E2E Checklist](#15-full-e2e-checklist)
+12. [Journey 10: Settings & Data Access](#12-journey-10-settings--data-access)
+13. [Journey 11: Programmatic Trigger API](#13-journey-11-programmatic-trigger-api)
+14. [Troubleshooting Databricks Job Failures](#14-troubleshooting-databricks-job-failures)
+15. [Edge Cases and Failure Scenarios](#15-edge-cases-and-failure-scenarios)
+16. [Issue Reporting Template](#16-issue-reporting-template)
+17. [Full E2E Checklist](#17-full-e2e-checklist)
 
 ---
 
@@ -61,7 +63,7 @@ The app does NOT look up a pre-deployed job by name. Instead, `job_launcher.py`:
 5 Delta tables in `{catalog}.{schema}`:
 - `genie_opt_runs` -- one row per optimization run (status, scores, config snapshot)
 - `genie_opt_stages` -- per-stage transitions (PREFLIGHT_STARTED, LEVER_1_EVAL_DONE, etc.)
-- `genie_opt_iterations` -- per-iteration evaluation results (8 judges: 7 quality dimensions + arbiter)
+- `genie_opt_iterations` -- per-iteration evaluation results (9 judges: 7 quality dimensions + response quality + arbiter)
 - `genie_opt_patches` -- individual patches (type, lever, old/new values, rolled_back flag)
 - `genie_eval_asi_results` -- failure assessments from LLM judges
 
@@ -448,7 +450,7 @@ Click "View Results" button → navigates to `/runs/{runId}/comparison`.
 }
 ```
 
-### 8 Evaluation Judges (7 Quality Dimensions + Arbiter)
+### 9 Evaluation Judges (7 Quality Dimensions + Response Quality + Arbiter)
 
 | Dimension Key | Display Name | Target Threshold |
 |--------------|-------------|-----------------|
@@ -457,11 +459,14 @@ Click "View Results" button → navigates to `/runs/{runId}/comparison`.
 | `logical_accuracy` | Logical Accuracy | 90% |
 | `semantic_equivalence` | Semantic Equivalence | 90% |
 | `completeness` | Completeness | 90% |
+| `response_quality` | Response Quality | N/A (advisory) |
 | `result_correctness` | Result Correctness | 85% |
 | `asset_routing` | Asset Routing | 95% |
 | `arbiter` | Arbiter (tie-breaker) | N/A (advisory; verdicts: `genie_correct`, `ground_truth_correct`, `both_correct`, `neither_correct`) |
 
-The arbiter judge does not contribute to the overall quality score but its `genie_correct` verdicts drive two mechanisms: (1) benchmark correction before the lever loop (rewriting stale gold SQL), and (2) failure row filtering (excluding `genie_correct` questions from failure clustering so levers don't chase false negatives).
+**Response quality** evaluates whether Genie's natural language analysis/explanation accurately describes the SQL query and answers the user's question. Returns `unknown` when no analysis text is available (Genie does not always include the text attachment), so this scorer never penalizes runs where the NL response is absent.
+
+The **arbiter** judge does not contribute to the overall quality score but its `genie_correct` verdicts drive two mechanisms: (1) benchmark correction before the lever loop (rewriting stale gold SQL), and (2) failure row filtering (excluding `genie_correct` questions from failure clustering so levers don't chase false negatives).
 
 ### Config Diff Tabs
 
@@ -552,7 +557,169 @@ After apply or discard, verify:
 
 ---
 
-## 12. Troubleshooting Databricks Job Failures
+## 12. Journey 10: Settings & Data Access
+
+### Navigation
+
+Click the **gear icon** in the navbar → navigates to `/settings`.
+
+### API Calls
+
+| Request | Endpoint | Expected Status |
+|---------|----------|----------------|
+| List grants | `GET /api/genie/settings/data-access` | 200 |
+| Grant access | `POST /api/genie/settings/data-access` | 200 |
+| Revoke access | `DELETE /api/genie/settings/data-access/{grant_id}` | 200 |
+
+### `GET /api/genie/settings/data-access` Response
+
+```json
+{
+  "grants": [
+    {
+      "grantId": "string",
+      "catalog": "string",
+      "schema": "string",
+      "status": "active",
+      "grantedAt": "ISO timestamp"
+    }
+  ],
+  "detectedSchemas": [
+    {"catalog": "string", "schema": "string", "tableCount": 5}
+  ],
+  "spPrincipalId": "string (app service principal ID)",
+  "spPrincipalDisplayName": "string | null"
+}
+```
+
+### Test Actions
+
+1. Navigate to Settings page → verify grants table loads
+2. Check `detectedSchemas` shows schemas referenced by Genie Spaces
+3. Click **Grant Access** on an ungranted schema → verify grant appears in table
+4. Click **Revoke** on an existing grant → verify grant removed
+
+### What the Backend Does
+
+**Grant (`POST`):**
+1. Resolves the app's service principal from `Dependencies.Client`
+2. Executes UC SQL grants via `Dependencies.UserClient` (OBO): `USE CATALOG`, `USE SCHEMA`, `SELECT`, `MODIFY`, etc.
+3. Records the grant in the Delta ledger table
+4. Returns the created grant
+
+**Revoke (`DELETE`):**
+1. Executes `REVOKE` SQL statements via OBO user client
+2. Removes the grant from the Delta ledger
+3. Returns the revoked grant
+
+### Failure Scenarios
+
+| Status | Body | Root Cause |
+|--------|------|------------|
+| **403** | Permission denied | OBO user lacks `MANAGE` on the target schema |
+| **404** | Grant not found | Invalid `grant_id` |
+| **500** | SQL execution error | Warehouse unavailable or UC permission issue |
+
+---
+
+## 13. Journey 11: Programmatic Trigger API
+
+### Overview
+
+The `/trigger` endpoint allows headless optimization — trigger runs programmatically without the UI. This is designed for CI/CD pipelines, scheduled workflows, or external automation tools.
+
+### Trigger an Optimization
+
+`POST /api/genie/trigger`
+
+**Request body:**
+```json
+{
+  "space_id": "string (Genie Space UUID)",
+  "apply_mode": "genie_config"
+}
+```
+
+**Response (200):**
+```json
+{
+  "runId": "UUID string",
+  "jobRunId": "integer as string",
+  "jobUrl": "https://<host>/jobs/<job_id>?o=<workspace_id>",
+  "status": "IN_PROGRESS"
+}
+```
+
+**Backend behavior:** Delegates to the same `do_start_optimization()` function used by the UI-driven `POST /spaces/{space_id}/optimize` endpoint. The Databricks Apps proxy injects OBO tokens automatically for any authenticated request.
+
+### Poll Run Status
+
+`GET /api/genie/trigger/status/{run_id}`
+
+**Response (200):**
+```json
+{
+  "runId": "string",
+  "status": "QUEUED|RUNNING|CONVERGED|STALLED|MAX_ITERATIONS|FAILED|APPLIED|DISCARDED",
+  "baselineScore": "float | null",
+  "optimizedScore": "float | null",
+  "convergenceReason": "string | null",
+  "completedAt": "ISO timestamp | null"
+}
+```
+
+### Test Actions
+
+1. **Trigger via curl:**
+```bash
+curl -X POST https://<app-url>/api/genie/trigger \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"space_id": "<genie-space-id>"}'
+```
+
+2. **Poll until terminal status:**
+```bash
+# Repeat every 30s until status is terminal
+curl https://<app-url>/api/genie/trigger/status/<run_id> \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+3. **Verify in UI:** Navigate to the Dashboard — the triggered run should appear in the activity table and be viewable from the space detail page.
+
+### Failure Scenarios
+
+| Status | Body | Root Cause |
+|--------|------|------------|
+| **400** | Missing or invalid `space_id` | Request body validation failed |
+| **409** | Active optimization already in progress | Another run is QUEUED or IN_PROGRESS for this space |
+| **500** | Job submission failed | Same causes as Journey 4 (wheel not found, permissions, etc.) |
+
+### Integration Testing Pattern
+
+```bash
+# Full headless E2E test
+RUN_ID=$(curl -s -X POST https://<app-url>/api/genie/trigger \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"space_id": "'$SPACE_ID'"}' | jq -r '.runId')
+
+# Poll loop
+while true; do
+  STATUS=$(curl -s https://<app-url>/api/genie/trigger/status/$RUN_ID \
+    -H "Authorization: Bearer $TOKEN" | jq -r '.status')
+  echo "Status: $STATUS"
+  case $STATUS in
+    CONVERGED|STALLED|MAX_ITERATIONS|APPLIED|DISCARDED) echo "Done"; break ;;
+    FAILED) echo "FAILED"; exit 1 ;;
+    *) sleep 30 ;;
+  esac
+done
+```
+
+---
+
+## 14. Troubleshooting Databricks Job Failures
 
 This is the most common source of issues. The optimization pipeline runs as a multi-task Databricks Job with 5 sequential notebook tasks. Each task can fail independently.
 
@@ -576,13 +743,15 @@ databricks runs get-output <job_run_id> -p <profile> -o json | jq '.notebook_out
 
 #### Task 1: `preflight`
 
-**What it does:** Fetches Genie Space config, collects UC metadata (columns, tags, routines), generates benchmark questions via LLM, creates MLflow experiment.
+**What it does:** Fetches Genie Space config, collects UC metadata (columns, tags, routines) via REST API with Spark SQL fallback, validates config with `genie_schema.py` (lenient mode), generates benchmark questions via LLM, creates MLflow experiment.
+
+**Metadata collection strategy:** Preflight tries three sources in order: (1) prefetched data from the optimization trigger, (2) UC REST API via `WorkspaceClient` (`get_columns_for_tables_rest`, `get_routines_for_schemas_rest`), (3) Spark SQL queries against `information_schema`. Tags always use Spark SQL (no REST API for `table_tags`).
 
 | Error Pattern | Likely Cause | Resolution |
 |--------------|-------------|------------|
 | `PermissionDenied` on Genie API | App SP lacks Genie access | Grant the app SP access to the Genie Space |
 | `SCHEMA_NOT_FOUND` or `CATALOG_NOT_FOUND` | Config vars point to nonexistent catalog/schema | Fix `GENIE_SPACE_OPTIMIZER_CATALOG` / `GENIE_SPACE_OPTIMIZER_SCHEMA` in `databricks.yml` |
-| `permission denied` on information_schema | App SP lacks UC grants | Re-run `databricks bundle deploy` to trigger grant script, or run `resources/grant_app_uc_permissions.py` manually |
+| `permission denied` on information_schema | App SP lacks UC grants; REST API also failed | Re-run `databricks bundle deploy` to trigger grant script, or use the Settings page to grant access, or run `resources/grant_app_uc_permissions.py` manually |
 | `Could not create MLflow experiment` | Shared experiment path not writable | Create `/Shared/genie-optimization/` in workspace or grant app SP write access |
 | `benchmark_count = 0` | LLM benchmark generation returned empty | Check Foundation Model API endpoint availability; verify `databricks-claude-opus-4-6` endpoint exists |
 | Timeout (>600s in DAB job, >7200s in launcher job) | Slow UC metadata queries or LLM calls | Increase timeout or investigate warehouse performance |
@@ -597,16 +766,17 @@ ORDER BY started_at
 
 #### Task 2: `baseline_eval`
 
-**What it does:** Runs all benchmark questions through Genie, scores responses with 8 LLM judges via MLflow, records baseline scores.
+**What it does:** Runs all benchmark questions through Genie (with exponential backoff on HTTP 429 rate limits), scores responses with 9 LLM judges via MLflow, records baseline scores. Uses robust JSON extraction (`_extract_json`) to handle markdown fences and prose-wrapped LLM responses.
 
 | Error Pattern | Likely Cause | Resolution |
 |--------------|-------------|------------|
 | `AttributeError: 'NoneType' object has no attribute 'info'` | Transient MLflow harness bug | Automatic retry up to 4 times with exponential backoff (10s, 20s, 30s, 40s). Falls back to single-worker mode on retry 2+. |
+| `ResourceExhausted` / HTTP 429 from Genie API | Rate limit hit | Built-in exponential backoff retries (configurable via `GENIE_RATE_LIMIT_BASE_DELAY` and `GENIE_RATE_LIMIT_RETRIES`). Should self-heal. |
 | `TABLE_OR_VIEW_NOT_FOUND` in evaluation | Benchmark SQL references missing table | Check benchmark questions reference valid tables; regenerate benchmarks |
 | `Infrastructure SQL errors detected during evaluation` | Multiple benchmark SQLs hit infra errors | Default: fails fast (`FAIL_ON_INFRA_EVAL_ERRORS=true`). Set to `false` to continue past infra errors. |
 | `_multithreadedrendezvous` | gRPC/Spark Connect timeout | Automatic retry with backoff |
 | `permission denied` on data tables | App SP can't SELECT from Genie space tables | Grant SELECT on the data tables to app SP |
-| Timeout (>3600s in DAB / >7200s in launcher) | 20 benchmarks x 8 judges = 160 LLM calls + Genie queries | Reduce `TARGET_BENCHMARK_COUNT` in `common/config.py` or increase timeout |
+| Timeout (>3600s in DAB / >7200s in launcher) | 20 benchmarks x 9 judges = 180 LLM calls + Genie queries | Reduce `TARGET_BENCHMARK_COUNT` in `common/config.py` or increase timeout |
 
 **Diagnostic query (check baseline iteration scores):**
 ```sql
@@ -639,7 +809,7 @@ WHERE run_id = '<run_id>' AND iteration = 0
 |--------------|-------------|------------|
 | `thresholds_met` → early exit | Baseline already met targets | Not an error. Run exits with `SKIPPED: baseline meets thresholds`. |
 | All levers rolled back | Every patch caused regression | Run completes as `STALLED`. Review failure analysis in `genie_eval_asi_results` table. |
-| `Genie API rate limit (429)` | Too many API calls | Built-in rate limiting at 12s intervals should prevent this. If it happens, increase `RATE_LIMIT_SECONDS`. |
+| `Genie API rate limit (429)` | Too many API calls | Built-in rate limiting at 12s intervals + automatic exponential backoff retries on `ResourceExhausted`. If persistent, increase `RATE_LIMIT_SECONDS` or `GENIE_RATE_LIMIT_BASE_DELAY`. |
 | `LLM endpoint not found` | Foundation Model API endpoint misconfigured | Verify `databricks-claude-opus-4-6` endpoint exists in workspace model serving |
 | Patch application error | Invalid patch command generated by LLM | Patch is rolled back, lever is skipped. Check `genie_opt_patches` table for the failed patch. |
 | `SQL context lost` | Spark session reset between evaluations | Built-in `_ensure_sql_context()` should prevent this. If persists, check Spark Connect stability. |
@@ -742,7 +912,7 @@ The `convergence_reason` on a run tells you exactly what happened:
 
 ---
 
-## 13. Edge Cases and Failure Scenarios
+## 15. Edge Cases and Failure Scenarios
 
 ### Authentication Edge Cases
 
@@ -784,7 +954,7 @@ When `apply_mode` includes UC artifact writes:
 
 ---
 
-## 14. Issue Reporting Template
+## 16. Issue Reporting Template
 
 When reporting issues found during testing, structure the report as follows. Include all available diagnostic data so the issue can be reproduced and debugged.
 
@@ -856,7 +1026,7 @@ databricks apps logs genie-space-optimizer -p <profile>
 
 ---
 
-## 15. Full E2E Checklist
+## 17. Full E2E Checklist
 
 ### Pre-deployment
 
@@ -918,7 +1088,7 @@ databricks apps logs genie-space-optimizer -p <profile>
 ### Comparison
 
 - [ ] `GET /api/genie/runs/{id}/comparison` returns 200 with scores and configs
-- [ ] Per-dimension scores show all 7 quality dimensions (+ arbiter if applicable)
+- [ ] Per-dimension scores show all 7 quality dimensions (+ response quality + arbiter if applicable)
 - [ ] Original and optimized configs differ (if patches were applied)
 - [ ] Improvement percentage calculated correctly
 
@@ -934,6 +1104,24 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] `POST /api/genie/runs/{id}/discard` returns 200
 - [ ] Run status updated to DISCARDED in Delta
 - [ ] Genie Space config in workspace reverted to original
+
+### Settings & Data Access
+
+- [ ] `GET /api/genie/settings/data-access` returns 200 with grants and detected schemas
+- [ ] Service principal ID is displayed
+- [ ] Grant a new schema → grant appears in table
+- [ ] Revoke an existing grant → grant removed
+- [ ] OBO permissions enforced (user needs MANAGE on schema)
+
+### Programmatic Trigger API
+
+- [ ] `POST /api/genie/trigger` with valid space_id returns 200 with runId, jobRunId, status
+- [ ] `GET /api/genie/trigger/status/{run_id}` returns 200 with current status
+- [ ] Triggered run appears in dashboard activity table
+- [ ] Triggered run visible from space detail history
+- [ ] Second trigger for same space returns 409 (active run exists)
+- [ ] Poll loop correctly detects terminal status
+- [ ] Invalid space_id returns 400
 
 ### Error Handling
 
