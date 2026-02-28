@@ -251,8 +251,10 @@ def build_metric_view_measures(config: dict) -> dict[str, set[str]]:
 def normalize_result_df(df: pd.DataFrame | None) -> pd.DataFrame:
     """Deterministic normalization of a result DataFrame.
 
-    Sort columns alphabetically, sort rows, round floats to 6 decimals,
-    normalize timestamps to UTC, strip whitespace.
+    Sort columns alphabetically, sort rows, round floats to 4 decimals,
+    normalize timestamps to UTC, strip whitespace.  We use 4 decimals
+    rather than 6 because GT (via Spark toPandas) and Genie (via REST API)
+    serialize floats at different precisions.
     """
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
@@ -260,7 +262,7 @@ def normalize_result_df(df: pd.DataFrame | None) -> pd.DataFrame:
     df.columns = [c.strip().lower() for c in df.columns]
     df = df[sorted(df.columns)]
     for col in df.select_dtypes(include=["float64", "float32"]).columns:
-        df[col] = df[col].round(6)
+        df[col] = df[col].round(4)
     for col in df.select_dtypes(include=["object"]).columns:
         df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
     for col in df.select_dtypes(include=["datetime64", "datetimetz"]).columns:
@@ -277,7 +279,7 @@ def result_signature(df: pd.DataFrame | None) -> dict:
     schema_hash = hashlib.md5(schema_str.encode()).hexdigest()[:8]
     numeric_sums: dict[str, float] = {}
     for col in df.select_dtypes(include=["number"]).columns:
-        numeric_sums[col] = round(float(df[col].sum()), 6)
+        numeric_sums[col] = round(float(df[col].sum()), 4)
     return {
         "schema_hash": schema_hash,
         "row_count": len(df),
@@ -920,6 +922,87 @@ def make_predict_fn(
                                     ).hexdigest()[:8]
                                     exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
                                     hash_match = gt_hash == genie_hash
+
+                                    subset_match = False
+                                    subset_type = None
+                                    if not hash_match:
+                                        genie_cols = set(genie_df.columns)
+                                        gt_cols = set(gt_df.columns)
+                                        shared_cols = sorted(genie_cols & gt_cols)
+
+                                        mapped_genie_df = genie_df
+                                        all_mapped = genie_cols <= gt_cols
+
+                                        if not all_mapped:
+                                            unmatched_genie = sorted(genie_cols - gt_cols)
+                                            candidate_gt = sorted(gt_cols - genie_cols)
+                                            col_map: dict[str, str] = {}
+                                            _ALIAS_SAMPLE = min(50, len(genie_df))
+                                            for gc in unmatched_genie:
+                                                g_vals = genie_df[gc].head(_ALIAS_SAMPLE).tolist()
+                                                for gtc in candidate_gt:
+                                                    if gtc in col_map.values():
+                                                        continue
+                                                    gt_vals = gt_df[gtc].head(_ALIAS_SAMPLE).tolist()
+                                                    if g_vals == gt_vals:
+                                                        col_map[gc] = gtc
+                                                        break
+                                            if len(col_map) == len(unmatched_genie):
+                                                mapped_genie_df = genie_df.rename(columns=col_map)
+                                                genie_cols = set(mapped_genie_df.columns)
+                                                shared_cols = sorted(genie_cols & gt_cols)
+                                                all_mapped = genie_cols <= gt_cols
+
+                                        if shared_cols and all_mapped:
+                                            _GENIE_ROW_CAP = 5000
+                                            gt_sub = gt_df[shared_cols].copy()
+                                            genie_sub = mapped_genie_df[shared_cols].copy()
+                                            if len(genie_df) == _GENIE_ROW_CAP and len(gt_df) > _GENIE_ROW_CAP:
+                                                gt_sub = gt_sub.head(_GENIE_ROW_CAP)
+                                            gt_sub_hash = hashlib.md5(
+                                                gt_sub.sort_values(shared_cols).reset_index(drop=True)
+                                                .to_csv(index=False).encode()
+                                            ).hexdigest()[:8]
+                                            genie_sub_hash = hashlib.md5(
+                                                genie_sub.sort_values(shared_cols).reset_index(drop=True)
+                                                .to_csv(index=False).encode()
+                                            ).hexdigest()[:8]
+                                            if gt_sub_hash == genie_sub_hash:
+                                                subset_match = True
+                                                subset_type = "column_subset"
+                                                if len(genie_df) == _GENIE_ROW_CAP and len(gt_df) > _GENIE_ROW_CAP:
+                                                    subset_type = "column_subset_row_capped"
+
+                                    approx_match = False
+                                    if (
+                                        not hash_match
+                                        and not subset_match
+                                        and gt_df.shape == genie_df.shape
+                                        and list(gt_df.columns) == list(genie_df.columns)
+                                    ):
+                                        try:
+                                            import numpy as np
+
+                                            gt_sorted = gt_df.sort_values(list(gt_df.columns)).reset_index(drop=True)
+                                            genie_sorted = genie_df.sort_values(list(genie_df.columns)).reset_index(drop=True)
+                                            non_numeric = gt_sorted.select_dtypes(exclude=["number"]).columns
+                                            non_num_match = gt_sorted[non_numeric].equals(genie_sorted[non_numeric]) if len(non_numeric) else True
+                                            numeric = gt_sorted.select_dtypes(include=["number"]).columns
+                                            num_match = (
+                                                np.allclose(
+                                                    gt_sorted[numeric].values,
+                                                    genie_sorted[numeric].values,
+                                                    rtol=1e-4,
+                                                    atol=1e-4,
+                                                    equal_nan=True,
+                                                )
+                                                if len(numeric)
+                                                else True
+                                            )
+                                            approx_match = bool(non_num_match and num_match)
+                                        except Exception:
+                                            approx_match = False
+
                                     gt_sig = result_signature(gt_df)
                                     genie_sig = result_signature(genie_df)
                                     sig_match = (
@@ -931,13 +1014,17 @@ def make_predict_fn(
                                         match_type = "exact"
                                     elif hash_match:
                                         match_type = "hash"
+                                    elif subset_match:
+                                        match_type = subset_type
+                                    elif approx_match:
+                                        match_type = "approx"
                                     elif sig_match:
                                         match_type = "signature"
                                     else:
                                         match_type = "mismatch"
 
                                     comparison = {
-                                        "match": exact_match or hash_match,
+                                        "match": exact_match or hash_match or subset_match or approx_match,
                                         "match_type": match_type,
                                         "gt_rows": len(gt_df),
                                         "genie_rows": len(genie_df),

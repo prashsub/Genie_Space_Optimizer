@@ -66,6 +66,11 @@ def _make_schema_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
         prompt = (
             "You are a SQL schema expert evaluating SQL for a Databricks Genie Space.\n"
             "Determine if the GENERATED SQL references the correct tables, columns, and joins.\n\n"
+            "IMPORTANT: Evaluate column selection against the USER'S QUESTION, not the Expected SQL.\n"
+            "The Expected SQL is a reference implementation that may include extra columns the user\n"
+            "did not ask for. If the Generated SQL includes all columns the user explicitly requested,\n"
+            "do NOT penalize it for omitting extra columns present only in the Expected SQL.\n"
+            "Only flag missing_column when a column the USER asked for is absent.\n\n"
             f"User question: {question}\n"
             f"Expected SQL: {gt_sql}\n"
             f"Generated SQL: {genie_sql}\n"

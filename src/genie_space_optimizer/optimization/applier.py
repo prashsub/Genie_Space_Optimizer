@@ -83,16 +83,40 @@ def _validate_join_spec_entry(entry: dict) -> bool:
         return False
 
 
-def _validate_example_sql_entry(entry: dict) -> bool:
-    """Validate an example_question_sql dict conforms to the Genie API schema."""
+def _validate_example_sql_entry(
+    entry: dict, config: dict | None = None
+) -> bool:
+    """Validate an example_question_sql dict conforms to the Genie API schema.
+
+    When *config* is provided, also verifies the SQL references at least one
+    known table, TVF, or metric view from the current config.
+    """
     from genie_space_optimizer.common.genie_schema import ExampleQuestionSql
 
     try:
         ExampleQuestionSql.model_validate(entry)
-        return True
     except Exception:
         logger.warning("Invalid example SQL entry rejected: %s", entry)
         return False
+
+    if config:
+        raw_sql = entry.get("sql") or ""
+        sql_lower = (" ".join(raw_sql) if isinstance(raw_sql, list) else str(raw_sql)).lower()
+        if sql_lower:
+            known: set[str] = set()
+            for tbl in (config.get("data_sources") or {}).get("tables", []):
+                ident = (tbl.get("identifier") or tbl.get("name") or "").lower()
+                known.add(ident)
+                known.add(ident.rsplit(".", 1)[-1])
+            known.discard("")
+            if known and not any(a in sql_lower for a in known):
+                logger.warning(
+                    "Example SQL references no known asset — rejected: %.120s",
+                    entry.get("sql", ""),
+                )
+                return False
+
+    return True
 
 
 def _enforce_instruction_limit(config: dict) -> None:
@@ -883,7 +907,7 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
                 new_entry["usage_guidance"] = (
                     [guidance] if isinstance(guidance, str) else guidance
                 )
-            if not _validate_example_sql_entry(new_entry):
+            if not _validate_example_sql_entry(new_entry, config=config):
                 return False
             eqs.append(new_entry)
             return True

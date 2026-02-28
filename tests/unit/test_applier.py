@@ -6,6 +6,7 @@ import json
 
 from genie_space_optimizer.optimization.applier import (
     _apply_action_to_config,
+    _validate_example_sql_entry,
     classify_risk,
     render_patch,
     validate_patch_set,
@@ -492,3 +493,27 @@ class TestAutoApplyPromptMatching:
         assert "industry" in em_cols
         assert "status" in em_cols
         assert em_cols.index("industry") < em_cols.index("random_string_col")
+
+
+class TestValidateExampleSqlEntry:
+    def test_valid_entry_passes(self):
+        entry = {"question": ["What?"], "sql": ["SELECT 1"], "id": "x"}
+        assert _validate_example_sql_entry(entry) is True
+
+    def test_invalid_entry_rejected(self):
+        entry = {"bad_key": "value"}
+        assert _validate_example_sql_entry(entry) is False
+
+    def test_valid_sql_with_known_asset(self):
+        entry = {"question": ["Q"], "sql": ["SELECT * FROM dim_property"], "id": "x"}
+        config = {"data_sources": {"tables": [{"identifier": "cat.sch.dim_property"}]}}
+        assert _validate_example_sql_entry(entry, config=config) is True
+
+    def test_sql_with_unknown_asset_rejected(self):
+        entry = {"question": ["Q"], "sql": ["SELECT * FROM hallucinated_table"], "id": "x"}
+        config = {"data_sources": {"tables": [{"identifier": "cat.sch.dim_property"}]}}
+        assert _validate_example_sql_entry(entry, config=config) is False
+
+    def test_no_config_skips_asset_check(self):
+        entry = {"question": ["Q"], "sql": ["SELECT * FROM anything"], "id": "x"}
+        assert _validate_example_sql_entry(entry, config=None) is True

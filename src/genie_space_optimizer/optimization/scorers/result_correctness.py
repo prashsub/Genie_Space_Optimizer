@@ -118,6 +118,24 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
             source=CODE_SOURCE,
         )
 
+    GENIE_ROW_CAP = 5000
+    if genie_rows == GENIE_ROW_CAP and gt_rows > GENIE_ROW_CAP:
+        return Feedback(
+            name="result_correctness",
+            value="yes",
+            rationale=format_asi_markdown(
+                judge_name="result_correctness",
+                value="yes",
+                rationale=(
+                    f"Genie hit platform row cap ({GENIE_ROW_CAP}). "
+                    f"GT has {gt_rows} rows. Row count difference is a "
+                    f"platform limitation, not a query error."
+                ),
+                extra={"comparison": cmp, "row_cap_applied": True},
+            ),
+            source=CODE_SOURCE,
+        )
+
     metadata = build_asi_metadata(
         failure_type="wrong_aggregation",
         severity="major",

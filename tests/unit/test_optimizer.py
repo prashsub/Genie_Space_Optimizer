@@ -7,9 +7,12 @@ import copy
 import pytest
 
 from genie_space_optimizer.optimization.optimizer import (
+    _detect_instruction_content_in_description,
     _is_fuzzy_match,
     _map_to_lever,
+    _resolve_lever5_llm_result,
     _types_compatible,
+    _validate_lever5_proposals,
     cluster_failures,
     detect_conflicts_and_batch,
     detect_regressions,
@@ -579,3 +582,106 @@ class TestValidateJoinSpecTypes:
         }
         valid, reason = validate_join_spec_types(spec, {})
         assert valid is True
+
+
+class TestResolveLever5LlmResult:
+    def test_example_sql_returns_add_example_sql(self):
+        result = {"instruction_type": "example_sql", "example_question": "Q", "example_sql": "SELECT 1"}
+        ptype, extra = _resolve_lever5_llm_result(result, "add_example_sql")
+        assert ptype == "add_example_sql"
+        assert extra["example_question"] == "Q"
+
+    def test_text_instruction_from_routing_sets_downgraded_flag(self):
+        result = {"instruction_type": "text_instruction", "instruction_text": "Do X"}
+        ptype, extra = _resolve_lever5_llm_result(result, "add_example_sql")
+        assert ptype == "add_instruction"
+        assert extra["downgraded_from_example_sql"] is True
+
+    def test_text_instruction_normal_no_downgrade(self):
+        result = {"instruction_type": "text_instruction", "instruction_text": "Do X"}
+        ptype, extra = _resolve_lever5_llm_result(result, "add_instruction")
+        assert ptype == "add_instruction"
+        assert extra.get("downgraded_from_example_sql") is False
+
+
+class TestValidateLever5Proposals:
+    _SNAP = {
+        "tables": [{"name": "cat.sch.dim_property"}],
+        "functions": [{"name": "cat.sch.get_revenue_summary"}],
+        "metric_views": [{"name": "cat.sch.booking_analytics_metrics"}],
+    }
+
+    def test_rejects_empty_instruction(self):
+        proposals = [{"patch_type": "add_instruction", "proposed_value": ""}]
+        result = _validate_lever5_proposals(proposals, self._SNAP)
+        assert len(result) == 0
+
+    def test_rejects_generic_instruction(self):
+        proposals = [
+            {"patch_type": "add_instruction", "proposed_value": "Revenue refers to gross revenue."}
+        ]
+        result = _validate_lever5_proposals(proposals, self._SNAP)
+        assert len(result) == 0
+
+    def test_keeps_instruction_with_asset_reference(self):
+        proposals = [
+            {"patch_type": "add_instruction", "proposed_value": "Use dim_property for property lookups."}
+        ]
+        result = _validate_lever5_proposals(proposals, self._SNAP)
+        assert len(result) == 1
+
+    def test_rejects_overlength_instruction(self):
+        proposals = [
+            {"patch_type": "add_instruction", "proposed_value": "dim_property " + "x" * 3000}
+        ]
+        result = _validate_lever5_proposals(proposals, self._SNAP)
+        assert len(result) == 0
+
+    def test_rejects_empty_example_sql(self):
+        proposals = [
+            {"patch_type": "add_example_sql", "example_question": "", "example_sql": ""}
+        ]
+        result = _validate_lever5_proposals(proposals, self._SNAP)
+        assert len(result) == 0
+
+    def test_keeps_valid_example_sql(self):
+        proposals = [
+            {"patch_type": "add_example_sql", "example_question": "Q?", "example_sql": "SELECT 1"}
+        ]
+        result = _validate_lever5_proposals(proposals, self._SNAP)
+        assert len(result) == 1
+
+    def test_passes_through_non_lever5_proposals(self):
+        proposals = [{"patch_type": "update_column_description", "proposed_value": "whatever"}]
+        result = _validate_lever5_proposals(proposals, self._SNAP)
+        assert len(result) == 1
+
+
+class TestDetectInstructionContentInDescription:
+    def test_clean_description_returns_empty(self):
+        snap = {"config": {"description": "Revenue analytics for Wanderbricks."}}
+        assert _detect_instruction_content_in_description(snap) == []
+
+    def test_instruction_content_detected(self):
+        snap = {
+            "config": {
+                "description": (
+                    "Revenue analytics for Wanderbricks.\n\n"
+                    "## ROUTING RULES\n"
+                    "MUST follow these routing rules for TVF ROUTING."
+                )
+            }
+        }
+        proposals = _detect_instruction_content_in_description(snap)
+        assert len(proposals) == 1
+        assert proposals[0]["patch_type"] == "update_description"
+        assert "Revenue analytics" in proposals[0]["proposed_value"]
+        assert "ROUTING RULES" not in proposals[0]["proposed_value"]
+
+    def test_empty_description_returns_empty(self):
+        snap = {"config": {"description": ""}}
+        assert _detect_instruction_content_in_description(snap) == []
+
+    def test_missing_config_returns_empty(self):
+        snap = {}
+        assert _detect_instruction_content_in_description(snap) == []

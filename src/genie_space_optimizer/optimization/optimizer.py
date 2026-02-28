@@ -1065,8 +1065,16 @@ def _resolve_lever5_llm_result(
         )
         return original_patch_type, {}
 
+    if original_patch_type == "add_example_sql":
+        logger.warning(
+            "Lever 6 LLM returned text_instruction for a routing failure "
+            "(original_patch_type=add_example_sql). Example SQL is preferred "
+            "for routing issues. Keeping text_instruction but marking as downgraded."
+        )
+
     return "add_instruction", {
         "new_text": llm_result.get("instruction_text", ""),
+        "downgraded_from_example_sql": original_patch_type == "add_example_sql",
     }
 
 
@@ -1501,6 +1509,137 @@ def _deduplicate_clusters(clusters: list[dict]) -> list[dict]:
     return list(seen.values())
 
 
+_INSTRUCTION_CONTENT_PATTERNS = re.compile(
+    r"(?i)(ROUTING\s*RULES|MUST\s+follow|MUST\s+use|TVF\s+ROUTING|"
+    r"METRIC\s+VIEW|MEASURE\s*\(|GROUP\s+BY|ORDER\s+BY|WHERE\s+.*=|"
+    r"SELECT\s+\*\s+FROM|CRITICAL\s+ROUTING|enable_format_assistance|"
+    r"enable_entity_matching)",
+)
+
+
+def _detect_instruction_content_in_description(
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Check if the Genie Space description contains instruction-like content.
+
+    Returns a list of ``update_description`` proposals that strip the
+    instruction content, keeping only the user-facing summary paragraph.
+    """
+    config = metadata_snapshot.get("config") or {}
+    desc = config.get("description") or ""
+    if isinstance(desc, list):
+        desc = "\n".join(desc)
+    if not desc or not _INSTRUCTION_CONTENT_PATTERNS.search(desc):
+        return []
+
+    paragraphs = desc.split("\n\n")
+    summary_parts: list[str] = []
+    for para in paragraphs:
+        if _INSTRUCTION_CONTENT_PATTERNS.search(para):
+            break
+        summary_parts.append(para.strip())
+    clean_desc = "\n\n".join(summary_parts).strip()
+    if not clean_desc or clean_desc == desc.strip():
+        return []
+
+    logger.info(
+        "Description contains instruction-like content (%d chars). "
+        "Proposing cleanup to %d chars.",
+        len(desc),
+        len(clean_desc),
+    )
+    return [
+        {
+            "patch_type": "update_description",
+            "scope": "genie_config",
+            "target": "genie_space",
+            "proposed_value": clean_desc,
+            "old_value": desc,
+            "rationale": (
+                "Description contained LLM-facing routing rules and SQL patterns. "
+                "Stripped to user-facing summary only."
+            ),
+            "lever": 5,
+            "net_impact": 1,
+            "question_ids": [],
+            "asi": {
+                "failure_type": "missing_instruction",
+                "severity": "minor",
+                "counterfactual_fixes": [],
+                "ambiguity_detected": False,
+            },
+        }
+    ]
+
+
+def _validate_lever5_proposals(
+    proposals: list[dict], metadata_snapshot: dict
+) -> list[dict]:
+    """Filter out empty, generic, or over-length Lever 5 proposals."""
+    from genie_space_optimizer.common.config import MAX_INSTRUCTION_TEXT_CHARS
+
+    _tables = metadata_snapshot.get("tables") or []
+    _funcs = metadata_snapshot.get("functions") or []
+    _mvs = metadata_snapshot.get("metric_views") or []
+    known_assets: set[str] = set()
+    for t in _tables:
+        name = (t.get("name") or t.get("identifier", "")).lower()
+        known_assets.add(name)
+        known_assets.add(name.rsplit(".", 1)[-1])
+    for f in _funcs:
+        name = (f.get("name") or f.get("identifier", "")).lower()
+        known_assets.add(name)
+        known_assets.add(name.rsplit(".", 1)[-1])
+    for m in _mvs:
+        name = (m.get("name") or m.get("identifier", "")).lower()
+        known_assets.add(name)
+        known_assets.add(name.rsplit(".", 1)[-1])
+    known_assets.discard("")
+
+    valid: list[dict] = []
+    for p in proposals:
+        ptype = p.get("patch_type", "")
+        if ptype not in ("add_instruction", "add_example_sql"):
+            valid.append(p)
+            continue
+
+        if ptype == "add_instruction":
+            text = (p.get("proposed_value") or p.get("new_text") or "").strip()
+            if not text:
+                logger.info("Rejecting empty add_instruction proposal")
+                continue
+            if len(text) > MAX_INSTRUCTION_TEXT_CHARS:
+                logger.warning(
+                    "Rejecting add_instruction proposal exceeding %d chars (%d chars)",
+                    MAX_INSTRUCTION_TEXT_CHARS,
+                    len(text),
+                )
+                continue
+            text_lower = text.lower()
+            if known_assets and not any(a in text_lower for a in known_assets):
+                logger.warning(
+                    "Rejecting generic add_instruction (no known asset referenced): %.100s...",
+                    text,
+                )
+                continue
+
+        if ptype == "add_example_sql":
+            eq = (p.get("example_question") or "").strip()
+            es = (p.get("example_sql") or "").strip()
+            if not eq or not es:
+                logger.info("Rejecting empty add_example_sql proposal")
+                continue
+
+        valid.append(p)
+
+    rejected = len(proposals) - len(valid)
+    if rejected:
+        logger.info(
+            "Lever 5 proposal validation: %d rejected, %d kept", rejected, len(valid)
+        )
+    return valid
+
+
 def _deduplicate_proposals(proposals: list[dict]) -> list[dict]:
     """Remove proposals with identical proposed_value, keeping highest net_impact."""
     seen: dict[tuple, int] = {}
@@ -1546,6 +1685,9 @@ def generate_metadata_proposals(
             _pre_dedup, len(clusters), _pre_dedup - len(clusters),
         )
     proposals: list[dict] = []
+    if target_lever == 5:
+        desc_proposals = _detect_instruction_content_in_description(metadata_snapshot)
+        proposals.extend(desc_proposals)
     for cluster in clusters:
         natural_lever = _map_to_lever(
             cluster["root_cause"],
@@ -1713,6 +1855,7 @@ def generate_metadata_proposals(
                     },
                 })
 
+    proposals = _validate_lever5_proposals(proposals, metadata_snapshot)
     _pre_dedup_p = len(proposals)
     proposals = _deduplicate_proposals(proposals)
     if len(proposals) < _pre_dedup_p:

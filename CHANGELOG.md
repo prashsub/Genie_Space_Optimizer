@@ -6,6 +6,30 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Lever 5 Quality, Result Matching, Anti-Hallucination
+- **Lever 5 prompt improvements** (`config.py`): routing failures now force
+  `example_sql` instruction type instead of falling back to text instructions;
+  added structured markdown formatting rules, anti-hallucination guard that
+  returns empty proposals when no actionable fix is identified, and explicit
+  requirement that all instructions reference specific Genie Space assets
+- **Description cleanup** (`optimizer.py`): `_detect_instruction_content_in_description()`
+  detects when the Genie Space description field contains LLM-facing routing rules
+  or SQL patterns and proposes stripping them to user-facing summary only
+- **Cluster deduplication** (`optimizer.py`): improved failure clustering with
+  downgrade tracking when LLM returns text_instruction for routing failures
+- **Fuzzy result matching** (`evaluation.py`): `normalize_result_df` and
+  `result_signature` now round to 4 decimals (was 6) to handle Spark vs REST API
+  float precision differences; new subset/superset matching and column alias
+  detection for result correctness scoring
+- **Scorer enhancements**: `completeness`, `logical_accuracy`, `result_correctness`,
+  `schema_accuracy`, and `semantic_equivalence` scorers enhanced with additional
+  context and edge-case handling
+- Expanded unit tests for optimizer (cluster dedup, description cleanup) and applier
+
+---
+
+## [Previous Unreleased]
+
 ### Added — Trigger API, Response Quality Scorer, Schema Validation v2
 - **Programmatic trigger API** (`trigger.py`): new `POST /trigger` and
   `GET /trigger/status/{run_id}` endpoints for headless optimization — enables

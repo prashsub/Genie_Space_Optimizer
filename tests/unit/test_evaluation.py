@@ -108,7 +108,7 @@ class TestNormalizeResultDf:
     def test_floats_rounded(self):
         df = pd.DataFrame({"val": [1.123456789]})
         result = normalize_result_df(df)
-        assert result["val"].iloc[0] == pytest.approx(1.123457, abs=1e-6)
+        assert result["val"].iloc[0] == pytest.approx(1.1235, abs=1e-4)
 
     def test_strings_stripped(self):
         df = pd.DataFrame({"name": ["  alice  ", "bob  "]})
