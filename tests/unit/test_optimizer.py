@@ -147,6 +147,67 @@ class TestClusterFailures:
         assert c["asi_failure_type"] == "wrong_table"
         assert c["asi_blame_set"] is not None
 
+    def test_asi_failure_type_from_sql_escaped_rationale(self):
+        """After SQL round-trip, newlines become literal \\n sequences.
+        cluster_failures should still extract ASI metadata."""
+        import json
+
+        asi_payload = json.dumps(
+            {
+                "failure_type": "wrong_column",
+                "severity": "major",
+                "wrong_clause": "SELECT invoice_id",
+                "blame_set": ["invoice_id"],
+                "confidence": 0.8,
+                "rationale": "Used wrong column",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        rationale_with_json = (
+            "### schema_accuracy\n"
+            "**Verdict:** Fail\n\n"
+            "Used wrong column\n\n"
+            f"```json\n{asi_payload}\n```"
+        )
+        escaped_rationale = rationale_with_json.replace("\n", "\\n")
+
+        eval_results = {
+            "rows": [
+                {
+                    "inputs/question_id": "q1",
+                    "feedback/schema_accuracy/value": "no",
+                    "feedback/schema_accuracy/rationale": escaped_rationale,
+                },
+            ]
+        }
+        clusters = cluster_failures(eval_results, {})
+        schema_clusters = [
+            c for c in clusters if c["affected_judge"] == "schema_accuracy"
+        ]
+        assert len(schema_clusters) >= 1
+        assert schema_clusters[0]["asi_failure_type"] == "wrong_column"
+
+    def test_asi_from_flattened_metadata_keys(self):
+        """cluster_failures should find ASI data in metadata/{judge}/{field} keys."""
+        eval_results = {
+            "rows": [
+                {
+                    "inputs/question_id": "q1",
+                    "feedback/schema_accuracy/value": "no",
+                    "feedback/schema_accuracy/rationale": "mismatch",
+                    "metadata/schema_accuracy/failure_type": "wrong_join",
+                    "metadata/schema_accuracy/blame_set": ["orders"],
+                },
+            ]
+        }
+        clusters = cluster_failures(eval_results, {})
+        schema_clusters = [
+            c for c in clusters if c["affected_judge"] == "schema_accuracy"
+        ]
+        assert len(schema_clusters) >= 1
+        assert schema_clusters[0]["asi_failure_type"] == "wrong_join"
+
 
 class TestDetectRegressions:
     def test_no_regression_when_scores_improve(self):

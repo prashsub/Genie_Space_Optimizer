@@ -13,6 +13,7 @@ from genie_space_optimizer.optimization.evaluation import (
     CODE_SOURCE,
     build_asi_metadata,
     format_asi_markdown,
+    slim_comparison,
 )
 
 
@@ -39,7 +40,27 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                         "GT returned 0 rows and Genie results unavailable — "
                         "treated as matching empty results (null-result defense)."
                     ),
-                    extra={"comparison": cmp},
+                    extra={"comparison": slim_comparison(cmp)},
+                ),
+                source=CODE_SOURCE,
+            )
+
+        if error_type == "genie_result_unavailable" and cmp.get("temporal_rewrite"):
+            return Feedback(
+                name="result_correctness",
+                value="excluded",
+                rationale=format_asi_markdown(
+                    judge_name="result_correctness",
+                    value="excluded",
+                    rationale=(
+                        f"Genie result unavailable with temporal rewrite active "
+                        f"({cmp['temporal_rewrite'].get('keyword', '?')}). "
+                        f"GT was rewritten from {cmp['temporal_rewrite'].get('original_dates')} "
+                        f"to {cmp['temporal_rewrite'].get('rewritten_dates')} but may use a "
+                        f"different date column than Genie. Cannot reliably compare results "
+                        f"— excluded from accuracy denominator."
+                    ),
+                    extra={"comparison": slim_comparison(cmp)},
                 ),
                 source=CODE_SOURCE,
             )
@@ -58,7 +79,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                         f"GT-side failure ({error_type}): {cmp['error'][:200]} "
                         f"— excluded from accuracy denominator."
                     ),
-                    extra={"comparison": cmp},
+                    extra={"comparison": slim_comparison(cmp)},
                 ),
                 source=CODE_SOURCE,
             )
@@ -77,7 +98,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                 value="no",
                 rationale=f"Comparison error: {cmp['error']}",
                 metadata=metadata,
-                extra={"comparison": cmp},
+                extra={"comparison": slim_comparison(cmp)},
             ),
             source=CODE_SOURCE,
             metadata=metadata,
@@ -95,7 +116,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                     f"Match type: {match_type}. Rows: {cmp.get('gt_rows', '?')}. "
                     f"Hash: {cmp.get('gt_hash', 'n/a')}."
                 ),
-                extra={"comparison": cmp},
+                extra={"comparison": slim_comparison(cmp)},
             ),
             source=CODE_SOURCE,
         )
@@ -113,7 +134,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                     "Both GT and Genie returned 0 rows — underlying dataset "
                     "has no matching data. Treated as matching empty results."
                 ),
-                extra={"comparison": cmp},
+                extra={"comparison": slim_comparison(cmp)},
             ),
             source=CODE_SOURCE,
         )
@@ -131,7 +152,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                     f"GT has {gt_rows} rows. Row count difference is a "
                     f"platform limitation, not a query error."
                 ),
-                extra={"comparison": cmp, "row_cap_applied": True},
+                extra={"comparison": slim_comparison(cmp), "row_cap_applied": True},
             ),
             source=CODE_SOURCE,
         )
@@ -156,7 +177,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                 f"Hash GT={cmp.get('gt_hash')} vs Genie={cmp.get('genie_hash')}."
             ),
             metadata=metadata,
-            extra={"comparison": cmp},
+            extra={"comparison": slim_comparison(cmp)},
         ),
         source=CODE_SOURCE,
         metadata=metadata,

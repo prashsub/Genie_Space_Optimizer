@@ -73,6 +73,7 @@ LLM_MAX_RETRIES = 3
 # ── 5. Benchmark Generation ────────────────────────────────────────────
 
 TARGET_BENCHMARK_COUNT = 20
+COVERAGE_GAP_SOFT_CAP_FACTOR = 1.5
 
 BENCHMARK_CATEGORIES = [
     "aggregation",
@@ -171,6 +172,60 @@ BENCHMARK_CORRECTION_PROMPT = (
     '"unfixable_reason" (null if fixed).\n'
     '\n'
     'No markdown, just JSON.'
+)
+
+BENCHMARK_COVERAGE_GAP_PROMPT = (
+    'You are a Databricks Genie Space evaluation expert.\n'
+    '\n'
+    'Given the following schema context for domain "{domain}":\n'
+    '\n'
+    '## VALID Data Assets (ONLY use these in SQL)\n'
+    '{valid_assets_context}\n'
+    '\n'
+    '## Tables and Columns\n'
+    '{tables_context}\n'
+    '\n'
+    '## Metric Views\n'
+    '{metric_views_context}\n'
+    '\n'
+    '## Table-Valued Functions\n'
+    '{tvfs_context}\n'
+    '\n'
+    '## Uncovered Assets (MUST be targeted)\n'
+    '{uncovered_assets}\n'
+    '\n'
+    'The benchmark suite already covers some assets but the ones listed under '
+    '"Uncovered Assets" have ZERO benchmark questions. Your job is to fill '
+    'these coverage gaps.\n'
+    '\n'
+    'CRITICAL CONSTRAINT: Your expected_sql MUST ONLY reference the tables, metric views, '
+    'and functions listed in "VALID Data Assets" above. Do NOT invent, hallucinate, or guess '
+    'table/view names. Every FROM clause, JOIN, and function call must reference a real asset '
+    'from the list above.\n'
+    'STRICT COLUMN CONSTRAINT: required_columns and SQL-selected/filter columns must come only '
+    'from the provided metadata context. Do NOT invent field names or aliases that are not '
+    'resolvable to listed metadata columns.\n'
+    '\n'
+    'Generate 1-2 benchmark questions PER uncovered asset. Each question MUST reference '
+    'the specified uncovered asset in its FROM clause, JOIN, or function call.\n'
+    '\n'
+    'For each question, provide:\n'
+    '1. "question": The natural language question a business user would ask\n'
+    '2. "expected_sql": The correct SQL referencing ONLY the valid assets listed above.\n'
+    '   Use fully-qualified names (catalog.schema.table) from the VALID Data Assets list.\n'
+    '   - For metric views: use MEASURE() syntax\n'
+    '   - For TVFs: use function call syntax\n'
+    '   - For tables: use standard SQL\n'
+    '3. "expected_asset": "MV" | "TVF" | "TABLE"\n'
+    '4. "category": one of {categories}\n'
+    '5. "required_tables": list of table names referenced\n'
+    '6. "required_columns": list of column names referenced\n'
+    '7. "expected_facts": list of 1-2 facts the answer should contain\n'
+    '\n'
+    '## Already Covered Questions (do NOT duplicate these)\n'
+    '{existing_questions}\n'
+    '\n'
+    'Return a JSON array of question objects. No markdown, just JSON.'
 )
 
 # ── 5b. Proposal Generation Prompts ───────────────────────────────────

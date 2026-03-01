@@ -109,17 +109,22 @@ def _resolve_experiment_path(
     return f"/Shared/genie-optimization/{domain}"
 
 
-def _ensure_experiment_parent_dir(ws: WorkspaceClient, experiment_path: str) -> None:
-    """Ensure the workspace parent directory exists before creating experiment."""
+def _ensure_experiment_parent_dir(ws: WorkspaceClient, experiment_path: str) -> bool:
+    """Ensure the workspace parent directory exists before creating experiment.
+
+    Returns ``True`` if the directory was verified/created, ``False`` on failure.
+    """
     if not experiment_path.startswith("/"):
-        return
+        return True
     parent = str(PurePosixPath(experiment_path).parent)
     if not parent or parent == "/":
-        return
+        return True
     try:
         ws.workspace.mkdirs(parent)
+        return True
     except Exception as exc:
         logger.warning("Could not ensure experiment parent directory %s: %s", parent, exc)
+        return False
 
 
 def _has_non_email_user_home(path: str) -> bool:
@@ -166,6 +171,13 @@ def run_preflight(
         config = snapshot
         logger.info("Using config snapshot from run row for %s", run_id)
     else:
+        logger.warning(
+            "No config snapshot found in run row for %s — fetching from API. "
+            "This may fail on serverless if the runtime identity lacks Genie "
+            "Space 'Can Edit' permission. The app backend should capture the "
+            "snapshot at trigger time.",
+            run_id,
+        )
         config = fetch_space_config(w, space_id)
         logger.info("Fetched config for space %s", space_id)
 
@@ -428,9 +440,15 @@ def run_preflight(
     if experiment_name is None:
         experiment_name = _resolve_experiment_path(run_data=run_data, domain=domain, ws=w)
     elif _has_non_email_user_home(experiment_name):
-        # Migrate away from service-principal style home paths like /Users/<uuid>/...
         experiment_name = _resolve_experiment_path(run_data=run_data, domain=domain, ws=w)
-    _ensure_experiment_parent_dir(w, experiment_name)
+    if not _ensure_experiment_parent_dir(w, experiment_name):
+        shared_fallback = f"/Shared/genie-optimization/{domain}"
+        logger.warning(
+            "Cannot create parent dir for %s — falling back to %s",
+            experiment_name, shared_fallback,
+        )
+        _ensure_experiment_parent_dir(w, shared_fallback)
+        experiment_name = shared_fallback
     mlflow.set_experiment(experiment_name)
     exp = mlflow.get_experiment_by_name(experiment_name)
     experiment_id = exp.experiment_id if exp else ""

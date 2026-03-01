@@ -305,9 +305,21 @@ On the first run, Delta state tables are created automatically in the configured
 
 The preflight stage now uses the Unity Catalog **REST API** by default to fetch column and routine metadata, bypassing `system.information_schema` permission requirements. If the REST API fails, it falls back to Spark SQL automatically. If both fail, ensure the app's service principal has `USE CATALOG` and `USE SCHEMA` grants on the target catalog/schema (see the **Settings** page or `resources/grant_app_uc_permissions.py`).
 
+### Benchmark dates look wrong (stale "this year" / "last quarter")
+
+The optimizer auto-detects relative time references in benchmark questions ("this year", "YTD", "last quarter", "last N months/days") and rewrites the ground-truth SQL date literals to match the current date. This is automatic and requires no manual intervention. If you still see date mismatches, the question may contain an explicit year (e.g., "for 2024") which is intentionally not rewritten.
+
 ### Evaluation takes a long time
 
 Each benchmark question requires a round-trip to the Genie API (with rate limiting and exponential backoff on 429 rate limits) plus LLM judge evaluation. For 20 questions with 9 judges, expect ~15 minutes for a full evaluation pass. You can reduce `TARGET_BENCHMARK_COUNT` in `config.py` for faster iteration during testing.
+
+### Spark session errors ("InvalidAccessKeyId", "ExpiredToken")
+
+The backend automatically detects stale AWS STS credentials and recreates the Spark session. If you see transient credential errors in logs, they should self-heal within one retry. Persistent errors indicate the workspace's credential vending is misconfigured.
+
+### Delta "SCHEMA_CHANGE_SINCE_ANALYSIS" errors
+
+The Delta state tables may be dropped and recreated by upstream pipeline tasks. The `read_table` helper automatically retries with `REFRESH TABLE` on schema change errors. If persistent, check that concurrent optimization runs aren't conflicting.
 
 ### Score didn't improve
 

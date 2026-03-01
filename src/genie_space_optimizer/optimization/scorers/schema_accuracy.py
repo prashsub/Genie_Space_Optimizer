@@ -19,6 +19,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
+    build_temporal_note,
     format_asi_markdown,
 )
 
@@ -50,31 +51,46 @@ def _make_schema_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
             )
 
         empty_data_note = ""
-        if cmp.get("gt_rows", -1) == 0:
+        if cmp.get("gt_rows", -1) == 0 and cmp.get("genie_rows", -1) > 0:
             empty_data_note = (
-                "\nIMPORTANT: The ground-truth query returned 0 rows, meaning "
-                "the underlying dataset currently has no matching data for this "
-                "question. When both queries would return empty results, minor "
-                "SQL differences (e.g. filter thresholds) have no practical impact. "
-                "Focus your assessment on whether the SQL structure and intent are "
-                "correct rather than penalizing differences that only matter when "
-                "data exists. If the SQL is structurally sound but differs in a "
-                "threshold or filter value that doesn't affect empty results, lean "
-                "toward PASS.\n"
+                "\nCRITICAL: The Expected SQL returned 0 rows while the Generated SQL "
+                "returned data. This likely means the Expected SQL has overly restrictive "
+                "filters NOT present in the user's question (e.g. date ranges, status "
+                "filters the user never asked for). When the Expected SQL is wrong, "
+                "evaluate the Generated SQL SOLELY against the user's question. If the "
+                "Generated SQL correctly answers what the user asked, it should PASS "
+                "regardless of differences from the Expected SQL.\n"
+            )
+        elif cmp.get("gt_rows", -1) == 0:
+            empty_data_note = (
+                "\nIMPORTANT: Both queries returned 0 rows — the underlying dataset "
+                "has no matching data. Minor SQL differences have no practical impact. "
+                "Focus on whether the SQL structure and intent are correct. Lean toward "
+                "PASS if structurally sound.\n"
             )
 
         prompt = (
             "You are a SQL schema expert evaluating SQL for a Databricks Genie Space.\n"
             "Determine if the GENERATED SQL references the correct tables, columns, and joins.\n\n"
-            "IMPORTANT: Evaluate column selection against the USER'S QUESTION, not the Expected SQL.\n"
-            "The Expected SQL is a reference implementation that may include extra columns the user\n"
-            "did not ask for. If the Generated SQL includes all columns the user explicitly requested,\n"
-            "do NOT penalize it for omitting extra columns present only in the Expected SQL.\n"
-            "Only flag missing_column when a column the USER asked for is absent.\n\n"
+            "IMPORTANT RULES:\n"
+            "1. Evaluate column selection against the USER'S QUESTION, not the Expected SQL.\n"
+            "   The Expected SQL is a reference that may include extra columns. Only flag\n"
+            "   missing_column when a column the USER asked for is absent.\n"
+            "2. ASSET EQUIVALENCE: A metric view (using MEASURE()), a TVF (table-valued function),\n"
+            "   and the underlying fact table are ALL valid schema choices when they answer the\n"
+            "   same question. Do NOT flag wrong_table when Generated SQL uses one asset type\n"
+            "   while Expected uses another (e.g. metric view vs TVF, TVF vs fact table) if\n"
+            "   both answer the user's question. The asset_routing judge handles routing\n"
+            "   preference separately — schema_accuracy only cares about correctness.\n"
+            "3. COSMETIC DIFFERENCES are NOT schema errors:\n"
+            "   - GROUP BY ALL vs explicit GROUP BY (identical semantics)\n"
+            "   - Defensive WHERE col IS NOT NULL filters\n"
+            "   - ORDER BY differences\n"
+            "   - Column aliasing differences\n\n"
             f"User question: {question}\n"
             f"Expected SQL: {gt_sql}\n"
             f"Generated SQL: {genie_sql}\n"
-            f"{cmp_summary}{empty_data_note}\n"
+            f"{cmp_summary}{empty_data_note}{build_temporal_note(cmp)}\n"
             'Respond with JSON only: {"correct": true/false, "failure_type": "<wrong_table|wrong_column|wrong_join|missing_column>", '
             '"wrong_clause": "<the problematic SQL clause>", "blame_set": ["<table_or_column>"], '
             '"rationale": "<brief explanation>"}\n'

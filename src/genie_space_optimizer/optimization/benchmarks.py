@@ -46,10 +46,15 @@ def load_benchmarks_from_dataset(
     spark_or_dataset: Any,
     uc_schema: str,
     domain: str,
+    _max_retries: int = 3,
 ) -> list[dict]:
     """Load benchmarks from an MLflow evaluation dataset in UC.
 
     Table name convention: ``{uc_schema}.genie_benchmarks_{domain}``.
+
+    Issues ``REFRESH TABLE`` before reading to avoid
+    ``DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS`` when the table was recently
+    dropped and recreated by the preflight task.
 
     Args:
         spark_or_dataset: A Spark session or a pre-loaded DataFrame/list.
@@ -67,14 +72,33 @@ def load_benchmarks_from_dataset(
 
     try:
         if hasattr(spark_or_dataset, "read"):
-            df = spark_or_dataset.table(table_name)
+            spark = spark_or_dataset
+            for attempt in range(_max_retries):
+                try:
+                    spark.sql(f"REFRESH TABLE {_quote_identifier_fqn(table_name)}")
+                    df = spark.table(table_name)
+                    rows = df.collect()
+                    return [r.asDict() for r in rows]
+                except Exception as read_err:
+                    err_msg = str(read_err)
+                    if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in err_msg and attempt < _max_retries - 1:
+                        import time as _time
+                        wait = 5 * (attempt + 1)
+                        logger.warning(
+                            "Delta schema change on attempt %d/%d for %s — retrying in %ds",
+                            attempt + 1, _max_retries, table_name, wait,
+                        )
+                        _time.sleep(wait)
+                        continue
+                    raise
         else:
             df = spark_or_dataset
-        rows = df.collect()
-        return [r.asDict() for r in rows]
+            rows = df.collect()
+            return [r.asDict() for r in rows]
     except Exception:
         logger.exception("Failed to load benchmarks from %s", table_name)
         return []
+    return []
 
 
 # ═══════════════════════════════════════════════════════════════════════

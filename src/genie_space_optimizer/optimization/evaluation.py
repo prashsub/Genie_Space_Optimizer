@@ -20,7 +20,8 @@ import re
 import time
 import traceback
 from difflib import get_close_matches
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Union
 
@@ -34,8 +35,10 @@ from genie_space_optimizer.common.config import (
     ASI_SCHEMA,
     BENCHMARK_CATEGORIES,
     BENCHMARK_CORRECTION_PROMPT,
+    BENCHMARK_COVERAGE_GAP_PROMPT,
     BENCHMARK_GENERATION_PROMPT,
     CODE_SOURCE_ID,
+    COVERAGE_GAP_SOFT_CAP_FACTOR,
     DEFAULT_THRESHOLDS,
     FAILURE_TAXONOMY,
     INSTRUCTION_PROMPT_ALIAS,
@@ -90,6 +93,32 @@ FAIL_ON_INFRA_EVAL_ERRORS = (
 
 
 # ── Shared Helpers ──────────────────────────────────────────────────────
+
+_CMP_BULKY_KEYS = frozenset({"gt_sample", "genie_sample", "gt_signature", "genie_signature"})
+
+
+def slim_comparison(cmp: dict) -> dict:
+    """Return a lightweight copy of a comparison dict for use in assessments.
+
+    Strips bulky keys (result samples, signatures) to keep MLflow
+    trace/assessment payloads well within size limits.
+    """
+    return {k: v for k, v in cmp.items() if k not in _CMP_BULKY_KEYS}
+
+
+def build_temporal_note(cmp: dict) -> str:
+    """Build a prompt note explaining temporal date rewriting, if applicable."""
+    tr = cmp.get("temporal_rewrite")
+    if not tr:
+        return ""
+    return (
+        "\nTEMPORAL CONTEXT: The question uses a relative time reference "
+        f"('{tr['keyword']}'). The GT SQL dates were auto-adjusted from "
+        f"{tr['original_dates']} to {tr['rewritten_dates']} to match the "
+        "current date. If there are still minor date differences between "
+        "GT and Genie, evaluate whether Genie's date interpretation is "
+        "reasonable for the temporal reference in the question.\n"
+    )
 
 
 def _extract_response_text(outputs: Union[dict, Any]) -> str:
@@ -248,6 +277,147 @@ def build_metric_view_measures(config: dict) -> dict[str, set[str]]:
     return result
 
 
+@dataclass(frozen=True)
+class TemporalIntent:
+    """Detected temporal intent from a question's relative time reference."""
+    keyword: str
+    start_date: date
+    end_date: date
+
+
+_TEMPORAL_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bthis\s+year\b", re.I), "this_year"),
+    (re.compile(r"\bytd\b|\byear[\s-]to[\s-]date\b", re.I), "ytd"),
+    (re.compile(r"\bthis\s+month\b", re.I), "this_month"),
+    (re.compile(r"\bthis\s+quarter\b", re.I), "this_quarter"),
+    (re.compile(r"\blast\s+quarter\b", re.I), "last_quarter"),
+    (re.compile(r"\blast\s+year\b", re.I), "last_year"),
+    (re.compile(r"\blast\s+(\d+)\s+months?\b", re.I), "last_n_months"),
+    (re.compile(r"\blast\s+(\d+)\s+days?\b", re.I), "last_n_days"),
+]
+
+_DATE_LITERAL_RE = re.compile(r"'(\d{4}-\d{2}-\d{2})'")
+_EXPLICIT_YEAR_RE = re.compile(r"\bfor\s+(\d{4})\b|\bin\s+(\d{4})\b|\byear\s+(\d{4})\b", re.I)
+
+
+def _quarter_start(d: date) -> date:
+    """Return the first day of the quarter containing *d*."""
+    return date(d.year, ((d.month - 1) // 3) * 3 + 1, 1)
+
+
+def _month_offset(d: date, months: int) -> date:
+    """Shift *d* by *months* (positive or negative), clamping the day."""
+    m = d.month + months
+    y = d.year + (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    import calendar
+    max_day = calendar.monthrange(y, m)[1]
+    return date(y, m, min(d.day, max_day))
+
+
+def _detect_temporal_intent(
+    question: str,
+    *,
+    today: date | None = None,
+) -> TemporalIntent | None:
+    """Detect relative temporal references in *question* and compute a date range.
+
+    Returns ``None`` when the question has no relative time phrase or when
+    an explicit year is mentioned (e.g. "for 2025").
+    """
+    if not question:
+        return None
+    today = today or date.today()
+
+    for pat, keyword in _TEMPORAL_PATTERNS:
+        m = pat.search(question)
+        if not m:
+            continue
+
+        if keyword == "this_year" or keyword == "ytd":
+            start = date(today.year, 1, 1)
+            end = today
+        elif keyword == "this_month":
+            start = date(today.year, today.month, 1)
+            end = today
+        elif keyword == "this_quarter":
+            start = _quarter_start(today)
+            end = today
+        elif keyword == "last_quarter":
+            qs = _quarter_start(today)
+            end = qs - timedelta(days=1)
+            start = _quarter_start(end)
+        elif keyword == "last_year":
+            start = date(today.year - 1, 1, 1)
+            end = date(today.year - 1, 12, 31)
+        elif keyword == "last_n_months":
+            n = int(m.group(1))
+            start = _month_offset(today, -n)
+            end = today
+        elif keyword == "last_n_days":
+            n = int(m.group(1))
+            start = today - timedelta(days=n)
+            end = today
+        else:
+            continue
+
+        explicit = _EXPLICIT_YEAR_RE.search(question)
+        if explicit:
+            explicit_year = int(next(g for g in explicit.groups() if g))
+            if start.year <= explicit_year <= end.year:
+                return None
+
+        return TemporalIntent(keyword=keyword, start_date=start, end_date=end)
+
+    return None
+
+
+def _rewrite_temporal_dates(
+    gt_sql: str,
+    intent: TemporalIntent,
+) -> tuple[str, dict | None]:
+    """Replace hardcoded date literals in *gt_sql* with *intent* dates.
+
+    Returns ``(rewritten_sql, metadata_dict | None)``.
+    ``metadata_dict`` is ``None`` when no rewriting was needed.
+    """
+    if not gt_sql:
+        return gt_sql, None
+
+    literals = _DATE_LITERAL_RE.findall(gt_sql)
+    if not literals:
+        return gt_sql, None
+
+    sorted_dates = sorted(set(literals))
+    gt_start = sorted_dates[0]
+    gt_end = sorted_dates[-1]
+
+    gt_start_year = int(gt_start[:4])
+    gt_end_year = int(gt_end[:4])
+    if intent.start_date.year == gt_start_year and intent.end_date.year == gt_end_year:
+        return gt_sql, None
+
+    new_start = intent.start_date.isoformat()
+    new_end = intent.end_date.isoformat()
+
+    rewritten = gt_sql
+    if len(sorted_dates) >= 2:
+        rewritten = rewritten.replace(f"'{gt_start}'", f"'{new_start}'")
+        rewritten = rewritten.replace(f"'{gt_end}'", f"'{new_end}'")
+    else:
+        rewritten = rewritten.replace(f"'{gt_start}'", f"'{new_start}'")
+
+    if rewritten == gt_sql:
+        return gt_sql, None
+
+    metadata = {
+        "keyword": intent.keyword,
+        "original_dates": [gt_start, gt_end] if len(sorted_dates) >= 2 else [gt_start],
+        "rewritten_dates": [new_start, new_end] if len(sorted_dates) >= 2 else [new_start],
+    }
+    return rewritten, metadata
+
+
 def normalize_result_df(df: pd.DataFrame | None) -> pd.DataFrame:
     """Deterministic normalization of a result DataFrame.
 
@@ -255,16 +425,26 @@ def normalize_result_df(df: pd.DataFrame | None) -> pd.DataFrame:
     normalize timestamps to UTC, strip whitespace.  We use 4 decimals
     rather than 6 because GT (via Spark toPandas) and Genie (via REST API)
     serialize floats at different precisions.
+
+    The Genie Statement Execution API returns all values as strings
+    (including scientific notation like ``1.75E7``), so we attempt
+    ``pd.to_numeric`` on object columns before rounding.
     """
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
     df = df[sorted(df.columns)]
-    for col in df.select_dtypes(include=["float64", "float32"]).columns:
-        df[col] = df[col].round(4)
     for col in df.select_dtypes(include=["object"]).columns:
         df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
+        converted = pd.to_numeric(df[col], errors="coerce")
+        if converted.notna().any() and converted.notna().sum() >= df[col].notna().sum() * 0.5:
+            df[col] = converted
+    for col in df.select_dtypes(include=["number"]).columns:
+        if df[col].dtype.kind == "i":
+            df[col] = df[col].astype("float64")
+        if df[col].dtype.kind == "f":
+            df[col] = df[col].round(4)
     for col in df.select_dtypes(include=["datetime64", "datetimetz"]).columns:
         df[col] = pd.to_datetime(df[col], utc=True)
     df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
@@ -375,26 +555,47 @@ def format_asi_markdown(
     if extra:
         payload.update(extra)
 
+    _MLFLOW_ASSESSMENT_LIMIT = 60_000
+    raw = json.dumps(payload, indent=2, sort_keys=True, default=str)
+    if len(raw) > _MLFLOW_ASSESSMENT_LIMIT:
+        for bulky_key in ("comparison", "llm_response", "extra"):
+            if bulky_key in payload:
+                payload[bulky_key] = "(truncated — exceeds MLflow 64KB limit)"
+        raw = json.dumps(payload, indent=2, sort_keys=True, default=str)
+
     return (
         f"### {judge_name}\n"
         f"**Verdict:** {verdict}\n\n"
         f"{rationale_text}\n\n"
         "```json\n"
-        f"{json.dumps(payload, indent=2, sort_keys=True)}\n"
+        f"{raw}\n"
         "```"
     )
 
 
 def _parse_asi_from_rationale(rationale: str) -> dict:
-    """Extract the ASI JSON payload embedded in a ``format_asi_markdown`` rationale."""
+    """Extract the ASI JSON payload embedded in a ``format_asi_markdown`` rationale.
+
+    Handles both real newlines and literal ``\\n`` sequences that arise when
+    the rationale survives a SQL round-trip through ``_esc`` / ``_opt_json``.
+    """
     if not rationale:
         return {}
-    try:
-        start = rationale.index("```json\n") + len("```json\n")
-        end = rationale.index("\n```", start)
-        return json.loads(rationale[start:end])
-    except (ValueError, json.JSONDecodeError):
-        return {}
+    _MARKERS = [
+        ("```json\n", "\n```"),
+        ("```json\\n", "\\n```"),
+    ]
+    for start_marker, end_marker in _MARKERS:
+        try:
+            start = rationale.index(start_marker) + len(start_marker)
+            end = rationale.index(end_marker, start)
+            json_text = rationale[start:end]
+            if "\\n" in json_text and "\n" not in json_text:
+                json_text = json_text.replace("\\n", "\n").replace("\\t", "\t")
+            return json.loads(json_text)
+        except (ValueError, json.JSONDecodeError):
+            continue
+    return {}
 
 
 def _extract_assessments_from_traces(results_df) -> dict[int, dict[str, dict]]:
@@ -850,6 +1051,7 @@ def make_predict_fn(
         result: dict[str, Any] = {}
         genie_sql = ""
         gt_sql = ""
+        temporal_rewrite_meta: dict | None = None
         try:
             time.sleep(RATE_LIMIT_SECONDS)
             result = run_genie_query(w, space_id, question)
@@ -857,6 +1059,16 @@ def make_predict_fn(
             gt_sql = resolve_sql(expected_sql, catalog, schema)
             if _mv_measures and gt_sql:
                 gt_sql = _rewrite_measure_refs(gt_sql, _mv_measures)
+            temporal_intent = _detect_temporal_intent(question)
+            if temporal_intent and gt_sql:
+                gt_sql, temporal_rewrite_meta = _rewrite_temporal_dates(gt_sql, temporal_intent)
+                if temporal_rewrite_meta:
+                    logger.info(
+                        "Temporal rewrite for '%s': %s → %s",
+                        temporal_intent.keyword,
+                        temporal_rewrite_meta["original_dates"],
+                        temporal_rewrite_meta["rewritten_dates"],
+                    )
             statement_id = result.get("statement_id")
 
             if genie_sql and gt_sql:
@@ -912,13 +1124,14 @@ def make_predict_fn(
                                     )
                                     comparison["error_type"] = "genie_result_unavailable"
                                     comparison["gt_rows"] = len(gt_df)
-                                    comparison["gt_sample"] = gt_df.head(5).to_csv(index=False)
+                                    comparison["gt_sample"] = gt_df.head(5).to_csv(index=False, float_format="%.4f")
                                 else:
+                                    _FLOAT_FMT = "%.4f"
                                     gt_hash = hashlib.md5(
-                                        gt_df.to_csv(index=False).encode()
+                                        gt_df.to_csv(index=False, float_format=_FLOAT_FMT).encode()
                                     ).hexdigest()[:8]
                                     genie_hash = hashlib.md5(
-                                        genie_df.to_csv(index=False).encode()
+                                        genie_df.to_csv(index=False, float_format=_FLOAT_FMT).encode()
                                     ).hexdigest()[:8]
                                     exact_match = gt_df.shape == genie_df.shape and gt_df.equals(genie_df)
                                     hash_match = gt_hash == genie_hash
@@ -947,6 +1160,15 @@ def make_predict_fn(
                                                     if g_vals == gt_vals:
                                                         col_map[gc] = gtc
                                                         break
+                                                    try:
+                                                        import numpy as np
+                                                        g_arr = np.array(g_vals, dtype=float)
+                                                        gt_arr = np.array(gt_vals, dtype=float)
+                                                        if np.allclose(g_arr, gt_arr, rtol=1e-4, atol=1e-4, equal_nan=True):
+                                                            col_map[gc] = gtc
+                                                            break
+                                                    except (ValueError, TypeError):
+                                                        pass
                                             if len(col_map) == len(unmatched_genie):
                                                 mapped_genie_df = genie_df.rename(columns=col_map)
                                                 genie_cols = set(mapped_genie_df.columns)
@@ -955,17 +1177,15 @@ def make_predict_fn(
 
                                         if shared_cols and all_mapped:
                                             _GENIE_ROW_CAP = 5000
-                                            gt_sub = gt_df[shared_cols].copy()
-                                            genie_sub = mapped_genie_df[shared_cols].copy()
+                                            gt_sub = gt_df[shared_cols].sort_values(shared_cols).reset_index(drop=True)
+                                            genie_sub = mapped_genie_df[shared_cols].sort_values(shared_cols).reset_index(drop=True)
                                             if len(genie_df) == _GENIE_ROW_CAP and len(gt_df) > _GENIE_ROW_CAP:
                                                 gt_sub = gt_sub.head(_GENIE_ROW_CAP)
                                             gt_sub_hash = hashlib.md5(
-                                                gt_sub.sort_values(shared_cols).reset_index(drop=True)
-                                                .to_csv(index=False).encode()
+                                                gt_sub.to_csv(index=False, float_format=_FLOAT_FMT).encode()
                                             ).hexdigest()[:8]
                                             genie_sub_hash = hashlib.md5(
-                                                genie_sub.sort_values(shared_cols).reset_index(drop=True)
-                                                .to_csv(index=False).encode()
+                                                genie_sub.to_csv(index=False, float_format=_FLOAT_FMT).encode()
                                             ).hexdigest()[:8]
                                             if gt_sub_hash == genie_sub_hash:
                                                 subset_match = True
@@ -974,29 +1194,41 @@ def make_predict_fn(
                                                     subset_type = "column_subset_row_capped"
 
                                     approx_match = False
+                                    _approx_genie = mapped_genie_df if mapped_genie_df is not genie_df else genie_df
                                     if (
                                         not hash_match
                                         and not subset_match
-                                        and gt_df.shape == genie_df.shape
-                                        and list(gt_df.columns) == list(genie_df.columns)
+                                        and gt_df.shape == _approx_genie.shape
+                                        and list(gt_df.columns) == list(_approx_genie.columns)
                                     ):
                                         try:
                                             import numpy as np
 
                                             gt_sorted = gt_df.sort_values(list(gt_df.columns)).reset_index(drop=True)
-                                            genie_sorted = genie_df.sort_values(list(genie_df.columns)).reset_index(drop=True)
-                                            non_numeric = gt_sorted.select_dtypes(exclude=["number"]).columns
-                                            non_num_match = gt_sorted[non_numeric].equals(genie_sorted[non_numeric]) if len(non_numeric) else True
-                                            numeric = gt_sorted.select_dtypes(include=["number"]).columns
+                                            genie_sorted = _approx_genie.sort_values(list(_approx_genie.columns)).reset_index(drop=True)
+
+                                            all_numeric = set(
+                                                gt_sorted.select_dtypes(include=["number"]).columns
+                                            ) | set(
+                                                genie_sorted.select_dtypes(include=["number"]).columns
+                                            )
+                                            for col in list(all_numeric):
+                                                for _df in (gt_sorted, genie_sorted):
+                                                    if _df[col].dtype == object:
+                                                        _df[col] = pd.to_numeric(_df[col], errors="coerce")
+
+                                            non_numeric = [c for c in gt_sorted.columns if c not in all_numeric]
+                                            non_num_match = gt_sorted[non_numeric].equals(genie_sorted[non_numeric]) if non_numeric else True
+                                            numeric = sorted(all_numeric)
                                             num_match = (
                                                 np.allclose(
-                                                    gt_sorted[numeric].values,
-                                                    genie_sorted[numeric].values,
+                                                    gt_sorted[numeric].values.astype(float),
+                                                    genie_sorted[numeric].values.astype(float),
                                                     rtol=1e-4,
                                                     atol=1e-4,
                                                     equal_nan=True,
                                                 )
-                                                if len(numeric)
+                                                if numeric
                                                 else True
                                             )
                                             approx_match = bool(non_num_match and num_match)
@@ -1023,17 +1255,30 @@ def make_predict_fn(
                                     else:
                                         match_type = "mismatch"
 
+                                    def _truncated_sample(df: pd.DataFrame, max_chars: int = 4000) -> str:
+                                        sample = df.head(5).copy()
+                                        for col in sample.select_dtypes(include=["object"]).columns:
+                                            sample[col] = sample[col].apply(
+                                                lambda x: (x[:100] + "...") if isinstance(x, str) and len(x) > 100 else x
+                                            )
+                                        csv = sample.to_csv(index=False, float_format=_FLOAT_FMT)
+                                        return csv[:max_chars] if len(csv) > max_chars else csv
+
+                                    gt_col_list = sorted(gt_df.columns.tolist())
+                                    genie_col_list = sorted(genie_df.columns.tolist())
                                     comparison = {
                                         "match": exact_match or hash_match or subset_match or approx_match,
                                         "match_type": match_type,
                                         "gt_rows": len(gt_df),
                                         "genie_rows": len(genie_df),
+                                        "gt_columns": gt_col_list,
+                                        "genie_columns": genie_col_list,
                                         "gt_hash": gt_hash,
                                         "genie_hash": genie_hash,
                                         "gt_signature": gt_sig,
                                         "genie_signature": genie_sig,
-                                        "gt_sample": gt_df.head(5).to_csv(index=False),
-                                        "genie_sample": genie_df.head(5).to_csv(index=False),
+                                        "gt_sample": _truncated_sample(gt_df),
+                                        "genie_sample": _truncated_sample(genie_df),
                                         "error": None,
                                     }
                     except Exception as exc:
@@ -1058,6 +1303,9 @@ def make_predict_fn(
                 "infrastructure" if _is_infrastructure_sql_error(err_msg) else "predict_fn_error"
             )
             comparison["sqlstate"] = _extract_sqlstate(err_msg)
+
+        if temporal_rewrite_meta:
+            comparison["temporal_rewrite"] = temporal_rewrite_meta
 
         output = {
             "response": genie_sql,
@@ -2113,6 +2361,24 @@ def _print_eval_summary(
             f"|   {judge:<24s} {score:6.1f}  (threshold: {threshold:.1f})  "
             f"{'PASS' if passed else 'FAIL'}{marker}"
         )
+    arbiter_counts: dict[str, int] = {
+        "both_correct": 0, "genie_correct": 0,
+        "ground_truth_correct": 0, "neither_correct": 0, "skipped": 0,
+    }
+    for row in rows:
+        av = str(row.get("arbiter/value", row.get("arbiter", "skipped"))).lower()
+        if av in arbiter_counts:
+            arbiter_counts[av] += 1
+        else:
+            arbiter_counts["skipped"] += 1
+    arbiter_total = sum(arbiter_counts.values())
+    lines.append(f"|")
+    lines.append(f"|   Arbiter verdicts ({arbiter_total} questions):")
+    for verdict in ("both_correct", "genie_correct", "ground_truth_correct", "neither_correct", "skipped"):
+        cnt = arbiter_counts[verdict]
+        pct = (cnt / arbiter_total * 100) if arbiter_total else 0
+        lines.append(f"|     {verdict:<24s} {cnt:3d}  ({pct:5.1f}%)")
+
     adj_accuracy, _adj_correct, adj_failures, adj_excluded = (
         _compute_arbiter_adjusted_accuracy(rows)
     )
@@ -2422,6 +2688,19 @@ def run_evaluation(
                             parsed = _parse_asi_from_rationale(str(row_dict.get(col_name, "")))
                             if parsed:
                                 row_dict[mkey] = parsed
+
+                _ASI_FLAT_FIELDS = ("failure_type", "blame_set", "wrong_clause", "counterfactual_fix", "severity", "confidence")
+                for col_name in list(row_dict.keys()):
+                    if not col_name.endswith("/metadata"):
+                        continue
+                    jname = col_name.removesuffix("/metadata")
+                    meta = row_dict[col_name]
+                    if not isinstance(meta, dict):
+                        continue
+                    for fld in _ASI_FLAT_FIELDS:
+                        flat_key = f"metadata/{jname}/{fld}"
+                        if flat_key not in row_dict and meta.get(fld) is not None:
+                            row_dict[flat_key] = meta[fld]
 
                 rows_for_output.append(row_dict)
 
@@ -3182,6 +3461,192 @@ def _extract_sql_asset_references(sql: str) -> set[str]:
     return refs
 
 
+def _compute_asset_coverage(
+    benchmarks: list[dict],
+    config: dict,
+) -> dict[str, Any]:
+    """Identify which Genie Space assets have/lack benchmark coverage.
+
+    Collects covered assets from ``required_tables`` and ``expected_sql``
+    SQL references across all benchmarks, then diffs against the full asset
+    list from the Genie Space config.
+
+    Returns a dict with ``covered``, ``uncovered_tables``,
+    ``uncovered_mvs``, and ``uncovered_functions`` sets (leaf-name normalised).
+    """
+    covered: set[str] = set()
+    for b in benchmarks:
+        for tbl in b.get("required_tables", []):
+            covered.update(_identifier_candidates(str(tbl)))
+        sql = str(b.get("expected_sql") or "")
+        if sql:
+            covered.update(_extract_sql_asset_references(sql))
+
+    def _leaf(name: str) -> str:
+        parts = name.replace("`", "").strip().split(".")
+        return parts[-1].lower() if parts else ""
+
+    all_tables = {_leaf(t) for t in config.get("_tables", []) if t}
+    all_mvs = {_leaf(m) for m in config.get("_metric_views", []) if m}
+    all_functions = {_leaf(f) for f in config.get("_functions", []) if f}
+
+    covered_leaves = {_leaf(c) for c in covered if c}
+
+    return {
+        "covered": covered_leaves,
+        "uncovered_tables": all_tables - covered_leaves,
+        "uncovered_mvs": all_mvs - covered_leaves,
+        "uncovered_functions": all_functions - covered_leaves,
+    }
+
+
+def _fill_coverage_gaps(
+    w: WorkspaceClient,
+    config: dict,
+    uc_columns: list[dict],
+    uc_routines: list[dict],
+    benchmarks: list[dict],
+    catalog: str,
+    schema: str,
+    spark: "SparkSession",
+    allowlist: dict[str, Any],
+    domain: str,
+    existing_questions: set[str],
+) -> list[dict]:
+    """Generate targeted benchmarks for Genie Space assets with zero coverage.
+
+    Runs after the main generation pipeline. Identifies uncovered assets via
+    ``_compute_asset_coverage``, then makes a single LLM call asking for 1-2
+    questions per uncovered asset.  Results go through the same metadata
+    constraint and SQL validation pipeline as normal benchmarks.
+
+    Returns only validated gap-fill benchmarks (may be empty).
+    """
+    soft_cap = int(TARGET_BENCHMARK_COUNT * COVERAGE_GAP_SOFT_CAP_FACTOR)
+    if len(benchmarks) >= soft_cap:
+        logger.info(
+            "Skipping coverage gap-fill: benchmark count %d already at soft cap %d",
+            len(benchmarks), soft_cap,
+        )
+        return []
+
+    coverage = _compute_asset_coverage(benchmarks, config)
+    uncovered_tables = coverage["uncovered_tables"]
+    uncovered_mvs = coverage["uncovered_mvs"]
+    uncovered_functions = coverage["uncovered_functions"]
+
+    if not uncovered_tables and not uncovered_mvs and not uncovered_functions:
+        logger.info("All Genie Space assets already covered by benchmarks")
+        return []
+
+    # Prioritise MVs and TVFs (higher routing-issue risk), then tables.
+    budget = soft_cap - len(benchmarks)
+    ordered_uncovered: list[str] = []
+    for mv in sorted(uncovered_mvs):
+        ordered_uncovered.append(f"METRIC VIEW: {mv}")
+    for fn in sorted(uncovered_functions):
+        ordered_uncovered.append(f"FUNCTION: {fn}")
+    for tbl in sorted(uncovered_tables):
+        ordered_uncovered.append(f"TABLE: {tbl}")
+
+    # Each uncovered asset targets ~2 questions; trim to budget.
+    max_assets = max(budget // 2, 1)
+    targeted = ordered_uncovered[:max_assets]
+
+    logger.info(
+        "Coverage gap-fill: %d uncovered assets (%d tables, %d MVs, %d functions). "
+        "Targeting %d within budget of %d.",
+        len(ordered_uncovered), len(uncovered_tables),
+        len(uncovered_mvs), len(uncovered_functions),
+        len(targeted), budget,
+    )
+
+    ctx = _build_schema_contexts(config, uc_columns, uc_routines)
+    existing_q_lines = "\n".join(f"- {q}" for q in sorted(existing_questions)) or "(none)"
+    uncovered_lines = "\n".join(f"- {a}" for a in targeted)
+
+    prompt = BENCHMARK_COVERAGE_GAP_PROMPT.format(
+        domain=domain,
+        categories=json.dumps(BENCHMARK_CATEGORIES),
+        uncovered_assets=uncovered_lines,
+        existing_questions=existing_q_lines,
+        **ctx,
+    )
+
+    try:
+        response = _call_llm_for_scoring(w, prompt)
+        raw: list[dict] = response if isinstance(response, list) else response.get("benchmarks", [])
+    except Exception:
+        logger.warning("Coverage gap-fill LLM call failed", exc_info=True)
+        return []
+
+    valid: list[dict] = []
+    for b in raw:
+        if not isinstance(b, dict):
+            continue
+        expected_sql = str(b.get("expected_sql", "") or "")
+        if not expected_sql:
+            continue
+        q_lower = str(b.get("question", "") or "").lower().strip()
+        if q_lower in existing_questions:
+            continue
+
+        required_tables = b.get("required_tables", [])
+        if not isinstance(required_tables, list):
+            required_tables = []
+        required_columns = b.get("required_columns", [])
+        if not isinstance(required_columns, list):
+            required_columns = []
+        expected_facts = b.get("expected_facts", [])
+        if not isinstance(expected_facts, list):
+            expected_facts = []
+
+        benchmark: dict[str, Any] = {
+            "question": b.get("question", ""),
+            "expected_sql": expected_sql,
+            "expected_asset": b.get("expected_asset", "TABLE"),
+            "category": b.get("category", ""),
+            "required_tables": [str(t) for t in required_tables],
+            "required_columns": [str(c) for c in required_columns],
+            "expected_facts": [str(f) for f in expected_facts],
+            "source": "llm_generated",
+            "provenance": "coverage_gap_fill",
+            "validation_status": "valid",
+            "validation_reason_code": "ok",
+            "validation_error": None,
+            "correction_source": "",
+        }
+
+        metadata_ok, _reason_code, _reason_msg = _enforce_metadata_constraints(
+            benchmark=benchmark,
+            sql=expected_sql,
+            allowlist=allowlist,
+            catalog=catalog,
+            schema=schema,
+        )
+        if not metadata_ok:
+            logger.debug(
+                "Gap-fill benchmark failed metadata constraints: %s",
+                str(benchmark.get("question", ""))[:60],
+            )
+            continue
+
+        is_valid, err = _validate_benchmark_sql(expected_sql, spark, catalog, schema)
+        if is_valid:
+            valid.append(benchmark)
+        else:
+            logger.debug(
+                "Gap-fill benchmark failed SQL validation: %s — %s",
+                str(benchmark.get("question", ""))[:60], err,
+            )
+
+    logger.info(
+        "Coverage gap-fill complete: %d valid out of %d generated for %d uncovered assets",
+        len(valid), len(raw), len(targeted),
+    )
+    return valid
+
+
 def _suggest_column_name(column: str, allowed_index: dict[str, str]) -> str | None:
     if not column:
         return None
@@ -3642,12 +4107,57 @@ def generate_benchmarks(
             }
         )
 
+    # ── Coverage gap-fill: ensure every asset has at least one benchmark ──
+    all_accepted_questions = (
+        curated_questions
+        | accepted_questions
+        | {str(b.get("question", "")).lower().strip() for b in _existing}
+    )
+    gap_fill_benchmarks = _fill_coverage_gaps(
+        w=w,
+        config=config,
+        uc_columns=uc_columns,
+        uc_routines=uc_routines,
+        benchmarks=all_benchmarks,
+        catalog=catalog,
+        schema=schema,
+        spark=spark,
+        allowlist=allowlist,
+        domain=domain,
+        existing_questions=all_accepted_questions,
+    )
+    gap_fill_offset = len(curated) + len(valid_benchmarks)
+    for idx, b in enumerate(gap_fill_benchmarks):
+        question_id = f"{domain}_gf_{gap_fill_offset + idx + 1:03d}"
+        split = "held_out" if (idx + 1) % 5 == 0 else "train"
+        all_benchmarks.append(
+            {
+                "id": question_id,
+                "question": b.get("question", ""),
+                "expected_sql": b.get("expected_sql", ""),
+                "expected_asset": b.get("expected_asset", "TABLE"),
+                "category": b.get("category", ""),
+                "required_tables": b.get("required_tables", []),
+                "required_columns": b.get("required_columns", []),
+                "expected_facts": b.get("expected_facts", []),
+                "priority": "P1",
+                "split": split,
+                "source": "llm_generated",
+                "provenance": "coverage_gap_fill",
+                "validation_status": b.get("validation_status", "valid"),
+                "validation_reason_code": b.get("validation_reason_code", "ok"),
+                "validation_error": b.get("validation_error"),
+                "correction_source": "",
+            }
+        )
+
     logger.info(
         "Final benchmark set: %d total (%d curated from Genie space, "
-        "%d synthetic, %d discarded out of %d raw generated)",
+        "%d synthetic, %d gap-fill, %d discarded out of %d raw generated)",
         len(all_benchmarks),
         len(curated),
         len(valid_benchmarks),
+        len(gap_fill_benchmarks),
         len(invalid_benchmarks),
         len(raw_benchmarks),
     )
@@ -3658,8 +4168,14 @@ def load_benchmarks_from_dataset(
     spark: SparkSession,
     uc_schema: str,
     domain: str,
+    _max_retries: int = 3,
 ) -> list[dict]:
-    """Load benchmarks from an existing MLflow UC evaluation dataset table."""
+    """Load benchmarks from an existing MLflow UC evaluation dataset table.
+
+    Issues ``REFRESH TABLE`` before reading to avoid
+    ``DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS`` when the upstream preflight task
+    drops and recreates the table in the same job run.
+    """
     table_name = f"{uc_schema}.genie_benchmarks_{domain}"
     try:
         parts = uc_schema.split(".", 1)
@@ -3672,7 +4188,35 @@ def load_benchmarks_from_dataset(
             return f"`{identifier.replace('`', '``')}`"
 
         quoted_table_name = f"{_q(catalog)}.{_q(schema)}.{_q(table)}"
-        df = spark.sql(f"SELECT * FROM {quoted_table_name}").toPandas()
+
+        df = None
+        last_err: Exception | None = None
+        for attempt in range(_max_retries):
+            try:
+                spark.sql(f"REFRESH TABLE {quoted_table_name}")
+                df = spark.sql(f"SELECT * FROM {quoted_table_name}").toPandas()
+                break
+            except Exception as read_err:
+                last_err = read_err
+                err_msg = str(read_err)
+                if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in err_msg and attempt < _max_retries - 1:
+                    import time as _time
+                    wait = 5 * (attempt + 1)
+                    logger.warning(
+                        "Delta schema change on attempt %d/%d for %s — refreshing and retrying in %ds",
+                        attempt + 1, _max_retries, table_name, wait,
+                    )
+                    try:
+                        spark.catalog.refreshTable(quoted_table_name.replace("`", ""))
+                    except Exception:
+                        pass
+                    _time.sleep(wait)
+                    continue
+                raise
+
+        if df is None:
+            raise last_err or RuntimeError(f"Failed to read {table_name} after {_max_retries} attempts")
+
         benchmarks: list[dict] = []
         for _, row in df.iterrows():
             inputs = row.get("inputs", {})

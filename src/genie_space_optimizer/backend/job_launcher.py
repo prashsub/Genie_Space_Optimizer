@@ -66,6 +66,7 @@ _NOTEBOOK_SOURCES = {
 _WS_NOTEBOOKS = {name: f"{_WS_BASE}/{name}" for name in _NOTEBOOK_SOURCES}
 
 _cached_wheel_path: str | None = None
+_cached_wheel_hash: str | None = None
 _cached_job_id: int | None = None
 _cached_job_wheel_path: str | None = None
 # Only guards single-process races; with multiple uvicorn workers cross-process
@@ -93,12 +94,11 @@ def _resolve_project_root() -> Path:
 
 
 def _find_wheel() -> Path:
-    """Locate the project wheel.
+    """Locate the newest project wheel across ALL search directories.
 
-    Search order:
-      1. Deployed app source root (/app/python/source_code/) and subdirs
-      2. Local .build/ and dist/ directories relative to project root
-      3. Fall back to building from source (dev only)
+    Scans every candidate directory and picks the globally-newest wheel by
+    filename (which embeds a build timestamp).  Falls back to building from
+    source in dev environments.
     """
     app_source = Path("/app/python/source_code")
     project_root = _resolve_project_root()
@@ -111,11 +111,21 @@ def _find_wheel() -> Path:
         project_root / "dist",
         project_root,
     ]
+
+    all_wheels: list[Path] = []
     for search_dir in search_dirs:
         if search_dir.is_dir():
-            wheels = sorted(search_dir.glob("genie_space_optimizer-*.whl"))
-            if wheels:
-                return wheels[-1]
+            all_wheels.extend(search_dir.glob("genie_space_optimizer-*.whl"))
+
+    if all_wheels:
+        best = sorted(all_wheels, key=lambda p: p.name)[-1]
+        logger.info(
+            "Discovered wheel: %s (from %d candidate(s) across %d dirs)",
+            best,
+            len(all_wheels),
+            len([d for d in search_dirs if d.is_dir()]),
+        )
+        return best
 
     import subprocess
 
@@ -144,26 +154,43 @@ def _find_wheel() -> Path:
     return wheels[-1]
 
 
-def _ensure_artifacts(ws: WorkspaceClient) -> str:
-    """Upload wheel + runner notebook to the workspace. Returns the wheel workspace path."""
-    global _cached_wheel_path
-    if _cached_wheel_path is not None:
-        return _cached_wheel_path
+def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
+    """Upload wheel + runner notebooks to the workspace.
+
+    Always re-discovers the local wheel and computes a content hash so that
+    new wheels are detected even if the app process was not restarted after a
+    deploy.
+
+    Returns ``(ws_wheel_path, wheel_hash)``.
+    """
+    global _cached_wheel_path, _cached_wheel_hash
 
     wheel_local = _find_wheel()
+    wheel_bytes = wheel_local.read_bytes()
+    wheel_hash = hashlib.md5(wheel_bytes).hexdigest()
     ws_wheel_path = f"{_WS_WHEEL_DIR}/{wheel_local.name}"
+
+    if _cached_wheel_hash == wheel_hash and _cached_wheel_path == ws_wheel_path:
+        logger.debug(
+            "Wheel unchanged (hash=%s), skipping upload", wheel_hash[:8]
+        )
+        return ws_wheel_path, wheel_hash
 
     ws.workspace.mkdirs(_WS_BASE)
     ws.workspace.mkdirs(_WS_WHEEL_DIR)
 
-    wheel_bytes = wheel_local.read_bytes()
     ws.workspace.import_(
         ws_wheel_path,
         content=base64.b64encode(wheel_bytes).decode("ascii"),
         format=ImportFormat.AUTO,
         overwrite=True,
     )
-    logger.info("Uploaded wheel → %s (%d bytes)", ws_wheel_path, len(wheel_bytes))
+    logger.info(
+        "Uploaded wheel → %s (%d bytes, hash=%s)",
+        ws_wheel_path,
+        len(wheel_bytes),
+        wheel_hash[:8],
+    )
 
     for name, src_path in _NOTEBOOK_SOURCES.items():
         notebook_src = src_path.read_text(encoding="utf-8")
@@ -178,10 +205,11 @@ def _ensure_artifacts(ws: WorkspaceClient) -> str:
         logger.info("Uploaded notebook → %s", ws_path)
 
     _cached_wheel_path = ws_wheel_path
-    return ws_wheel_path
+    _cached_wheel_hash = wheel_hash
+    return ws_wheel_path, wheel_hash
 
 
-def _job_settings(ws_wheel_path: str) -> JobSettings:
+def _job_settings(ws_wheel_path: str, wheel_hash: str = "") -> JobSettings:
     def _job_param_ref(name: str) -> str:
         return f"{{{{job.parameters.{name}}}}}"
 
@@ -283,6 +311,7 @@ def _job_settings(ws_wheel_path: str) -> JobSettings:
             "app": "genie-space-optimizer",
             "managed-by": "backend-job-launcher",
             "pattern": "persistent-dag",
+            "wheel-hash": wheel_hash[:12] if wheel_hash else "unknown",
         },
     )
 
@@ -308,7 +337,9 @@ def _ensure_job_visibility(ws: WorkspaceClient, job_id: int) -> None:
         )
 
 
-def _ensure_persistent_job(ws: WorkspaceClient, ws_wheel_path: str) -> int:
+def _ensure_persistent_job(
+    ws: WorkspaceClient, ws_wheel_path: str, wheel_hash: str = ""
+) -> int:
     """Find or create the persistent optimization job and return job_id.
 
     Does NOT set ``run_as`` here — that is applied per-submission in
@@ -319,7 +350,7 @@ def _ensure_persistent_job(ws: WorkspaceClient, ws_wheel_path: str) -> int:
     if _cached_job_id is not None and _cached_job_wheel_path == ws_wheel_path:
         return _cached_job_id
 
-    settings = _job_settings(ws_wheel_path)
+    settings = _job_settings(ws_wheel_path, wheel_hash=wheel_hash)
 
     if _cached_job_id is not None:
         try:
@@ -404,8 +435,8 @@ def submit_optimization(
     The job runs as the SP which has been granted SELECT/EXECUTE on user
     schemas via the Data Access Settings page.
     """
-    ws_wheel_path = _ensure_artifacts(ws)
-    job_id = _ensure_persistent_job(ws, ws_wheel_path)
+    ws_wheel_path, wheel_hash = _ensure_artifacts(ws)
+    job_id = _ensure_persistent_job(ws, ws_wheel_path, wheel_hash=wheel_hash)
 
     with _job_submit_lock:
         waiter = ws.jobs.run_now(

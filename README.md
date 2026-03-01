@@ -29,7 +29,7 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 
 1. **Configuration Analysis** -- Scans the Genie Space config, counts tables/instructions/sample questions, and validates structure.
 2. **Metadata Collection** -- Queries Unity Catalog via REST API (with Spark SQL fallback) for columns, data types, tags, routines, and table descriptions.
-3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges.
+3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges.
 4. **Configuration Generation (Lever Loop)** -- Iterates through 6 optimization levers (up to 5 iterations), applying targeted patches. Each patch is evaluated; regressions trigger automatic rollback.
 5. **Optimized Evaluation & Repeatability** -- Final evaluation of the optimized config, including repeatability testing to ensure consistent results.
 
@@ -94,7 +94,7 @@ Genie_Space_Optimizer/
 │   │   ├── job_launcher.py           # Databricks Jobs submission helper
 │   │   ├── constants.py              # Backend-specific constants
 │   │   ├── utils.py                  # Backend utility functions
-│   │   ├── _spark.py                 # Serverless Spark session factory
+│   │   ├── _spark.py                 # Serverless Spark session factory (auto-recreate on credential errors)
 │   │   ├── core/                     # Dependency injection & infrastructure
 │   │   │   ├── dependencies.py       # Dependencies.Client, .UserClient, .Config, etc.
 │   │   │   ├── _config.py            # AppConfig (env vars → typed config)
@@ -138,7 +138,7 @@ Genie_Space_Optimizer/
 │   │
 │   ├── optimization/                 # Core optimization engine
 │   │   ├── optimizer.py              # Failure analysis → proposal generation → patch application
-│   │   ├── evaluation.py             # Benchmark generation, 9-judge scoring, robust JSON parsing, MLflow tracking
+│   │   ├── evaluation.py             # Benchmark generation, temporal date resolution, 9-judge scoring, MLflow tracking
 │   │   ├── applier.py                # Patch application & rollback
 │   │   ├── harness.py                # Full pipeline orchestration
 │   │   ├── preflight.py              # Pre-flight validation

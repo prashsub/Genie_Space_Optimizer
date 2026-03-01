@@ -29,11 +29,16 @@ def read_table(
     schema: str,
     table: str,
     filters: dict[str, Any] | None = None,
+    _max_retries: int = 3,
 ) -> pd.DataFrame:
     """Read a Delta table into a Pandas DataFrame, optionally filtered.
 
     ``filters`` is a dict of ``{column: value}`` equality predicates
     combined with ``AND``.
+
+    Issues ``REFRESH TABLE`` before reading and retries on
+    ``DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS`` to handle tables that were
+    dropped and recreated by an upstream task in the same job.
     """
     fqn = _fqn(catalog, schema, table)
     where_clauses: list[str] = []
@@ -48,8 +53,26 @@ def read_table(
     if where_clauses:
         query += " WHERE " + " AND ".join(where_clauses)
 
-    logger.debug("read_table: %s", query)
-    return spark.sql(query).toPandas()
+    for attempt in range(_max_retries):
+        try:
+            try:
+                spark.sql(f"REFRESH TABLE {fqn}")
+            except Exception:
+                pass
+            logger.debug("read_table: %s", query)
+            return spark.sql(query).toPandas()
+        except Exception as exc:
+            if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in str(exc) and attempt < _max_retries - 1:
+                import time as _time
+                wait = 5 * (attempt + 1)
+                logger.warning(
+                    "Delta schema change on attempt %d/%d for %s — retrying in %ds",
+                    attempt + 1, _max_retries, fqn, wait,
+                )
+                _time.sleep(wait)
+                continue
+            raise
+    return pd.DataFrame()
 
 
 def insert_row(
@@ -109,7 +132,32 @@ def update_row(
     spark.sql(stmt)
 
 
-def run_query(spark: SparkSession, sql: str) -> pd.DataFrame:
-    """Execute arbitrary SQL and return results as a Pandas DataFrame."""
-    logger.debug("run_query: %s", sql)
-    return spark.sql(sql).toPandas()
+def run_query(spark: SparkSession, sql: str, _max_retries: int = 3) -> pd.DataFrame:
+    """Execute arbitrary SQL and return results as a Pandas DataFrame.
+
+    Retries on ``DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS`` with a ``REFRESH TABLE``
+    for any table referenced in the query.
+    """
+    for attempt in range(_max_retries):
+        try:
+            logger.debug("run_query: %s", sql)
+            return spark.sql(sql).toPandas()
+        except Exception as exc:
+            if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in str(exc) and attempt < _max_retries - 1:
+                import re as _re
+                import time as _time
+                tables = _re.findall(r"FROM\s+([\w.]+)", sql, _re.IGNORECASE)
+                for tbl in tables:
+                    try:
+                        spark.sql(f"REFRESH TABLE {tbl}")
+                    except Exception:
+                        pass
+                wait = 5 * (attempt + 1)
+                logger.warning(
+                    "Delta schema change on attempt %d/%d — refreshing and retrying in %ds",
+                    attempt + 1, _max_retries, wait,
+                )
+                _time.sleep(wait)
+                continue
+            raise
+    return pd.DataFrame()

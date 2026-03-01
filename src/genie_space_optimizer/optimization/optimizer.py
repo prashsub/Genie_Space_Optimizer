@@ -333,15 +333,21 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
             "comparison": _resp.get("comparison", {}) if isinstance(_resp, dict) else {},
         }
 
+        _NON_JUDGE_SUFFIXES = ("/rationale", "/source", "/metadata", "/error")
         for col_name, val in list(row.items()):
             judge: str | None = None
             if col_name.startswith("feedback/") and col_name.endswith("/value"):
                 judge = col_name.removeprefix("feedback/").removesuffix("/value")
-            elif col_name.startswith("feedback/") and "/value" not in col_name:
-                judge = col_name.removeprefix("feedback/")
+            elif col_name.startswith("feedback/") and not any(col_name.endswith(s) for s in _NON_JUDGE_SUFFIXES):
+                bare = col_name.removeprefix("feedback/")
+                if "/" not in bare:
+                    judge = bare
             elif col_name.endswith("/value") and not col_name.startswith("feedback/"):
                 judge = col_name.removesuffix("/value")
             if judge and "no" in str(val).lower():
+                from genie_space_optimizer.optimization.evaluation import (
+                    _parse_asi_from_rationale,
+                )
                 rationale = (
                     row.get(f"feedback/{judge}/rationale")
                     or row.get(f"{judge}/rationale")
@@ -359,9 +365,6 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
                     except (json.JSONDecodeError, TypeError):
                         judge_meta = {}
                 if not judge_meta:
-                    from genie_space_optimizer.optimization.evaluation import (
-                        _parse_asi_from_rationale,
-                    )
                     judge_meta = _parse_asi_from_rationale(rationale)
                 asi_failure_type = (
                     judge_meta.get("failure_type")

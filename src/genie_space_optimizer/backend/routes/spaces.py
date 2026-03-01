@@ -27,7 +27,7 @@ from ..models import (
     TableInfo,
 )
 from ..utils import ensure_utc_iso, get_sp_principal, safe_float
-from .._spark import get_spark
+from .._spark import get_spark, reset_spark, _is_credential_error
 
 router = create_router()
 logger = logging.getLogger(__name__)
@@ -610,10 +610,25 @@ def do_start_optimization(
             ),
         )
 
-    spark = get_spark()
-    ensure_optimization_tables(spark, config.catalog, config.schema_name)
+    def _init_spark_state():
+        """Run Spark-dependent initialization; may be retried on credential errors."""
+        _spark = get_spark()
+        ensure_optimization_tables(_spark, config.catalog, config.schema_name)
+        _df = load_runs_for_space(_spark, space_id, config.catalog, config.schema_name)
+        return _spark, _df
 
-    runs_df = load_runs_for_space(spark, space_id, config.catalog, config.schema_name)
+    try:
+        spark, runs_df = _init_spark_state()
+    except Exception as _spark_err:
+        if _is_credential_error(_spark_err):
+            logger.warning(
+                "Spark credential error during init — resetting session and retrying: %s",
+                str(_spark_err)[:200],
+            )
+            reset_spark()
+            spark, runs_df = _init_spark_state()
+        else:
+            raise
     if not runs_df.empty and _reconcile_active_runs(
         spark=spark,
         runs_df=runs_df,
@@ -641,18 +656,45 @@ def do_start_optimization(
 
     run_id = str(uuid.uuid4())
 
-    client = _genie_client(ws, sp_ws)
     space_snapshot: dict = {}
-    try:
-        space_snapshot = fetch_space_config(client, space_id)
-    except Exception:
-        logger.warning("Failed to capture space config snapshot for %s", space_id)
+    _snap_errors: list[str] = []
+    for label, cli in [("OBO/user", ws), ("SP", sp_ws)]:
+        try:
+            space_snapshot = fetch_space_config(cli, space_id)
+            logger.info("Captured space snapshot via %s client for %s", label, space_id)
+            break
+        except PermissionDenied as exc:
+            _snap_errors.append(f"{label}: {exc}")
+            logger.info(
+                "Snapshot via %s failed (PermissionDenied) for %s — trying next",
+                label, space_id,
+            )
+        except Exception as exc:
+            _snap_errors.append(f"{label}: {exc}")
+            logger.info(
+                "Snapshot via %s failed for %s — trying next: %s",
+                label, space_id, exc,
+            )
+
+    if not space_snapshot:
+        combined = "; ".join(_snap_errors)
+        logger.error("All clients failed to export space %s: %s", space_id, combined)
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Cannot export Genie Space config for {space_id}. "
+                "The optimization job requires the space config snapshot to be "
+                "captured at trigger time. Ensure the requesting user AND/OR the "
+                "app service principal has 'Can Edit' or 'Can Manage' permission "
+                f"on the Genie Space. Errors: {combined}"
+            ),
+        )
 
     if space_snapshot:
         title = str(space_snapshot.get("title", "") or "")
         domain = title.lower().replace(" ", "_").replace("-", "_") if title else "default"
     else:
-        domain = _infer_domain(client, space_id)
+        domain = _infer_domain(_genie_client(ws, sp_ws), space_id)
 
     from genie_space_optimizer.common.uc_metadata import extract_genie_space_table_refs
 

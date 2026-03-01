@@ -236,8 +236,12 @@ def fetch_genie_result_df(w: WorkspaceClient, statement_id: str):
         if stmt.result and stmt.result.data_array and stmt.manifest and stmt.manifest.schema:
             cols = stmt.manifest.schema.columns
             if cols:
-                col_names = [c.name for c in cols]
-                return pd.DataFrame(stmt.result.data_array, columns=col_names)  # type: ignore[arg-type]
+                col_names = pd.Index([str(c.name) for c in cols])
+                rows = [
+                    [str(v) if v is not None else None for v in row]
+                    for row in stmt.result.data_array
+                ]
+                return pd.DataFrame(rows, columns=col_names)
         return None
     except Exception:
         logger.debug("Could not fetch statement %s results", statement_id, exc_info=True)
@@ -317,14 +321,40 @@ def _migrate_column_configs_v1_to_v2(config: dict) -> dict:
     return config
 
 
+_NON_API_COLUMN_CONFIG_KEYS = {"uc_comment", "data_type_source"}
+
+
 def strip_non_exportable_fields(config: dict) -> dict:
     """Remove read-only server-managed fields before PATCH requests.
 
     The GET ``/api/2.0/genie/spaces/{id}`` response includes top-level
     metadata fields that are NOT part of the ``GenieSpaceExport`` protobuf.
     Including them in the PATCH payload causes ``InvalidParameterValue``.
+    Also strips internal-only keys from nested ``column_configs``.
     """
     cleaned = {k: v for k, v in config.items() if k not in NON_EXPORTABLE_FIELDS}
+
+    ds = cleaned.get("data_sources")
+    if isinstance(ds, dict):
+        for key in ("tables", "metric_views"):
+            for tbl in ds.get(key, []):
+                if not isinstance(tbl, dict):
+                    continue
+                for cc in tbl.get("column_configs", []):
+                    if not isinstance(cc, dict):
+                        continue
+                    for bad_key in _NON_API_COLUMN_CONFIG_KEYS:
+                        cc.pop(bad_key, None)
+
+    inst = cleaned.get("instructions")
+    if isinstance(inst, dict):
+        ti_list = inst.get("text_instructions")
+        if isinstance(ti_list, list):
+            inst["text_instructions"] = [
+                ti for ti in ti_list
+                if isinstance(ti, dict) and ti.get("content")
+            ]
+
     return _migrate_column_configs_v1_to_v2(cleaned)
 
 
@@ -453,7 +483,11 @@ def _benchmarks_to_genie_format(benchmarks: list[dict]) -> list[dict]:
             continue
         seen.add(q_lower)
 
-        entry: dict[str, Any] = {"question": [question]}
+        import uuid
+        entry: dict[str, Any] = {
+            "id": uuid.uuid4().hex,
+            "question": [question],
+        }
         expected_sql = str(b.get("expected_sql", "")).strip()
         if expected_sql:
             entry["answer"] = [{"format": "SQL", "content": [expected_sql]}]

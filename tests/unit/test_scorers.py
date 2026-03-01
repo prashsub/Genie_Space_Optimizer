@@ -332,8 +332,8 @@ class TestArbiterScorerNullDefense:
         )
         assert feedback.value == "skipped"
 
-    def test_match_is_skipped(self):
-        """When results match, arbiter is still skipped."""
+    def test_match_is_both_correct(self):
+        """When results match, arbiter returns both_correct."""
         from genie_space_optimizer.optimization.scorers.arbiter import _make_arbiter_scorer
 
         mock_ws = MagicMock()
@@ -351,4 +351,4 @@ class TestArbiterScorerNullDefense:
             },
             expectations={"expected_response": "SELECT SUM(amount) FROM orders"},
         )
-        assert feedback.value == "skipped"
+        assert feedback.value == "both_correct"

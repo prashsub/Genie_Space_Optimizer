@@ -6,6 +6,34 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Temporal Date Resolution, Coverage Gap Benchmarks, Spark Resilience
+- **Temporal date resolution** (`evaluation.py`): auto-detects relative time
+  references ("this year", "last quarter", "YTD", "last N months/days") in
+  benchmark questions and rewrites GT SQL date literals to current-date-relative
+  values before scoring — eliminates false failures from stale benchmark dates
+- **Benchmark coverage gap generation** (`evaluation.py`, `config.py`): new
+  `BENCHMARK_COVERAGE_GAP_PROMPT` and `COVERAGE_GAP_SOFT_CAP_FACTOR` to generate
+  targeted benchmarks for uncovered assets (tables, MVs, TVFs with zero questions)
+- **Spark session resilience** (`_spark.py`): session factory now detects
+  `InvalidAccessKeyId`, `ExpiredToken`, `AccessDenied` credential errors and
+  auto-recreates the session; `run_with_retry()` wrapper retries Spark operations
+  with session recreation on credential failures
+- **Delta table resilience** (`delta_helpers.py`): `read_table` now issues
+  `REFRESH TABLE` before reads and retries on `DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS`
+  to handle tables dropped/recreated by upstream tasks
+- **Job launcher improvements** (`job_launcher.py`): picks globally-newest wheel
+  across all search directories; caches wheel content hash for upload dedup
+- **Arbiter scorer overhaul** (`arbiter.py`): result-match now returns
+  `both_correct` (was `skipped`); temporal context injected into LLM prompts;
+  slim comparison payloads to stay within MLflow trace size limits
+- **Scorer temporal awareness**: all LLM scorers (`completeness`, `logical_accuracy`,
+  `result_correctness`, `schema_accuracy`, `semantic_equivalence`) now receive
+  temporal rewrite context so judges account for date drift
+- Expanded test coverage: +481 lines for evaluation (temporal rewriting, coverage
+  gap, benchmark generation), +61 lines for optimizer
+
+---
+
 ### Added — Lever 5 Quality, Result Matching, Anti-Hallucination
 - **Lever 5 prompt improvements** (`config.py`): routing failures now force
   `example_sql` instruction type instead of falling back to text instructions;

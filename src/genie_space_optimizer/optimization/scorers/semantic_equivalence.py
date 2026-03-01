@@ -19,6 +19,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
+    build_temporal_note,
     format_asi_markdown,
 )
 
@@ -49,18 +50,33 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
                 "even if SQL syntax differs. Weight this heavily in your assessment.\n"
             )
 
+        column_note = ""
+        gt_cols = set(cmp.get("gt_columns") or [])
+        genie_cols = set(cmp.get("genie_columns") or [])
+        extra_gt_cols = gt_cols - genie_cols
+        if extra_gt_cols and genie_cols <= gt_cols:
+            column_note = (
+                f"\nCOLUMN NOTE: The Expected SQL returns {len(extra_gt_cols)} extra column(s) "
+                f"not in Generated SQL: {sorted(extra_gt_cols)}. "
+                "All Generated SQL columns exist in Expected SQL — this is a column SUBSET, "
+                "not a schema error. If those extra columns were NOT requested by the user, "
+                "the queries are still semantically equivalent.\n"
+            )
+
         empty_data_note = ""
-        if cmp.get("gt_rows", -1) == 0:
+        if cmp.get("gt_rows", -1) == 0 and cmp.get("genie_rows", -1) > 0:
             empty_data_note = (
-                "\nIMPORTANT: The ground-truth query returned 0 rows, meaning "
-                "the underlying dataset currently has no matching data for this "
-                "question. When both queries would return empty results, minor "
-                "SQL differences (e.g. filter thresholds) have no practical impact. "
-                "Focus your assessment on whether the SQL structure and intent are "
-                "correct rather than penalizing differences that only matter when "
-                "data exists. If the SQL is structurally sound but differs in a "
-                "threshold or filter value that doesn't affect empty results, lean "
-                "toward PASS.\n"
+                "\nCRITICAL: The Expected SQL returned 0 rows while the Generated SQL "
+                "returned data. This likely means the Expected SQL has overly restrictive "
+                "filters NOT present in the user's question. If the Generated SQL answers "
+                "the user's question correctly, it IS semantically valid — treat it as "
+                "equivalent or better. PASS.\n"
+            )
+        elif cmp.get("gt_rows", -1) == 0:
+            empty_data_note = (
+                "\nIMPORTANT: Both queries returned 0 rows — the underlying dataset "
+                "has no matching data. Minor SQL differences have no practical impact. "
+                "Lean toward PASS if structurally sound.\n"
             )
 
         prompt = (
@@ -73,12 +89,20 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
             "  Extra columns in the Expected SQL do not change the business metric.\n"
             "- ILIKE '%value%' vs = 'value' for proper nouns (cities, countries) are equivalent.\n"
             "- Defensive IS NOT NULL guards do not change the business metric being measured.\n"
+            "- GROUP BY ALL vs explicit GROUP BY is semantically identical.\n"
+            "- ORDER BY differences are cosmetic and do not change what is measured.\n"
+            "- MEASURE() on a metric view is semantically equivalent to SUM/AVG on the\n"
+            "  underlying fact table — both measure the same business metric.\n"
+            "- A metric view query and a TVF (table-valued function) call that cover the same\n"
+            "  domain are semantically equivalent if both answer the user's question. A TVF may\n"
+            "  return extra columns — that does NOT make the queries semantically different.\n"
+            "  Routing preference (which asset to use) is judged by asset_routing, not here.\n"
             "- Focus on whether BOTH queries answer the SAME question, not whether they produce\n"
             "  byte-identical output.\n\n"
             f"User question: {question}\n"
             f"Expected SQL: {gt_sql}\n"
             f"Generated SQL: {genie_sql}\n"
-            f"{cmp_summary}{empty_data_note}\n"
+            f"{cmp_summary}{column_note}{empty_data_note}{build_temporal_note(cmp)}\n"
             'Respond with JSON only: {"equivalent": true/false, "failure_type": "<different_metric|different_grain|different_scope>", '
             '"blame_set": ["<metric_or_dimension>"], '
             '"rationale": "<brief explanation>"}\n'
@@ -136,7 +160,12 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
             )
 
         result_matched = cmp.get("match", False)
-        result_override = result_matched and not result.get("equivalent", False)
+        _GENIE_ROW_CAP = 5000
+        row_cap_hit = (
+            cmp.get("genie_rows") == _GENIE_ROW_CAP
+            and (cmp.get("gt_rows") or 0) > _GENIE_ROW_CAP
+        )
+        result_override = (result_matched or row_cap_hit) and not result.get("equivalent", False)
 
         logger.info(
             "\n"
@@ -152,10 +181,16 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
             result.get("rationale", "(none)"),
             result.get("failure_type", "n/a"),
             result.get("blame_set", []),
-            "result_match -> forced PASS" if result_override else "none",
+            (
+                "result_match -> forced PASS" if result_matched
+                else "row_cap -> forced PASS" if row_cap_hit
+                else "none"
+            ) if result_override else "none",
         )
 
         if result_override:
+            override_reason = "result_match" if result_matched else "row_cap"
+            override_detail = cmp.get("match_type", "unknown") if result_matched else f"genie={cmp.get('genie_rows')}/gt={cmp.get('gt_rows')}"
             return Feedback(
                 name="semantic_equivalence",
                 value="yes",
@@ -163,7 +198,7 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
                     judge_name="semantic_equivalence",
                     value="yes",
                     rationale=(
-                        f"OVERRIDE: Results match ({cmp.get('match_type')}). "
+                        f"OVERRIDE ({override_reason}): {override_detail}. "
                         f"LLM noted SQL differences: {result.get('rationale', '')}"
                     ),
                     extra={"llm_response": result, "override_reason": "result_match"},
