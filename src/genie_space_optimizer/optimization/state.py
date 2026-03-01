@@ -22,6 +22,7 @@ from genie_space_optimizer.common.config import (
     TABLE_ASI,
     TABLE_ITERATIONS,
     TABLE_PATCHES,
+    TABLE_PROVENANCE,
     TABLE_RUNS,
     TABLE_STAGES,
 )
@@ -145,7 +146,8 @@ CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_patches (
     rolled_back_at      TIMESTAMP              COMMENT 'When the rollback occurred',
     rollback_reason     STRING                 COMMENT 'Why the patch was rolled back',
     proposal_id         STRING                 COMMENT 'FK to the proposal that generated this patch',
-    cluster_id          STRING                 COMMENT 'Failure cluster that motivated this patch'
+    cluster_id          STRING                 COMMENT 'Failure cluster that motivated this patch',
+    provenance_json     STRING                 COMMENT 'JSON: full provenance chain from judge verdicts to this patch'
 )
 USING DELTA
 PARTITIONED BY (run_id)
@@ -157,7 +159,8 @@ TBLPROPERTIES (
 
 _GENIE_EVAL_ASI_RESULTS_DDL = """\
 CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_eval_asi_results (
-    run_id              STRING        NOT NULL COMMENT 'MLflow run ID',
+    run_id              STRING        NOT NULL COMMENT 'Optimization run ID',
+    mlflow_run_id       STRING                 COMMENT 'MLflow evaluation run ID (for trace linking)',
     iteration           INT           NOT NULL COMMENT 'Evaluation iteration number',
     question_id         STRING        NOT NULL COMMENT 'Benchmark question ID',
     judge               STRING        NOT NULL COMMENT 'Judge name',
@@ -200,6 +203,41 @@ TBLPROPERTIES (
     'delta.autoOptimize.autoCompact' = 'true'
 )"""
 
+_GENIE_OPT_PROVENANCE_DDL = """\
+CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_provenance (
+    run_id              STRING        NOT NULL  COMMENT 'FK to genie_opt_runs.run_id',
+    iteration           INT           NOT NULL  COMMENT 'Lever loop iteration',
+    lever               INT           NOT NULL  COMMENT 'Lever number (1-5)',
+    question_id         STRING        NOT NULL  COMMENT 'Benchmark question ID',
+    signal_type         STRING        NOT NULL  COMMENT 'hard or soft',
+    arbiter_verdict     STRING                  COMMENT 'Arbiter verdict for this question',
+    judge               STRING        NOT NULL  COMMENT 'Judge that failed',
+    judge_verdict       STRING        NOT NULL  COMMENT 'Judge verdict (PASS/FAIL)',
+    asi_failure_type_raw STRING                 COMMENT 'Raw failure_type from ASI metadata',
+    resolved_root_cause STRING        NOT NULL  COMMENT 'Final root cause after resolution chain',
+    resolution_method   STRING        NOT NULL  COMMENT 'asi_metadata or rationale_pattern or sql_diff',
+    blame_set           STRING                  COMMENT 'JSON array of blamed objects',
+    counterfactual_fix  STRING                  COMMENT 'Suggested fix from judge',
+    wrong_clause        STRING                  COMMENT 'SQL clause identified as wrong',
+    rationale_snippet   STRING                  COMMENT 'First 500 chars of judge rationale',
+    expected_sql        STRING                  COMMENT 'Expected SQL (first 2000 chars)',
+    generated_sql       STRING                  COMMENT 'Generated SQL (first 2000 chars)',
+    cluster_id          STRING        NOT NULL  COMMENT 'Cluster this question was grouped into',
+    proposal_id         STRING                  COMMENT 'Proposal generated from this cluster',
+    patch_type          STRING                  COMMENT 'Type of patch applied',
+    gate_type           STRING                  COMMENT 'slice or p0 or full',
+    gate_result         STRING                  COMMENT 'pass or fail or rollback',
+    gate_regression     STRING                  COMMENT 'JSON regression details if gate failed',
+    logged_at           TIMESTAMP     NOT NULL  COMMENT 'When this row was written'
+)
+USING DELTA
+PARTITIONED BY (run_id)
+COMMENT 'End-to-end provenance: links every patch to originating judge verdicts and gate outcomes'
+TBLPROPERTIES (
+    'delta.autoOptimize.optimizeWrite' = 'true',
+    'delta.autoOptimize.autoCompact' = 'true'
+)"""
+
 _ALL_DDL: dict[str, str] = {
     TABLE_RUNS: _GENIE_OPT_RUNS_DDL,
     TABLE_STAGES: _GENIE_OPT_STAGES_DDL,
@@ -207,6 +245,7 @@ _ALL_DDL: dict[str, str] = {
     TABLE_PATCHES: _GENIE_OPT_PATCHES_DDL,
     TABLE_ASI: _GENIE_EVAL_ASI_RESULTS_DDL,
     TABLE_DATA_ACCESS_GRANTS: _GENIE_OPT_DATA_ACCESS_GRANTS_DDL,
+    TABLE_PROVENANCE: _GENIE_OPT_PROVENANCE_DDL,
 }
 
 
@@ -227,6 +266,7 @@ def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None
     """Add columns introduced after initial DDL (safe to run repeatedly)."""
     migrations = [
         (TABLE_RUNS, "job_id", "STRING COMMENT 'Databricks Job definition ID'"),
+        (TABLE_PATCHES, "provenance_json", "STRING COMMENT 'JSON: full provenance chain from judge verdicts to this patch'"),
     ]
     for table, col, col_def in migrations:
         fqn = _fqn(catalog, schema, table)
@@ -563,6 +603,10 @@ def write_patch(
     if cluster_id is not None:
         row["cluster_id"] = cluster_id
 
+    provenance = patch_record.get("provenance")
+    if provenance is not None:
+        row["provenance_json"] = json.dumps(provenance, default=str)
+
     insert_row(spark, catalog, schema, TABLE_PATCHES, row)
     logger.info(
         "Patch %d (lever %d, iter %d) for run %s: %s on %s",
@@ -594,6 +638,151 @@ def mark_patches_rolled_back(
         f"WHERE run_id = '{run_id}' AND iteration = {iteration}"
     )
     logger.info("Rolled back patches for run %s iteration %d: %s", run_id, iteration, reason)
+
+
+# ── ASI & Provenance Write Functions ─────────────────────────────────────
+
+
+def write_asi_results(
+    spark: SparkSession,
+    run_id: str,
+    iteration: int,
+    asi_rows: list[dict],
+    catalog: str,
+    schema: str,
+    *,
+    mlflow_run_id: str = "",
+) -> None:
+    """Write per-question per-judge ASI feedback to ``genie_eval_asi_results``."""
+    if not asi_rows:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    for a in asi_rows:
+        blame = a.get("blame_set")
+        if isinstance(blame, list):
+            blame = json.dumps(blame)
+        row: dict[str, Any] = {
+            "run_id": run_id,
+            "mlflow_run_id": mlflow_run_id or a.get("mlflow_run_id", ""),
+            "iteration": iteration,
+            "question_id": a.get("question_id", ""),
+            "judge": a.get("judge", ""),
+            "value": a.get("value", "no"),
+            "failure_type": a.get("failure_type"),
+            "severity": a.get("severity"),
+            "confidence": a.get("confidence"),
+            "blame_set": blame,
+            "counterfactual_fix": a.get("counterfactual_fix"),
+            "wrong_clause": a.get("wrong_clause"),
+            "expected_value": a.get("expected_value"),
+            "actual_value": a.get("actual_value"),
+            "missing_metadata": a.get("missing_metadata"),
+            "ambiguity_detected": a.get("ambiguity_detected", False),
+            "logged_at": now,
+        }
+        row = {k: v for k, v in row.items() if v is not None}
+        try:
+            insert_row(spark, catalog, schema, TABLE_ASI, row)
+        except Exception:
+            logger.debug("Failed to write ASI row for %s/%s", a.get("question_id"), a.get("judge"), exc_info=True)
+    logger.info("Wrote %d ASI results for run %s iter %d", len(asi_rows), run_id, iteration)
+
+
+def write_provenance(
+    spark: SparkSession,
+    run_id: str,
+    iteration: int,
+    lever: int,
+    provenance_rows: list[dict],
+    catalog: str,
+    schema: str,
+) -> None:
+    """Write provenance rows linking questions/judges to clusters."""
+    if not provenance_rows:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    for p in provenance_rows:
+        blame = p.get("blame_set")
+        if isinstance(blame, list):
+            blame = json.dumps(blame)
+        row: dict[str, Any] = {
+            "run_id": run_id,
+            "iteration": iteration,
+            "lever": lever,
+            "question_id": p.get("question_id", ""),
+            "signal_type": p.get("signal_type", "hard"),
+            "arbiter_verdict": p.get("arbiter_verdict"),
+            "judge": p.get("judge", ""),
+            "judge_verdict": p.get("judge_verdict", "FAIL"),
+            "asi_failure_type_raw": p.get("asi_failure_type_raw"),
+            "resolved_root_cause": p.get("resolved_root_cause", "other"),
+            "resolution_method": p.get("resolution_method", "unknown"),
+            "blame_set": blame,
+            "counterfactual_fix": p.get("counterfactual_fix"),
+            "wrong_clause": p.get("wrong_clause"),
+            "rationale_snippet": (p.get("rationale_snippet") or "")[:500],
+            "expected_sql": (p.get("expected_sql") or "")[:2000],
+            "generated_sql": (p.get("generated_sql") or "")[:2000],
+            "cluster_id": p.get("cluster_id", ""),
+            "logged_at": now,
+        }
+        row = {k: v for k, v in row.items() if v is not None}
+        try:
+            insert_row(spark, catalog, schema, TABLE_PROVENANCE, row)
+        except Exception:
+            logger.debug("Failed to write provenance row for %s/%s", p.get("question_id"), p.get("judge"), exc_info=True)
+    logger.info("Wrote %d provenance rows for run %s iter %d lever %d", len(provenance_rows), run_id, iteration, lever)
+
+
+def update_provenance_proposals(
+    spark: SparkSession,
+    run_id: str,
+    iteration: int,
+    proposal_mappings: list[dict],
+    catalog: str,
+    schema: str,
+) -> None:
+    """Backfill ``proposal_id`` and ``patch_type`` into provenance rows."""
+    fqn = _fqn(catalog, schema, TABLE_PROVENANCE)
+    for m in proposal_mappings:
+        cid = (m.get("cluster_id") or "").replace("'", "''")
+        pid = (m.get("proposal_id") or "").replace("'", "''")
+        pt = (m.get("patch_type") or "").replace("'", "''")
+        if not cid:
+            continue
+        try:
+            spark.sql(
+                f"UPDATE {fqn} SET proposal_id = '{pid}', patch_type = '{pt}' "
+                f"WHERE run_id = '{run_id}' AND iteration = {iteration} AND cluster_id = '{cid}'"
+            )
+        except Exception:
+            logger.debug("Failed to update provenance proposals for cluster %s", cid, exc_info=True)
+
+
+def update_provenance_gate(
+    spark: SparkSession,
+    run_id: str,
+    iteration: int,
+    lever: int,
+    gate_type: str,
+    gate_result: str,
+    gate_regression: dict | None,
+    catalog: str,
+    schema: str,
+) -> None:
+    """Backfill gate outcome into provenance rows."""
+    fqn = _fqn(catalog, schema, TABLE_PROVENANCE)
+    gt = gate_type.replace("'", "''")
+    gr = gate_result.replace("'", "''")
+    reg_json = json.dumps(gate_regression, default=str) if gate_regression else None
+    reg_str = f"'{reg_json.replace(chr(39), chr(39)+chr(39))}'" if reg_json else "NULL"
+    try:
+        spark.sql(
+            f"UPDATE {fqn} SET gate_type = '{gt}', gate_result = '{gr}', gate_regression = {reg_str} "
+            f"WHERE run_id = '{run_id}' AND iteration = {iteration} AND lever = {lever}"
+        )
+    except Exception:
+        logger.debug("Failed to update provenance gate for run %s iter %d lever %d", run_id, iteration, lever, exc_info=True)
 
 
 # ── Read Functions ───────────────────────────────────────────────────────

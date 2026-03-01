@@ -44,6 +44,7 @@ def create_genie_model_version(
     uc_routines: list[dict] | None = None,
     patch_set: list[dict] | None = None,
     parent_model_id: str | None = None,
+    optimization_run_id: str = "",
 ) -> str:
     """Create an MLflow LoggedModel snapshot for a Genie Space iteration.
 
@@ -109,6 +110,7 @@ def create_genie_model_version(
                     "iteration": str(iteration),
                     "uc_schema": uc_schema,
                     "traceability": "genie_space_optimizer",
+                    **({"genie.optimization_run_id": optimization_run_id} if optimization_run_id else {}),
                 },
             )
             model_id = model.model_id
@@ -231,10 +233,25 @@ def link_eval_scores_to_model(
     model_id: str,
     scores: dict[str, float],
 ) -> None:
-    """Link evaluation metrics to a LoggedModel."""
+    """Link evaluation metrics to a LoggedModel.
+
+    Logs metrics both on the active MLflow Run (for backward compat) and
+    directly to the LoggedModel so they appear on the Model card in the UI.
+    """
     try:
         for judge, score in scores.items():
             mlflow.log_metric(f"eval_{judge}", score)
+
+        if model_id and model_id.startswith("m-"):
+            try:
+                mlflow.set_active_model(model_id=model_id)
+                metrics_dict = {f"eval_{judge}": score for judge, score in scores.items()}
+                mlflow.log_metrics(metrics_dict, model_id=model_id)
+            except (TypeError, AttributeError):
+                pass
+            except Exception:
+                logger.debug("Model-level metric logging not supported, run-level only", exc_info=True)
+
         logger.info("Linked %d scores to model %s", len(scores), model_id)
     except Exception:
         logger.exception("Failed to link scores to model %s", model_id)

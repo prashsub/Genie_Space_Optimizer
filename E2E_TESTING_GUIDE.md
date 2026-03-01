@@ -63,12 +63,13 @@ At app startup, a `_WheelHealthCheck` logs the resolved wheel name and size for 
 
 ### State Management
 
-5 Delta tables in `{catalog}.{schema}`:
+6 Delta tables in `{catalog}.{schema}`:
 - `genie_opt_runs` -- one row per optimization run (status, scores, config snapshot)
 - `genie_opt_stages` -- per-stage transitions (PREFLIGHT_STARTED, LEVER_1_EVAL_DONE, etc.)
 - `genie_opt_iterations` -- per-iteration evaluation results (9 judges: 7 quality dimensions + response quality + arbiter)
-- `genie_opt_patches` -- individual patches (type, lever, old/new values, rolled_back flag)
-- `genie_eval_asi_results` -- failure assessments from LLM judges
+- `genie_opt_patches` -- individual patches (type, lever, old/new values, rolled_back flag, provenance chain)
+- `genie_eval_asi_results` -- failure assessments from LLM judges (with `mlflow_run_id` for trace linking)
+- `genie_opt_provenance` -- end-to-end provenance linking patches to judge verdicts, clusters, and gate outcomes
 
 ### UC Permissions Grant
 
@@ -867,6 +868,15 @@ FROM <catalog>.<schema>.genie_eval_asi_results
 WHERE run_id = '<run_id>' AND iteration = 0 AND arbiter_verdict = 'genie_correct'
 ```
 
+**Diagnostic query (trace provenance from patch back to judge verdicts):**
+```sql
+SELECT p.question_id, p.judge, p.resolved_root_cause, p.signal_type,
+       p.cluster_id, p.proposal_id, p.gate_type, p.gate_result
+FROM <catalog>.<schema>.genie_opt_provenance p
+WHERE p.run_id = '<run_id>'
+ORDER BY p.iteration, p.lever, p.question_id
+```
+
 #### Task 4: `finalize`
 
 **What it does:** Runs exactly **2 repeatability evaluation passes** (re-asks all benchmark questions to check SQL consistency), averages the results, promotes the best model in MLflow, generates a summary report, and writes the final terminal stage records.
@@ -1107,8 +1117,10 @@ databricks apps logs genie-space-optimizer -p <profile>
 
 ### Job Execution (check each task)
 
-- [ ] Preflight completes: config fetched, benchmarks generated, experiment created
+- [ ] Preflight completes: config fetched, benchmarks generated, experiment created, experiment-level tags set
+- [ ] Preflight labeling: schemas ensured, human feedback ingested from prior session (if available)
 - [ ] Baseline eval completes: scores recorded in `genie_opt_iterations` with iteration=0
+- [ ] Baseline traces tagged with `genie.optimization_run_id`, `genie.iteration`, `genie.eval_scope`
 - [ ] Lever loop Stage 2.5: prompt matching auto-config applied (format assistance + entity matching)
 - [ ] Lever loop arbiter corrections: applied if ≥3 `genie_correct` verdicts in baseline
 - [ ] Lever loop arbiter filter: `both_correct` AND `genie_correct` excluded from hard failure rows
@@ -1118,6 +1130,10 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Lever 5: holistic instruction rewrite produces `rewrite_instruction` patch
 - [ ] Lever loop 5-lever iteration completes (or skips if thresholds met): patches in `genie_opt_patches`
 - [ ] ASI data present on clusters (failure_type not None for applicable questions)
+- [ ] ASI results written to `genie_eval_asi_results` with `mlflow_run_id` for trace linking
+- [ ] Provenance rows written to `genie_opt_provenance` linking judges → clusters → proposals → gates
+- [ ] ASI Feedback logged on MLflow traces (`asi_{judge}` entries)
+- [ ] Gate Feedback logged on MLflow traces (`gate_{type}` entries with pass/fail + regression details)
 - [ ] Finalize completes: 2 repeatability runs averaged, model promoted, run status set to terminal
 - [ ] Finalize heartbeats visible in `genie_opt_stages` (FINALIZE_HEARTBEAT events)
 - [ ] Deploy skipped (deploy_target empty): deploy_check condition evaluates to false

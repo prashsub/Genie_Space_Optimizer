@@ -6,6 +6,45 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — MLflow Provenance, Labeling Sessions, Trace Tagging, SCD Filters
+- **End-to-end provenance table** (`state.py`): new `genie_opt_provenance` Delta table
+  linking every patch back to originating judge verdicts, failure clusters, and gate
+  outcomes — columns include `signal_type`, `resolution_method`, `gate_result`,
+  `gate_regression` for full traceability
+- **MLflow Labeling Sessions** (`labeling.py`): new module with custom labeling schemas
+  (`judge_verdict_accuracy`, `corrected_expected_sql`, `patch_approval`,
+  `improvement_suggestions`) for human-in-the-loop review; auto-creates review
+  sessions after lever loop runs; preflight ingests human feedback from prior sessions
+  to correct benchmarks and improve subsequent runs
+- **MLflow trace tagging** (`evaluation.py`, `harness.py`): all evaluation traces now
+  tagged with `genie.optimization_run_id`, `genie.iteration`, `genie.lever`, and
+  `genie.eval_scope` for cross-run traceability; experiment-level tags set during
+  preflight (`genie.space_id`, `genie.domain`, `genie.pipeline_version`)
+- **MLflow Feedback on traces** (`evaluation.py`): `log_asi_feedback_on_traces()` attaches
+  ASI root-cause analysis as Feedback; `log_gate_feedback_on_traces()` attaches gate
+  pass/fail verdicts with regression details to evaluation traces
+- **Model-level metric logging** (`models.py`): `link_eval_scores_to_model()` now logs
+  metrics both on the active MLflow Run and directly to the LoggedModel for UI display
+- **SCD filter detection** (`optimizer.py`): new `missing_scd_filter` and
+  `wrong_filter_condition` failure types; `_classify_sql_diff` detects missing
+  `is_current`/`is_active` filters and WHERE condition differences
+- **Join type analysis** (`optimizer.py`): new `wrong_join_type` failure type for
+  LEFT vs INNER join mismatches; lever mapping sends to Lever 5 for instruction guidance
+- **ASI & provenance Delta writes in harness**: lever loop now writes per-iteration
+  ASI results and provenance rows to Delta, linking clusters → proposals → gate outcomes
+- **Evaluation dataset upsert** (`evaluation.py`): `create_evaluation_dataset()` now uses
+  `merge_records` (upsert by question_id) to preserve version history instead of drop/recreate
+- **Preflight experiment tags**: `run_preflight()` sets experiment-level tags for
+  pipeline version, catalog, schema, space_id, and domain
+
+### Fixed
+- **Scope filter fallback**: `run_evaluation()` falls back to full benchmark set when
+  scope filtering returns empty results (prevents empty evaluations)
+- **Provenance JSON**: patches now carry `provenance_json` column linking to full
+  provenance chain from judge verdicts
+
+---
+
 ### Added — Holistic Lever 5, Tiered Arbiter Soft Signals, Join Discovery, Deployment Pipeline
 
 - **Holistic Lever 5 instructions** (`config.py`, `optimizer.py`, `applier.py`, `harness.py`):

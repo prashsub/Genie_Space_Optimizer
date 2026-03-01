@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
 from collections import Counter, defaultdict
 from typing import Any
@@ -129,7 +130,7 @@ def _map_to_lever(
     Falls back to the judge name when rationale-based pattern extraction
     yields "other".
     """
-    ft = asi_failure_type or root_cause
+    ft = (asi_failure_type if asi_failure_type and asi_failure_type != "other" else None) or root_cause
 
     if ft == "repeatability_issue":
         bs = str(blame_set).upper() if blame_set else ""
@@ -143,7 +144,10 @@ def _map_to_lever(
         "wrong_aggregation": 2,
         "wrong_measure": 2,
         "missing_filter": 2,
+        "missing_scd_filter": 2,
+        "wrong_filter_condition": 2,
         "missing_temporal_filter": 2,
+        "wrong_join_type": 5,
         "tvf_parameter_error": 3,
         "wrong_join": 4,
         "missing_join_spec": 4,
@@ -186,6 +190,10 @@ def _extract_pattern(rationale: str) -> str:
     r = (rationale or "").lower()
     if not r:
         return "other"
+    if "is_current" in r or ("scd" in r and ("filter" in r or "dimension" in r)):
+        return "missing_scd_filter"
+    if ("left join" in r or "inner join" in r) and ("join type" in r or "instead of" in r or "wrong join" in r):
+        return "wrong_join_type"
     if "table" in r and ("wrong" in r or "missing" in r or "incorrect" in r):
         return "wrong_table"
     if "column" in r and ("wrong" in r or "missing" in r):
@@ -196,6 +204,8 @@ def _extract_pattern(rationale: str) -> str:
         return "wrong_join"
     if "filter" in r or "where" in r:
         return "missing_filter"
+    if "limit" in r and ("missing" in r or "without" in r):
+        return "wrong_filter_condition"
     if "asset" in r or "routing" in r:
         return "asset_routing_error"
     if "instruction" in r or "ambiguous" in r or "unclear" in r:
@@ -210,6 +220,9 @@ _SQL_MEASURE = re.compile(r"\bMEASURE\s*\(", re.I)
 _SQL_TVF = re.compile(r"\b(\w+)\s*\((?:[^)]*,){2,}", re.I)
 _SQL_AGG = re.compile(r"\b(SUM|AVG|COUNT|MIN|MAX|STDDEV|VARIANCE)\s*\(", re.I)
 _SQL_SELECT_STAR = re.compile(r"\bSELECT\s+\*\b", re.I)
+_SQL_SCD_FILTER = re.compile(r"\b(is_current|is_active)\s*=\s*(true|1|'true')\b", re.I)
+_SQL_JOIN_TYPE = re.compile(r"\b(LEFT|RIGHT|INNER|CROSS|FULL)\s+(OUTER\s+)?JOIN\b", re.I)
+_SQL_WHERE_CONDITIONS = re.compile(r"\bWHERE\b\s+(.+?)(?:\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|\bHAVING\b|;|\Z)", re.I | re.S)
 
 
 def _extract_sql_tables(sql: str) -> set[str]:
@@ -311,6 +324,28 @@ def _classify_sql_diff(ctx: dict) -> str:
     if exp_has_where and not gen_has_where:
         return "missing_filter"
 
+    # 3b. SCD filter — expected has is_current/is_active = true, generated omits it
+    exp_has_scd = bool(_SQL_SCD_FILTER.search(exp_lower))
+    gen_has_scd = bool(_SQL_SCD_FILTER.search(gen_lower))
+    if exp_has_scd and not gen_has_scd:
+        return "missing_scd_filter"
+
+    # 3c. WHERE condition diff — both have WHERE but conditions differ
+    if exp_has_where and gen_has_where:
+        exp_conds = _SQL_WHERE_CONDITIONS.search(exp_lower)
+        gen_conds = _SQL_WHERE_CONDITIONS.search(gen_lower)
+        if exp_conds and gen_conds:
+            exp_text = re.sub(r"\s+", " ", exp_conds.group(1).strip())
+            gen_text = re.sub(r"\s+", " ", gen_conds.group(1).strip())
+            if exp_text != gen_text:
+                return "wrong_filter_condition"
+
+    # 3d. Join type diff — same tables but different join types (LEFT vs INNER)
+    exp_join_types = sorted(_SQL_JOIN_TYPE.findall(exp_lower))
+    gen_join_types = sorted(_SQL_JOIN_TYPE.findall(gen_lower))
+    if exp_join_types and gen_join_types and exp_join_types != gen_join_types:
+        return "wrong_join_type"
+
     # 4. Wrong join column — both queries join the same tables but on
     #    different columns (e.g. destination_name vs destination_key).
     if exp_join_pairs and gen_join_pairs and exp_join_pairs != gen_join_pairs:
@@ -365,13 +400,36 @@ def _classify_sql_diff(ctx: dict) -> str:
     return "missing_instruction"
 
 
-def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
+def cluster_failures(
+    eval_results: dict,
+    metadata_snapshot: dict,
+    *,
+    spark: Any = None,
+    run_id: str = "",
+    catalog: str = "",
+    schema: str = "",
+) -> list[dict]:
     """Group evaluation failures into actionable clusters.
 
     Groups by ``(judge, asi_failure_type, blame_set_str)``.  Falls back to
     ``(judge, _extract_pattern(rationale), "")`` when ASI is absent.
     Returns clusters with >= 1 question so even single failures are actionable.
+
+    When ``spark/run_id/catalog/schema`` are provided, enriches with stored
+    ASI data from ``genie_eval_asi_results`` Delta table.
     """
+    uc_asi_map: dict[tuple[str, str], dict] = {}
+    if spark and run_id and catalog and schema:
+        try:
+            uc_asi = read_asi_from_uc(spark, run_id, catalog, schema)
+            for a in uc_asi:
+                key = (a.get("question_id", ""), a.get("judge", ""))
+                uc_asi_map[key] = a
+            if uc_asi_map:
+                logger.info("Enriched clustering with %d UC ASI records", len(uc_asi_map))
+        except Exception:
+            logger.debug("UC ASI enrichment failed", exc_info=True)
+
     failures: list[dict] = []
     table = None
 
@@ -482,6 +540,15 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
                     judge_meta.get("wrong_clause")
                     or row.get(f"metadata/{judge}/wrong_clause")
                 )
+
+                if not asi_failure_type and uc_asi_map:
+                    uc_asi_entry = uc_asi_map.get((question_id, judge))
+                    if uc_asi_entry:
+                        asi_failure_type = asi_failure_type or uc_asi_entry.get("failure_type")
+                        asi_blame_set = asi_blame_set or uc_asi_entry.get("blame_set")
+                        asi_counterfactual = asi_counterfactual or uc_asi_entry.get("counterfactual_fix")
+                        asi_wrong_clause = asi_wrong_clause or uc_asi_entry.get("wrong_clause")
+
                 failures.append(
                     {
                         "question_id": question_id,
@@ -512,11 +579,20 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
         profile["judges"].add(f["judge"])
         profile["failures"].append(f)
 
-        if f.get("asi_failure_type"):
-            root = f["asi_failure_type"]
+        asi_ft = f.get("asi_failure_type")
+        if asi_ft and asi_ft != "other":
+            root = asi_ft
+            resolution_method = "asi_metadata"
         else:
             pattern = _extract_pattern(f["rationale"])
-            root = pattern if pattern != "other" else _classify_sql_diff(f.get("sql_context", {}))
+            if pattern != "other":
+                root = pattern
+                resolution_method = "rationale_pattern"
+            else:
+                root = _classify_sql_diff(f.get("sql_context", {}))
+                resolution_method = "sql_diff"
+        f["_resolved_root_cause"] = root
+        f["_resolution_method"] = resolution_method
         profile["root_causes"].append(root)
 
         if f.get("asi_blame_set"):
@@ -532,6 +608,39 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
         cause_counts = Counter(profile["root_causes"])
         profile["dominant_root_cause"] = cause_counts.most_common(1)[0][0] if cause_counts else "other"
 
+    # ── 8a. Per-Question ASI Extraction Trace ───────────────────────────
+    _cluster_debug = os.environ.get("CLUSTER_DEBUG", "1").lower() not in ("0", "false", "no")
+    if _cluster_debug and question_profiles:
+        lines = ["\n== ASI EXTRACTION TRACE ======================================================"]
+        for qid, profile in question_profiles.items():
+            lines.append(f"\n--- Q: {qid} " + "-" * max(1, 60 - len(qid)))
+            for f in profile["failures"]:
+                judge = f["judge"]
+                verdict = "FAIL"
+                asi_ft = f.get("asi_failure_type")
+                blame = f.get("asi_blame_set")
+                cfix = f.get("asi_counterfactual_fix")
+                wclause = f.get("asi_wrong_clause")
+                resolved = f.get("_resolved_root_cause", "other")
+                method = f.get("_resolution_method", "unknown")
+                lines.append(f"|  Judge: {judge:<24s}|  Verdict: {verdict}")
+                has_asi = bool(asi_ft)
+                lines.append(f"|    ASI metadata found:      {'YES' if has_asi else 'NO'}")
+                if has_asi:
+                    lines.append(f"|      failure_type (raw):    {asi_ft}")
+                    if blame:
+                        lines.append(f"|      blame_set:             {blame}")
+                    if cfix:
+                        lines.append(f"|      counterfactual_fix:    \"{str(cfix)[:120]}\"")
+                    if wclause:
+                        lines.append(f"|      wrong_clause:          {wclause}")
+                lines.append(f"|    Final root cause:        {resolved}  (via {method})")
+            lines.append(f"|  Dominant root cause:       {profile['dominant_root_cause']}")
+            blame_key = "|".join(sorted(profile["blame_sets"])) if profile["blame_sets"] else "(none)"
+            lines.append(f"|  Cluster group key:         ({profile['dominant_root_cause']}, \"{blame_key}\")")
+        lines.append("-" * 78)
+        print("\n".join(lines))
+
     cluster_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
     for qid, profile in question_profiles.items():
         blame_key = "|".join(sorted(profile["blame_sets"])) if profile["blame_sets"] else ""
@@ -546,6 +655,7 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
         sql_contexts: list[dict] = []
         sample_asi_type: str | None = None
 
+        question_traces: list[dict] = []
         for qid in qids:
             profile = question_profiles[qid]
             all_judges.update(profile["judges"])
@@ -558,6 +668,25 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
                     if f.get("asi_failure_type"):
                         sample_asi_type = f["asi_failure_type"]
                         break
+            q_text = profile["sql_context"].get("question", "") if profile["sql_context"] else ""
+            judge_traces = []
+            for f in profile["failures"]:
+                judge_traces.append({
+                    "judge": f["judge"],
+                    "verdict": "FAIL",
+                    "asi_failure_type_raw": f.get("asi_failure_type"),
+                    "resolved_root_cause": f.get("_resolved_root_cause", "other"),
+                    "resolution_method": f.get("_resolution_method", "unknown"),
+                    "blame_set": f.get("asi_blame_set"),
+                    "counterfactual_fix": f.get("asi_counterfactual_fix"),
+                    "wrong_clause": f.get("asi_wrong_clause"),
+                    "rationale_snippet": (f.get("rationale") or "")[:500],
+                })
+            question_traces.append({
+                "question_id": qid,
+                "question_text": q_text[:200],
+                "failed_judges": judge_traces,
+            })
 
         unique_qids = sorted(set(qids))
         entry = {
@@ -572,10 +701,29 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
             "asi_wrong_clause": next((wc for wc in all_wrong_clauses if wc), None),
             "asi_counterfactual_fixes": list(dict.fromkeys(cf for cf in all_counterfactuals if cf)),
             "sql_contexts": sql_contexts[:5],
+            "question_traces": question_traces,
         }
         clusters.append(entry)
 
     clusters.sort(key=lambda c: len(c["question_ids"]), reverse=True)
+
+    # ── 8b. Cluster Formation Summary ────────────────────────────────────
+    if _cluster_debug and clusters:
+        total_failures = sum(len(p["failures"]) for p in question_profiles.values())
+        total_judges = len({f["judge"] for p in question_profiles.values() for f in p["failures"]})
+        lines = ["\n== CLUSTER FORMATION ========================================================="]
+        lines.append(f"|  Total failure entries:     {total_failures} (across {len(question_profiles)} questions, {total_judges} judges)")
+        lines.append(f"|  Question profiles:         {len(question_profiles)}")
+        lines.append(f"|  Cluster groups formed:     {len(clusters)}")
+        for c in clusters:
+            cid = c["cluster_id"]
+            rc = c["root_cause"]
+            blame = c.get("asi_blame_set") or "(none)"
+            qids = c["question_ids"]
+            lines.append(f"|    {cid} ({rc}, blame=\"{blame}\"): {len(qids)} question(s) {qids}")
+        lines.append("=" * 78)
+        print("\n".join(lines))
+
     return clusters
 
 
@@ -1468,12 +1616,48 @@ def _call_llm_for_proposal(
     _hdr = f"┌─── LLM Call [{_tmpl_name}] " + "─" * max(0, _W - 18 - len(_tmpl_name))
     _ftr = "└" + "─" * (_W - 1)
 
+    _cid = cluster.get("cluster_id", "?")
+    _root = cluster.get("root_cause", "?")
+    _q_traces = cluster.get("question_traces", [])
+    _ctxts = cluster.get("sql_contexts", [])
+
+    _judge_lines = []
+    for qt in _q_traces[:5]:
+        for jt in qt.get("failed_judges", []):
+            snip = (jt.get("rationale_snippet") or "")[:120].replace("\n", " ")
+            _judge_lines.append(f"│   {qt['question_id'][:40]} / {jt['judge']}: \"{snip}\"")
+
+    _sql_diff_lines = []
+    if _ctxts:
+        ctx = _ctxts[0]
+        exp_snip = (ctx.get("expected_sql") or "")[:200].replace("\n", " ")
+        gen_snip = (ctx.get("generated_sql") or "")[:200].replace("\n", " ")
+        if exp_snip or gen_snip:
+            _sql_diff_lines.append(f"│   Expected:  {exp_snip}")
+            _sql_diff_lines.append(f"│   Generated: {gen_snip}")
+
+    _cfix_lines = []
+    for cf in cluster.get("asi_counterfactual_fixes", [])[:3]:
+        _cfix_lines.append(f"│   \"{str(cf)[:120]}\"")
+
+    _extra = (
+        f"│ {'Cluster:':<24s} {_cid}\n"
+        f"│ {'Root cause:':<24s} {_root}\n"
+    )
+    if _judge_lines:
+        _extra += "│\n│ --- Judge Feedback Driving This Patch ---\n" + "\n".join(_judge_lines) + "\n"
+    if _sql_diff_lines:
+        _extra += "│\n│ --- SQL Diff (sample) ---\n" + "\n".join(_sql_diff_lines) + "\n"
+    if _cfix_lines:
+        _extra += "│\n│ --- Counterfactual Fixes ---\n" + "\n".join(_cfix_lines) + "\n"
+
     print(
         f"\n{_hdr}\n"
         f"│ {'Patch type:':<24s} {patch_type}\n"
         f"│ {'Failure type:':<24s} {format_kwargs.get('failure_type', '?')}\n"
         f"│ {'Blame set:':<24s} {format_kwargs.get('blame_set', '?')}\n"
         f"│ {'Questions:':<24s} {len(format_kwargs.get('affected_questions', []))}\n"
+        f"{_extra}"
         f"│ {'Prompt length:':<24s} {len(prompt):,} chars\n│"
     )
 
@@ -2269,6 +2453,21 @@ def _merge_overlapping_instructions(proposals: list[dict]) -> list[dict]:
     return others + merged
 
 
+_LEVER_NAMES = {1: "Tables & Columns", 2: "Metric Views", 3: "Table-Valued Functions", 4: "Join Specifications", 5: "Genie Space Instructions"}
+
+
+def _build_provenance(cluster: dict, lever: int, patch_type: str) -> dict:
+    """Build a provenance dict from a cluster's question_traces."""
+    return {
+        "cluster_id": cluster.get("cluster_id", ""),
+        "root_cause": cluster.get("root_cause", "other"),
+        "originating_questions": cluster.get("question_traces", []),
+        "lever": lever,
+        "lever_name": _LEVER_NAMES.get(lever, f"Lever {lever}"),
+        "patch_type": patch_type,
+    }
+
+
 def generate_metadata_proposals(
     clusters: list[dict],
     metadata_snapshot: dict,
@@ -2338,6 +2537,9 @@ def generate_metadata_proposals(
 
         if instruction_text:
             total_q = sum(len(c.get("question_ids", [])) for c in all_lever5_clusters)
+            holistic_traces = []
+            for c in (all_lever5_clusters or clusters):
+                holistic_traces.extend(c.get("question_traces", []))
             proposals.append({
                 "proposal_id": f"P{len(proposals) + 1:03d}",
                 "cluster_id": "HOLISTIC_L5",
@@ -2359,6 +2561,14 @@ def generate_metadata_proposals(
                     "severity": "major",
                     "counterfactual_fixes": [],
                     "ambiguity_detected": False,
+                },
+                "provenance": {
+                    "cluster_id": "HOLISTIC_L5",
+                    "root_cause": "missing_instruction",
+                    "originating_questions": holistic_traces,
+                    "lever": 5,
+                    "lever_name": "Genie Space Instructions",
+                    "patch_type": "rewrite_instruction",
                 },
             })
 
@@ -2501,6 +2711,7 @@ def generate_metadata_proposals(
                     "questions_at_risk": 0,
                     "net_impact": net_impact,
                     "asi": asi_block,
+                    "provenance": _build_provenance(cluster, lever, patch_type),
                     "table": tbl,
                     "column": col,
                     "column_description": desc,
@@ -2530,6 +2741,7 @@ def generate_metadata_proposals(
                 "questions_at_risk": 0,
                 "net_impact": net_impact,
                 "asi": asi_block,
+                "provenance": _build_provenance(cluster, lever, patch_type),
                 **extra_fields,
             }
             proposals.append(proposal)

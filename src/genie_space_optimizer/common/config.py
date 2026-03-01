@@ -796,6 +796,7 @@ TABLE_STAGES = "genie_opt_stages"
 TABLE_ITERATIONS = "genie_opt_iterations"
 TABLE_PATCHES = "genie_opt_patches"
 TABLE_ASI = "genie_eval_asi_results"
+TABLE_PROVENANCE = "genie_opt_provenance"
 
 # ── 13. MLflow Conventions ─────────────────────────────────────────────
 

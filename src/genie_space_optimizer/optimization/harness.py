@@ -56,6 +56,8 @@ from genie_space_optimizer.optimization.evaluation import (
     all_thresholds_met,
     extract_reference_sqls,
     filter_benchmarks_by_scope,
+    log_asi_feedback_on_traces,
+    log_gate_feedback_on_traces,
     make_predict_fn,
     normalize_scores,
     register_instruction_version,
@@ -84,9 +86,13 @@ from genie_space_optimizer.optimization.state import (
     load_run,
     load_stages,
     mark_patches_rolled_back,
+    update_provenance_gate,
+    update_provenance_proposals,
     update_run_status,
+    write_asi_results,
     write_iteration,
     write_patch,
+    write_provenance,
     write_stage,
 )
 
@@ -703,6 +709,8 @@ def _run_lever_loop(
     levers_accepted: list[int] = []
     levers_rolled_back: list[int] = []
     lever_changes: list[dict] = []
+    all_failure_trace_ids: list[str] = []
+    all_regression_trace_ids: list[str] = []
 
     _ensure_sql_context(spark, catalog, schema)
     from genie_space_optimizer.optimization.evaluation import build_metric_view_measures
@@ -863,12 +871,18 @@ def _run_lever_loop(
         print("\n".join(_fa_lines))
 
         eval_result_for_clustering = {"rows": filtered_failure_rows}
-        clusters = cluster_failures(eval_result_for_clustering, metadata_snapshot)
+        clusters = cluster_failures(
+            eval_result_for_clustering, metadata_snapshot,
+            spark=spark, run_id=run_id, catalog=catalog, schema=schema,
+        )
 
         soft_signal_clusters: list[dict] = []
         if soft_signal_rows:
             soft_eval = {"rows": soft_signal_rows}
-            soft_signal_clusters = cluster_failures(soft_eval, metadata_snapshot)
+            soft_signal_clusters = cluster_failures(
+                soft_eval, metadata_snapshot,
+                spark=spark, run_id=run_id, catalog=catalog, schema=schema,
+            )
             for sc in soft_signal_clusters:
                 sc["signal_type"] = "soft"
             _soft_qids_total = sum(len(sc.get("question_ids", [])) for sc in soft_signal_clusters)
@@ -946,6 +960,75 @@ def _run_lever_loop(
         cluster_lines.append(_bar("-"))
         print("\n".join(cluster_lines))
 
+        # ── Write ASI results to Delta ───────────────────────────────
+        all_clusters_for_asi = clusters + soft_signal_clusters
+        _asi_rows: list[dict] = []
+        _prov_rows: list[dict] = []
+        for c in all_clusters_for_asi:
+            sig_type = c.get("signal_type", "hard")
+            for qt in c.get("question_traces", []):
+                qid = qt.get("question_id", "")
+                for jt in qt.get("failed_judges", []):
+                    _asi_rows.append({
+                        "question_id": qid,
+                        "judge": jt.get("judge", ""),
+                        "value": "no",
+                        "failure_type": jt.get("asi_failure_type_raw"),
+                        "blame_set": jt.get("blame_set"),
+                        "counterfactual_fix": jt.get("counterfactual_fix"),
+                        "wrong_clause": jt.get("wrong_clause"),
+                    })
+                    _prov_rows.append({
+                        "question_id": qid,
+                        "signal_type": sig_type,
+                        "judge": jt.get("judge", ""),
+                        "judge_verdict": jt.get("verdict", "FAIL"),
+                        "asi_failure_type_raw": jt.get("asi_failure_type_raw"),
+                        "resolved_root_cause": jt.get("resolved_root_cause", "other"),
+                        "resolution_method": jt.get("resolution_method", "unknown"),
+                        "blame_set": jt.get("blame_set"),
+                        "counterfactual_fix": jt.get("counterfactual_fix"),
+                        "wrong_clause": jt.get("wrong_clause"),
+                        "rationale_snippet": jt.get("rationale_snippet"),
+                        "cluster_id": c.get("cluster_id", ""),
+                    })
+        try:
+            write_asi_results(spark, run_id, iteration_counter, _asi_rows, catalog, schema, mlflow_run_id="")
+        except Exception:
+            logger.debug("Failed to write ASI results", exc_info=True)
+        try:
+            write_provenance(spark, run_id, iteration_counter, lever, _prov_rows, catalog, schema)
+        except Exception:
+            logger.debug("Failed to write provenance rows", exc_info=True)
+
+        # ── 8d. Pipeline Lineage summary ─────────────────────────────
+        _lineage_lines = ["\n== PIPELINE LINEAGE ==========================================================", "|"]
+        for c in clusters:
+            mapped = _map_to_lever(
+                c["root_cause"],
+                asi_failure_type=c.get("asi_failure_type"),
+                blame_set=c.get("asi_blame_set"),
+                judge=c.get("affected_judge"),
+            )
+            for qt in c.get("question_traces", []):
+                qid = qt.get("question_id", "")
+                judges_info = ", ".join(
+                    f"{jt['judge']} ({jt.get('resolved_root_cause', '?')})"
+                    for jt in qt.get("failed_judges", [])
+                )
+                blame = c.get("asi_blame_set") or "(none)"
+                cfix_list = c.get("asi_counterfactual_fixes", [])
+                cfix = str(cfix_list[0])[:120] if cfix_list else "(none)"
+                _lineage_lines.append(f"|  Q: {qid}")
+                _lineage_lines.append(f"|    Failed judges:         {judges_info}")
+                _lineage_lines.append(f"|    Dominant root cause:   {c['root_cause']}")
+                _lineage_lines.append(f"|    Blame:                 {blame}")
+                _lineage_lines.append(f"|    Counterfactual:        \"{cfix}\"")
+                _lineage_lines.append(f"|    -> Cluster {c['cluster_id']} -> Lever {mapped} ({LEVER_NAMES.get(mapped, '?')})")
+                _lineage_lines.append("|")
+        _lineage_lines.append("=" * 78)
+        print("\n".join(_lineage_lines))
+
         matching_count = _lever_counter.get(lever, 0)
         _failed_lever_set = set(levers_rolled_back)
         if lever == 5:
@@ -1019,6 +1102,36 @@ def _run_lever_loop(
         proposal_lines.append(f"|    Proceeding with {_n_valid} patch(es)")
         proposal_lines.append(_bar("-"))
         print("\n".join(proposal_lines))
+
+        # ── 8e. Patch Provenance log ─────────────────────────────────
+        _prov_patch_lines = ["\n-- Patch Provenance " + "-" * 58]
+        for pi, p in enumerate(proposals, 1):
+            prov = p.get("provenance", {})
+            if not prov:
+                continue
+            cid = prov.get("cluster_id", "?")
+            rc = prov.get("root_cause", "?")
+            lv = prov.get("lever", "?")
+            ln = prov.get("lever_name", "?")
+            pt = prov.get("patch_type", "?")
+            _prov_patch_lines.append(f"|  Patch P{pi:03d} [cluster {cid}]  lever={lv} ({ln})  type={pt}  root_cause={rc}")
+            for qt in prov.get("originating_questions", [])[:5]:
+                qid = qt.get("question_id", "?")
+                for jt in qt.get("failed_judges", [])[:3]:
+                    snip = (jt.get("rationale_snippet") or "")[:80].replace("\n", " ")
+                    _prov_patch_lines.append(f"|    {qid}: {jt.get('judge', '?')}={jt.get('verdict', '?')} (\"{snip}\")")
+        _prov_patch_lines.append("-" * 78)
+        print("\n".join(_prov_patch_lines))
+
+        # ── Write provenance proposal mappings to Delta ──────────────
+        _prop_mappings = [
+            {"cluster_id": p.get("cluster_id"), "proposal_id": p.get("proposal_id"), "patch_type": p.get("patch_type")}
+            for p in proposals if p.get("cluster_id")
+        ]
+        try:
+            update_provenance_proposals(spark, run_id, iteration_counter, _prop_mappings, catalog, schema)
+        except Exception:
+            logger.debug("Failed to update provenance proposals", exc_info=True)
 
         if not proposals:
             print(_section(f"No proposals for {lever_name} -- SKIPPING lever", "-"))
@@ -1111,13 +1224,50 @@ def _run_lever_loop(
                     f"{d['judge']} {best_scores.get(d['judge'], 0):.1f}->{slice_scores.get(d['judge'], 0):.1f} ({d['drop']:+.1f})"
                     for d in slice_drops
                 )
-                print(
-                    _section("SLICE GATE: FAIL", "-") + "\n"
-                    + _kv("Benchmarks evaluated", len(slice_benchmarks)) + "\n"
-                    + _kv("Regressions", _score_changes) + "\n"
-                    + _kv("Action", "ROLLBACK") + "\n"
-                    + _bar("-")
-                )
+                _gate_lines = [
+                    _section("SLICE GATE: FAIL", "-"),
+                    _kv("Benchmarks evaluated", len(slice_benchmarks)),
+                    _kv("Regressions", _score_changes),
+                    "",
+                    "|  Patches applied in this iteration:",
+                ]
+                for p in proposals:
+                    prov = p.get("provenance", {})
+                    pid = p.get("proposal_id", "?")
+                    pt = p.get("patch_type", "?")
+                    lv = p.get("lever", "?")
+                    rc = prov.get("root_cause", "?")
+                    _gate_lines.append(f"|    {pid} ({pt}, lever {lv}): root_cause={rc}")
+                    for qt in prov.get("originating_questions", [])[:3]:
+                        judges_str = " + ".join(
+                            f"{qt.get('question_id', '?')}/{jt.get('judge', '?')}"
+                            for jt in qt.get("failed_judges", [])[:3]
+                        )
+                        if judges_str:
+                            _gate_lines.append(f"|      Originated from: {judges_str}")
+                _gate_lines.append("|")
+                _gate_lines.append(_kv("Action", "ROLLBACK"))
+                _gate_lines.append(_bar("-"))
+                print("\n".join(_gate_lines))
+
+                try:
+                    update_provenance_gate(
+                        spark, run_id, iteration_counter, lever,
+                        "slice", "rollback",
+                        {"regressions": [{"judge": d["judge"], "drop": d["drop"]} for d in slice_drops]},
+                        catalog, schema,
+                    )
+                except Exception:
+                    logger.debug("Failed to update provenance gate", exc_info=True)
+
+                try:
+                    log_gate_feedback_on_traces(
+                        slice_result, "slice", "rollback",
+                        regressions=slice_drops, lever=lever, iteration=iteration_counter,
+                    )
+                except Exception:
+                    logger.debug("Failed to log gate feedback on traces", exc_info=True)
+
                 rollback(apply_log, w, space_id, metadata_snapshot)
                 mark_patches_rolled_back(
                     spark, run_id, iteration_counter,
@@ -1143,6 +1293,20 @@ def _run_lever_loop(
                     + _kv("Score changes", _score_changes) + "\n"
                     + _bar("-")
                 )
+                try:
+                    update_provenance_gate(
+                        spark, run_id, iteration_counter, lever,
+                        "slice", "pass", None, catalog, schema,
+                    )
+                except Exception:
+                    logger.debug("Failed to update provenance gate (pass)", exc_info=True)
+                try:
+                    log_gate_feedback_on_traces(
+                        slice_result, "slice", "pass",
+                        lever=lever, iteration=iteration_counter,
+                    )
+                except Exception:
+                    logger.debug("Failed to log gate feedback on traces", exc_info=True)
 
         # ── P0 gate ───────────────────────────────────────────────
         try:
@@ -1168,6 +1332,13 @@ def _run_lever_loop(
                     + _kv("Action", "ROLLBACK") + "\n"
                     + _bar("-")
                 )
+                try:
+                    log_gate_feedback_on_traces(
+                        p0_result, "p0", "fail",
+                        lever=lever, iteration=iteration_counter,
+                    )
+                except Exception:
+                    logger.debug("Failed to log p0 gate feedback", exc_info=True)
                 rollback(apply_log, w, space_id, metadata_snapshot)
                 mark_patches_rolled_back(
                     spark, run_id, iteration_counter,
@@ -1189,6 +1360,13 @@ def _run_lever_loop(
                     + _kv("P0 failures", 0) + "\n"
                     + _bar("-")
                 )
+                try:
+                    log_gate_feedback_on_traces(
+                        p0_result, "p0", "pass",
+                        lever=lever, iteration=iteration_counter,
+                    )
+                except Exception:
+                    logger.debug("Failed to log p0 gate feedback", exc_info=True)
 
         # ── Full evaluation ───────────────────────────────────────
         try:
@@ -1221,6 +1399,12 @@ def _run_lever_loop(
         full_scores = full_result.get("scores", {})
         full_accuracy = full_result.get("overall_accuracy", 0.0)
 
+        _full_trace_map = full_result.get("trace_map", {})
+        _full_failures = set(full_result.get("failure_question_ids", []))
+        for qid, tid in _full_trace_map.items():
+            if qid in _full_failures:
+                all_failure_trace_ids.append(tid)
+
         write_iteration(
             spark, run_id, iteration_counter, full_result,
             catalog=catalog, schema=schema,
@@ -1243,6 +1427,8 @@ def _run_lever_loop(
             })
 
         if regressions:
+            for tid in _full_trace_map.values():
+                all_regression_trace_ids.append(tid)
             _reg_details = ", ".join(
                 f"{r['judge']} {best_scores.get(r['judge'], 0):.1f}->{full_scores.get(r['judge'], 0):.1f} ({r['drop']:+.1f})"
                 for r in regressions
@@ -1254,6 +1440,22 @@ def _run_lever_loop(
                 + _kv("Action", "ROLLBACK") + "\n"
                 + _bar("-")
             )
+            try:
+                update_provenance_gate(
+                    spark, run_id, iteration_counter, lever,
+                    "full", "rollback",
+                    {"regressions": [{"judge": r["judge"], "drop": r["drop"]} for r in regressions]},
+                    catalog, schema,
+                )
+            except Exception:
+                logger.debug("Failed to update provenance gate (full rollback)", exc_info=True)
+            try:
+                log_gate_feedback_on_traces(
+                    full_result, "full", "rollback",
+                    regressions=regressions, lever=lever, iteration=iteration_counter,
+                )
+            except Exception:
+                logger.debug("Failed to log full eval gate feedback", exc_info=True)
             rollback(apply_log, w, space_id, metadata_snapshot)
             mark_patches_rolled_back(
                 spark, run_id, iteration_counter,
@@ -1281,6 +1483,20 @@ def _run_lever_loop(
             + _kv("Result", f"LEVER {lever} ACCEPTED") + "\n"
             + _bar("=")
         )
+        try:
+            update_provenance_gate(
+                spark, run_id, iteration_counter, lever,
+                "full", "pass", None, catalog, schema,
+            )
+        except Exception:
+            logger.debug("Failed to update provenance gate (full pass)", exc_info=True)
+        try:
+            log_gate_feedback_on_traces(
+                full_result, "full", "pass",
+                lever=lever, iteration=iteration_counter,
+            )
+        except Exception:
+            logger.debug("Failed to log full eval gate feedback", exc_info=True)
 
         levers_accepted.append(lever)
         lever_changes.append({
@@ -1354,6 +1570,27 @@ def _run_lever_loop(
         catalog=catalog, schema=schema,
     )
 
+    session_info: dict = {}
+    if all_failure_trace_ids or all_regression_trace_ids:
+        try:
+            from genie_space_optimizer.optimization.labeling import create_review_session
+            session_info = create_review_session(
+                run_id=run_id,
+                domain=domain,
+                experiment_name=exp_name,
+                failure_trace_ids=list(dict.fromkeys(all_failure_trace_ids)),
+                regression_trace_ids=list(dict.fromkeys(all_regression_trace_ids)),
+            )
+            if session_info.get("session_url"):
+                print(
+                    f"\n[MLflow Review] Labeling session created for human review:\n"
+                    f"  URL: {session_info['session_url']}\n"
+                    f"  Name: {session_info.get('session_name', '')}\n"
+                    f"  Traces: {session_info.get('trace_count', 0)}\n"
+                )
+        except Exception:
+            logger.debug("Failed to create labeling session", exc_info=True)
+
     return {
         "scores": best_scores,
         "accuracy": best_accuracy,
@@ -1363,6 +1600,7 @@ def _run_lever_loop(
         "levers_attempted": levers_attempted,
         "levers_accepted": levers_accepted,
         "levers_rolled_back": levers_rolled_back,
+        "labeling_session": session_info,
         "_debug_ref_sqls_count": len(reference_sqls),
         "_debug_failure_rows_loaded": len(_get_failure_rows(spark, run_id, catalog, schema)),
     }

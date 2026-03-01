@@ -182,7 +182,40 @@ When the pipeline completes (status: `CONVERGED`, `STALLED`, or `MAX_ITERATIONS`
 
 ---
 
-## 7. Programmatic API (Headless Trigger)
+## 7. Deploy & Run (Quick Reference)
+
+One-liner to build, deploy, and trigger an optimization run:
+
+```bash
+# 1. Deploy (build wheel + sync + restart app)
+make deploy PROFILE=genie-test
+
+# 2. Trigger optimization for a Genie Space
+APP_URL=$(databricks apps get genie-space-optimizer -p genie-test -o json | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
+TOKEN=$(databricks auth token -p genie-test | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+curl -s -X POST "${APP_URL}/api/genie/trigger" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"space_id": "<GENIE_SPACE_ID>"}' | python3 -m json.tool
+```
+
+**Known Space IDs (genie-test profile):**
+
+| Space | ID |
+|-------|-----|
+| Revenue & Property Intelligence | `01f10e84df3b14d993c30773abde7f44` |
+
+**Poll run status:**
+
+```bash
+curl -s "${APP_URL}/api/genie/trigger/status/<RUN_ID>" \
+  -H "Authorization: Bearer ${TOKEN}" | python3 -m json.tool
+```
+
+---
+
+## 8. Programmatic API (Headless Trigger)
 
 You can trigger optimization runs programmatically without the UI, using the `/trigger` endpoint:
 
@@ -202,7 +235,7 @@ This is useful for CI/CD pipelines or scheduled optimization workflows.
 
 ---
 
-## 8. Local Development
+## 9. Local Development
 
 For making changes to the app itself:
 
@@ -239,7 +272,7 @@ apx dev stop
 
 ---
 
-## 9. Key Configuration Knobs
+## 10. Key Configuration Knobs
 
 All tunable parameters are in `src/genie_space_optimizer/common/config.py`:
 

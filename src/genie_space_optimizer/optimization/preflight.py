@@ -465,6 +465,21 @@ def run_preflight(
     experiment_id = exp.experiment_id if exp else ""
     logger.info("Experiment: %s (id=%s)", experiment_name, experiment_id)
 
+    try:
+        from genie_space_optimizer import __version__ as _pipeline_version
+    except ImportError:
+        _pipeline_version = "0.0.0"
+    try:
+        mlflow.set_experiment_tags({
+            "genie.space_id": space_id,
+            "genie.domain": domain,
+            "genie.pipeline_version": _pipeline_version,
+            "genie.catalog": catalog,
+            "genie.schema": schema,
+        })
+    except Exception:
+        logger.debug("Failed to set experiment-level tags", exc_info=True)
+
     initial_instructions = _get_general_instructions(config.get("_parsed_space", config))
     if initial_instructions:
         register_instruction_version(
@@ -602,6 +617,32 @@ def run_preflight(
         spark, benchmarks, uc_schema, domain,
         space_id=space_id, catalog=catalog, gold_schema=schema,
     )
+
+    _human_corrections: list[dict] = []
+    try:
+        from genie_space_optimizer.optimization.labeling import (
+            ensure_labeling_schemas,
+            ingest_human_feedback,
+            sync_corrections_to_dataset,
+        )
+        ensure_labeling_schemas()
+
+        prior_run = load_run(spark, run_id, catalog, schema) if run_id else None
+        _prior_session_id = (prior_run or {}).get("labeling_session_run_id", "")
+        if _prior_session_id:
+            feedback = ingest_human_feedback(experiment_name, _prior_session_id)
+            _human_corrections = feedback.get("corrections", [])
+            if _human_corrections:
+                logger.info(
+                    "Loaded %d human corrections from prior labeling session %s",
+                    len(_human_corrections), _prior_session_id,
+                )
+                _benchmark_table = f"{uc_schema}.genie_benchmarks_{domain}"
+                _sql_corrections = [c for c in _human_corrections if c["type"] == "benchmark_correction"]
+                if _sql_corrections:
+                    sync_corrections_to_dataset(_prior_session_id, _benchmark_table)
+    except Exception:
+        logger.debug("Human feedback ingestion skipped (no prior session or module unavailable)", exc_info=True)
 
     prompt_registrations = register_judge_prompts(uc_schema, domain, experiment_name)
 

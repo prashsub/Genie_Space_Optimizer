@@ -1068,6 +1068,11 @@ def make_predict_fn(
     catalog: str,
     schema: str,
     metric_view_measures: dict[str, set[str]] | None = None,
+    *,
+    optimization_run_id: str = "",
+    iteration: int | None = None,
+    lever: int | None = None,
+    eval_scope: str = "",
 ):
     """Return a predict function with bound workspace/spark context.
 
@@ -1091,12 +1096,19 @@ def make_predict_fn(
         limitations (e.g. METRIC_VIEW_JOIN_NOT_SUPPORTED).
         """
         try:
-            mlflow.update_current_trace(
-                tags={
-                    "question_id": kwargs.get("question_id", ""),
-                    "space_id": space_id,
-                },
-            )
+            _trace_tags: dict[str, str] = {
+                "question_id": kwargs.get("question_id", ""),
+                "space_id": space_id,
+            }
+            if optimization_run_id:
+                _trace_tags["genie.optimization_run_id"] = optimization_run_id
+            if iteration is not None:
+                _trace_tags["genie.iteration"] = str(iteration)
+            if lever is not None:
+                _trace_tags["genie.lever"] = str(lever)
+            if eval_scope:
+                _trace_tags["genie.eval_scope"] = eval_scope
+            mlflow.update_current_trace(tags=_trace_tags)
         except Exception:
             pass
 
@@ -2210,15 +2222,13 @@ def create_evaluation_dataset(
     catalog: str = "",
     gold_schema: str = "",
 ) -> Any | None:
-    """Create or replace the MLflow UC evaluation dataset from benchmarks.
+    """Create or update the MLflow UC evaluation dataset from benchmarks.
 
-    Drops the existing table first to prevent stale/invalid benchmarks from
-    persisting across runs (``merge_records`` appends and never removes old rows).
+    Uses ``merge_records`` (upsert by question_id) to preserve version history
+    rather than dropping and recreating each run.
     """
     uc_table_name = f"{uc_schema}.genie_benchmarks_{domain}"
     try:
-        _drop_benchmark_table(spark, uc_table_name)
-
         eval_dataset = mlflow.genai.datasets.create_dataset(
             uc_table_name=uc_table_name,
         )
@@ -2251,7 +2261,7 @@ def create_evaluation_dataset(
                 }
             )
         eval_dataset.merge_records(records)
-        logger.info("UC Evaluation Dataset: %s (%d records)", uc_table_name, len(records))
+        logger.info("UC Evaluation Dataset: %s (%d records merged)", uc_table_name, len(records))
         return eval_dataset
     except Exception:
         logger.exception("UC dataset creation failed for %s", uc_table_name)
@@ -2516,6 +2526,8 @@ def run_evaluation(
     reference_sqls: dict[str, str] | None = None,
     metric_view_names: set[str] | None = None,
     metric_view_measures: dict[str, set[str]] | None = None,
+    optimization_run_id: str = "",
+    lever: int | None = None,
 ) -> dict:
     """Run ``mlflow.genai.evaluate()`` and return structured results.
 
@@ -2543,11 +2555,35 @@ def run_evaluation(
     )
 
     scope_filtered = filter_benchmarks_by_scope(benchmarks, eval_scope, patched_objects)
+    if not scope_filtered and benchmarks:
+        scope_filtered = benchmarks
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = RUN_NAME_TEMPLATE.format(iteration=iteration, timestamp=ts)
 
     with mlflow.start_run(run_name=run_name) as run:
+        _version_tags: dict[str, str] = {
+            "genie.space_id": space_id,
+            "genie.domain": domain,
+            "genie.iteration": str(iteration),
+            "genie.eval_scope": eval_scope,
+        }
+        if optimization_run_id:
+            _version_tags["genie.optimization_run_id"] = optimization_run_id
+        if lever is not None:
+            _version_tags["genie.lever"] = str(lever)
+        else:
+            _version_tags["genie.lever"] = "baseline"
+        mlflow.set_tags(_version_tags)
+
+        try:
+            _ds_table = f"{uc_schema}.genie_benchmarks_{domain}" if uc_schema and domain else ""
+            if _ds_table:
+                _dataset_ref = mlflow.genai.datasets.create_dataset(uc_table_name=_ds_table)
+                mlflow.log_input(_dataset_ref, context=eval_scope or "evaluation")
+        except Exception:
+            logger.debug("Failed to link dataset to evaluation run", exc_info=True)
+
         if spark is not None:
             known_functions = _load_known_functions(spark, catalog, gold_schema)
             filtered, quarantined_benchmarks, precheck_counts = _precheck_benchmarks_for_eval(
@@ -2753,7 +2789,7 @@ def run_evaluation(
         arbiter_actions: list[dict[str, str]] = []
         rows_for_output: list[dict] = []
 
-        _STRIP_COLS = {"trace", "trace_id", "assessments", "spans", "trace_metadata"}
+        _STRIP_COLS = {"trace", "assessments", "spans", "trace_metadata"}
         cached_feedback = _drain_scorer_feedback_cache()
 
         if hasattr(eval_result, "tables") and "eval_results" in eval_result.tables:
@@ -2962,6 +2998,17 @@ def run_evaluation(
             }
         )
 
+        trace_map: dict[str, str] = {}
+        for _row in rows_for_output:
+            _qid = (
+                _row.get("question_id")
+                or _row.get("inputs/question_id")
+                or (_row.get("inputs") or {}).get("question_id", "")
+            )
+            _tid = _row.get("trace_id")
+            if _qid and _tid:
+                trace_map[_qid] = str(_tid)
+
         output: dict[str, Any] = {
             "run_id": run.info.run_id,
             "mlflow_run_id": run.info.run_id,
@@ -2982,6 +3029,7 @@ def run_evaluation(
             "arbiter_actions": arbiter_actions,
             "model_id": model_id,
             "rows": rows_for_output,
+            "trace_map": trace_map,
             "invalid_benchmark_count": precheck_counts["invalid_benchmark_count"],
             "permission_blocked_count": permission_blocked_count,
             "unresolved_column_count": unresolved_column_count,
@@ -3135,7 +3183,7 @@ def run_repeatability_evaluation(
         repeatability_pct = repeatability_raw * 100 if repeatability_raw <= 1.0 else repeatability_raw
 
         rows_for_output: list[dict] = []
-        _STRIP_COLS_REP = {"trace", "trace_id", "assessments", "spans", "trace_metadata"}
+        _STRIP_COLS_REP = {"trace", "assessments", "spans", "trace_metadata"}
         if hasattr(eval_result, "tables") and "eval_results" in eval_result.tables:
             rep_df = eval_result.tables["eval_results"]
             rep_assessment_map = _extract_assessments_from_traces(rep_df)
@@ -3186,6 +3234,17 @@ def run_repeatability_evaluation(
         repeatability_pct,
     )
 
+    rep_trace_map: dict[str, str] = {}
+    for _row in rows_for_output:
+        _qid = (
+            _row.get("question_id")
+            or _row.get("inputs/question_id")
+            or (_row.get("inputs") or {}).get("question_id", "")
+        )
+        _tid = _row.get("trace_id")
+        if _qid and _tid:
+            rep_trace_map[_qid] = str(_tid)
+
     return {
         "run_id": run.info.run_id,
         "mlflow_run_id": run.info.run_id,
@@ -3194,6 +3253,7 @@ def run_repeatability_evaluation(
         "per_judge": per_judge,
         "rows": rows_for_output,
         "scores": normalize_scores(per_judge),
+        "trace_map": rep_trace_map,
     }
 
 
@@ -4418,3 +4478,105 @@ def load_benchmarks_from_dataset(
     except Exception:
         logger.exception("Failed to load benchmarks from %s", table_name)
         return []
+
+
+# ── MLflow Feedback Helpers (gate outcomes & ASI on traces) ──────────
+
+
+def log_gate_feedback_on_traces(
+    eval_result: dict,
+    gate_type: str,
+    gate_result: str,
+    regressions: list[dict] | None = None,
+    lever: int | None = None,
+    iteration: int | None = None,
+) -> int:
+    """Attach gate outcome as Feedback assessment on each evaluation trace.
+
+    Returns the number of feedback entries successfully logged.
+    """
+    trace_map = eval_result.get("trace_map", {})
+    if not trace_map:
+        return 0
+
+    logged = 0
+    for qid, trace_id in trace_map.items():
+        reg_summary = ""
+        if regressions:
+            reg_summary = "; regressions: " + ", ".join(
+                f"{r.get('judge', '?')} -{r.get('drop', 0):.1f}"
+                for r in regressions[:3]
+            )
+        try:
+            mlflow.log_feedback(
+                trace_id=trace_id,
+                name=f"gate_{gate_type}",
+                value=gate_result == "pass",
+                rationale=f"Lever {lever} gate {gate_type}: {gate_result}{reg_summary}",
+                source=AssessmentSource(
+                    source_type="CODE",
+                    source_id="genie_space_optimizer/gate",
+                ),
+                metadata={
+                    "gate_type": gate_type,
+                    "gate_result": gate_result,
+                    "lever": lever,
+                    "iteration": iteration,
+                    "question_id": qid,
+                    "regressions": (regressions or [])[:3],
+                },
+            )
+            logged += 1
+        except Exception:
+            logger.debug("Failed to log gate feedback for trace %s", trace_id, exc_info=True)
+    if logged:
+        logger.info("Logged gate_%s feedback on %d/%d traces", gate_type, logged, len(trace_map))
+    return logged
+
+
+def log_asi_feedback_on_traces(
+    eval_result: dict,
+    asi_rows: list[dict],
+) -> int:
+    """Attach ASI root-cause analysis as Feedback on evaluation traces.
+
+    Returns the number of feedback entries successfully logged.
+    """
+    trace_map = eval_result.get("trace_map", {})
+    if not trace_map or not asi_rows:
+        return 0
+
+    logged = 0
+    for asi in asi_rows:
+        qid = asi.get("question_id", "")
+        tid = trace_map.get(qid)
+        if not tid:
+            continue
+        judge = asi.get("judge", "unknown")
+        try:
+            mlflow.log_feedback(
+                trace_id=tid,
+                name=f"asi_{judge}",
+                value=asi.get("value", "no") == "yes",
+                rationale=asi.get("counterfactual_fix") or asi.get("rationale_snippet") or "",
+                source=AssessmentSource(
+                    source_type="CODE",
+                    source_id="genie_space_optimizer/asi",
+                ),
+                metadata={
+                    "failure_type": asi.get("failure_type"),
+                    "severity": asi.get("severity"),
+                    "blame_set": asi.get("blame_set"),
+                    "wrong_clause": asi.get("wrong_clause"),
+                    "expected_value": asi.get("expected_value"),
+                    "actual_value": asi.get("actual_value"),
+                    "question_id": qid,
+                    "judge": judge,
+                },
+            )
+            logged += 1
+        except Exception:
+            logger.debug("Failed to log ASI feedback for trace %s judge %s", tid, judge, exc_info=True)
+    if logged:
+        logger.info("Logged ASI feedback on %d traces", logged)
+    return logged

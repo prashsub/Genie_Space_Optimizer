@@ -29,7 +29,7 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 
 1. **Configuration Analysis** -- Scans the Genie Space config, counts tables/instructions/sample questions, and validates structure.
 2. **Metadata Collection** -- Queries Unity Catalog via REST API (with Spark SQL fallback) for columns, data types, tags, routines, and table descriptions.
-3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges. The arbiter judge identifies `genie_correct` verdicts for benchmark correction and tiered soft signals for best-practice guidance.
+3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges. All evaluation traces are tagged with `genie.optimization_run_id`, `genie.iteration`, and `genie.lever` for end-to-end traceability. The arbiter judge identifies `genie_correct` verdicts for benchmark correction and tiered soft signals for best-practice guidance.
 4. **Configuration Generation (Lever Loop)** -- Stage 2.5 applies deterministic prompt matching (format assistance + entity matching). Arbiter benchmark corrections rewrite stale gold SQL. Then iterates through 5 optimization levers (up to 5 iterations), applying targeted patches with tiered failure analysis (hard failures + soft signals). Each patch is evaluated via a 3-gate system (slice, P0, full); regressions trigger automatic rollback.
 5. **Optimized Evaluation & Repeatability** -- Final evaluation of the optimized config, including repeatability testing to ensure consistent results.
 
@@ -73,7 +73,7 @@ Plus **Response Quality** (LLM analysis accuracy), **Repeatability** (variance d
 | **Frontend** | React 19, TypeScript, TanStack Router & Query, Vite |
 | **UI Components** | shadcn/ui, Radix UI, Tailwind CSS 4 |
 | **Data** | Delta Lake (state), PostgreSQL (Lakebase), Unity Catalog |
-| **ML/AI** | MLflow 3.4+, Claude Opus 4.6 (via Databricks Foundation Model API), MLflow GenAI scorers |
+| **ML/AI** | MLflow 3.4+, Claude Opus 4.6 (via Databricks Foundation Model API), MLflow GenAI scorers, MLflow Labeling Sessions |
 | **Infrastructure** | Databricks Apps, Databricks Jobs, SQL Warehouse |
 | **SDK** | Databricks SDK 0.40+, Databricks Connect 15+ |
 | **Build** | apx, uv (Python), bun (JavaScript) |
@@ -148,11 +148,12 @@ Genie_Space_Optimizer/
 │   │   ├── applier.py                # Patch application & rollback
 │   │   ├── harness.py                # Full pipeline orchestration
 │   │   ├── preflight.py              # Pre-flight validation
-│   │   ├── state.py                  # Delta-backed state machine (5 tables)
+│   │   ├── labeling.py               # MLflow labeling sessions (human-in-the-loop review)
+│   │   ├── state.py                  # Delta-backed state machine (6 tables + provenance)
 │   │   ├── benchmarks.py             # Benchmark question definitions
 │   │   ├── repeatability.py          # Repeatability testing & variance classification
 │   │   ├── report.py                 # Run report generation
-│   │   ├── models.py                 # Internal data models
+│   │   ├── models.py                 # MLflow LoggedModel snapshots & metric linking
 │   │   └── scorers/                  # 10 quality scorers
 │   │       ├── syntax_validity.py
 │   │       ├── schema_accuracy.py
@@ -203,15 +204,16 @@ All endpoints are prefixed with `/api/genie`.
 
 ## State Management
 
-The optimizer maintains state across 5 Delta tables (partitioned by `run_id` or `space_id`):
+The optimizer maintains state across 6 Delta tables (partitioned by `run_id` or `space_id`):
 
 | Table | Purpose |
 |-------|---------|
 | `genie_opt_runs` | Run lifecycle: status, scores, config snapshots, convergence reason |
 | `genie_opt_stages` | Per-stage tracking: preflight, lever iterations, finalize |
 | `genie_opt_iterations` | Per-iteration scores across all 7 quality dimensions |
-| `genie_opt_patches` | Individual patches: type, lever, old/new values, applied/rolled-back |
-| `genie_eval_asi_results` | Failure assessments: type, severity, blame set, counterfactual fixes |
+| `genie_opt_patches` | Individual patches: type, lever, old/new values, applied/rolled-back, provenance chain |
+| `genie_eval_asi_results` | Failure assessments: type, severity, blame set, counterfactual fixes, MLflow run ID for trace linking |
+| `genie_opt_provenance` | End-to-end provenance: links every patch to originating judge verdicts, clusters, and gate outcomes |
 
 Run statuses: `QUEUED` → `IN_PROGRESS` → `CONVERGED` | `STALLED` | `MAX_ITERATIONS` | `FAILED` → `APPLIED` | `DISCARDED`
 
@@ -241,7 +243,7 @@ Environment variables (set via `databricks.yml`):
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `GENIE_SPACE_OPTIMIZER_CATALOG` | Unity Catalog name for Delta state tables | `vibe_coding_workshop_catalog` |
+| `GENIE_SPACE_OPTIMIZER_CATALOG` | Unity Catalog name for Delta state tables | `main` |
 | `GENIE_SPACE_OPTIMIZER_SCHEMA` | Schema name for Delta state tables | `genie_optimization` |
 | `GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID` | SQL Warehouse ID for query execution | (workspace-specific) |
 | `GENIE_SPACE_OPTIMIZER_PROPAGATION_WAIT` | Seconds to wait after config patch before re-evaluation | `30` |
