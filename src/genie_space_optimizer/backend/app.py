@@ -19,6 +19,29 @@ from .routes import trigger as _trigger  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
+class _WheelHealthCheck(LifespanDependency):
+    """Log the resolved wheel at startup for immediate deploy verification."""
+
+    @asynccontextmanager
+    async def lifespan(self, app: FastAPI) -> AsyncGenerator[None, None]:
+        try:
+            from .job_launcher import _find_wheel
+
+            wheel = _find_wheel()
+            logger.info(
+                "Wheel health: %s (size=%d bytes)",
+                wheel.name,
+                wheel.stat().st_size,
+            )
+        except Exception:
+            logger.warning("Wheel health check failed — no wheel found", exc_info=True)
+        yield
+
+    @staticmethod
+    def __call__() -> None:
+        return None
+
+
 class _DeltaTableBootstrap(LifespanDependency):
     """Create optimization Delta tables on app startup so read paths never 404."""
 

@@ -788,9 +788,20 @@ def _compute_arbiter_adjusted_accuracy(
         if is_correct:
             correct += 1
         else:
-            qid = row.get(
-                "inputs/question_id",
-                row.get("inputs", {}).get("question_id", ""),
+            _rq = row.get("request") or {}
+            if isinstance(_rq, str):
+                try:
+                    _rq = json.loads(_rq)
+                except (json.JSONDecodeError, TypeError):
+                    _rq = {}
+            _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
+            qid = (
+                row.get("inputs/question_id")
+                or (row.get("inputs") or {}).get("question_id", "")
+                or row.get("question_id")
+                or _rqk.get("question_id")
+                or (_rq.get("question_id") if isinstance(_rq, dict) else None)
+                or ""
             )
             if qid:
                 failure_ids.append(str(qid))
@@ -1293,6 +1304,43 @@ def make_predict_fn(
                                         and gt_sig["row_count"] == genie_sig["row_count"]
                                     )
 
+                                    tied_subset = False
+                                    if (
+                                        not exact_match
+                                        and not hash_match
+                                        and not subset_match
+                                        and not approx_match
+                                        and len(gt_df) == len(genie_df)
+                                        and len(gt_df) > 0
+                                        and bool(re.search(r"\bLIMIT\b", gt_sql, re.I))
+                                    ):
+                                        try:
+                                            import numpy as np
+
+                                            _tg = mapped_genie_df if mapped_genie_df is not genie_df else genie_df
+                                            _shared = sorted(set(gt_df.columns) & set(_tg.columns))
+                                            if _shared:
+                                                _gt_s = gt_df[_shared].sort_values(_shared).reset_index(drop=True)
+                                                _ge_s = _tg[_shared].sort_values(_shared).reset_index(drop=True)
+                                                _num_cols = sorted(
+                                                    set(_gt_s.select_dtypes(include=["number"]).columns)
+                                                    | set(_ge_s.select_dtypes(include=["number"]).columns)
+                                                )
+                                                _non_num = [c for c in _shared if c not in _num_cols]
+                                                _nn_ok = _gt_s[_non_num].equals(_ge_s[_non_num]) if _non_num else True
+                                                _n_ok = (
+                                                    np.allclose(
+                                                        _gt_s[_num_cols].values.astype(float),
+                                                        _ge_s[_num_cols].values.astype(float),
+                                                        rtol=1e-4, atol=1e-4, equal_nan=True,
+                                                    )
+                                                    if _num_cols
+                                                    else True
+                                                )
+                                                tied_subset = bool(_nn_ok and _n_ok)
+                                        except Exception:
+                                            tied_subset = False
+
                                     if exact_match:
                                         match_type = "exact"
                                     elif hash_match:
@@ -1301,6 +1349,8 @@ def make_predict_fn(
                                         match_type = subset_type
                                     elif approx_match:
                                         match_type = "approx"
+                                    elif tied_subset:
+                                        match_type = "tied_subset"
                                     elif sig_match:
                                         match_type = "signature"
                                     else:
@@ -1318,7 +1368,7 @@ def make_predict_fn(
                                     gt_col_list = sorted(gt_df.columns.tolist())
                                     genie_col_list = sorted(genie_df.columns.tolist())
                                     comparison = {
-                                        "match": exact_match or hash_match or subset_match or approx_match,
+                                        "match": exact_match or hash_match or subset_match or approx_match or tied_subset,
                                         "match_type": match_type,
                                         "gt_rows": len(gt_df),
                                         "genie_rows": len(genie_df),
@@ -2731,9 +2781,19 @@ def run_evaluation(
                     if meta_key not in row_dict and adata.get("metadata"):
                         row_dict[meta_key] = adata["metadata"]
 
+                _req_raw = row_dict.get("request") or {}
+                if isinstance(_req_raw, str):
+                    try:
+                        _req_raw = json.loads(_req_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        _req_raw = {}
+                _req_kw = _req_raw.get("kwargs", {}) if isinstance(_req_raw, dict) else {}
                 qid = (
                     row_dict.get("inputs/question_id")
                     or (row_dict.get("inputs") or {}).get("question_id", "")
+                    or row_dict.get("question_id")
+                    or _req_kw.get("question_id")
+                    or (_req_raw.get("question_id") if isinstance(_req_raw, dict) else None)
                     or ""
                 )
                 if qid and qid in cached_feedback:
@@ -2802,14 +2862,28 @@ def run_evaluation(
             )
             if not error_val:
                 continue
+            _fa_req = row.get("request") or {}
+            if isinstance(_fa_req, str):
+                try:
+                    _fa_req = json.loads(_fa_req)
+                except (json.JSONDecodeError, TypeError):
+                    _fa_req = {}
+            _fa_kw = _fa_req.get("kwargs", {}) if isinstance(_fa_req, dict) else {}
             question_failure_artifacts.append(
                 {
                     "question_id": str(
                         row.get("inputs/question_id")
                         or row.get("question_id")
+                        or _fa_kw.get("question_id")
+                        or (_fa_req.get("question_id") if isinstance(_fa_req, dict) else None)
                         or ""
                     ),
-                    "expected_sql": str(row.get("inputs/expected_sql") or ""),
+                    "expected_sql": str(
+                        row.get("inputs/expected_sql")
+                        or _fa_kw.get("expected_sql")
+                        or (_fa_req.get("expected_sql") if isinstance(_fa_req, dict) else None)
+                        or ""
+                    ),
                     "generated_sql": str(row.get("outputs/response") or row.get("response") or ""),
                     "error_type": str(
                         row.get("outputs/comparison/error_type")

@@ -53,10 +53,13 @@ When the OBO token is missing or lacks the `dashboards.genie` scope, the backend
 ### Job Launcher
 
 The app does NOT look up a pre-deployed job by name. Instead, `job_launcher.py`:
-1. Finds/builds the project wheel
+1. Finds/builds the project wheel (with content hash embedded in the filename for cache busting)
 2. Uploads wheel + all 6 job notebooks to `/Workspace/Shared/genie-space-optimizer/`
-3. Creates or updates a persistent job named `genie-space-optimizer-runner` (idempotent)
-4. Submits the run via `jobs.run_now()` with widget parameters
+3. Cleans up stale `.whl` files from the workspace dist directory (`_cleanup_stale_wheels`)
+4. Creates or updates a persistent job named `genie-space-optimizer-runner` (idempotent)
+5. Submits the run via `jobs.run_now()` with widget parameters
+
+At app startup, a `_WheelHealthCheck` logs the resolved wheel name and size for deploy verification.
 
 ### State Management
 
@@ -93,6 +96,24 @@ databricks apps get genie-space-optimizer -p <profile> -o json | jq '.status'
 
 # Get the app URL
 databricks apps get genie-space-optimizer -p <profile> -o json | jq -r '.url'
+
+# Verify the correct wheel is deployed (via Makefile)
+make verify PROFILE=<profile>
+```
+
+### Wheel Health Check
+
+After deployment, verify the app loaded the correct wheel by checking the startup logs:
+
+```bash
+databricks apps logs genie-space-optimizer -p <profile> | grep "App wheel:"
+# Expected: "App wheel: genie_space_optimizer-x.y.z.whl (size=NNNNN bytes)"
+```
+
+If the wheel size is unexpectedly small or the log line is missing, redeploy:
+
+```bash
+make deploy PROFILE=<profile>
 ```
 
 ### SQL Warehouse Check
@@ -385,7 +406,7 @@ After successful optimization start, browser navigates to `/runs/{runId}`.
 | 2 | Metadata Collection | `preflight` (second half) | 30s - 2min |
 | 3 | Baseline Evaluation | `baseline_eval` | 5 - 20min |
 | 3.5 | Prompt Matching Auto-Config | `lever_loop` (Stage 2.5, before levers) | 30s - 3min |
-| 4 | Configuration Generation | `lever_loop` (5-lever iteration) | 10 - 45min |
+| 4 | Configuration Generation | `lever_loop` (Stage 2.5 + 5-lever iteration with tiered failure analysis) | 10 - 45min |
 | 5 | Optimized Evaluation | `finalize` (2 repeatability runs + model promotion) | 5 - 15min |
 
 ### Lever Status Lifecycle
@@ -466,7 +487,7 @@ Click "View Results" button → navigates to `/runs/{runId}/comparison`.
 
 **Response quality** evaluates whether Genie's natural language analysis/explanation accurately describes the SQL query and answers the user's question. Returns `unknown` when no analysis text is available (Genie does not always include the text attachment), so this scorer never penalizes runs where the NL response is absent.
 
-The **arbiter** judge does not contribute to the overall quality score but its `genie_correct` verdicts drive two mechanisms: (1) benchmark correction before the lever loop (rewriting stale gold SQL), and (2) failure row filtering (excluding `genie_correct` questions from failure clustering so levers don't chase false negatives).
+The **arbiter** judge does not contribute to the overall quality score but its verdicts drive three mechanisms: (1) benchmark correction before the lever loop (rewriting stale gold SQL for `genie_correct` verdicts), (2) hard failure filtering (excluding `genie_correct` and `both_correct` verdicts from the main failure cluster), and (3) tiered soft signal extraction (`genie_correct`/`both_correct` rows where individual judges still failed are clustered separately as best-practice signals for Levers 4 and 5).
 
 ### Config Diff Tabs
 
@@ -796,14 +817,18 @@ WHERE run_id = '<run_id>' AND iteration = 0
 2. **Arbiter Benchmark Corrections** — Extracts `genie_correct` arbiter verdicts from baseline evaluation. When the count meets `ARBITER_CORRECTION_TRIGGER` (default 3), rewrites those benchmarks' `expected_sql` to match Genie's correct SQL via `apply_benchmark_corrections()`. This prevents chasing false failures from stale gold SQL.
 
 3. **5-Lever Optimization Loop** — Iterates through 5 levers (Tables & Columns, Metric Views, TVFs, Join Specifications, Genie Space Instructions). For each lever:
-   - Loads failure rows and filters out `genie_correct` arbiter verdicts before clustering
-   - Clusters failures, generates proposals via LLM, converts to patches
+   - **Tiered failure analysis**: loads failure rows and splits them into:
+     - **Hard failures** (`ground_truth_correct` / `neither_correct` arbiter verdicts) — drive targeted fixes
+     - **Soft signals** (`genie_correct` / `both_correct` verdicts where individual judges still failed) — inform best-practice guidance
+   - Clusters hard failures and soft signals separately (soft clusters tagged `signal_type: soft`)
+   - Generates proposals via LLM, converts to patches
    - Applies patches in risk order (low → medium → high)
    - Propagation wait: 90s if value dictionary changes, 30s otherwise
    - Runs **3-gate evaluation** (slice → P0 → full) with noise-floor-adjusted tolerances
    - Rolls back if any gate detects regression beyond the effective threshold (default `REGRESSION_THRESHOLD=10.0%`, adjusted upward for small benchmark sets)
    - On acceptance: updates best scores, registers instruction version snapshot, refreshes reference SQLs
-   - Lever 5 prioritizes example SQL (`add_example_sql`) over text instructions per the LEVER_5_INSTRUCTION_PROMPT priority hierarchy
+   - **Lever 4** always runs its join discovery path (even without join failure clusters), detecting implicit joins from successful Genie queries and proposing explicit documentation
+   - **Lever 5** generates a holistic instruction rewrite using `LEVER_5_HOLISTIC_PROMPT` (inspired by [AgentSkills.io](https://agentskills.io/specification)), considering the space's purpose, all benchmark evaluation learnings, prior lever tweaks, and both hard failure clusters and soft signal clusters. Produces a `rewrite_instruction` patch that replaces the full instruction body.
 
 | Error Pattern | Likely Cause | Resolution |
 |--------------|-------------|------------|
@@ -815,6 +840,9 @@ WHERE run_id = '<run_id>' AND iteration = 0
 | `SQL context lost` | Spark session reset between evaluations | Built-in `_ensure_sql_context()` should prevent this. If persists, check Spark Connect stability. |
 | Timeout (>5400s in DAB / >7200s in launcher) | Many levers x many iterations | Reduce `MAX_ITERATIONS` in config or limit levers via `levers` parameter |
 | Arbiter corrections applied but scores worsen | Benchmark gold SQL was actually correct | Check `genie_correct` verdicts in `genie_eval_asi_results`; manually verify questionable benchmarks |
+| ASI data shows `failure_type: None` | QID extraction failed — `question_id` not merging with eval rows | Check that `_row_qid()` is parsing the MLflow `request` column correctly; verify wheel is up to date |
+| All clusters are `wrong_table` with overlapping questions | Clustering by per-judge instead of by question | Verify the deployed wheel contains the question-level clustering fix; redeploy with `make deploy` |
+| Soft signals not appearing in logs | Arbiter filter not splitting hard/soft rows | Verify `_has_individual_judge_failure()` is present in the deployed code; check wheel health |
 
 **Diagnostic query (check lever outcomes):**
 ```sql
@@ -880,7 +908,8 @@ ORDER BY started_at
 
 | Issue | Symptom | Resolution |
 |-------|---------|------------|
-| **Wheel not found** | Job fails immediately with `RuntimeError: Could not find or build the genie_space_optimizer wheel` | Re-deploy the app: `databricks bundle deploy`. The build step creates and uploads the wheel. |
+| **Wheel not found** | Job fails immediately with `RuntimeError: Could not find or build the genie_space_optimizer wheel` | Re-deploy the app: `make deploy`. The build step creates and uploads the wheel. |
+| **Stale wheel (old code running)** | Optimization runs show old behavior despite code changes | `.build/.gitignore` blocked wheel sync. Run `make deploy` which removes `.gitignore`, runs `bundle deploy` (sync) + `apps deploy` (snapshot + restart), and verifies. Check app startup logs for `App wheel:` line to confirm correct version. |
 | **Notebook not found** | Job task fails with path not found error | The job launcher uploads notebooks to `/Workspace/Shared/genie-space-optimizer/`. Check workspace permissions on `/Workspace/Shared/`. |
 | **Stale run stuck in QUEUED** | Run shows QUEUED forever, no job_run_id | Wait 10 minutes -- reconciliation will mark it FAILED. Or load the space detail page to trigger reconciliation immediately. |
 | **Job terminated but run still shows IN_PROGRESS** | Delta state not updated | Load the space detail page -- `_reconcile_active_runs()` will check job state and update Delta. |
@@ -1030,9 +1059,11 @@ databricks apps logs genie-space-optimizer -p <profile>
 
 ### Pre-deployment
 
-- [ ] `databricks bundle deploy -p <profile>` succeeds
+- [ ] `make deploy PROFILE=<profile>` succeeds (runs bundle deploy + apps deploy)
 - [ ] Grant script ran (check output for `[grant-app-sp] Ensured UC grants for principal=...`)
+- [ ] `make verify PROFILE=<profile>` confirms wheel is on workspace
 - [ ] App is RUNNING: `databricks apps get genie-space-optimizer -p <profile>`
+- [ ] App startup logs show `App wheel: genie_space_optimizer-x.y.z.whl (size=... bytes)`
 - [ ] SQL Warehouse is RUNNING
 - [ ] At least one Genie Space exists and is accessible
 
@@ -1080,7 +1111,13 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Baseline eval completes: scores recorded in `genie_opt_iterations` with iteration=0
 - [ ] Lever loop Stage 2.5: prompt matching auto-config applied (format assistance + entity matching)
 - [ ] Lever loop arbiter corrections: applied if ≥3 `genie_correct` verdicts in baseline
+- [ ] Lever loop arbiter filter: `both_correct` AND `genie_correct` excluded from hard failure rows
+- [ ] Lever loop tiered arbiter: soft signal rows extracted (individual judge failures on correct verdicts)
+- [ ] Lever loop soft clusters: tagged `signal_type: soft`, passed to Levers 4 and 5
+- [ ] Lever 4: join discovery runs even without explicit join failure clusters
+- [ ] Lever 5: holistic instruction rewrite produces `rewrite_instruction` patch
 - [ ] Lever loop 5-lever iteration completes (or skips if thresholds met): patches in `genie_opt_patches`
+- [ ] ASI data present on clusters (failure_type not None for applicable questions)
 - [ ] Finalize completes: 2 repeatability runs averaged, model promoted, run status set to terminal
 - [ ] Finalize heartbeats visible in `genie_opt_stages` (FINALIZE_HEARTBEAT events)
 - [ ] Deploy skipped (deploy_target empty): deploy_check condition evaluates to false

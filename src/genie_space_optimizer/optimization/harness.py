@@ -702,6 +702,7 @@ def _run_lever_loop(
     levers_attempted: list[int] = []
     levers_accepted: list[int] = []
     levers_rolled_back: list[int] = []
+    lever_changes: list[dict] = []
 
     _ensure_sql_context(spark, catalog, schema)
     from genie_space_optimizer.optimization.evaluation import build_metric_view_measures
@@ -802,9 +803,12 @@ def _run_lever_loop(
 
         failure_rows = _get_failure_rows(spark, run_id, catalog, schema)
 
+        _NON_ACTIONABLE_VERDICTS = {"genie_correct", "both_correct"}
         arbiter_counts: dict[str, int] = {}
         arbiter_excluded: list[str] = []
+        soft_signal_qids: list[str] = []
         filtered_failure_rows: list[dict] = []
+        soft_signal_rows: list[dict] = []
         for row in failure_rows:
             av = str(
                 row.get("arbiter/value")
@@ -813,29 +817,86 @@ def _run_lever_loop(
                 or "skipped"
             ).lower()
             arbiter_counts[av] = arbiter_counts.get(av, 0) + 1
-            if av == "genie_correct":
-                qid = (
+            if av in _NON_ACTIONABLE_VERDICTS:
+                _rq = row.get("request") or {}
+                if isinstance(_rq, str):
+                    try:
+                        _rq = json.loads(_rq)
+                    except (json.JSONDecodeError, TypeError):
+                        _rq = {}
+                _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
+                qid = str(
                     row.get("inputs/question_id")
-                    or (row.get("inputs") or {}).get("question_id", "?")
+                    or (row.get("inputs") or {}).get("question_id", "")
+                    or row.get("question_id")
+                    or _rqk.get("question_id")
+                    or (_rq.get("question_id") if isinstance(_rq, dict) else None)
+                    or "?"
                 )
-                arbiter_excluded.append(str(qid))
+                if _has_individual_judge_failure(row):
+                    soft_signal_rows.append(row)
+                    soft_signal_qids.append(qid)
+                else:
+                    arbiter_excluded.append(qid)
             else:
                 filtered_failure_rows.append(row)
 
         _arbiter_summary = "  ".join(f"{k}={v}" for k, v in sorted(arbiter_counts.items()))
+        _excluded_breakdown = "  ".join(
+            f"{k}={v}" for k, v in sorted(arbiter_counts.items()) if k in _NON_ACTIONABLE_VERDICTS
+        )
         _fa_lines = [
             _section("Failure Analysis", "-"),
             _kv("Total rows loaded", len(failure_rows)),
             _kv("Arbiter verdicts", _arbiter_summary),
         ]
         if arbiter_excluded:
-            _fa_lines.append(_kv("Excluded (genie_correct)", f"{len(arbiter_excluded)} question(s)"))
-        _fa_lines.append(_kv("Rows for clustering", len(filtered_failure_rows)))
+            _fa_lines.append(_kv("Excluded (fully correct)", f"{len(arbiter_excluded)} question(s)"))
+        if soft_signal_rows:
+            _fa_lines.append(_kv("Soft signals (correct but judges failed)", f"{len(soft_signal_rows)} question(s)"))
+            _fa_lines.append(_kv("  Soft signal question IDs", ", ".join(soft_signal_qids[:10])))
+            for _ss_row, _ss_qid in zip(soft_signal_rows[:10], soft_signal_qids[:10]):
+                _failed_judges = _get_failed_judges(_ss_row)
+                _fa_lines.append(f"  |    {_ss_qid}: failed judges = {', '.join(_failed_judges) if _failed_judges else '(none detected)'}")
+        _fa_lines.append(_kv("Hard failure rows for clustering", len(filtered_failure_rows)))
         _fa_lines.append(_bar("-"))
         print("\n".join(_fa_lines))
 
         eval_result_for_clustering = {"rows": filtered_failure_rows}
         clusters = cluster_failures(eval_result_for_clustering, metadata_snapshot)
+
+        soft_signal_clusters: list[dict] = []
+        if soft_signal_rows:
+            soft_eval = {"rows": soft_signal_rows}
+            soft_signal_clusters = cluster_failures(soft_eval, metadata_snapshot)
+            for sc in soft_signal_clusters:
+                sc["signal_type"] = "soft"
+            _soft_qids_total = sum(len(sc.get("question_ids", [])) for sc in soft_signal_clusters)
+            _soft_lines = [
+                _section("Soft Signal Clusters (correct-but-suboptimal)", "-"),
+                _kv("Soft signal rows", len(soft_signal_rows)),
+                _kv("Soft clusters formed", len(soft_signal_clusters)),
+                _kv("Soft cluster questions", _soft_qids_total),
+                "|",
+            ]
+            for si, sc in enumerate(soft_signal_clusters, 1):
+                sc_judge = sc.get("affected_judge", "?")
+                sc_cause = sc.get("root_cause", "?")
+                sc_asi = sc.get("asi_failure_type", "n/a")
+                sc_qids = sc.get("question_ids", [])
+                sc_blame = sc.get("asi_blame_set", sc.get("blame_set", []))
+                blame_str = ", ".join(sc_blame) if isinstance(sc_blame, list) and sc_blame else str(sc_blame) if sc_blame else "(none)"
+                _soft_lines.append(f"|  Soft cluster {si} / {len(soft_signal_clusters)}")
+                _soft_lines.append(f"|    {'Judge:':<24s} {sc_judge}")
+                _soft_lines.append(f"|    {'Root cause:':<24s} {sc_cause}")
+                _soft_lines.append(f"|    {'ASI failure type:':<24s} {sc_asi}")
+                _soft_lines.append(f"|    {'Blame:':<24s} {blame_str}")
+                _soft_lines.append(f"|    Questions ({len(sc_qids)}):")
+                for qid in sc_qids:
+                    _soft_lines.append(f"|      {qid}")
+                _soft_lines.append("|")
+            _soft_lines.append(_bar("-"))
+            print("\n".join(_soft_lines))
 
         from genie_space_optimizer.optimization.optimizer import _map_to_lever
 
@@ -891,7 +952,7 @@ def _run_lever_loop(
             matching_count += sum(
                 _lever_counter.get(fl, 0) for fl in _failed_lever_set
             )
-        if matching_count == 0:
+        if matching_count == 0 and lever not in (4, 5):
             print(_section(f"No clusters match lever {lever} -- SKIPPING", "-"))
             logger.info("No clusters match lever %d — skipping", lever)
             write_stage(
@@ -901,11 +962,32 @@ def _run_lever_loop(
                 catalog=catalog, schema=schema,
             )
             continue
+        if matching_count == 0 and lever == 4:
+            print(_section("Lever 4: no failure clusters, running proactive join discovery", "-"))
+            logger.info("Lever 4: no failure clusters — proceeding with proactive join discovery")
+        if matching_count == 0 and lever == 5:
+            print(_section("Lever 5: running holistic instruction synthesis", "-"))
+            logger.info("Lever 5: no direct clusters — proceeding with holistic instruction synthesis")
+
+        effective_clusters = clusters
+        if lever in (4, 5) and soft_signal_clusters:
+            effective_clusters = clusters + soft_signal_clusters
+            print(
+                _kv(
+                    f"Lever {lever}: enriched with soft signals",
+                    f"{len(clusters)} hard + {len(soft_signal_clusters)} soft = {len(effective_clusters)} total clusters",
+                )
+            )
+            logger.info(
+                "Lever %d: enriched with %d soft-signal clusters (%d hard + %d soft)",
+                lever, len(soft_signal_clusters), len(clusters), len(soft_signal_clusters),
+            )
 
         proposals = generate_metadata_proposals(
-            clusters, metadata_snapshot,
+            effective_clusters, metadata_snapshot,
             target_lever=lever, apply_mode=apply_mode, w=w,
             failed_levers=_failed_lever_set,
+            lever_changes=lever_changes if lever == 5 else None,
         )
 
         _n_valid = 0
@@ -1201,6 +1283,15 @@ def _run_lever_loop(
         )
 
         levers_accepted.append(lever)
+        lever_changes.append({
+            "lever": lever,
+            "lever_name": LEVER_NAMES.get(lever, f"Lever {lever}"),
+            "patches": [
+                {"change": p.get("change_description", ""), "patch_type": p.get("patch_type", "")}
+                for p in proposals
+            ],
+            "accuracy_delta": full_accuracy - best_accuracy,
+        })
         best_scores = full_scores
         best_accuracy = full_accuracy
         best_model_id = new_model_id
@@ -1976,6 +2067,34 @@ def _build_patch_record(entry: dict, lever: int, apply_mode: str) -> dict:
         "rollback": action.get("rollback_command"),
         "proposal_id": patch.get("source_proposal_id", ""),
     }
+
+
+def _get_failed_judges(row: dict) -> list[str]:
+    """Return list of individual scorer judge names that failed (value contains 'no')."""
+    _NON_JUDGE_SUFFIXES = ("/rationale", "/source", "/metadata", "/error")
+    failed: list[str] = []
+    for col, val in row.items():
+        is_judge = False
+        if col.startswith("feedback/") and col.endswith("/value"):
+            is_judge = True
+        elif col.startswith("feedback/") and not any(col.endswith(s) for s in _NON_JUDGE_SUFFIXES):
+            if "/" not in col.removeprefix("feedback/"):
+                is_judge = True
+        elif col.endswith("/value") and not col.startswith("feedback/"):
+            is_judge = True
+        if is_judge and "no" in str(val).lower():
+            judge_name = col.replace("feedback/", "").replace("/value", "")
+            failed.append(judge_name)
+    return failed
+
+
+def _has_individual_judge_failure(row: dict) -> bool:
+    """Return True if at least one individual scorer judge failed (value contains 'no').
+
+    Used to detect rows where the arbiter said 'both_correct' or 'genie_correct'
+    but individual judges flagged suboptimal patterns worth learning from.
+    """
+    return len(_get_failed_judges(row)) > 0
 
 
 def _get_failure_rows(

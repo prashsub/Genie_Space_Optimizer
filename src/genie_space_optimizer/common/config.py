@@ -530,6 +530,118 @@ LEVER_5_INSTRUCTION_PROMPT = (
     '"expression": "...", "rationale": "..."}}'
 )
 
+LEVER_5_HOLISTIC_PROMPT = (
+    'You are a Databricks Genie Space instruction architect.\n'
+    'Your task is to synthesize ALL evaluation learnings into a single, coherent\n'
+    'instruction document for this Genie Space, plus targeted example SQL queries.\n'
+    '\n'
+    '## Genie Space Purpose\n'
+    '{space_description}\n'
+    '\n'
+    '## Evaluation Summary\n'
+    '{eval_summary}\n'
+    '\n'
+    '## Failure Clusters from Evaluation\n'
+    'The following clusters represent systematic issues found during benchmark evaluation.\n'
+    'Each cluster groups related failures by root cause and blamed objects.\n'
+    'Clusters tagged "Correct-but-Suboptimal" produced correct results but used fragile or\n'
+    'non-standard approaches -- use these for best-practice guidance in instructions, not fixes.\n'
+    '{cluster_briefs}\n'
+    '\n'
+    '## Changes Already Applied by Earlier Levers\n'
+    'Levers 1-4 have already applied the following fixes in this optimization iteration.\n'
+    'Your instructions should COMPLEMENT these fixes, not duplicate them.\n'
+    '{lever_summary}\n'
+    '\n'
+    '## Current Text Instructions\n'
+    '{current_instructions}\n'
+    '\n'
+    '## Existing Example SQL Queries\n'
+    '{existing_example_sqls}\n'
+    '\n'
+    '## Available Assets\n'
+    'Tables: {table_names}\n'
+    'Metric Views: {mv_names}\n'
+    'TVFs: {tvf_names}\n'
+    '\n'
+    '## Output Requirements\n'
+    '\n'
+    '### 1. Instruction Document (COMPLETE REWRITE)\n'
+    'Write a complete instruction document that replaces the current instructions entirely.\n'
+    'Preserve any WORKING guidance from Current Text Instructions, but restructure and\n'
+    'improve it based on all evaluation learnings.\n'
+    '\n'
+    'Follow this template structure (AgentSkills-inspired progressive disclosure):\n'
+    '\n'
+    '```\n'
+    '## Purpose\n'
+    'One paragraph: what this Genie Space does and who it serves.\n'
+    '\n'
+    '## Asset Routing\n'
+    '- When user asks about {topic}, use {specific_table_or_tvf_or_mv}\n'
+    '- {additional routing rules referencing ACTUAL asset names from Available Assets}\n'
+    '\n'
+    '## Query Patterns\n'
+    '- {pattern}: {SQL guidance with actual column names}\n'
+    '- Focus on patterns that evaluation showed Genie gets wrong\n'
+    '\n'
+    '## Business Definitions\n'
+    '- {term}: defined as {specific_column} from {specific_table}\n'
+    '- Only include definitions that prevent evaluation failures\n'
+    '\n'
+    '## Disambiguation\n'
+    '- When {ambiguous scenario from eval failures}, prefer {specific approach}\n'
+    '\n'
+    '## Formatting & Behavior\n'
+    '- {any cross-cutting behavioral guidance}\n'
+    '```\n'
+    '\n'
+    'Rules for the instruction document:\n'
+    '- EVERY bullet must reference a specific asset from Available Assets.\n'
+    '- NEVER include generic domain guidance that does not reference an actual asset.\n'
+    '- Be concise: target 30-80 lines. Prefer bullets over paragraphs.\n'
+    '- Use ## headers and - bullets for structure.\n'
+    '- Instruction budget: {instruction_char_budget} chars MAXIMUM.\n'
+    '- Omit sections that have no actionable content (e.g., skip "Formatting" if\n'
+    '  no formatting issues were found in evaluation).\n'
+    '\n'
+    '### 2. Example SQL Proposals\n'
+    'For failure clusters involving ROUTING issues (wrong table, wrong TVF, wrong MV)\n'
+    'or ambiguous question patterns, propose example SQL queries. Example SQL is the\n'
+    'most effective lever for routing — Genie pattern-matches against it directly.\n'
+    '\n'
+    'Rules for example SQL:\n'
+    '- The question must be a realistic user prompt matching a failure pattern.\n'
+    '- The SQL must be correct, executable, and reference assets from Available Assets.\n'
+    '- Do NOT duplicate existing example SQL questions (see above).\n'
+    '- Use named parameter markers (`:param_name`) when the query filters on a\n'
+    '  user-variable value. Parameterized queries produce trusted asset responses.\n'
+    '- For each parameter: name, type_hint (STRING|INTEGER|DATE|DECIMAL), default_value.\n'
+    '- Include usage_guidance describing when Genie should match this query.\n'
+    '\n'
+    '## Anti-Hallucination Guard\n'
+    'CRITICAL: If you cannot identify specific assets to reference or specific\n'
+    'evaluation failures to address, return empty instruction_text and no example SQL.\n'
+    'An empty instruction_text signals that no changes should be made.\n'
+    '\n'
+    'Return a single JSON object:\n'
+    '{{\n'
+    '  "instruction_text": "## Purpose\\n...",\n'
+    '  "example_sql_proposals": [\n'
+    '    {{\n'
+    '      "example_question": "What is the total revenue by destination?",\n'
+    '      "example_sql": "SELECT ...",\n'
+    '      "parameters": [{{"name": "...", "type_hint": "STRING", "default_value": "..."}}],\n'
+    '      "usage_guidance": "Use when user asks about revenue breakdown by destination"\n'
+    '    }}\n'
+    '  ],\n'
+    '  "rationale": "Explanation of key changes made and why"\n'
+    '}}\n'
+    '\n'
+    'If no example SQL proposals are needed, set "example_sql_proposals" to [].\n'
+    'If no instruction changes are needed, set "instruction_text" to "".'
+)
+
 # ── 6. Non-Exportable Genie Config Fields ──────────────────────────────
 
 NON_EXPORTABLE_FIELDS = {
@@ -580,6 +692,7 @@ LOW_RISK_PATCHES = {
 
 MEDIUM_RISK_PATCHES = {
     "update_instruction",
+    "rewrite_instruction",
     "remove_instruction",
     "rename_column_alias",
     "add_default_filter",
@@ -699,6 +812,7 @@ INSTRUCTION_PROMPT_ALIAS = "latest"
 
 MAX_PATCH_OBJECTS = 5
 MAX_INSTRUCTION_TEXT_CHARS = 2000
+MAX_HOLISTIC_INSTRUCTION_CHARS = 8000
 
 RISK_LEVEL_SCORE = {
     "low": 1,
@@ -928,6 +1042,12 @@ PATCH_TYPES = {
         "risk_level": "medium",
         "affects": ["instructions"],
     },
+    "rewrite_instruction": {
+        "type": "rewrite_instruction",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["instructions"],
+    },
     # Lever 6: Genie Space Example SQL (preferred over text instructions)
     "add_example_sql": {
         "type": "add_example_sql",
@@ -996,6 +1116,10 @@ CONFLICT_RULES = [
     # Cross-type conflicts: example SQL vs text instructions on same routing
     ("add_example_sql", "add_instruction"),
     ("add_example_sql", "update_instruction"),
+    # Holistic rewrite conflicts with any other instruction mutation
+    ("rewrite_instruction", "add_instruction"),
+    ("rewrite_instruction", "update_instruction"),
+    ("rewrite_instruction", "remove_instruction"),
 ]
 
 # ── 19. Failure Taxonomy (22 types) ───────────────────────────────────

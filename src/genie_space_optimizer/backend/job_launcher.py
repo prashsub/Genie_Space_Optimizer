@@ -153,6 +153,27 @@ def _find_wheel() -> Path:
     return wheels[-1]
 
 
+def _cleanup_stale_wheels(ws: WorkspaceClient, keep_path: str) -> None:
+    """Remove old hash-bucketed wheel directories from the workspace dist directory.
+
+    Wheels are stored as ``{_WS_WHEEL_DIR}/{hash[:8]}/{filename}.whl``.
+    This deletes any sibling hash directories that don't contain the current wheel.
+    """
+    keep_dir = keep_path.rsplit("/", 1)[0] if "/" in keep_path else keep_path
+    try:
+        entries = ws.workspace.list(_WS_WHEEL_DIR)
+        for entry in entries or []:
+            path = entry.path or ""
+            if path != keep_dir and path != keep_path:
+                try:
+                    ws.workspace.delete(path, recursive=True)
+                    logger.info("Deleted stale wheel artifact: %s", path)
+                except Exception:
+                    logger.debug("Could not delete stale artifact: %s", path, exc_info=True)
+    except Exception:
+        logger.debug("Could not list %s for cleanup", _WS_WHEEL_DIR, exc_info=True)
+
+
 def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
     """Upload wheel + runner notebooks to the workspace.
 
@@ -167,7 +188,16 @@ def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
     wheel_local = _find_wheel()
     wheel_bytes = wheel_local.read_bytes()
     wheel_hash = hashlib.md5(wheel_bytes).hexdigest()
-    ws_wheel_path = f"{_WS_WHEEL_DIR}/{wheel_local.name}"
+    wheel_filename = wheel_local.name
+    ws_wheel_path = f"{_WS_WHEEL_DIR}/{wheel_hash[:8]}/{wheel_filename}"
+
+    logger.info(
+        "Wheel resolved: %s (local=%s, size=%d, hash=%s)",
+        wheel_filename,
+        wheel_local,
+        len(wheel_bytes),
+        wheel_hash[:8],
+    )
 
     if _cached_wheel_hash == wheel_hash and _cached_wheel_path == ws_wheel_path:
         logger.debug(
@@ -176,7 +206,8 @@ def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
         return ws_wheel_path, wheel_hash
 
     ws.workspace.mkdirs(_WS_BASE)
-    ws.workspace.mkdirs(_WS_WHEEL_DIR)
+    ws_wheel_dir = ws_wheel_path.rsplit("/", 1)[0]
+    ws.workspace.mkdirs(ws_wheel_dir)
 
     ws.workspace.import_(
         ws_wheel_path,
@@ -190,6 +221,8 @@ def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
         len(wheel_bytes),
         wheel_hash[:8],
     )
+
+    _cleanup_stale_wheels(ws, keep_path=ws_wheel_path)
 
     for name, src_path in _NOTEBOOK_SOURCES.items():
         notebook_src = src_path.read_text(encoding="utf-8")

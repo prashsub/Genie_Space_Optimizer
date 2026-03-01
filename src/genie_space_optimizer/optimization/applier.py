@@ -12,6 +12,7 @@ import copy
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from databricks.sdk import WorkspaceClient
@@ -152,6 +153,9 @@ def _get_general_instructions(config: dict) -> str:
     return str(content)
 
 
+_HEX_32 = re.compile(r"^[0-9a-f]{32}$")
+
+
 def _set_general_instructions(
     config: dict, text: str, instruction_id: str | None = None
 ) -> None:
@@ -161,9 +165,11 @@ def _set_general_instructions(
     inst = config.setdefault("instructions", {})
     ti = inst.setdefault("text_instructions", [])
     effective_id = instruction_id or (ti[0].get("id") if ti else None) or generate_genie_id()
+    if not _HEX_32.match(effective_id or ""):
+        effective_id = generate_genie_id()
     lines = [ln for ln in text.split("\n")] if text else [""]
     if ti:
-        ti[0] = {"id": ti[0].get("id", effective_id), "content": lines}
+        ti[0] = {"id": effective_id, "content": lines}
     else:
         ti.append({"id": effective_id, "content": lines})
 
@@ -546,6 +552,8 @@ def proposals_to_patches(proposals: list[dict]) -> list[dict]:
             patch_dict["parameters"] = p["parameters"]
         if "usage_guidance" in p:
             patch_dict["usage_guidance"] = p["usage_guidance"]
+        if "old_value" in p:
+            patch_dict["old_value"] = p["old_value"]
         patches.append(patch_dict)
     return patches
 
@@ -595,6 +603,12 @@ def render_patch(patch: dict, space_id: str, space_config: dict) -> dict:
         return action(
             json.dumps({"op": "remove", "section": "instructions", "old_text": old_text}),
             json.dumps({"op": "add", "section": "instructions", "new_text": old_text}),
+        )
+    if patch_type == "rewrite_instruction":
+        rewrite_old = patch.get("old_value", old_text)
+        return action(
+            json.dumps({"op": "rewrite", "section": "instructions", "new_text": new_text, "old_text": rewrite_old}),
+            json.dumps({"op": "rewrite", "section": "instructions", "new_text": rewrite_old, "old_text": new_text}),
         )
 
     # ── Example SQL (preferred over text instructions) ────────────
@@ -868,6 +882,10 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
             if old_text and old_text not in current:
                 return False
             _set_general_instructions(config, current.replace(old_text, "").strip())
+            return True
+        if op == "rewrite":
+            text = cmd.get("new_text", "")
+            _set_general_instructions(config, text)
             return True
 
     # ── Example SQL Queries (preferred over text instructions) ────

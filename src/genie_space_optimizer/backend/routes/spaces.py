@@ -43,7 +43,7 @@ def _sql_warehouse_query(
     ws: WorkspaceClient,
     warehouse_id: str,
     sql: str,
-) -> "pd.DataFrame":
+) -> Any:
     """Execute SQL via the SQL Statement Execution API (bypasses Spark Connect).
 
     Returns results as a pandas DataFrame, consistent with the Spark-based
@@ -60,12 +60,14 @@ def _sql_warehouse_query(
         format=Format.JSON_ARRAY,
     )
     if resp.status and resp.status.state == StatementState.SUCCEEDED:
-        columns = [c.name for c in (resp.manifest.schema.columns or [])] if resp.manifest else []
+        manifest_schema = resp.manifest.schema if resp.manifest else None
+        schema_cols = manifest_schema.columns if manifest_schema else None
+        columns = [str(c.name or "") for c in (schema_cols or [])]
         rows: list[dict] = []
         if resp.result and resp.result.data_array:
             for row_data in resp.result.data_array:
                 rows.append(dict(zip(columns, row_data)))
-        return pd.DataFrame(rows, columns=columns or None)
+        return pd.DataFrame(rows, columns=pd.Index(columns) if columns else None)
     error_msg = ""
     if resp.status and resp.status.error:
         error_msg = resp.status.error.message or str(resp.status.error)
@@ -879,6 +881,29 @@ def do_start_optimization(
             pass
         mlflow.set_experiment(experiment_name)
         logger.info("Pre-created MLflow experiment %s via OBO", experiment_name)
+
+        exp = mlflow.get_experiment_by_name(experiment_name)
+        if exp:
+            sp_id = get_sp_principal(sp_ws)
+            try:
+                ws.api_client.do(
+                    "PUT",
+                    f"/api/2.0/permissions/experiments/{exp.experiment_id}",
+                    body={
+                        "access_control_list": [{
+                            "service_principal_name": sp_id,
+                            "all_permissions": [{"permission_level": "CAN_MANAGE"}],
+                        }]
+                    },
+                )
+                logger.info(
+                    "Granted SP %s CAN_MANAGE on experiment %s",
+                    sp_id, exp.experiment_id,
+                )
+            except Exception as perm_err:
+                logger.warning(
+                    "Failed to grant SP experiment permission: %s", perm_err,
+                )
     except Exception as _mlflow_err:
         logger.warning(
             "OBO experiment pre-creation failed for %s: %s — job will create it",

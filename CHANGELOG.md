@@ -6,6 +6,72 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Holistic Lever 5, Tiered Arbiter Soft Signals, Join Discovery, Deployment Pipeline
+
+- **Holistic Lever 5 instructions** (`config.py`, `optimizer.py`, `applier.py`, `harness.py`):
+  Lever 5 now evaluates the entire Genie Space instruction set holistically rather than
+  patching individual instructions. A new `LEVER_5_HOLISTIC_PROMPT` (inspired by the
+  [AgentSkills.io](https://agentskills.io/specification) specification) generates a
+  single cohesive instruction document considering the space's purpose, all benchmark
+  evaluation learnings, and prior lever tweaks. New `rewrite_instruction` patch type
+  replaces the full instruction body in one operation.
+- **Tiered arbiter soft signals** (`harness.py`, `optimizer.py`, `config.py`):
+  Questions with `genie_correct` or `both_correct` arbiter verdicts that still have
+  individual judge failures are now extracted as "soft signal" rows. These are clustered
+  separately (tagged `signal_type: soft`) and passed to Levers 4 and 5 alongside hard
+  failure clusters, providing best-practice guidance without triggering aggressive fixes.
+- **Lever 4 always-run join discovery** (`harness.py`, `optimizer.py`):
+  Lever 4 (Join Specifications) now always runs its discovery path regardless of
+  failure cluster count, detecting implicit joins from successful Genie queries and
+  proposing explicit join documentation. `_classify_sql_diff` reordered to check
+  missing dimension JOINs and wrong join columns before aggregation checks.
+- **Robust QID extraction** (`optimizer.py`, `evaluation.py`, `harness.py`):
+  New `_row_qid()` helper robustly extracts `question_id` from eval rows, accounting
+  for MLflow's `request` column and nested structures. Fixes ASI data merging that was
+  silently failing due to mismatched QID keys.
+- **Deployment pipeline hardening** (`databricks.yml`, `Makefile`, `job_launcher.py`, `app.py`):
+  - `databricks.yml` build step now removes `.build/.gitignore` (which `apx build`
+    generates with a blanket `*` pattern that blocks file sync)
+  - New `Makefile` with `make deploy` orchestrating four steps: `clean-wheels` →
+    `databricks bundle deploy` (builds wheel + syncs to workspace) →
+    `databricks apps deploy` (creates snapshot + restarts app) → `verify`
+  - `_cleanup_stale_wheels()` in `job_launcher.py` removes old wheels from the
+    workspace dist directory after uploading the new one
+  - `_WheelHealthCheck` lifespan dependency in `app.py` logs the resolved wheel
+    name and size at app startup for immediate deploy verification
+  - Enhanced wheel logging throughout `_ensure_artifacts` (hash, size, path)
+- **Enhanced soft signal logging** (`harness.py`): soft signal clusters now print
+  full per-cluster detail (judge, root cause, ASI type, blame, questions) matching
+  the hard cluster format. Per-question failed judge names shown in the Failure
+  Analysis section for debugging. New `_get_failed_judges()` helper.
+- **Wheel cache busting** (`job_launcher.py`): workspace wheel path now embeds a
+  content hash (`{stem}_{hash[:8]}.whl`) to prevent stale wheel caching
+
+### Fixed — Lever Loop Effectiveness
+
+- **Arbiter filter**: now excludes both `genie_correct` AND `both_correct` verdicts
+  from failure clustering (previously only excluded `genie_correct`)
+- **`_classify_sql_diff` over-classification**: introduced `format_difference` and
+  `extra_columns_only` types mapped to lever 0 (no-op) to prevent benign SQL
+  differences from triggering unnecessary patches
+- **Deduplication**: `_deduplicate_proposals` now checks `update_description` patch type
+- **No-op filtering**: `_filter_no_op_proposals` uses 0.97 n-gram similarity threshold
+  to drop cosmetic-only proposals while preserving surgical improvements
+- **No-op filtering crash** (`optimizer.py`): `_filter_no_op_proposals` crashed with
+  `'list' object has no attribute 'strip'` when Genie metadata `description` field
+  was a list instead of a string; now coerces to string safely
+- **Instruction ID validation** (`applier.py`): generates a valid 32-char hex ID when
+  the default `genie_opt` ID fails validation
+- **Tied subset matching** (`evaluation.py`): `LIMIT` queries with tied values that
+  produce different but semantically equivalent row orderings now score as `tied_subset`
+  instead of `mismatch`
+- **`mapped_genie_df` UnboundLocalError** (`evaluation.py`): moved assignment before
+  exception-prone code path to ensure it's always defined
+- **MLflow experiment permissions** (`spaces.py`): Service Principal is now explicitly
+  granted `CAN_MANAGE` on the MLflow experiment via the Permissions API
+
+---
+
 ### Added — Temporal Date Resolution, Coverage Gap Benchmarks, Spark Resilience
 - **Temporal date resolution** (`evaluation.py`): auto-detects relative time
   references ("this year", "last quarter", "YTD", "last N months/days") in

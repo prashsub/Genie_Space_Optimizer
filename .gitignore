@@ -39,5 +39,8 @@ node_modules/
 # pytest cache
 .pytest_cache/
 
+# Build artifacts
+.build/
+
 # UI dist folder
 src/genie_space_optimizer/__dist__/

@@ -26,12 +26,14 @@ from genie_space_optimizer.common.config import (
     LEVER_1_2_COLUMN_PROMPT,
     LEVER_4_JOIN_DISCOVERY_PROMPT,
     LEVER_4_JOIN_SPEC_PROMPT,
+    LEVER_5_HOLISTIC_PROMPT,
     LEVER_5_INSTRUCTION_PROMPT,
     LEVER_NAMES,
     LLM_ENDPOINT,
     LLM_MAX_RETRIES,
     LLM_TEMPERATURE,
     LOW_RISK_PATCHES,
+    MAX_HOLISTIC_INSTRUCTION_CHARS,
     MAX_PATCH_OBJECTS,
     MAX_VALUE_DICTIONARY_COLUMNS,
     MEDIUM_RISK_PATCHES,
@@ -43,6 +45,34 @@ from genie_space_optimizer.common.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _row_qid(row: dict, *, fallback: str = "unknown") -> str:
+    """Extract question_id from an eval-results row regardless of column layout.
+
+    MLflow stores inputs in the ``request`` column (not ``inputs/…``), so we
+    parse both layouts to robustly recover the QID.
+    """
+    direct = (
+        row.get("inputs/question_id")
+        or row.get("inputs/question")
+        or row.get("question_id")
+    )
+    if direct:
+        return str(direct)
+    _req = row.get("request") or {}
+    if isinstance(_req, str):
+        try:
+            _req = json.loads(_req)
+        except (json.JSONDecodeError, TypeError):
+            _req = {}
+    if isinstance(_req, dict):
+        _kw = _req.get("kwargs", {})
+        qid = _kw.get("question_id") or _req.get("question_id") or _req.get("question")
+        if qid:
+            return str(qid)
+    return row.get("question", fallback) or fallback
+
 
 # ── Dual Persistence Paths ─────────────────────────────────────────────
 
@@ -121,6 +151,9 @@ def _map_to_lever(
         "asset_routing_error": 5,
         "missing_instruction": 5,
         "ambiguous_question": 5,
+        "format_difference": 0,
+        "extra_columns_only": 0,
+        "select_star": 0,
     }
 
     if asi_failure_type and asi_failure_type in mapping:
@@ -191,6 +224,29 @@ def _extract_sql_tables(sql: str) -> set[str]:
     return tables
 
 
+_SQL_JOIN_ON = re.compile(
+    r"\bJOIN\s+([\w.`]+)\s+(?:AS\s+)?(\w+)?\s*ON\s+(.+?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|;|\Z)",
+    re.I | re.S,
+)
+
+
+def _extract_join_pairs(sql: str) -> set[tuple[str, str]]:
+    """Extract (table, join_column) pairs from JOIN...ON clauses.
+
+    Parses each ``JOIN <table> ... ON <condition>`` and extracts every
+    ``alias.column`` reference from the ON clause, pairing the joined
+    table with the column names used in the condition.
+    """
+    pairs: set[tuple[str, str]] = set()
+    for m in _SQL_JOIN_ON.finditer(sql or ""):
+        table = m.group(1).strip("`").lower()
+        on_clause = m.group(3)
+        cols = re.findall(r"[\w`]+\.`?([\w]+)`?", on_clause)
+        for col in cols:
+            pairs.add((table, col.lower()))
+    return pairs
+
+
 def _classify_sql_diff(ctx: dict) -> str:
     """Classify a failure's root cause by comparing expected vs generated SQL.
 
@@ -226,7 +282,22 @@ def _classify_sql_diff(ctx: dict) -> str:
 
     exp_tables = _extract_sql_tables(expected_sql)
     gen_tables = _extract_sql_tables(generated_sql)
+    exp_join_pairs = _extract_join_pairs(expected_sql)
+    gen_join_pairs = _extract_join_pairs(generated_sql)
+    exp_has_join = bool(re.search(r"\bJOIN\b", exp_lower))
 
+    _DIM_PREFIXES = ("dim_", "lookup_", "ref_")
+    missing_tables = exp_tables - gen_tables if exp_tables and gen_tables else set()
+
+    # 1. Missing dimension JOIN — GT joins a dim/lookup/ref table that
+    #    Genie omits entirely. This is fundamentally a join issue even if
+    #    aggregation or filter differences also exist.
+    if missing_tables:
+        dim_tables = {t for t in missing_tables if any(t.startswith(p) or f".{p}" in t for p in _DIM_PREFIXES)}
+        if dim_tables:
+            return "wrong_join"
+
+    # 2. Aggregation checks
     exp_aggs = set(_SQL_AGG.findall(exp_lower))
     gen_aggs = set(_SQL_AGG.findall(gen_lower))
     if exp_aggs and not gen_aggs:
@@ -234,16 +305,23 @@ def _classify_sql_diff(ctx: dict) -> str:
     if exp_aggs != gen_aggs and exp_aggs and gen_aggs:
         return "wrong_aggregation"
 
+    # 3. Filter checks
     exp_has_where = bool(_SQL_WHERE.search(exp_lower))
     gen_has_where = bool(_SQL_WHERE.search(gen_lower))
     if exp_has_where and not gen_has_where:
         return "missing_filter"
 
-    exp_has_join = bool(re.search(r"\bJOIN\b", exp_lower))
-    gen_has_join = bool(re.search(r"\bJOIN\b", gen_lower))
-    if exp_has_join and not gen_has_join:
+    # 4. Wrong join column — both queries join the same tables but on
+    #    different columns (e.g. destination_name vs destination_key).
+    if exp_join_pairs and gen_join_pairs and exp_join_pairs != gen_join_pairs:
+        return "wrong_join_spec"
+
+    # 5. Missing join — GT has a JOIN that Genie doesn't (regardless of
+    #    whether Genie has other JOINs).
+    if exp_has_join and missing_tables:
         return "wrong_join"
 
+    # 6. SELECT *, TVF, MEASURE, GROUP BY checks
     gen_has_star = bool(_SQL_SELECT_STAR.search(gen_lower))
     exp_has_star = bool(_SQL_SELECT_STAR.search(exp_lower))
     if gen_has_star and not exp_has_star:
@@ -264,14 +342,24 @@ def _classify_sql_diff(ctx: dict) -> str:
     if exp_has_group != gen_has_group:
         return "wrong_aggregation"
 
+    # 7. Table-set differs (non-dimension tables)
     if exp_tables and gen_tables and exp_tables != gen_tables:
-        missing_tables = exp_tables - gen_tables
-        if missing_tables and exp_has_join and not gen_has_join:
-            return "wrong_join"
-        if missing_tables or (gen_tables - exp_tables):
+        extra_tables = gen_tables - exp_tables
+        date_dims = {t for t in missing_tables if "dim_date" in t or "dim_time" in t}
+        if missing_tables == date_dims and not extra_tables:
+            return "format_difference"
+        if missing_tables or extra_tables:
             return "wrong_table"
 
+    # 8. Same tables, different columns
     if exp_tables == gen_tables and exp_tables:
+        exp_select = re.findall(r"\bSELECT\b(.+?)\bFROM\b", exp_lower, re.S)
+        gen_select = re.findall(r"\bSELECT\b(.+?)\bFROM\b", gen_lower, re.S)
+        if exp_select and gen_select:
+            exp_cols = [c.strip() for c in exp_select[0].split(",")]
+            gen_cols = [c.strip() for c in gen_select[0].split(",")]
+            if len(exp_cols) > len(gen_cols) and len(gen_cols) >= 1:
+                return "extra_columns_only"
         return "wrong_column"
 
     return "missing_instruction"
@@ -333,14 +421,7 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
             except (json.JSONDecodeError, TypeError):
                 _resp = {}
 
-        question_id = (
-            row.get("inputs/question_id")
-            or row.get("inputs/question")
-            or row.get("question_id")
-            or _req_kwargs.get("question_id")
-            or (_req.get("question") if isinstance(_req, dict) else None)
-            or row.get("question", "unknown")
-        )
+        question_id = _row_qid(row)
 
         sql_ctx = {
             "question": _req.get("question", "") if isinstance(_req, dict) else "",
@@ -869,10 +950,7 @@ def _extract_judge_feedbacks_from_eval(
                             "blame_set": meta.get("blame_set", []),
                             "counterfactual_fix": [meta.get("counterfactual_fix", "")],
                             "confidence": float(meta.get("confidence", 0.7)),
-                            "question_id": row.get(
-                                "inputs/question_id",
-                                (row.get("inputs", {}) or {}).get("question_id", f"q{i}"),
-                            ),
+                            "question_id": _row_qid(row, fallback=f"q{i}"),
                             "feedback_id": f"r{i}_{judge}",
                         }
                     )
@@ -1095,6 +1173,132 @@ def _format_existing_example_sqls(metadata_snapshot: dict) -> str:
             entry += f"\n  Guidance: {g[:150]}"
         lines.append(entry)
     return "\n".join(lines) if lines else "(none)"
+
+
+def _format_eval_summary(clusters: list[dict]) -> str:
+    """Produce a compact summary of all evaluation clusters for the holistic prompt."""
+    if not clusters:
+        return "No failure clusters from evaluation (all questions passed)."
+
+    hard = [c for c in clusters if c.get("signal_type") != "soft"]
+    soft = [c for c in clusters if c.get("signal_type") == "soft"]
+    total_questions = sum(len(c.get("question_ids", [])) for c in clusters)
+    root_causes: dict[str, int] = {}
+    judges: dict[str, int] = {}
+    for c in clusters:
+        rc = c.get("root_cause", "unknown")
+        root_causes[rc] = root_causes.get(rc, 0) + len(c.get("question_ids", []))
+        judge = c.get("affected_judge", "unknown")
+        judges[judge] = judges.get(judge, 0) + len(c.get("question_ids", []))
+
+    lines = [
+        f"Total clusters: {len(clusters)} (hard failures: {len(hard)}, soft signals: {len(soft)})",
+        f"Total affected questions: {total_questions}",
+        "",
+        "Failures by root cause:",
+    ]
+    for rc, count in sorted(root_causes.items(), key=lambda x: -x[1]):
+        lines.append(f"  - {rc}: {count} questions")
+    lines.append("")
+    lines.append("Failures by judge:")
+    for judge, count in sorted(judges.items(), key=lambda x: -x[1]):
+        lines.append(f"  - {judge}: {count} questions")
+    return "\n".join(lines)
+
+
+def _format_lever_summary(lever_changes: list[dict] | None) -> str:
+    """Format what levers 1-4 did for the holistic lever 5 prompt."""
+    if not lever_changes:
+        return "(No changes applied by earlier levers in this iteration.)"
+
+    lines: list[str] = []
+    for lc in lever_changes:
+        lever_name = lc.get("lever_name", f"Lever {lc.get('lever', '?')}")
+        delta = lc.get("accuracy_delta", 0)
+        patches = lc.get("patches", [])
+        delta_str = f"+{delta:.1f}%" if delta >= 0 else f"{delta:.1f}%"
+        lines.append(f"### {lever_name} (accuracy change: {delta_str})")
+        for p in patches[:10]:
+            change = p.get("change", "")
+            ptype = p.get("patch_type", "")
+            lines.append(f"  - [{ptype}] {change}")
+        if len(patches) > 10:
+            lines.append(f"  ... and {len(patches) - 10} more patches")
+        lines.append("")
+    return "\n".join(lines) if lines else "(No changes applied.)"
+
+
+def _format_cluster_briefs(clusters: list[dict], top_n: int = 5) -> str:
+    """Format cluster data for the holistic prompt.
+
+    Hard-failure clusters (top N) get full SQL diffs; remaining get one-line
+    summaries.  Soft-signal clusters (correct-but-suboptimal) are rendered
+    under a separate header so the LLM can weight them appropriately.
+    """
+    if not clusters:
+        return "(No failure clusters.)"
+
+    hard = [c for c in clusters if c.get("signal_type") != "soft"]
+    soft = [c for c in clusters if c.get("signal_type") == "soft"]
+
+    sorted_hard = sorted(hard, key=lambda c: len(c.get("question_ids", [])), reverse=True)
+    lines: list[str] = []
+
+    for idx, cluster in enumerate(sorted_hard[:top_n], 1):
+        rc = cluster.get("root_cause", "unknown")
+        q_ids = cluster.get("question_ids", [])
+        judge = cluster.get("affected_judge", "unknown")
+        blame = cluster.get("asi_blame_set") or []
+        lines.append(f"### Cluster {idx}: {rc} ({len(q_ids)} questions, judge: {judge})")
+        if blame:
+            lines.append(f"Blamed objects: {', '.join(str(b) for b in blame[:5])}")
+        lines.append(_format_sql_diffs(cluster))
+        lines.append("")
+
+    remaining_hard = sorted_hard[top_n:]
+    if remaining_hard:
+        lines.append(f"### Additional hard-failure clusters ({len(remaining_hard)} more):")
+        for cluster in remaining_hard:
+            rc = cluster.get("root_cause", "unknown")
+            q_ids = cluster.get("question_ids", [])
+            judge = cluster.get("affected_judge", "unknown")
+            blame = cluster.get("asi_blame_set") or []
+            blame_str = f" blamed=[{', '.join(str(b) for b in blame[:3])}]" if blame else ""
+            lines.append(
+                f"  - {rc}: {len(q_ids)} questions (judge: {judge}){blame_str}"
+            )
+
+    if soft:
+        sorted_soft = sorted(soft, key=lambda c: len(c.get("question_ids", [])), reverse=True)
+        lines.append("")
+        lines.append("### Correct-but-Suboptimal Patterns (arbiter: correct, individual judges: failed)")
+        lines.append("These queries returned correct results but used suboptimal approaches.")
+        lines.append("Use these to inform best-practice guidance, NOT to fix failures.")
+        lines.append("")
+        for idx, cluster in enumerate(sorted_soft[:top_n], 1):
+            rc = cluster.get("root_cause", "unknown")
+            q_ids = cluster.get("question_ids", [])
+            judge = cluster.get("affected_judge", "unknown")
+            blame = cluster.get("asi_blame_set") or []
+            lines.append(f"#### Soft {idx}: {rc} ({len(q_ids)} questions, judge: {judge})")
+            if blame:
+                lines.append(f"Blamed objects: {', '.join(str(b) for b in blame[:5])}")
+            lines.append(_format_sql_diffs(cluster))
+            lines.append("")
+        remaining_soft = sorted_soft[top_n:]
+        if remaining_soft:
+            lines.append(f"#### Additional soft-signal clusters ({len(remaining_soft)} more):")
+            for cluster in remaining_soft:
+                rc = cluster.get("root_cause", "unknown")
+                q_ids = cluster.get("question_ids", [])
+                judge = cluster.get("affected_judge", "unknown")
+                blame = cluster.get("asi_blame_set") or []
+                blame_str = f" blamed=[{', '.join(str(b) for b in blame[:3])}]" if blame else ""
+                lines.append(
+                    f"  - {rc}: {len(q_ids)} questions (judge: {judge}){blame_str}"
+                )
+
+    return "\n".join(lines)
 
 
 _SQL_PATTERN_ROOT_CAUSES = frozenset({
@@ -1471,6 +1675,131 @@ def _call_llm_for_join_discovery(
     return []
 
 
+def _call_llm_for_holistic_instructions(
+    all_clusters: list[dict],
+    metadata_snapshot: dict,
+    lever_changes: list[dict] | None = None,
+    w: WorkspaceClient | None = None,
+) -> dict:
+    """Single LLM call to synthesize ALL evaluation learnings into holistic instructions.
+
+    Returns ``{"instruction_text": str, "example_sql_proposals": list, "rationale": str}``.
+    """
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    _tables = metadata_snapshot.get("tables", []) or ds.get("tables", [])
+    _mvs = metadata_snapshot.get("metric_views", []) or ds.get("metric_views", [])
+    _funcs = metadata_snapshot.get("functions", []) or ds.get("functions", [])
+
+    config = metadata_snapshot.get("config") or {}
+    space_desc = config.get("description") or ""
+    if isinstance(space_desc, list):
+        space_desc = "\n".join(space_desc)
+    if not space_desc:
+        space_desc = "(No description set for this Genie Space.)"
+
+    current_instructions = metadata_snapshot.get("general_instructions", "")
+    existing_example_sqls = _format_existing_example_sqls(metadata_snapshot)
+
+    format_kwargs: dict[str, Any] = {
+        "space_description": space_desc,
+        "eval_summary": _format_eval_summary(all_clusters),
+        "cluster_briefs": _format_cluster_briefs(all_clusters, top_n=5),
+        "lever_summary": _format_lever_summary(lever_changes),
+        "current_instructions": current_instructions or "(No current instructions.)",
+        "existing_example_sqls": existing_example_sqls,
+        "instruction_char_budget": max(0, 24500 - 500),
+        "table_names": [t.get("name") or t.get("identifier", "") for t in _tables],
+        "mv_names": [m.get("name") or m.get("identifier", "") for m in _mvs],
+        "tvf_names": [f.get("name") or f.get("identifier", "") for f in _funcs],
+    }
+
+    try:
+        prompt = LEVER_5_HOLISTIC_PROMPT.format(**format_kwargs)
+    except KeyError:
+        prompt = LEVER_5_HOLISTIC_PROMPT.format_map(defaultdict(str, format_kwargs))
+
+    _W = 78
+    _hdr = "┌─── LLM Call [LEVER_5_HOLISTIC] " + "─" * max(0, _W - 32)
+    _ftr = "└" + "─" * (_W - 1)
+
+    logger.info(
+        "\n%s\n│ Clusters: %d\n│ Lever changes: %d\n│ Prompt length: %d chars\n%s",
+        _hdr, len(all_clusters), len(lever_changes or []), len(prompt), _ftr,
+    )
+
+    import time
+
+    from databricks.sdk import WorkspaceClient as _WC
+
+    text = ""
+    for attempt in range(LLM_MAX_RETRIES):
+        try:
+            wc = w or _WC()
+            response = wc.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+                temperature=LLM_TEMPERATURE,
+                max_tokens=4096,
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise ValueError("LLM response had no choices")
+            first_choice = choices[0]
+            message = getattr(first_choice, "message", None)
+            content = getattr(message, "content", None)
+            if not content:
+                raise ValueError("LLM response content is empty")
+            text = str(content).strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+            result = json.loads(text)
+
+            instruction_text = result.get("instruction_text", "")
+            example_proposals = result.get("example_sql_proposals", [])
+            rationale = result.get("rationale", "")
+
+            if instruction_text and len(instruction_text) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+                logger.warning(
+                    "Holistic instruction text exceeds %d chars (%d), truncating",
+                    MAX_HOLISTIC_INSTRUCTION_CHARS, len(instruction_text),
+                )
+                instruction_text = instruction_text[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+
+            logger.info(
+                "\n┌─── LLM Response [LEVER_5_HOLISTIC] ──────────────────────────────────\n"
+                "│ Instruction text: %d chars\n"
+                "│ Example SQL proposals: %d\n"
+                "│ Rationale: %s\n"
+                "└─────────────────────────────────────────────────────────────────────────",
+                len(instruction_text), len(example_proposals), str(rationale)[:300],
+            )
+            return {
+                "instruction_text": instruction_text,
+                "example_sql_proposals": example_proposals if isinstance(example_proposals, list) else [],
+                "rationale": rationale,
+            }
+        except json.JSONDecodeError:
+            logger.warning(
+                "Holistic LLM response was not valid JSON (attempt %d): %.500s",
+                attempt + 1, text,
+            )
+            if attempt >= LLM_MAX_RETRIES - 1:
+                return {"instruction_text": "", "example_sql_proposals": [], "rationale": "JSON parse failed"}
+        except Exception:
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(2**attempt)
+            else:
+                logger.exception(
+                    "Holistic LLM call failed after %d retries (prompt len: %d)",
+                    LLM_MAX_RETRIES, len(prompt),
+                )
+                return {"instruction_text": "", "example_sql_proposals": [], "rationale": "LLM call failed"}
+    return {"instruction_text": "", "example_sql_proposals": [], "rationale": "All retries exhausted"}
+
+
 def validate_join_spec_types(
     join_spec: dict,
     metadata_snapshot: dict,
@@ -1689,7 +2018,28 @@ def _validate_lever5_proposals(
     valid: list[dict] = []
     for p in proposals:
         ptype = p.get("patch_type", "")
-        if ptype not in ("add_instruction", "add_example_sql"):
+        if ptype not in ("add_instruction", "add_example_sql", "rewrite_instruction"):
+            valid.append(p)
+            continue
+
+        if ptype == "rewrite_instruction":
+            text = (p.get("proposed_value") or "").strip()
+            if not text:
+                logger.info("Rejecting empty rewrite_instruction proposal")
+                continue
+            if len(text) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+                logger.warning(
+                    "Rejecting rewrite_instruction exceeding %d chars (%d chars)",
+                    MAX_HOLISTIC_INSTRUCTION_CHARS, len(text),
+                )
+                continue
+            text_lower = text.lower()
+            if known_assets and not any(a in text_lower for a in known_assets):
+                logger.warning(
+                    "Rejecting generic rewrite_instruction (no known asset referenced): %.100s...",
+                    text,
+                )
+                continue
             valid.append(p)
             continue
 
@@ -1742,6 +2092,55 @@ def _ngram_similarity(a: str, b: str, n: int = 3) -> float:
     return len(a_ngrams & b_ngrams) / len(a_ngrams | b_ngrams)
 
 
+def _filter_no_op_proposals(proposals: list[dict], metadata_snapshot: dict) -> list[dict]:
+    """Remove proposals that don't meaningfully change the current metadata.
+
+    For ``update_column_description`` / ``update_description``: drops the
+    proposal if the proposed value is essentially identical to the existing
+    column description (after normalizing whitespace).
+    """
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+
+    existing_descs: dict[tuple[str, str], str] = {}
+    for tbl in tables:
+        tbl_name = (tbl.get("name") or tbl.get("identifier") or "").lower()
+        short_name = tbl_name.rsplit(".", 1)[-1] if "." in tbl_name else tbl_name
+        for col in tbl.get("columns", tbl.get("column_configs", [])):
+            col_name = (col.get("name") or col.get("column_name") or "").lower()
+            raw_desc = col.get("description") or col.get("comment") or ""
+            if isinstance(raw_desc, list):
+                raw_desc = " ".join(str(x) for x in raw_desc)
+            desc = re.sub(r"\s+", " ", str(raw_desc).strip().lower())
+            if desc:
+                existing_descs[(tbl_name, col_name)] = desc
+                existing_descs[(short_name, col_name)] = desc
+
+    kept: list[dict] = []
+    dropped = 0
+    for p in proposals:
+        ptype = p.get("patch_type", "")
+        if ptype in ("update_column_description", "update_description", "add_column_synonym"):
+            tbl = (p.get("table") or p.get("target_table") or "").lower()
+            col = (p.get("column") or p.get("target_column") or "").lower()
+            proposed = re.sub(r"\s+", " ", (p.get("proposed_value") or "").strip().lower())
+            short_tbl = tbl.rsplit(".", 1)[-1] if "." in tbl else tbl
+            current = existing_descs.get((tbl, col)) or existing_descs.get((short_tbl, col)) or ""
+            if current and proposed and _ngram_similarity(current, proposed) > 0.97:
+                dropped += 1
+                continue
+        kept.append(p)
+
+    if dropped:
+        logger.info(
+            "Filtered %d no-op proposals (description unchanged from current metadata)",
+            dropped,
+        )
+    return kept
+
+
 def _deduplicate_proposals(proposals: list[dict]) -> list[dict]:
     """Remove duplicate proposals using type-aware deduplication.
 
@@ -1762,7 +2161,7 @@ def _deduplicate_proposals(proposals: list[dict]) -> list[dict]:
         val = (p.get("proposed_value") or "").strip()
         impact = p.get("net_impact", 0)
 
-        if ptype in ("update_column_description", "add_column_synonym"):
+        if ptype in ("update_column_description", "update_description", "add_column_synonym"):
             tbl = p.get("table", p.get("target_table", ""))
             col = p.get("column", p.get("target_column", ""))
             key = (tbl, col)
@@ -1877,11 +2276,18 @@ def generate_metadata_proposals(
     apply_mode: str = APPLY_MODE,
     w: WorkspaceClient | None = None,
     failed_levers: set[int] | None = None,
+    lever_changes: list[dict] | None = None,
 ) -> list[dict]:
     """Generate metadata change proposals from failure clusters.
 
     For each cluster, maps to a lever, calls the LLM to generate a concrete
     ``proposed_value``, resolves scope, and scores by net_impact.
+
+    When *target_lever* is 5, uses **holistic mode**: a single LLM call
+    synthesizes ALL evaluation learnings into a coherent instruction document
+    (``rewrite_instruction``) plus targeted example SQL proposals. The
+    *lever_changes* parameter provides context about what levers 1-4 already
+    fixed in this iteration.
 
     When *failed_levers* is provided and *target_lever* is 5, clusters whose
     natural lever is in *failed_levers* are also included so that lever 5
@@ -1900,6 +2306,108 @@ def generate_metadata_proposals(
         desc_proposals = _detect_instruction_content_in_description(metadata_snapshot)
         proposals.extend(desc_proposals)
 
+    # ── Holistic path for lever 5 ─────────────────────────────────────
+    if target_lever == 5:
+        all_lever5_clusters: list[dict] = []
+        for cluster in clusters:
+            natural_lever = _map_to_lever(
+                cluster["root_cause"],
+                asi_failure_type=cluster.get("asi_failure_type"),
+                blame_set=cluster.get("asi_blame_set"),
+                judge=cluster.get("affected_judge"),
+            )
+            if natural_lever == 5 or natural_lever in failed_levers:
+                all_lever5_clusters.append(cluster)
+
+        holistic_result = _call_llm_for_holistic_instructions(
+            all_lever5_clusters if all_lever5_clusters else clusters,
+            metadata_snapshot,
+            lever_changes=lever_changes,
+            w=w,
+        )
+
+        instruction_text = holistic_result.get("instruction_text", "")
+        example_proposals = holistic_result.get("example_sql_proposals", [])
+        rationale = holistic_result.get("rationale", "")
+
+        from genie_space_optimizer.optimization.applier import _get_general_instructions
+
+        current_instructions = _get_general_instructions(
+            metadata_snapshot.get("config") or metadata_snapshot
+        )
+
+        if instruction_text:
+            total_q = sum(len(c.get("question_ids", [])) for c in all_lever5_clusters)
+            proposals.append({
+                "proposal_id": f"P{len(proposals) + 1:03d}",
+                "cluster_id": "HOLISTIC_L5",
+                "lever": 5,
+                "scope": "genie_config",
+                "patch_type": "rewrite_instruction",
+                "change_description": f"Holistic instruction rewrite ({len(instruction_text)} chars)",
+                "proposed_value": instruction_text,
+                "old_value": current_instructions,
+                "rationale": rationale,
+                "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                "confidence": 0.8,
+                "questions_fixed": total_q,
+                "questions_at_risk": 0,
+                "net_impact": max(total_q * 0.8, 1.0),
+                "asi": {
+                    "failure_type": "missing_instruction",
+                    "blame_set": [],
+                    "severity": "major",
+                    "counterfactual_fixes": [],
+                    "ambiguity_detected": False,
+                },
+            })
+
+        for idx, ex in enumerate(example_proposals):
+            if not isinstance(ex, dict):
+                continue
+            eq = (ex.get("example_question") or "").strip()
+            es = (ex.get("example_sql") or "").strip()
+            if not eq or not es:
+                continue
+            proposals.append({
+                "proposal_id": f"P{len(proposals) + 1:03d}",
+                "cluster_id": f"HOLISTIC_EX_{idx + 1:03d}",
+                "lever": 5,
+                "scope": "genie_config",
+                "patch_type": "add_example_sql",
+                "change_description": f"Example SQL: {eq[:80]}",
+                "proposed_value": eq,
+                "example_question": eq,
+                "example_sql": es,
+                "parameters": ex.get("parameters", []),
+                "usage_guidance": ex.get("usage_guidance", ""),
+                "rationale": rationale,
+                "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                "confidence": 0.75,
+                "questions_fixed": 1,
+                "questions_at_risk": 0,
+                "net_impact": 0.75,
+                "asi": {
+                    "failure_type": "asset_routing_error",
+                    "blame_set": [],
+                    "severity": "major",
+                    "counterfactual_fixes": [],
+                    "ambiguity_detected": False,
+                },
+            })
+
+        proposals = _validate_lever5_proposals(proposals, metadata_snapshot)
+        _pre_dedup_p = len(proposals)
+        proposals = _deduplicate_proposals(proposals)
+        if len(proposals) < _pre_dedup_p:
+            logger.info(
+                "Proposal dedup: %d -> %d (removed %d duplicates)",
+                _pre_dedup_p, len(proposals), _pre_dedup_p - len(proposals),
+            )
+        proposals.sort(key=lambda p: p["net_impact"], reverse=True)
+        return proposals
+
+    # ── Standard per-cluster path (levers 1-4) ───────────────────────
     _MAX_CLUSTERS_PER_LEVER = 3
     eligible_clusters: list[tuple[dict, int]] = []
     for cluster in clusters:
@@ -1911,10 +2419,7 @@ def generate_metadata_proposals(
         )
         lever = natural_lever
         if target_lever is not None and lever != target_lever:
-            if target_lever == 5 and natural_lever in failed_levers:
-                lever = 5
-            else:
-                continue
+            continue
         eligible_clusters.append((cluster, lever))
 
     eligible_clusters.sort(key=lambda x: len(x[0]["question_ids"]), reverse=True)
@@ -1938,10 +2443,6 @@ def generate_metadata_proposals(
         llm_result = _call_llm_for_proposal(cluster, metadata_snapshot, patch_type, lever)
 
         extra_fields: dict = {}
-        if lever == 5:
-            patch_type, extra_fields = _resolve_lever5_llm_result(
-                llm_result, patch_type, cluster=cluster,
-            )
 
         if lever == 4 and isinstance(llm_result.get("join_spec"), dict):
             valid, reason = validate_join_spec_types(
@@ -2089,7 +2590,9 @@ def generate_metadata_proposals(
             _pre_dedup_p, len(proposals), _pre_dedup_p - len(proposals),
         )
     proposals = _merge_overlapping_instructions(proposals)
+    proposals = _filter_no_op_proposals(proposals, metadata_snapshot)
     proposals.sort(key=lambda p: p["net_impact"], reverse=True)
+
     return proposals
 
 

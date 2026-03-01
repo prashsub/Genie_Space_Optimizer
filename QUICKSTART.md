@@ -78,11 +78,19 @@ variables:
 
 ## 4. Deploy to Databricks
 
-Build and deploy the app, database, and jobs:
+The recommended deployment method uses `make deploy`, which orchestrates the full pipeline:
 
 ```bash
-databricks bundle deploy -p <your-profile>
+make deploy PROFILE=<your-profile>
 ```
+
+This runs four steps automatically:
+1. **clean-wheels** -- Removes stale `.whl` files from the workspace to prevent cache issues
+2. **bundle deploy** -- Builds the wheel via `apx build`, removes `.build/.gitignore`, syncs files to workspace
+3. **apps deploy** -- Creates a new deployment snapshot and restarts the app with the synced code
+4. **verify** -- Confirms the new wheel is present on the workspace
+
+Both `databricks bundle deploy` (file sync) and `databricks apps deploy` (snapshot + restart) are required. The bundle deploy syncs files but does not restart the app; the apps deploy creates an immutable snapshot from the synced files and restarts.
 
 This provisions:
 - A **Databricks App** at `https://<workspace>/apps/genie-space-optimizer`
@@ -140,11 +148,13 @@ Click **Optimize** to kick off the pipeline. This submits a multi-task Databrick
 |-------|----------|-------------|
 | Preflight | ~1 min | Validates config, collects UC metadata |
 | Baseline Eval | ~5-15 min | Generates 20 benchmark questions, runs through Genie, scores with 9 LLM judges |
-| Lever Loop | ~10-30 min | Iterates through 6 optimization levers (up to 5 iterations each) |
+| Lever Loop | ~10-30 min | Stage 2.5 prompt matching, arbiter benchmark corrections, then 5 levers with tiered failure analysis |
 | Finalize | ~5-10 min | Repeatability testing, final scoring, report generation |
 | Deploy | ~1 min | (Optional) Deploys optimized config to version control |
 
 **Total time: 20-60 minutes** depending on space complexity and number of tables.
+
+The lever loop now uses **tiered failure analysis**: hard failures (arbiter says `ground_truth_correct` or `neither_correct`) drive targeted fixes, while soft signals (individual judge failures on otherwise-correct questions) inform best-practice guidance in Lever 5 instructions. Lever 4 (Join Specifications) always runs its discovery path to document implicit joins. Lever 5 generates a holistic instruction rewrite considering all evaluation learnings.
 
 ### Step 4: Monitor Progress
 
@@ -320,6 +330,24 @@ The backend automatically detects stale AWS STS credentials and recreates the Sp
 ### Delta "SCHEMA_CHANGE_SINCE_ANALYSIS" errors
 
 The Delta state tables may be dropped and recreated by upstream pipeline tasks. The `read_table` helper automatically retries with `REFRESH TABLE` on schema change errors. If persistent, check that concurrent optimization runs aren't conflicting.
+
+### Stale wheel after deployment (optimization runs old code)
+
+The `apx build` step generates a `.build/.gitignore` with `*` that blocks wheel sync. The `make deploy` pipeline handles this by removing the `.gitignore`, running `databricks bundle deploy` (file sync), and then `databricks apps deploy` (snapshot + restart). Always use `make deploy` to avoid stale wheels:
+
+```bash
+# Full redeploy (clean + bundle deploy + app deploy + verify)
+make deploy PROFILE=<your-profile>
+
+# Or just verify the current state
+make verify PROFILE=<your-profile>
+```
+
+The app logs the resolved wheel at startup (`App wheel: genie_space_optimizer-x.y.z.whl (size=... bytes)`). Check app logs to confirm the correct wheel is loaded:
+
+```bash
+databricks apps logs genie-space-optimizer -p <your-profile>
+```
 
 ### Score didn't improve
 

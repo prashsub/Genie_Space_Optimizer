@@ -297,15 +297,17 @@ def validate_question_sql_alignment(
 
         try:
             from databricks.sdk import WorkspaceClient
+            from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
             w = WorkspaceClient()
             response = w.serving_endpoints.query(
                 name=LLM_ENDPOINT,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
                 temperature=0.0,
                 max_tokens=4096,
             )
-            raw = response.choices[0].message.content.strip()
+            choices = response.choices or []
+            raw = (choices[0].message.content or "").strip() if choices and choices[0].message else ""
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             checks = json.loads(raw)

@@ -16,10 +16,11 @@ variables:
 sync:
   include:
     - .build
+    - .build/**
 
 artifacts:
   default:
-    build: apx build && uv run python resources/grant_app_uc_permissions.py --profile ${var.deploy_profile} --app-name ${var.app_name} --catalog ${var.catalog} --schema ${var.gold_schema}
+    build: apx build && rm -f .build/.gitignore && uv run python resources/grant_app_uc_permissions.py --profile ${var.deploy_profile} --app-name ${var.app_name} --catalog ${var.catalog} --schema ${var.gold_schema}
 
 resources:
   apps:

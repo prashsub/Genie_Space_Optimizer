@@ -29,20 +29,25 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 
 1. **Configuration Analysis** -- Scans the Genie Space config, counts tables/instructions/sample questions, and validates structure.
 2. **Metadata Collection** -- Queries Unity Catalog via REST API (with Spark SQL fallback) for columns, data types, tags, routines, and table descriptions.
-3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges.
-4. **Configuration Generation (Lever Loop)** -- Iterates through 6 optimization levers (up to 5 iterations), applying targeted patches. Each patch is evaluated; regressions trigger automatic rollback.
+3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges. The arbiter judge identifies `genie_correct` verdicts for benchmark correction and tiered soft signals for best-practice guidance.
+4. **Configuration Generation (Lever Loop)** -- Stage 2.5 applies deterministic prompt matching (format assistance + entity matching). Arbiter benchmark corrections rewrite stale gold SQL. Then iterates through 5 optimization levers (up to 5 iterations), applying targeted patches with tiered failure analysis (hard failures + soft signals). Each patch is evaluated via a 3-gate system (slice, P0, full); regressions trigger automatic rollback.
 5. **Optimized Evaluation & Repeatability** -- Final evaluation of the optimized config, including repeatability testing to ensure consistent results.
 
-### 6 Optimization Levers
+### Optimization Levers
+
+Before the main lever loop, **Stage 2.5 (Prompt Matching Auto-Config)** runs deterministically -- applying format assistance (`get_example_values`) and entity matching (`build_value_dictionary`) on prioritized columns. No LLM is involved.
+
+The **5-lever loop** then iterates up to 5 times:
 
 | Lever | Name | What It Optimizes |
 |-------|------|-------------------|
 | 1 | Tables & Columns | Descriptions, visibility, column aliases |
 | 2 | Metric Views | Measures, dimensions, MV YAML definitions |
 | 3 | Table-Valued Functions | Parameters, TVF SQL, function signatures |
-| 4 | Join Specifications | Table relationships, join columns, cardinality |
-| 5 | Column Discovery | Example values, value dictionaries, synonyms |
-| 6 | Genie Instructions | Routing rules, disambiguation, default behaviors |
+| 4 | Join Specifications | Table relationships, join columns, cardinality (always runs discovery) |
+| 5 | Genie Instructions | Holistic instruction rewrite (routing, disambiguation, best practices) |
+
+Lever 4 always runs its join discovery path, even without explicit join failures, to document implicit joins from successful Genie queries. Lever 5 generates a single cohesive instruction document considering the space's purpose, all evaluation learnings, and prior lever tweaks.
 
 ### 7 Quality Dimensions (9 Scorers)
 
@@ -81,6 +86,7 @@ Plus **Response Quality** (LLM analysis accuracy), **Repeatability** (variance d
 Genie_Space_Optimizer/
 ├── pyproject.toml                    # Python project config & apx metadata
 ├── databricks.yml                    # Databricks Asset Bundle definition
+├── Makefile                          # Deployment helpers (build → clean → deploy → verify)
 ├── app.yml                           # Databricks App entry point (uvicorn)
 ├── resources/
 │   └── grant_app_uc_permissions.py   # Script to grant app SP access to UC schemas
@@ -278,8 +284,23 @@ apx build            # Create production build
 
 ### Deploy to Databricks
 
+The recommended deployment method uses `make deploy`, which orchestrates the full pipeline:
+
 ```bash
-databricks bundle deploy -p <your-profile>
+make deploy PROFILE=<your-profile>
+```
+
+This runs four steps:
+1. **clean-wheels** -- Removes stale `.whl` files from the workspace
+2. **bundle deploy** -- Builds the wheel, removes `.build/.gitignore`, syncs files to workspace
+3. **apps deploy** -- Creates a new deployment snapshot and restarts the app
+4. **verify** -- Confirms the wheel is present on the workspace
+
+You can also run individual targets:
+
+```bash
+make clean-wheels PROFILE=<your-profile>   # Remove stale wheels
+make verify PROFILE=<your-profile>         # Confirm wheel on workspace
 ```
 
 ---
