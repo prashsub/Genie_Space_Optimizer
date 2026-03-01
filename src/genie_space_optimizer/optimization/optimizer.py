@@ -175,6 +175,8 @@ _SQL_WHERE = re.compile(r"\bWHERE\b", re.I)
 _SQL_GROUP = re.compile(r"\bGROUP\s+BY\b", re.I)
 _SQL_MEASURE = re.compile(r"\bMEASURE\s*\(", re.I)
 _SQL_TVF = re.compile(r"\b(\w+)\s*\((?:[^)]*,){2,}", re.I)
+_SQL_AGG = re.compile(r"\b(SUM|AVG|COUNT|MIN|MAX|STDDEV|VARIANCE)\s*\(", re.I)
+_SQL_SELECT_STAR = re.compile(r"\bSELECT\s+\*\b", re.I)
 
 
 def _extract_sql_tables(sql: str) -> set[str]:
@@ -224,21 +226,28 @@ def _classify_sql_diff(ctx: dict) -> str:
 
     exp_tables = _extract_sql_tables(expected_sql)
     gen_tables = _extract_sql_tables(generated_sql)
-    if exp_tables and gen_tables and exp_tables != gen_tables:
-        missing = exp_tables - gen_tables
-        extra = gen_tables - exp_tables
-        if missing or extra:
-            return "wrong_table"
 
-    exp_has_join = bool(re.search(r"\bJOIN\b", exp_lower))
-    gen_has_join = bool(re.search(r"\bJOIN\b", gen_lower))
-    if exp_has_join != gen_has_join:
-        return "wrong_join"
+    exp_aggs = set(_SQL_AGG.findall(exp_lower))
+    gen_aggs = set(_SQL_AGG.findall(gen_lower))
+    if exp_aggs and not gen_aggs:
+        return "missing_aggregation"
+    if exp_aggs != gen_aggs and exp_aggs and gen_aggs:
+        return "wrong_aggregation"
 
     exp_has_where = bool(_SQL_WHERE.search(exp_lower))
     gen_has_where = bool(_SQL_WHERE.search(gen_lower))
     if exp_has_where and not gen_has_where:
         return "missing_filter"
+
+    exp_has_join = bool(re.search(r"\bJOIN\b", exp_lower))
+    gen_has_join = bool(re.search(r"\bJOIN\b", gen_lower))
+    if exp_has_join and not gen_has_join:
+        return "wrong_join"
+
+    gen_has_star = bool(_SQL_SELECT_STAR.search(gen_lower))
+    exp_has_star = bool(_SQL_SELECT_STAR.search(exp_lower))
+    if gen_has_star and not exp_has_star:
+        return "select_star"
 
     exp_has_tvf = bool(_SQL_TVF.search(exp_lower))
     gen_has_tvf = bool(_SQL_TVF.search(gen_lower))
@@ -254,6 +263,13 @@ def _classify_sql_diff(ctx: dict) -> str:
     gen_has_group = bool(_SQL_GROUP.search(gen_lower))
     if exp_has_group != gen_has_group:
         return "wrong_aggregation"
+
+    if exp_tables and gen_tables and exp_tables != gen_tables:
+        missing_tables = exp_tables - gen_tables
+        if missing_tables and exp_has_join and not gen_has_join:
+            return "wrong_join"
+        if missing_tables or (gen_tables - exp_tables):
+            return "wrong_table"
 
     if exp_tables == gen_tables and exp_tables:
         return "wrong_column"
@@ -398,45 +414,85 @@ def cluster_failures(eval_results: dict, metadata_snapshot: dict) -> list[dict]:
                     }
                 )
 
-    pattern_groups: dict[tuple, list] = defaultdict(list)
+    question_profiles: dict[str, dict] = {}
     for f in failures:
+        qid = f["question_id"]
+        if qid not in question_profiles:
+            question_profiles[qid] = {
+                "judges": set(),
+                "root_causes": [],
+                "blame_sets": [],
+                "counterfactual_fixes": [],
+                "wrong_clauses": [],
+                "sql_context": f.get("sql_context", {}),
+                "failures": [],
+            }
+        profile = question_profiles[qid]
+        profile["judges"].add(f["judge"])
+        profile["failures"].append(f)
+
         if f.get("asi_failure_type"):
-            blame = str(f.get("asi_blame_set", "")) if f.get("asi_blame_set") else ""
-            key = (f["judge"], f["asi_failure_type"], blame)
+            root = f["asi_failure_type"]
         else:
             pattern = _extract_pattern(f["rationale"])
-            if pattern == "other":
-                pattern = _classify_sql_diff(f.get("sql_context", {}))
-            key = (f["judge"], pattern, "")
-        pattern_groups[key].append(f)
+            root = pattern if pattern != "other" else _classify_sql_diff(f.get("sql_context", {}))
+        profile["root_causes"].append(root)
+
+        if f.get("asi_blame_set"):
+            blame_str = str(f["asi_blame_set"])
+            if blame_str not in profile["blame_sets"]:
+                profile["blame_sets"].append(blame_str)
+        if f.get("asi_counterfactual_fix"):
+            profile["counterfactual_fixes"].append(f["asi_counterfactual_fix"])
+        if f.get("asi_wrong_clause"):
+            profile["wrong_clauses"].append(f["asi_wrong_clause"])
+
+    for qid, profile in question_profiles.items():
+        cause_counts = Counter(profile["root_causes"])
+        profile["dominant_root_cause"] = cause_counts.most_common(1)[0][0] if cause_counts else "other"
+
+    cluster_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for qid, profile in question_profiles.items():
+        blame_key = "|".join(sorted(profile["blame_sets"])) if profile["blame_sets"] else ""
+        group_key = (profile["dominant_root_cause"], blame_key)
+        cluster_groups[group_key].append(qid)
 
     clusters: list[dict] = []
-    for group_key, items in pattern_groups.items():
-        judge, pattern, blame = group_key[0], group_key[1], group_key[2] if len(group_key) > 2 else ""
-        sample_asi_type = next(
-            (i["asi_failure_type"] for i in items if i.get("asi_failure_type")), None
-        )
-        sql_contexts = [i["sql_context"] for i in items if i.get("sql_context")]
+    for (root_cause, blame_str), qids in cluster_groups.items():
+        all_judges: set[str] = set()
+        all_counterfactuals: list[str] = []
+        all_wrong_clauses: list[str] = []
+        sql_contexts: list[dict] = []
+        sample_asi_type: str | None = None
+
+        for qid in qids:
+            profile = question_profiles[qid]
+            all_judges.update(profile["judges"])
+            all_counterfactuals.extend(profile["counterfactual_fixes"])
+            all_wrong_clauses.extend(profile["wrong_clauses"])
+            if profile["sql_context"]:
+                sql_contexts.append(profile["sql_context"])
+            if not sample_asi_type:
+                for f in profile["failures"]:
+                    if f.get("asi_failure_type"):
+                        sample_asi_type = f["asi_failure_type"]
+                        break
+
+        unique_qids = sorted(set(qids))
         entry = {
             "cluster_id": f"C{len(clusters) + 1:03d}",
-            "root_cause": pattern,
-            "question_ids": [i["question_id"] for i in items],
-            "affected_judge": judge,
-            "confidence": min(0.9, 0.5 + 0.1 * len(items)),
+            "root_cause": root_cause,
+            "question_ids": unique_qids,
+            "affected_judges": sorted(all_judges),
+            "affected_judge": sorted(all_judges)[0] if all_judges else "unknown",
+            "confidence": min(0.9, 0.5 + 0.1 * len(unique_qids)),
             "asi_failure_type": sample_asi_type,
-            "asi_blame_set": blame or None,
-            "asi_wrong_clause": next(
-                (i["asi_wrong_clause"] for i in items if i.get("asi_wrong_clause")), None
-            ),
-            "asi_counterfactual_fixes": [
-                i["asi_counterfactual_fix"]
-                for i in items
-                if i.get("asi_counterfactual_fix")
-            ],
+            "asi_blame_set": blame_str or None,
+            "asi_wrong_clause": next((wc for wc in all_wrong_clauses if wc), None),
+            "asi_counterfactual_fixes": list(dict.fromkeys(cf for cf in all_counterfactuals if cf)),
             "sql_contexts": sql_contexts[:5],
         }
-        if len(items) >= 1:
-            clusters.append(entry)
+        clusters.append(entry)
 
     clusters.sort(key=lambda c: len(c["question_ids"]), reverse=True)
     return clusters
@@ -1041,11 +1097,22 @@ def _format_existing_example_sqls(metadata_snapshot: dict) -> str:
     return "\n".join(lines) if lines else "(none)"
 
 
+_SQL_PATTERN_ROOT_CAUSES = frozenset({
+    "wrong_table", "wrong_join", "missing_filter", "missing_aggregation",
+    "wrong_aggregation", "wrong_measure", "select_star", "tvf_parameter_error",
+})
+
+
 def _resolve_lever5_llm_result(
-    llm_result: dict, original_patch_type: str
+    llm_result: dict, original_patch_type: str, cluster: dict | None = None,
 ) -> tuple[str, dict]:
     """Interpret the instruction_type returned by the Lever 6 LLM and resolve
     the actual patch_type and extra fields to merge into the proposal.
+
+    When the cluster's root_cause is a clear SQL-pattern issue (e.g.
+    ``wrong_join``, ``missing_filter``) and the cluster has SQL context with
+    a valid expected SQL, force ``add_example_sql`` to provide a concrete
+    pattern rather than a verbose text instruction.
 
     Returns ``(resolved_patch_type, extra_fields)``.
     """
@@ -1067,6 +1134,26 @@ def _resolve_lever5_llm_result(
             llm_result.get("target_column", ""),
         )
         return original_patch_type, {}
+
+    if cluster and cluster.get("root_cause") in _SQL_PATTERN_ROOT_CAUSES:
+        sql_ctxs = cluster.get("sql_contexts", [])
+        representative = next(
+            (sc for sc in sql_ctxs if sc.get("expected_sql") and sc.get("question")),
+            None,
+        )
+        if representative:
+            logger.info(
+                "Forcing add_example_sql for SQL-pattern root cause '%s' "
+                "(LLM returned text_instruction)",
+                cluster["root_cause"],
+            )
+            return "add_example_sql", {
+                "example_question": representative["question"],
+                "example_sql": representative["expected_sql"],
+                "parameters": [],
+                "usage_guidance": llm_result.get("rationale", ""),
+                "forced_from_sql_pattern": True,
+            }
 
     if original_patch_type == "add_example_sql":
         logger.warning(
@@ -1643,23 +1730,144 @@ def _validate_lever5_proposals(
     return valid
 
 
+def _ngram_similarity(a: str, b: str, n: int = 3) -> float:
+    """Compute Jaccard similarity over character n-grams."""
+    if not a or not b:
+        return 0.0
+    a_lower, b_lower = a.lower(), b.lower()
+    a_ngrams = {a_lower[i : i + n] for i in range(len(a_lower) - n + 1)}
+    b_ngrams = {b_lower[i : i + n] for i in range(len(b_lower) - n + 1)}
+    if not a_ngrams or not b_ngrams:
+        return 0.0
+    return len(a_ngrams & b_ngrams) / len(a_ngrams | b_ngrams)
+
+
 def _deduplicate_proposals(proposals: list[dict]) -> list[dict]:
-    """Remove proposals with identical proposed_value, keeping highest net_impact."""
-    seen: dict[tuple, int] = {}
+    """Remove duplicate proposals using type-aware deduplication.
+
+    - ``update_column_description`` / ``add_column_synonym``: dedup by (table, column).
+    - ``add_instruction``: merge near-duplicates (ngram similarity > 0.7).
+    - ``add_example_sql``: dedup by normalized SQL text.
+    - Others: dedup by exact (patch_type, proposed_value).
+    """
     out: list[dict] = []
+
+    col_desc_best: dict[tuple[str, str], int] = {}
+    instruction_entries: list[tuple[int, dict]] = []
+    example_sql_seen: dict[str, int] = {}
+    exact_seen: dict[tuple[str, str], int] = {}
+
     for p in proposals:
-        val = (p.get("proposed_value") or "").strip()
         ptype = p.get("patch_type", "")
-        if ptype in ("add_example_sql", "add_instruction") and val:
-            key = (ptype, val)
-            if key in seen:
-                existing_idx = seen[key]
-                if p.get("net_impact", 0) > out[existing_idx].get("net_impact", 0):
+        val = (p.get("proposed_value") or "").strip()
+        impact = p.get("net_impact", 0)
+
+        if ptype in ("update_column_description", "add_column_synonym"):
+            tbl = p.get("table", p.get("target_table", ""))
+            col = p.get("column", p.get("target_column", ""))
+            key = (tbl, col)
+            if key in col_desc_best:
+                existing_idx = col_desc_best[key]
+                if impact > out[existing_idx].get("net_impact", 0):
                     out[existing_idx] = p
                 continue
-            seen[key] = len(out)
-        out.append(p)
+            col_desc_best[key] = len(out)
+            out.append(p)
+
+        elif ptype == "add_instruction" and val:
+            merged = False
+            for existing_idx, existing_p in instruction_entries:
+                existing_val = (existing_p.get("proposed_value") or "").strip()
+                if _ngram_similarity(val, existing_val) > 0.7:
+                    if impact > out[existing_idx].get("net_impact", 0):
+                        out[existing_idx] = p
+                        instruction_entries = [
+                            (ei, ep) if ei != existing_idx else (ei, p)
+                            for ei, ep in instruction_entries
+                        ]
+                    merged = True
+                    break
+            if not merged:
+                instruction_entries.append((len(out), p))
+                out.append(p)
+
+        elif ptype == "add_example_sql" and val:
+            normalized = re.sub(r"\s+", " ", val.lower()).strip()
+            if normalized in example_sql_seen:
+                existing_idx = example_sql_seen[normalized]
+                if impact > out[existing_idx].get("net_impact", 0):
+                    out[existing_idx] = p
+                continue
+            example_sql_seen[normalized] = len(out)
+            out.append(p)
+
+        else:
+            key = (ptype, val)
+            if key in exact_seen:
+                existing_idx = exact_seen[key]
+                if impact > out[existing_idx].get("net_impact", 0):
+                    out[existing_idx] = p
+                continue
+            exact_seen[key] = len(out)
+            out.append(p)
+
     return out
+
+
+def _merge_overlapping_instructions(proposals: list[dict]) -> list[dict]:
+    """Merge ``add_instruction`` proposals that share >70% keyword overlap.
+
+    Keeps all non-instruction proposals intact. For instructions, groups those
+    with high overlap and concatenates into a single combined instruction.
+    """
+    instructions: list[dict] = []
+    others: list[dict] = []
+    for p in proposals:
+        if p.get("patch_type") == "add_instruction":
+            instructions.append(p)
+        else:
+            others.append(p)
+
+    if len(instructions) <= 1:
+        return proposals
+
+    def _keywords(text: str) -> set[str]:
+        return {w.lower() for w in re.findall(r"\b\w{3,}\b", text)}
+
+    merged: list[dict] = []
+    used: set[int] = set()
+
+    for i, p1 in enumerate(instructions):
+        if i in used:
+            continue
+        group = [p1]
+        kw1 = _keywords(p1.get("proposed_value", ""))
+        for j, p2 in enumerate(instructions):
+            if j <= i or j in used:
+                continue
+            kw2 = _keywords(p2.get("proposed_value", ""))
+            if kw1 and kw2:
+                overlap = len(kw1 & kw2) / len(kw1 | kw2)
+                if overlap > 0.7:
+                    group.append(p2)
+                    used.add(j)
+        used.add(i)
+
+        if len(group) == 1:
+            merged.append(group[0])
+        else:
+            best = max(group, key=lambda g: g.get("net_impact", 0))
+            total_questions = sum(g.get("questions_fixed", 0) for g in group)
+            best = dict(best)
+            best["questions_fixed"] = total_questions
+            best["merged_count"] = len(group)
+            merged.append(best)
+            logger.info(
+                "Merged %d overlapping instructions into one (kept best net_impact=%.2f)",
+                len(group), best.get("net_impact", 0),
+            )
+
+    return others + merged
 
 
 def generate_metadata_proposals(
@@ -1691,6 +1899,9 @@ def generate_metadata_proposals(
     if target_lever == 5:
         desc_proposals = _detect_instruction_content_in_description(metadata_snapshot)
         proposals.extend(desc_proposals)
+
+    _MAX_CLUSTERS_PER_LEVER = 3
+    eligible_clusters: list[tuple[dict, int]] = []
     for cluster in clusters:
         natural_lever = _map_to_lever(
             cluster["root_cause"],
@@ -1704,6 +1915,17 @@ def generate_metadata_proposals(
                 lever = 5
             else:
                 continue
+        eligible_clusters.append((cluster, lever))
+
+    eligible_clusters.sort(key=lambda x: len(x[0]["question_ids"]), reverse=True)
+    if len(eligible_clusters) > _MAX_CLUSTERS_PER_LEVER:
+        logger.info(
+            "Capping clusters for lever %s: %d -> %d (keeping top by question count)",
+            target_lever, len(eligible_clusters), _MAX_CLUSTERS_PER_LEVER,
+        )
+        eligible_clusters = eligible_clusters[:_MAX_CLUSTERS_PER_LEVER]
+
+    for cluster, lever in eligible_clusters:
 
         failure_type = cluster.get("asi_failure_type") or cluster.get("root_cause", "other")
         patch_type = _LEVER_TO_PATCH_TYPE.get(
@@ -1718,7 +1940,7 @@ def generate_metadata_proposals(
         extra_fields: dict = {}
         if lever == 5:
             patch_type, extra_fields = _resolve_lever5_llm_result(
-                llm_result, patch_type
+                llm_result, patch_type, cluster=cluster,
             )
 
         if lever == 4 and isinstance(llm_result.get("join_spec"), dict):
@@ -1866,6 +2088,7 @@ def generate_metadata_proposals(
             "Proposal dedup: %d -> %d (removed %d duplicates)",
             _pre_dedup_p, len(proposals), _pre_dedup_p - len(proposals),
         )
+    proposals = _merge_overlapping_instructions(proposals)
     proposals.sort(key=lambda p: p["net_impact"], reverse=True)
     return proposals
 

@@ -91,32 +91,22 @@
 
 import json
 import traceback
-from datetime import datetime, timezone
+from functools import partial
 from typing import Any, cast
 
 from databricks.sdk import WorkspaceClient
 from pyspark.sql import SparkSession
 
+from genie_space_optimizer.jobs._helpers import _banner as _banner_base
+from genie_space_optimizer.jobs._helpers import _log as _log_base
 from genie_space_optimizer.optimization.harness import _run_preflight
 from genie_space_optimizer.optimization.state import ensure_optimization_tables
 
 dbutils = cast(Any, globals().get("dbutils"))
 
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def _banner(title: str) -> None:
-    print("\n" + "=" * 120)
-    print(f"[{_ts()}] [TASK-1 PREFLIGHT] {title}")
-    print("=" * 120)
-
-
-def _log(event: str, **payload) -> None:
-    print(f"[{_ts()}] [TASK-1 PREFLIGHT] {event}")
-    if payload:
-        print(json.dumps(payload, indent=2, default=str))
+_TASK_LABEL = "TASK-1 PREFLIGHT"
+_banner = partial(_banner_base, _TASK_LABEL)
+_log = partial(_log_base, _TASK_LABEL)
 
 # COMMAND ----------
 

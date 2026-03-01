@@ -441,15 +441,26 @@ def run_preflight(
         experiment_name = _resolve_experiment_path(run_data=run_data, domain=domain, ws=w)
     elif _has_non_email_user_home(experiment_name):
         experiment_name = _resolve_experiment_path(run_data=run_data, domain=domain, ws=w)
-    if not _ensure_experiment_parent_dir(w, experiment_name):
+    def _try_set_experiment(path: str) -> bool:
+        """Attempt to set an MLflow experiment, returning True on success."""
+        _ensure_experiment_parent_dir(w, path)
+        try:
+            mlflow.set_experiment(path)
+            return True
+        except Exception as exc:
+            logger.warning("mlflow.set_experiment(%s) failed: %s", path, exc)
+            return False
+
+    if not _try_set_experiment(experiment_name):
         shared_fallback = f"/Shared/genie-optimization/{domain}"
         logger.warning(
-            "Cannot create parent dir for %s — falling back to %s",
-            experiment_name, shared_fallback,
+            "Falling back to %s for experiment", shared_fallback,
         )
-        _ensure_experiment_parent_dir(w, shared_fallback)
+        if not _try_set_experiment(shared_fallback):
+            raise RuntimeError(
+                f"Cannot create MLflow experiment at {experiment_name} or {shared_fallback}"
+            )
         experiment_name = shared_fallback
-    mlflow.set_experiment(experiment_name)
     exp = mlflow.get_experiment_by_name(experiment_name)
     experiment_id = exp.experiment_id if exp else ""
     logger.info("Experiment: %s (id=%s)", experiment_name, experiment_id)

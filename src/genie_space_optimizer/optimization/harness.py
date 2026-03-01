@@ -1,13 +1,18 @@
 """
 Optimization Harness — stage functions for the 5-task Databricks Job.
 
-Each ``_run_*`` function is callable independently from a job notebook.
-The ``optimize_genie_space()`` convenience function runs all 5 stages
-in a single process for notebook/test use.
+The canonical execution path is the **5-task DAG** launched via
+``submit_optimization()`` in ``job_launcher.py``.  Each DAG notebook is a
+thin wrapper that deserializes task values, calls a single harness function,
+and publishes outputs.
 
-Architecture: ``preflight`` → ``baseline_eval`` → ``lever_loop`` →
-``finalize`` → ``deploy``.  Inter-task data flows via
-``dbutils.jobs.taskValues``. Detailed state goes to Delta.
+Each ``_run_*`` / ``_prepare_*`` function encapsulates all business logic
+for its stage so that both the DAG notebooks and the ``optimize_genie_space()``
+convenience function (used for dev/test only) share identical code paths.
+
+Architecture: ``preflight`` → ``baseline_eval`` → ``prepare_lever_loop`` +
+``lever_loop`` → ``finalize`` → ``deploy``.  Inter-task data flows via
+``dbutils.jobs.taskValues``.  Detailed state goes to Delta.
 """
 
 from __future__ import annotations
@@ -76,6 +81,7 @@ from genie_space_optimizer.optimization.state import (
     create_run,
     ensure_optimization_tables,
     load_latest_full_iteration,
+    load_run,
     load_stages,
     mark_patches_rolled_back,
     update_run_status,
@@ -435,6 +441,165 @@ def _run_prompt_matching_setup(
         return {"format_assistance_count": 0, "entity_matching_count": 0, "total_changes": 0}
 
 
+# ── Stage 2.5b: PREPARE LEVER LOOP ──────────────────────────────────
+
+
+def _prepare_lever_loop(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    catalog: str,
+    schema: str,
+) -> dict:
+    """Load Genie Space config, enrich UC metadata, run Stage 2.5 prompt matching.
+
+    Consolidates all config preparation needed before the lever loop into a
+    single function used by both the DAG notebook and the convenience wrapper.
+
+    Steps:
+      1. Load config from Delta snapshot (API fetch fallback).
+      2. Fetch UC column metadata via REST API (for prompt matching + type
+         enrichment in the lever loop).
+      3. Print detailed inventory diagnostic (tables, cols, FA/VD stats).
+      4. Run Stage 2.5 prompt matching auto-config (if enabled).
+      5. If changes applied: entity-matching-aware propagation wait + diagnostic.
+      6. Post-wait config refresh from API.
+      7. If no changes or prompt matching disabled: skip wait entirely.
+
+    Non-fatal: exceptions in UC fetch or prompt matching are logged and
+    swallowed so the lever loop can still proceed.
+
+    Returns the fully prepared config dict with ``_uc_columns`` populated.
+    """
+    from genie_space_optimizer.common.genie_client import fetch_space_config
+    from genie_space_optimizer.common.uc_metadata import (
+        extract_genie_space_table_refs,
+        get_columns_for_tables_rest,
+    )
+
+    # ── 1. Load config from Delta snapshot (API fetch fallback) ──────
+    run_data = load_run(spark, run_id, catalog, schema) or {}
+    snapshot = run_data.get("config_snapshot", {})
+    config: dict
+    if isinstance(snapshot, dict) and snapshot:
+        config = snapshot
+        logger.info("Lever loop: using config snapshot from run row for %s", run_id)
+    else:
+        logger.warning(
+            "No config snapshot found in run row for %s — fetching from API.",
+            run_id,
+        )
+        config = fetch_space_config(w, space_id)
+        logger.info("Lever loop: fetched config for space %s", space_id)
+
+    logger.info(
+        "Lever loop config loaded: keys=%s",
+        sorted(list(config.keys()))[:20] if isinstance(config, dict) else [],
+    )
+
+    # ── 2. Fetch UC column metadata via REST API ─────────────────────
+    table_refs: list = []
+    try:
+        table_refs = extract_genie_space_table_refs(config)
+        uc_columns = get_columns_for_tables_rest(w, table_refs) if table_refs else []
+        config["_uc_columns"] = uc_columns
+        logger.info(
+            "Lever loop: fetched %d UC columns across %d tables",
+            len(uc_columns), len(table_refs),
+        )
+    except Exception as exc:
+        logger.warning(
+            "UC column metadata fetch failed for %s (non-fatal): %s",
+            run_id, exc,
+        )
+        uc_columns = config.get("_uc_columns", [])
+
+    # ── 3. Print detailed inventory diagnostic ───────────────────────
+    _parsed = config.get("_parsed_space", {})
+    _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
+    _tables = _ds.get("tables", []) + _ds.get("metric_views", [])
+    _total_cols = sum(len(t.get("column_configs", [])) for t in _tables)
+    _visible_cols = sum(
+        1 for t in _tables for c in t.get("column_configs", [])
+        if not c.get("hidden")
+    )
+    _hidden_cols = _total_cols - _visible_cols
+    _string_cols = sum(
+        1 for c in uc_columns
+        if str(c.get("data_type", "")).upper() == "STRING"
+    )
+    _fa_existing = sum(
+        1 for t in _tables for c in t.get("column_configs", [])
+        if c.get("enable_format_assistance")
+    )
+    _vd_existing = sum(
+        1 for t in _tables for c in t.get("column_configs", [])
+        if c.get("enable_entity_matching")
+    )
+    print(
+        f"\n{'=' * 62}\n"
+        f"  PREPARE LEVER LOOP — GENIE SPACE INVENTORY\n"
+        f"{'=' * 62}\n"
+        f"\n-- GENIE SPACE INVENTORY " + "-" * 27 + "\n"
+        f"  Tables: {len(_tables)}"
+        f" ({', '.join(t.get('name', t.get('identifier', '?')) for t in _tables[:10])})\n"
+        f"  Total columns: {_total_cols}"
+        f" (visible: {_visible_cols}, hidden: {_hidden_cols})\n"
+        f"  UC column metadata: {len(uc_columns)} columns"
+        f" fetched across {len(table_refs)} tables\n"
+        f"  STRING columns eligible for entity matching: {_string_cols}\n"
+        f"  Columns already with format assistance: {_fa_existing}\n"
+        f"  Columns already with value dictionary: {_vd_existing} of 120 max slots\n"
+        + "-" * 52
+    )
+
+    # ── 4–7. Stage 2.5 prompt matching + propagation wait ────────────
+    if ENABLE_PROMPT_MATCHING_AUTO_APPLY:
+        try:
+            pm_result = _run_prompt_matching_setup(
+                w, spark, run_id, space_id, config, catalog, schema,
+            )
+            logger.info(
+                "Prompt matching complete: FA=%d, EM=%d, total=%d",
+                pm_result.get("format_assistance_count", 0),
+                pm_result.get("entity_matching_count", 0),
+                pm_result.get("total_changes", 0),
+            )
+
+            if pm_result.get("total_changes", 0) > 0:
+                has_entity_matching = pm_result.get("entity_matching_count", 0) > 0
+                wait_time = (
+                    PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS if has_entity_matching
+                    else PROPAGATION_WAIT_SECONDS
+                )
+                print(
+                    f"\n-- PROPAGATION WAIT " + "-" * 32 + "\n"
+                    f"  Changes applied: {pm_result.get('total_changes', 0)}\n"
+                    f"  Entity matching changes:"
+                    f" {pm_result.get('entity_matching_count', 0)}\n"
+                    f"  Wait time: {wait_time}s"
+                    + (
+                        " (extended for value dictionary rebuild)"
+                        if has_entity_matching else ""
+                    )
+                    + "\n" + "-" * 52
+                )
+                time.sleep(wait_time)
+                config = fetch_space_config(w, space_id)
+                config["_uc_columns"] = uc_columns
+                logger.info("Config refreshed after prompt matching propagation wait")
+            else:
+                logger.info("Prompt matching: no changes applied, skipping wait")
+        except Exception as exc:
+            logger.warning(
+                "Stage 2.5 prompt matching failed (non-fatal, continuing): %s: %s",
+                type(exc).__name__, exc,
+            )
+
+    return config
+
+
 # ── Stage 3: LEVER LOOP ─────────────────────────────────────────────
 
 
@@ -720,7 +885,23 @@ def _run_lever_loop(
         cluster_lines.append(_bar("-"))
         print("\n".join(cluster_lines))
 
+        matching_count = _lever_counter.get(lever, 0)
         _failed_lever_set = set(levers_rolled_back)
+        if lever == 5:
+            matching_count += sum(
+                _lever_counter.get(fl, 0) for fl in _failed_lever_set
+            )
+        if matching_count == 0:
+            print(_section(f"No clusters match lever {lever} -- SKIPPING", "-"))
+            logger.info("No clusters match lever %d — skipping", lever)
+            write_stage(
+                spark, run_id, f"LEVER_{lever}_STARTED", "SKIPPED",
+                task_key="lever_loop", lever=lever, iteration=iteration_counter,
+                detail={"reason": "no_matching_clusters"},
+                catalog=catalog, schema=schema,
+            )
+            continue
+
         proposals = generate_metadata_proposals(
             clusters, metadata_snapshot,
             target_lever=lever, apply_mode=apply_mode, w=w,
@@ -812,8 +993,15 @@ def _run_lever_loop(
             mlflow.end_run()
         except Exception:
             pass
+        affected_qids: set[str] = set()
+        for p in proposals:
+            cid = p.get("cluster_id", "")
+            for c in clusters:
+                if c.get("cluster_id") == cid:
+                    affected_qids.update(c.get("question_ids", []))
         slice_benchmarks = filter_benchmarks_by_scope(
             benchmarks, "slice", patched_objects,
+            affected_question_ids=affected_qids,
         )
         if slice_benchmarks:
             _ensure_sql_context(spark, catalog, schema)
@@ -961,6 +1149,16 @@ def _run_lever_loop(
         regressions = detect_regressions(
             full_scores, best_scores, threshold=effective_regression_tol,
         )
+
+        accuracy_drop = best_accuracy - full_accuracy
+        accuracy_threshold = max(effective_regression_tol / 2, noise_floor)
+        if accuracy_drop > accuracy_threshold:
+            regressions.append({
+                "judge": "overall_accuracy",
+                "previous": best_accuracy,
+                "current": full_accuracy,
+                "drop": accuracy_drop,
+            })
 
         if regressions:
             _reg_details = ", ".join(
@@ -1712,12 +1910,10 @@ def optimize_genie_space(
                 convergence_reason="baseline_meets_thresholds",
             )
         else:
-            # Stage 2.5: Prompt Matching Auto-Config
-            if ENABLE_PROMPT_MATCHING_AUTO_APPLY:
-                _run_prompt_matching_setup(
-                    w, spark, run_id_str, space_id, config, catalog, schema,
-                )
-                time.sleep(PROPAGATION_WAIT_SECONDS)
+            # Stage 2.5 + config prep (unified path for DAG and convenience)
+            config = _prepare_lever_loop(
+                w, spark, run_id_str, space_id, catalog, schema,
+            )
 
             # Stage 3: Lever Loop
             loop_out = _run_lever_loop(

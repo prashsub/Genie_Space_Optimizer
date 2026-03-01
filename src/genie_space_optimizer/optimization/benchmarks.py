@@ -75,7 +75,8 @@ def load_benchmarks_from_dataset(
             spark = spark_or_dataset
             for attempt in range(_max_retries):
                 try:
-                    spark.sql(f"REFRESH TABLE {_quote_identifier_fqn(table_name)}")
+                    from genie_space_optimizer.common.delta_helpers import _safe_refresh
+                    _safe_refresh(spark, _quote_identifier_fqn(table_name))
                     df = spark.table(table_name)
                     rows = df.collect()
                     return [r.asDict() for r in rows]
@@ -161,13 +162,18 @@ def validate_ground_truth_sql(
     spark: Any,
     catalog: str = "",
     gold_schema: str = "",
+    *,
+    execute: bool = False,
 ) -> tuple[bool, str]:
     """Validate a single expected SQL via EXPLAIN + table existence checks.
 
-    Two-phase validation:
+    Three-phase validation:
       1. EXPLAIN: catches syntax errors and unresolvable column references.
       2. Table existence: catches hallucinated table/view names that EXPLAIN
          sometimes doesn't catch (e.g. metric views with MEASURE() syntax).
+      3. Execution sanity (optional, ``execute=True``): runs the query with
+         ``LIMIT 1`` to verify it produces at least one row and doesn't fail
+         at runtime on data type mismatches.
 
     Returns ``(is_valid, error_message)``.
     """
@@ -199,6 +205,16 @@ def validate_ground_truth_sql(
         if not exists:
             return False, err
 
+    if execute:
+        try:
+            result = spark.sql(f"SELECT * FROM ({resolved}) _vgt LIMIT 1").collect()
+            if len(result) == 0:
+                return False, (
+                    "EMPTY_RESULT: Query returned 0 rows — likely wrong filter or empty table"
+                )
+        except Exception as exec_err:
+            return False, f"EXECUTION_ERROR: {str(exec_err)[:300]}"
+
     return True, ""
 
 
@@ -228,6 +244,96 @@ def validate_benchmarks(
                 "error": error,
             }
         )
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2b. Question-SQL Alignment Validation (LLM-based)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def validate_question_sql_alignment(
+    benchmarks: list[dict],
+    *,
+    batch_size: int = 10,
+) -> list[dict]:
+    """Check whether each benchmark's GT SQL answers exactly what the question asks.
+
+    Uses a lightweight LLM call to detect misalignment issues such as extra
+    filters, extra columns, missing aggregation, or wrong interpretation.
+
+    Returns a list of ``{question, aligned, issues}`` dicts, one per benchmark.
+    Benchmarks without ``expected_sql`` are marked as aligned (nothing to check).
+    """
+    import json
+
+    from genie_space_optimizer.common.config import (
+        BENCHMARK_ALIGNMENT_CHECK_PROMPT,
+        LLM_ENDPOINT,
+    )
+
+    results: list[dict] = []
+    to_check: list[tuple[int, dict]] = []
+    for i, b in enumerate(benchmarks):
+        sql = b.get("expected_sql", "")
+        if not sql or not sql.strip():
+            results.append({"question": b.get("question", ""), "aligned": True, "issues": []})
+        else:
+            results.append({"question": b.get("question", ""), "aligned": True, "issues": []})
+            to_check.append((i, b))
+
+    if not to_check:
+        return results
+
+    for batch_start in range(0, len(to_check), batch_size):
+        batch = to_check[batch_start : batch_start + batch_size]
+        batch_payload = [
+            {"question": b.get("question", ""), "expected_sql": b.get("expected_sql", "")}
+            for _, b in batch
+        ]
+        prompt = BENCHMARK_ALIGNMENT_CHECK_PROMPT.format(
+            benchmarks_json=json.dumps(batch_payload, indent=2),
+        )
+
+        try:
+            from databricks.sdk import WorkspaceClient
+
+            w = WorkspaceClient()
+            response = w.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            checks = json.loads(raw)
+
+            for j, check in enumerate(checks):
+                if j < len(batch):
+                    idx = batch[j][0]
+                    results[idx]["aligned"] = check.get("aligned", True)
+                    results[idx]["issues"] = check.get("issues", [])
+        except Exception as exc:
+            logger.warning(
+                "Alignment check failed for batch starting at %d: %s",
+                batch_start, exc,
+            )
+
+    misaligned = sum(1 for r in results if not r["aligned"])
+    if misaligned:
+        logger.info(
+            "Alignment check: %d/%d benchmarks flagged as misaligned",
+            misaligned, len(benchmarks),
+        )
+        for r in results:
+            if not r["aligned"]:
+                logger.info(
+                    "  Misaligned: %s — %s",
+                    r["question"][:80], "; ".join(r["issues"]),
+                )
+
     return results
 
 
@@ -329,6 +435,18 @@ def apply_benchmark_corrections(
 
         if not new_sql:
             errors.append(f"Empty new_expected_sql for question: {question[:50]}")
+            skipped += 1
+            continue
+
+        is_valid, val_err = validate_ground_truth_sql(new_sql, spark)
+        if not is_valid:
+            errors.append(
+                f"Correction SQL invalid for '{question[:50]}': {val_err[:200]}"
+            )
+            logger.warning(
+                "Skipping arbiter correction — SQL fails validation: %s — %s",
+                question[:60], val_err[:200],
+            )
             skipped += 1
             continue
 

@@ -17,6 +17,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_REFRESH_SKIP: bool | None = None
+
+
+def _safe_refresh(spark: "SparkSession", table_name: str) -> None:
+    """Best-effort REFRESH TABLE — skipped entirely on serverless/Spark Connect.
+
+    Spark Connect (used by serverless and Databricks Apps) does not support
+    REFRESH TABLE. We detect Connect sessions upfront by checking the session
+    class module path, avoiding a noisy gRPC round-trip on every call.
+    """
+    global _REFRESH_SKIP
+    if _REFRESH_SKIP is None:
+        try:
+            _REFRESH_SKIP = "connect" in type(spark).__module__
+        except Exception:
+            _REFRESH_SKIP = False
+    if _REFRESH_SKIP:
+        return
+    try:
+        spark.sql(f"REFRESH TABLE {table_name}")
+    except Exception:
+        pass
+
 
 def _fqn(catalog: str, schema: str, table: str) -> str:
     """Build a fully-qualified Delta table name."""
@@ -55,10 +78,7 @@ def read_table(
 
     for attempt in range(_max_retries):
         try:
-            try:
-                spark.sql(f"REFRESH TABLE {fqn}")
-            except Exception:
-                pass
+            _safe_refresh(spark, fqn)
             logger.debug("read_table: %s", query)
             return spark.sql(query).toPandas()
         except Exception as exc:
@@ -148,10 +168,7 @@ def run_query(spark: SparkSession, sql: str, _max_retries: int = 3) -> pd.DataFr
                 import time as _time
                 tables = _re.findall(r"FROM\s+([\w.]+)", sql, _re.IGNORECASE)
                 for tbl in tables:
-                    try:
-                        spark.sql(f"REFRESH TABLE {tbl}")
-                    except Exception:
-                        pass
+                    _safe_refresh(spark, tbl)
                 wait = 5 * (attempt + 1)
                 logger.warning(
                     "Delta schema change on attempt %d/%d — refreshing and retrying in %ds",

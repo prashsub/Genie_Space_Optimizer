@@ -27,6 +27,9 @@ _CREDENTIAL_ERROR_MARKERS = (
     "s3:ListBucket",
     "AmazonS3Exception",
     "not authorized to perform",
+    "PERMISSION_DENIED",
+    "UnauthorizedAccessException",
+    "Failed to get credentials",
 )
 
 

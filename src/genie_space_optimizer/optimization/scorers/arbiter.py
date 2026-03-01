@@ -56,6 +56,7 @@ def _make_arbiter_scorer(
 
         Returns value="skipped" when results match (no LLM call).
         """
+        question_id = inputs.get("question_id", "")
         cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
         if cmp.get("match"):
@@ -76,6 +77,7 @@ def _make_arbiter_scorer(
                     value="both_correct",
                     rationale=f"Results match ({cmp.get('match_type', 'unknown')}) — both queries are correct.",
                     extra={"comparison": slim_comparison(cmp)},
+                    question_id=question_id,
                 ),
                 source=CODE_SOURCE,
             )
@@ -103,6 +105,7 @@ def _make_arbiter_scorer(
                             "both are effectively correct (empty result set)."
                         ),
                         extra={"comparison": slim_comparison(cmp)},
+                        question_id=question_id,
                     ),
                     source=CODE_SOURCE,
                 )
@@ -129,6 +132,7 @@ def _make_arbiter_scorer(
                         value="skipped",
                         rationale=f"SQL execution error — cannot arbitrate: {cmp['error']}",
                         extra={"comparison": slim_comparison(cmp)},
+                        question_id=question_id,
                     ),
                     source=CODE_SOURCE,
                 )
@@ -285,6 +289,7 @@ def _make_arbiter_scorer(
                     rationale=result.get("rationale", verdict),
                     metadata=_meta,
                     extra={"llm_response": result, "comparison": slim_comparison(cmp)},
+                    question_id=question_id,
                 ),
                 source=LLM_SOURCE,
                 metadata=_meta,
@@ -315,6 +320,7 @@ def _make_arbiter_scorer(
                     rationale=f"Arbiter LLM call failed, defaulting to ground_truth_correct: {e}",
                     metadata=metadata,
                     extra={"comparison": slim_comparison(cmp)},
+                    question_id=question_id,
                 ),
                 source=LLM_SOURCE,
                 metadata=metadata,

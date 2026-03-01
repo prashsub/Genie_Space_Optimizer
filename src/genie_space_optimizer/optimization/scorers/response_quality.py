@@ -42,6 +42,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
         Skips gracefully (``value="unknown"``) when no analysis text is
         available from Genie.
         """
+        question_id = inputs.get("question_id", "")
         analysis_text = outputs.get("analysis_text") if isinstance(outputs, dict) else None
 
         if not analysis_text:
@@ -52,6 +53,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                     judge_name="response_quality",
                     value="unknown",
                     rationale="No analysis text available from Genie.",
+                    question_id=question_id,
                 ),
                 source=LLM_SOURCE,
             )
@@ -123,6 +125,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                     value="unknown",
                     rationale=f"LLM call failed: {e}",
                     metadata=metadata,
+                    question_id=question_id,
                 ),
                 source=LLM_SOURCE,
                 metadata=metadata,
@@ -151,6 +154,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                     value="yes",
                     rationale=result.get("rationale", "Response is accurate"),
                     extra={"llm_response": result},
+                    question_id=question_id,
                 ),
                 source=LLM_SOURCE,
             )
@@ -170,6 +174,7 @@ def _make_response_quality_judge(w: WorkspaceClient, catalog: str, schema: str):
                 rationale=result.get("rationale", "Response quality issue"),
                 metadata=metadata,
                 extra={"llm_response": result},
+                question_id=question_id,
             ),
             source=LLM_SOURCE,
             metadata=metadata,

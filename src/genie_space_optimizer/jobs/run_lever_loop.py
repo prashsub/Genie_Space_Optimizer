@@ -123,47 +123,26 @@
 # COMMAND ----------
 
 import json
-import time
 import traceback
-from datetime import datetime, timezone
+from functools import partial
 from typing import Any, cast
 
 from databricks.sdk import WorkspaceClient
 from pyspark.sql import SparkSession
 
-from genie_space_optimizer.common.config import (
-    ENABLE_PROMPT_MATCHING_AUTO_APPLY,
-    PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS,
-    PROPAGATION_WAIT_SECONDS,
-)
-from genie_space_optimizer.common.genie_client import fetch_space_config
-from genie_space_optimizer.common.uc_metadata import (
-    extract_genie_space_table_refs,
-    get_columns_for_tables_rest,
-)
+from genie_space_optimizer.jobs._helpers import _banner as _banner_base
+from genie_space_optimizer.jobs._helpers import _log as _log_base
 from genie_space_optimizer.optimization.evaluation import load_benchmarks_from_dataset
 from genie_space_optimizer.optimization.harness import (
+    _prepare_lever_loop,
     _run_lever_loop,
-    _run_prompt_matching_setup,
 )
 
 dbutils = cast(Any, globals().get("dbutils"))
 
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def _banner(title: str) -> None:
-    print("\n" + "=" * 120)
-    print(f"[{_ts()}] [TASK-3 LEVER_LOOP] {title}")
-    print("=" * 120)
-
-
-def _log(event: str, **payload) -> None:
-    print(f"[{_ts()}] [TASK-3 LEVER_LOOP] {event}")
-    if payload:
-        print(json.dumps(payload, indent=2, default=str))
+_TASK_LABEL = "TASK-3 LEVER_LOOP"
+_banner = partial(_banner_base, _TASK_LABEL)
+_log = partial(_log_base, _TASK_LABEL)
 
 # COMMAND ----------
 
@@ -247,110 +226,45 @@ if thresholds_met:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Loading Benchmarks and Config
+# MAGIC ## Loading Benchmarks and Preparing Config
 # MAGIC
-# MAGIC - **Benchmarks:** Loaded from the MLflow evaluation dataset `{catalog}.{schema}.genie_benchmarks_{domain}`. These are the gold questions used for slice, P0, and full evaluation.
-# MAGIC - **Config:** Fetched via `fetch_space_config()` — the Genie Space configuration including tables, instructions, join_specs, column_configs, etc. The harness uses this to apply patches and roll back.
+# MAGIC - **Benchmarks:** Loaded from the MLflow evaluation dataset `{catalog}.{schema}.genie_benchmarks_{domain}`.
+# MAGIC - **Config:** `_prepare_lever_loop()` handles config loading from Delta snapshot (API fetch fallback),
+# MAGIC   UC column metadata enrichment, Stage 2.5 prompt matching auto-config (format assistance + entity matching),
+# MAGIC   entity-matching-aware propagation wait, and post-wait config refresh. All business logic lives in the harness.
 
 # COMMAND ----------
 
 uc_schema = f"{catalog}.{schema}"
 benchmarks = load_benchmarks_from_dataset(spark, uc_schema, domain)
-config = fetch_space_config(w, space_id)
-_banner("Loaded Runtime Inputs")
-_log(
-    "Dataset/config loaded",
-    uc_schema=uc_schema,
-    benchmark_count=len(benchmarks),
-    config_keys=sorted(list(config.keys()))[:20] if isinstance(config, dict) else [],
-)
+_banner("Loaded Benchmarks")
+_log("Benchmark dataset", uc_schema=uc_schema, domain=domain, benchmark_count=len(benchmarks))
+if not benchmarks:
+    raise RuntimeError(f"No benchmarks found in {uc_schema}.genie_benchmarks_{domain}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Stage 2.5: Prompt Matching Auto-Config
+# MAGIC ## Prepare Config (Stage 2.5 included)
 # MAGIC
-# MAGIC Before the lever loop, apply format assistance and entity matching as a best-practice hygiene step.
-# MAGIC This enables `enable_format_assistance` on all visible columns and `enable_entity_matching` on prioritized
-# MAGIC STRING columns (up to the 120-column cap), skipping metric view measure columns.
+# MAGIC `_prepare_lever_loop()` is the single unified function that:
+# MAGIC 1. Loads config from Delta snapshot (API fetch fallback)
+# MAGIC 2. Fetches UC column metadata via REST API
+# MAGIC 3. Runs Stage 2.5 prompt matching auto-config (format assistance + entity matching)
+# MAGIC 4. Applies entity-matching-aware propagation wait (extended for value dictionary rebuild)
+# MAGIC 5. Refreshes config from API after wait
 # MAGIC
-# MAGIC After applying changes, a propagation wait allows the Genie Space to rebuild its index:
-# MAGIC - **With entity matching changes:** `PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS` (default 90s) — extended wait for value dictionary rebuild
-# MAGIC - **Without entity matching changes:** `PROPAGATION_WAIT_SECONDS` (default 30s)
-# MAGIC
-# MAGIC The same two-tier propagation wait applies per-lever in the lever loop when patches include value dictionary changes.
+# MAGIC All non-fatal: if UC metadata or prompt matching fails, the lever loop proceeds anyway.
 
 # COMMAND ----------
 
-if ENABLE_PROMPT_MATCHING_AUTO_APPLY:
-    _banner("Stage 2.5: Prompt Matching Auto-Config")
-    try:
-        table_refs = extract_genie_space_table_refs(config)
-        uc_columns = get_columns_for_tables_rest(w, table_refs) if table_refs else []
-        config["_uc_columns"] = uc_columns
-
-        _parsed = config.get("_parsed_space", {})
-        _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
-        _tables = _ds.get("tables", []) + _ds.get("metric_views", [])
-        _total_cols = sum(len(t.get("column_configs", [])) for t in _tables)
-        _visible_cols = sum(
-            1 for t in _tables for c in t.get("column_configs", [])
-            if not c.get("hidden")
-        )
-        _hidden_cols = _total_cols - _visible_cols
-        _string_cols = sum(
-            1 for c in uc_columns
-            if str(c.get("data_type", "")).upper() == "STRING"
-        )
-        _fa_existing = sum(
-            1 for t in _tables for c in t.get("column_configs", [])
-            if c.get("enable_format_assistance")
-        )
-        _vd_existing = sum(
-            1 for t in _tables for c in t.get("column_configs", [])
-            if c.get("enable_entity_matching")
-        )
-        print(
-            f"\n{'=' * 62}\n"
-            f"  STAGE 2.5: Prompt Matching Auto-Config\n"
-            f"{'=' * 62}\n"
-            f"\n-- GENIE SPACE INVENTORY " + "-" * 27 + "\n"
-            f"  Tables: {len(_tables)} ({', '.join(t.get('name', t.get('identifier', '?')) for t in _tables[:10])})\n"
-            f"  Total columns: {_total_cols} (visible: {_visible_cols}, hidden: {_hidden_cols})\n"
-            f"  UC column metadata: {len(uc_columns)} columns fetched across {len(table_refs)} tables\n"
-            f"  STRING columns eligible for entity matching: {_string_cols}\n"
-            f"  Columns already with format assistance: {_fa_existing}\n"
-            f"  Columns already with value dictionary: {_vd_existing} of 120 max slots\n"
-            + "-" * 52
-        )
-
-        pm_result = _run_prompt_matching_setup(w, spark, run_id, space_id, config, catalog, schema)
-        _log(
-            "Prompt matching complete",
-            format_assistance=pm_result.get("format_assistance_count", 0),
-            entity_matching=pm_result.get("entity_matching_count", 0),
-            total_changes=pm_result.get("total_changes", 0),
-        )
-        if pm_result.get("total_changes", 0) > 0:
-            has_entity_matching = pm_result.get("entity_matching_count", 0) > 0
-            wait_time = (
-                PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS if has_entity_matching
-                else PROPAGATION_WAIT_SECONDS
-            )
-            print(
-                f"\n-- PROPAGATION WAIT " + "-" * 32 + "\n"
-                f"  Changes applied: {pm_result.get('total_changes', 0)}\n"
-                f"  Entity matching changes: {pm_result.get('entity_matching_count', 0)}\n"
-                f"  Wait time: {wait_time}s"
-                + (" (extended for value dictionary rebuild)" if has_entity_matching else "")
-                + "\n" + "-" * 52
-            )
-            time.sleep(wait_time)
-            config = fetch_space_config(w, space_id)
-            _log("Config refreshed after prompt matching")
-    except Exception as exc:
-        _banner("Prompt Matching FAILED (non-fatal, continuing to lever loop)")
-        _log("Prompt matching error", error_type=type(exc).__name__, error_message=str(exc))
+_banner("Preparing Lever Loop Config (Stage 2.5)")
+config = _prepare_lever_loop(w, spark, run_id, space_id, catalog, schema)
+_log(
+    "Config prepared",
+    config_keys=sorted(list(config.keys()))[:20] if isinstance(config, dict) else [],
+    uc_columns_count=len(config.get("_uc_columns", [])),
+)
 
 # COMMAND ----------
 
@@ -436,15 +350,23 @@ dbutils.notebook.exit(json.dumps(debug_info, default=str))
 # MAGIC %md
 # MAGIC ## Summary
 # MAGIC
-# MAGIC Task 3 (Lever Loop) is the core optimization stage. It:
+# MAGIC Task 3 (Lever Loop) is a **thin wrapper** around two harness functions:
+# MAGIC
+# MAGIC 1. **`_prepare_lever_loop()`** — loads config from Delta snapshot, enriches UC column metadata,
+# MAGIC    runs Stage 2.5 prompt matching (format assistance + entity matching) with entity-matching-aware
+# MAGIC    propagation wait, and refreshes config from the API.
+# MAGIC 2. **`_run_lever_loop()`** — the core optimization engine that iterates through 5 levers,
+# MAGIC    applies patches via 3-gate evaluation (slice → P0 → full), and rolls back on regression.
+# MAGIC
+# MAGIC All business logic lives in the harness (`optimization/harness.py`), shared identically by
+# MAGIC the DAG notebooks and the `optimize_genie_space()` convenience function.
+# MAGIC
+# MAGIC The lever loop:
 # MAGIC - Skips when baseline already meets thresholds
-# MAGIC - Applies prompt matching (format assistance + entity matching) as a best-practice hygiene step (Stage 2.5), with extended propagation wait for entity matching changes
 # MAGIC - Applies arbiter benchmark corrections when `genie_correct` verdicts exceed the trigger threshold
-# MAGIC - Filters `genie_correct` arbiter verdicts from failure rows before clustering to avoid chasing false failures
+# MAGIC - Filters `genie_correct` arbiter verdicts from failure rows before clustering
 # MAGIC - Tracks reference SQLs from baseline for cross-iteration consistency scoring
 # MAGIC - Iterates through 5 levers (Tables & Columns → Metric Views → TVFs → Join Specs → Instructions)
 # MAGIC - Lever 5 prioritizes example SQL over text instructions (SQL expressions > example SQL > text)
-# MAGIC - Applies patches, evaluates via slice → P0 → full gates with noise-floor-adjusted tolerances, rolls back on regression
 # MAGIC - On lever acceptance: registers instruction version snapshot and updates reference SQLs
-# MAGIC - Sets `USE CATALOG` / `USE SCHEMA` before each evaluation to avoid catalog/schema resolution errors
 # MAGIC - Publishes scores, model_id, iteration counts, and lever outcomes for finalize and deploy

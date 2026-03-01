@@ -77,6 +77,32 @@ LLM_SOURCE = AssessmentSource(
     source_id=LLM_SOURCE_ID_TEMPLATE.format(endpoint=LLM_ENDPOINT),
 )
 
+_SCORER_FEEDBACK_CACHE: dict[tuple[str, str], dict] = {}
+
+
+def _cache_scorer_feedback(
+    question_id: str, judge_name: str, rationale: str, metadata: dict | None = None
+) -> None:
+    """Store scorer feedback for later merge into rows_for_output.
+
+    Called by scorers via ``format_asi_markdown`` so that rationale and
+    metadata survive even when MLflow's eval_results table drops them.
+    """
+    _SCORER_FEEDBACK_CACHE[(question_id, judge_name)] = {
+        "rationale": rationale,
+        "metadata": metadata or {},
+    }
+
+
+def _drain_scorer_feedback_cache() -> dict[str, dict[str, dict]]:
+    """Return and clear all cached feedback, keyed by question_id then judge."""
+    by_question: dict[str, dict[str, dict]] = {}
+    for (qid, judge), data in _SCORER_FEEDBACK_CACHE.items():
+        by_question.setdefault(qid, {})[judge] = data
+    _SCORER_FEEDBACK_CACHE.clear()
+    return by_question
+
+
 EVAL_SCOPES = {"full", "slice", "p0", "held_out"}
 EVAL_DEBUG = os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_DEBUG", "true").lower() in {"1", "true", "yes", "on"}
 EVAL_MAX_ATTEMPTS = int(os.getenv("GENIE_SPACE_OPTIMIZER_EVAL_MAX_ATTEMPTS", "4"))
@@ -505,8 +531,15 @@ def format_asi_markdown(
     rationale: str,
     metadata: dict | None = None,
     extra: dict | None = None,
+    question_id: str | None = None,
 ) -> str:
-    """Render scorer feedback in a structured markdown + JSON ASI format."""
+    """Render scorer feedback in a structured markdown + JSON ASI format.
+
+    When *question_id* is provided, the payload is also written to
+    ``_SCORER_FEEDBACK_CACHE`` so that downstream code (``run_evaluation``)
+    can recover rationale / metadata even when MLflow's eval_results table
+    only stores the verdict value.
+    """
     verdict_map = {
         "yes": "Pass",
         "no": "Fail",
@@ -554,6 +587,15 @@ def format_asi_markdown(
                 payload[key] = metadata[key]
     if extra:
         payload.update(extra)
+
+    if question_id:
+        cache_meta = {
+            k: payload[k]
+            for k in ("failure_type", "severity", "wrong_clause", "blame_set",
+                       "confidence", "counterfactual_fix")
+            if payload.get(k) is not None
+        }
+        _cache_scorer_feedback(question_id, judge_name, rationale_text, cache_meta)
 
     _MLFLOW_ASSESSMENT_LIMIT = 60_000
     raw = json.dumps(payload, indent=2, sort_keys=True, default=str)
@@ -764,24 +806,34 @@ def filter_benchmarks_by_scope(
     benchmarks: list[dict],
     scope: str = "full",
     patched_objects: list[str] | None = None,
+    affected_question_ids: set[str] | None = None,
 ) -> list[dict]:
     """Filter benchmarks based on evaluation scope.
 
     Scopes: "full" (all), "slice" (affected by patches),
     "p0" (priority P0 only), "held_out" (held-out split).
+
+    For "slice" scope, benchmarks are included if:
+    - Their required tables/columns overlap with *patched_objects*, OR
+    - Their question id is in *affected_question_ids* (from proposal clusters).
     """
     if scope == "full":
         return benchmarks
-    if scope == "slice" and patched_objects:
-        patched = {o.lower() for o in patched_objects}
-        return [
-            b
-            for b in benchmarks
-            if any(
+    if scope == "slice":
+        patched = {o.lower() for o in patched_objects} if patched_objects else set()
+        affected_qids = affected_question_ids or set()
+        result = []
+        for b in benchmarks:
+            qid = b.get("id", "")
+            if qid and qid in affected_qids:
+                result.append(b)
+                continue
+            if patched and any(
                 t.lower() in patched
                 for t in b.get("required_tables", []) + b.get("required_columns", [])
-            )
-        ]
+            ):
+                result.append(b)
+        return result
     if scope == "p0":
         return [b for b in benchmarks if b.get("priority", "P1") == "P0"]
     if scope == "held_out":
@@ -1126,6 +1178,7 @@ def make_predict_fn(
                                     comparison["gt_rows"] = len(gt_df)
                                     comparison["gt_sample"] = gt_df.head(5).to_csv(index=False, float_format="%.4f")
                                 else:
+                                    mapped_genie_df = genie_df
                                     _FLOAT_FMT = "%.4f"
                                     gt_hash = hashlib.md5(
                                         gt_df.to_csv(index=False, float_format=_FLOAT_FMT).encode()
@@ -1142,8 +1195,6 @@ def make_predict_fn(
                                         genie_cols = set(genie_df.columns)
                                         gt_cols = set(gt_df.columns)
                                         shared_cols = sorted(genie_cols & gt_cols)
-
-                                        mapped_genie_df = genie_df
                                         all_mapped = genie_cols <= gt_cols
 
                                         if not all_mapped:
@@ -2653,6 +2704,8 @@ def run_evaluation(
         rows_for_output: list[dict] = []
 
         _STRIP_COLS = {"trace", "trace_id", "assessments", "spans", "trace_metadata"}
+        cached_feedback = _drain_scorer_feedback_cache()
+
         if hasattr(eval_result, "tables") and "eval_results" in eval_result.tables:
             results_df = eval_result.tables["eval_results"]
 
@@ -2677,6 +2730,20 @@ def run_evaluation(
                         row_dict[rat_key] = adata["rationale"]
                     if meta_key not in row_dict and adata.get("metadata"):
                         row_dict[meta_key] = adata["metadata"]
+
+                qid = (
+                    row_dict.get("inputs/question_id")
+                    or (row_dict.get("inputs") or {}).get("question_id", "")
+                    or ""
+                )
+                if qid and qid in cached_feedback:
+                    for judge_name, fb_data in cached_feedback[qid].items():
+                        rat_key = f"{judge_name}/rationale"
+                        meta_key = f"{judge_name}/metadata"
+                        if rat_key not in row_dict and fb_data.get("rationale"):
+                            row_dict[rat_key] = fb_data["rationale"]
+                        if meta_key not in row_dict and fb_data.get("metadata"):
+                            row_dict[meta_key] = fb_data["metadata"]
 
                 for col_name in list(row_dict.keys()):
                     if col_name.endswith("/rationale"):
@@ -3284,6 +3351,8 @@ def _validate_benchmark_sql(
     spark: SparkSession,
     catalog: str,
     schema: str,
+    *,
+    execute: bool = False,
 ) -> tuple[bool, str]:
     """Validate a benchmark's expected_sql. Returns (is_valid, error)."""
     from genie_space_optimizer.optimization.benchmarks import validate_ground_truth_sql
@@ -3292,7 +3361,9 @@ def _validate_benchmark_sql(
     sanitized = sanitize_sql(resolved)
     if not sanitized.strip():
         return False, "Empty SQL"
-    return validate_ground_truth_sql(sanitized, spark, catalog=catalog, gold_schema=schema)
+    return validate_ground_truth_sql(
+        sanitized, spark, catalog=catalog, gold_schema=schema, execute=execute,
+    )
 
 
 def _attempt_benchmark_correction(
@@ -3329,6 +3400,8 @@ def _attempt_benchmark_correction(
     prompt = BENCHMARK_CORRECTION_PROMPT.format(
         valid_assets_context=ctx["valid_assets_context"],
         tables_context=ctx["tables_context"],
+        metric_views_context=ctx.get("metric_views_context", "None"),
+        tvfs_context=ctx.get("tvfs_context", "None"),
         benchmarks_to_fix=benchmarks_to_fix,
     )
 
@@ -3950,7 +4023,9 @@ def generate_benchmarks(
             )
             continue
 
-        is_valid, err = _validate_benchmark_sql(expected_sql, spark, catalog, schema)
+        is_valid, err = _validate_benchmark_sql(
+            expected_sql, spark, catalog, schema, execute=True,
+        )
         if is_valid:
             benchmark["validation_status"] = "valid"
             benchmark["validation_reason_code"] = "ok"
@@ -4049,6 +4124,25 @@ def generate_benchmarks(
             MAX_CORRECTION_ROUNDS,
             [b.get("question", "")[:50] for b in invalid_benchmarks[:3]],
         )
+
+    # ── Post-validation: check question-SQL alignment via LLM ──────────
+    try:
+        from genie_space_optimizer.optimization.benchmarks import (
+            validate_question_sql_alignment,
+        )
+        alignment_targets = [b for b in valid_benchmarks if b.get("expected_sql")]
+        if alignment_targets:
+            alignment_results = validate_question_sql_alignment(alignment_targets)
+            for b, ar in zip(alignment_targets, alignment_results):
+                if not ar.get("aligned", True):
+                    b["alignment_issues"] = ar.get("issues", [])
+                    logger.info(
+                        "Alignment issue in benchmark: %s — %s",
+                        b.get("question", "")[:80],
+                        "; ".join(ar.get("issues", [])),
+                    )
+    except Exception as _align_err:
+        logger.warning("Alignment validation skipped: %s", _align_err)
 
     all_benchmarks: list[dict] = list(_existing)
 
@@ -4193,7 +4287,8 @@ def load_benchmarks_from_dataset(
         last_err: Exception | None = None
         for attempt in range(_max_retries):
             try:
-                spark.sql(f"REFRESH TABLE {quoted_table_name}")
+                from genie_space_optimizer.common.delta_helpers import _safe_refresh
+                _safe_refresh(spark, quoted_table_name)
                 df = spark.sql(f"SELECT * FROM {quoted_table_name}").toPandas()
                 break
             except Exception as read_err:
@@ -4203,13 +4298,9 @@ def load_benchmarks_from_dataset(
                     import time as _time
                     wait = 5 * (attempt + 1)
                     logger.warning(
-                        "Delta schema change on attempt %d/%d for %s — refreshing and retrying in %ds",
+                        "Delta schema change on attempt %d/%d for %s — retrying in %ds",
                         attempt + 1, _max_retries, table_name, wait,
                     )
-                    try:
-                        spark.catalog.refreshTable(quoted_table_name.replace("`", ""))
-                    except Exception:
-                        pass
                     _time.sleep(wait)
                     continue
                 raise

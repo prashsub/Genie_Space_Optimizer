@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,95 @@ _TERMINAL_JOB_STATES = TERMINAL_JOB_STATES
 _STALE_QUEUE_TIMEOUT = timedelta(minutes=10)
 _SUPPORTED_APPLY_MODES = {"genie_config", "uc_artifact", "both"}
 _PIPELINE_APPLY_MODE = "genie_config"
+
+
+def _sql_warehouse_query(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    sql: str,
+) -> "pd.DataFrame":
+    """Execute SQL via the SQL Statement Execution API (bypasses Spark Connect).
+
+    Returns results as a pandas DataFrame, consistent with the Spark-based
+    ``run_query`` interface.
+    """
+    import pandas as pd
+    from databricks.sdk.service.sql import StatementState
+
+    resp = ws.statement_execution.execute_statement(
+        warehouse_id=warehouse_id,
+        statement=sql,
+        wait_timeout="50s",
+        disposition=Disposition.INLINE,
+        format=Format.JSON_ARRAY,
+    )
+    if resp.status and resp.status.state == StatementState.SUCCEEDED:
+        columns = [c.name for c in (resp.manifest.schema.columns or [])] if resp.manifest else []
+        rows: list[dict] = []
+        if resp.result and resp.result.data_array:
+            for row_data in resp.result.data_array:
+                rows.append(dict(zip(columns, row_data)))
+        return pd.DataFrame(rows, columns=columns or None)
+    error_msg = ""
+    if resp.status and resp.status.error:
+        error_msg = resp.status.error.message or str(resp.status.error)
+    raise RuntimeError(f"SQL warehouse query failed: {error_msg}")
+
+
+def _sql_warehouse_execute(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    sql: str,
+) -> None:
+    """Execute a DML/DDL statement via the SQL warehouse (no result expected)."""
+    from databricks.sdk.service.sql import StatementState
+
+    resp = ws.statement_execution.execute_statement(
+        warehouse_id=warehouse_id,
+        statement=sql,
+        wait_timeout="50s",
+    )
+    if resp.status and resp.status.state != StatementState.SUCCEEDED:
+        error_msg = ""
+        if resp.status.error:
+            error_msg = resp.status.error.message or str(resp.status.error)
+        raise RuntimeError(f"SQL warehouse execute failed: {error_msg}")
+
+
+def _wh_create_run(
+    ws: WorkspaceClient,
+    warehouse_id: str,
+    *,
+    run_id: str,
+    space_id: str,
+    domain: str,
+    catalog: str,
+    schema: str,
+    apply_mode: str = "genie_config",
+    triggered_by: str | None = None,
+    experiment_name: str | None = None,
+    config_snapshot: dict | None = None,
+) -> None:
+    """Insert a QUEUED run via SQL warehouse (fallback when Spark is broken)."""
+    from genie_space_optimizer.common.config import DEFAULT_LEVER_ORDER, MAX_ITERATIONS
+
+    snap_json = json.dumps(config_snapshot).replace("'", "''") if config_snapshot else ""
+    levers_json = json.dumps(DEFAULT_LEVER_ORDER)
+    exp = (experiment_name or "").replace("'", "''")
+    user = (triggered_by or "").replace("'", "''")
+
+    sql = (
+        f"INSERT INTO {catalog}.{schema}.genie_opt_runs "
+        f"(run_id, space_id, domain, catalog, uc_schema, status, started_at, "
+        f"max_iterations, levers, apply_mode, updated_at, "
+        f"experiment_name, triggered_by, config_snapshot) VALUES ("
+        f"'{run_id}', '{space_id}', '{domain}', '{catalog}', "
+        f"'{catalog}.{schema}', 'QUEUED', current_timestamp(), "
+        f"{MAX_ITERATIONS}, '{levers_json}', '{apply_mode}', current_timestamp(), "
+        f"'{exp}', '{user}', '{snap_json}')"
+    )
+    _sql_warehouse_execute(ws, warehouse_id, sql)
+    logger.info("Created run %s via SQL warehouse fallback", run_id)
 
 
 def _genie_client(ws: WorkspaceClient, sp_ws: WorkspaceClient) -> WorkspaceClient:
@@ -610,8 +700,9 @@ def do_start_optimization(
             ),
         )
 
+    use_warehouse_fallback = False
+
     def _init_spark_state():
-        """Run Spark-dependent initialization; may be retried on credential errors."""
         _spark = get_spark()
         ensure_optimization_tables(_spark, config.catalog, config.schema_name)
         _df = load_runs_for_space(_spark, space_id, config.catalog, config.schema_name)
@@ -622,11 +713,27 @@ def do_start_optimization(
     except Exception as _spark_err:
         if _is_credential_error(_spark_err):
             logger.warning(
-                "Spark credential error during init — resetting session and retrying: %s",
-                str(_spark_err)[:200],
+                "Spark credential error — resetting session: %s", str(_spark_err)[:200],
             )
-            reset_spark()
-            spark, runs_df = _init_spark_state()
+            try:
+                reset_spark()
+                spark, runs_df = _init_spark_state()
+            except Exception as _retry_err:
+                if _is_credential_error(_retry_err):
+                    logger.warning(
+                        "Spark credentials still broken after reset — "
+                        "falling back to SQL warehouse for state management"
+                    )
+                    use_warehouse_fallback = True
+                    spark = get_spark()
+                    runs_df = _sql_warehouse_query(
+                        ws,
+                        config.warehouse_id,
+                        f"SELECT * FROM {config.catalog}.{config.schema_name}.genie_opt_runs "
+                        f"WHERE space_id = '{space_id}' ORDER BY started_at DESC",
+                    )
+                else:
+                    raise
         else:
             raise
     if not runs_df.empty and _reconcile_active_runs(
@@ -714,7 +821,10 @@ def do_start_optimization(
         logger.warning("OBO UC metadata prefetch failed for run %s", run_id, exc_info=True)
 
     try:
-        missing = _check_sp_data_access(spark, config.catalog, config.schema_name, genie_refs, sp_ws)
+        if use_warehouse_fallback:
+            missing = []
+        else:
+            missing = _check_sp_data_access(spark, config.catalog, config.schema_name, genie_refs, sp_ws)
         if missing:
             sp_id = get_sp_principal(sp_ws)
             lines = []
@@ -747,18 +857,56 @@ def do_start_optimization(
             ),
         )
 
-    create_run(
-        spark,
-        run_id,
-        space_id,
-        domain,
-        config.catalog,
-        config.schema_name,
-        apply_mode=requested_apply_mode,
-        triggered_by=current_user,
-        experiment_name=prev_experiment,
-        config_snapshot=space_snapshot if space_snapshot else None,
-    )
+    # Pre-create MLflow experiment using OBO so the serverless job
+    # (running as SP) doesn't need to create it under the user's path.
+    experiment_name = prev_experiment
+    if not experiment_name:
+        from genie_space_optimizer.common.config import EXPERIMENT_PATH_TEMPLATE
+        experiment_name = EXPERIMENT_PATH_TEMPLATE.format(
+            user_email=current_user, domain=domain,
+        )
+    try:
+        import mlflow
+        obo_host = (ws.config.host or "").rstrip("/")
+        obo_token = ws.config.token
+        if obo_host and obo_token:
+            mlflow.set_tracking_uri("databricks")
+            os.environ["DATABRICKS_HOST"] = obo_host
+            os.environ["DATABRICKS_TOKEN"] = obo_token
+        try:
+            ws.workspace.mkdirs(str(__import__("pathlib").PurePosixPath(experiment_name).parent))
+        except Exception:
+            pass
+        mlflow.set_experiment(experiment_name)
+        logger.info("Pre-created MLflow experiment %s via OBO", experiment_name)
+    except Exception as _mlflow_err:
+        logger.warning(
+            "OBO experiment pre-creation failed for %s: %s — job will create it",
+            experiment_name, _mlflow_err,
+        )
+
+    if use_warehouse_fallback:
+        _wh_create_run(
+            ws, config.warehouse_id,
+            run_id=run_id, space_id=space_id, domain=domain,
+            catalog=config.catalog, schema=config.schema_name,
+            apply_mode=requested_apply_mode, triggered_by=current_user,
+            experiment_name=experiment_name,
+            config_snapshot=space_snapshot if space_snapshot else None,
+        )
+    else:
+        create_run(
+            spark,
+            run_id,
+            space_id,
+            domain,
+            config.catalog,
+            config.schema_name,
+            apply_mode=requested_apply_mode,
+            triggered_by=current_user,
+            experiment_name=experiment_name,
+            config_snapshot=space_snapshot if space_snapshot else None,
+        )
 
     try:
         job_run_id, job_id = submit_optimization(
@@ -770,15 +918,25 @@ def do_start_optimization(
             schema=config.schema_name,
             apply_mode=_PIPELINE_APPLY_MODE,
             triggered_by=current_user,
-            experiment_name=prev_experiment or "",
+            experiment_name=experiment_name or "",
         )
 
-        update_run_status(
-            spark, run_id, config.catalog, config.schema_name,
-            status="IN_PROGRESS",
-            job_run_id=job_run_id,
-            job_id=str(job_id),
-        )
+        if use_warehouse_fallback:
+            _sql_warehouse_execute(
+                ws, config.warehouse_id,
+                f"UPDATE {config.catalog}.{config.schema_name}.genie_opt_runs "
+                f"SET status = 'IN_PROGRESS', job_run_id = '{job_run_id}', "
+                f"job_id = '{job_id}', "
+                f"updated_at = current_timestamp() "
+                f"WHERE run_id = '{run_id}'",
+            )
+        else:
+            update_run_status(
+                spark, run_id, config.catalog, config.schema_name,
+                status="IN_PROGRESS",
+                job_run_id=job_run_id,
+                job_id=str(job_id),
+            )
 
         host = (sp_ws.config.host or "").rstrip("/")
         workspace_id: int | None = None
@@ -797,11 +955,24 @@ def do_start_optimization(
 
     except Exception as exc:
         logger.exception("Job submission failed for run %s", run_id)
-        update_run_status(
-            spark, run_id, config.catalog, config.schema_name,
-            status="FAILED",
-            convergence_reason=f"job_submission_error: {exc}",
-        )
+        try:
+            if use_warehouse_fallback:
+                _sql_warehouse_execute(
+                    ws, config.warehouse_id,
+                    f"UPDATE {config.catalog}.{config.schema_name}.genie_opt_runs "
+                    f"SET status = 'FAILED', "
+                    f"convergence_reason = 'job_submission_error: {str(exc)[:500]}', "
+                    f"updated_at = current_timestamp() "
+                    f"WHERE run_id = '{run_id}'",
+                )
+            else:
+                update_run_status(
+                    spark, run_id, config.catalog, config.schema_name,
+                    status="FAILED",
+                    convergence_reason=f"job_submission_error: {exc}",
+                )
+        except Exception:
+            logger.warning("Failed to update run status to FAILED for %s", run_id)
         raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
 
 

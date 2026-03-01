@@ -1,7 +1,7 @@
 command: ["uvicorn", "genie_space_optimizer.backend.app:app", "--workers", "2"]
 env:
   - name: GENIE_SPACE_OPTIMIZER_CATALOG
-    value: "vibe_coding_workshop_catalog"
+    value: "main"
   - name: GENIE_SPACE_OPTIMIZER_SCHEMA
     value: "genie_optimization"
   - name: GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID

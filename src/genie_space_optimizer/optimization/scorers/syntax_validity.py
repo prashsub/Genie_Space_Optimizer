@@ -39,6 +39,7 @@ def _make_syntax_validity_scorer(spark: SparkSession, catalog: str, schema: str)
     @scorer
     def syntax_validity_scorer(inputs: dict, outputs: dict) -> Feedback:
         """Check SQL syntax by running EXPLAIN."""
+        question_id = inputs.get("question_id", "")
         sql = sanitize_sql(_extract_response_text(outputs))
         if not sql or not sql.strip():
             metadata = build_asi_metadata(
@@ -56,6 +57,7 @@ def _make_syntax_validity_scorer(spark: SparkSession, catalog: str, schema: str)
                     value="no",
                     rationale="No SQL generated.",
                     metadata=metadata,
+                    question_id=question_id,
                 ),
                 source=CODE_SOURCE,
                 metadata=metadata,
@@ -70,6 +72,7 @@ def _make_syntax_validity_scorer(spark: SparkSession, catalog: str, schema: str)
                     judge_name="syntax_validity",
                     value="yes",
                     rationale="SQL parses successfully via EXPLAIN.",
+                    question_id=question_id,
                 ),
                 source=CODE_SOURCE,
             )
@@ -91,6 +94,7 @@ def _make_syntax_validity_scorer(spark: SparkSession, catalog: str, schema: str)
                     value="no",
                     rationale=f"EXPLAIN failed: {error_msg}",
                     metadata=metadata,
+                    question_id=question_id,
                 ),
                 source=CODE_SOURCE,
                 metadata=metadata,

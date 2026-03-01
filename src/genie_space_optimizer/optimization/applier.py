@@ -153,16 +153,19 @@ def _get_general_instructions(config: dict) -> str:
 
 
 def _set_general_instructions(
-    config: dict, text: str, instruction_id: str = "genie_opt"
+    config: dict, text: str, instruction_id: str | None = None
 ) -> None:
     """Set general instructions into text_instructions."""
+    from genie_space_optimizer.common.genie_schema import generate_genie_id
+
     inst = config.setdefault("instructions", {})
     ti = inst.setdefault("text_instructions", [])
+    effective_id = instruction_id or (ti[0].get("id") if ti else None) or generate_genie_id()
     lines = [ln for ln in text.split("\n")] if text else [""]
     if ti:
-        ti[0] = {"id": ti[0].get("id", instruction_id), "content": lines}
+        ti[0] = {"id": ti[0].get("id", effective_id), "content": lines}
     else:
-        ti.append({"id": instruction_id, "content": lines})
+        ti.append({"id": effective_id, "content": lines})
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -38,6 +38,7 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
         genie_sql = sanitize_sql(_extract_response_text(outputs))
         gt_sql = resolve_sql(expectations.get("expected_response", ""), catalog, schema)
         question = inputs.get("question", "")
+        question_id = inputs.get("question_id", "")
         cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
         cmp_summary = ""
@@ -154,6 +155,7 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
                     value="unknown",
                     rationale=f"LLM call failed: {e}",
                     metadata=metadata,
+                    question_id=question_id,
                 ),
                 source=LLM_SOURCE,
                 metadata=metadata,
@@ -202,6 +204,7 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
                         f"LLM noted SQL differences: {result.get('rationale', '')}"
                     ),
                     extra={"llm_response": result, "override_reason": "result_match"},
+                    question_id=question_id,
                 ),
                 source=LLM_SOURCE,
             )
@@ -215,6 +218,7 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
                     value="yes",
                     rationale=result.get("rationale", "Semantically equivalent"),
                     extra={"llm_response": result},
+                    question_id=question_id,
                 ),
                 source=LLM_SOURCE,
             )
@@ -243,6 +247,7 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
                 rationale=result.get("rationale", "Semantic mismatch"),
                 metadata=metadata,
                 extra={"llm_response": result},
+                question_id=question_id,
             ),
             source=LLM_SOURCE,
             metadata=metadata,

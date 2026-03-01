@@ -5,7 +5,7 @@ variables:
   app_name:
     default: "genie-space-optimizer"
   catalog:
-    default: "vibe_coding_workshop_catalog"
+    default: "main"
   gold_schema:
     default: "genie_optimization"
   warehouse_id:

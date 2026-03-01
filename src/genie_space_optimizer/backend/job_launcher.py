@@ -56,7 +56,6 @@ _JOB_PARAM_DEFAULTS = {
 }
 
 _NOTEBOOK_SOURCES = {
-    "run_optimization": Path(__file__).resolve().parent.parent / "jobs" / "run_optimization.py",
     "run_preflight": Path(__file__).resolve().parent.parent / "jobs" / "run_preflight.py",
     "run_baseline": Path(__file__).resolve().parent.parent / "jobs" / "run_baseline.py",
     "run_lever_loop": Path(__file__).resolve().parent.parent / "jobs" / "run_lever_loop.py",
@@ -387,6 +386,7 @@ def _ensure_persistent_job(
                 description=settings.description,
                 max_concurrent_runs=settings.max_concurrent_runs,
                 queue=settings.queue,
+                parameters=settings.parameters,
                 tasks=settings.tasks,
                 environments=settings.environments,
                 tags=settings.tags,
@@ -401,6 +401,7 @@ def _ensure_persistent_job(
             description=settings.description,
             max_concurrent_runs=settings.max_concurrent_runs,
             queue=settings.queue,
+            parameters=settings.parameters,
             tasks=settings.tasks,
             environments=settings.environments,
             tags=settings.tags,

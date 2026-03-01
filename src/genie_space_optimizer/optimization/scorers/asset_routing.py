@@ -20,6 +20,7 @@ from genie_space_optimizer.optimization.evaluation import (
 @scorer
 def asset_routing_scorer(inputs: dict, outputs: dict, expectations: dict) -> Feedback:
     """Check if Genie selected the correct asset type."""
+    question_id = inputs.get("question_id", "")
     sql = sanitize_sql(_extract_response_text(outputs) or "").lower()
     expected_asset = expectations.get("expected_asset", "").upper()
 
@@ -48,6 +49,7 @@ def asset_routing_scorer(inputs: dict, outputs: dict, expectations: dict) -> Fee
             rationale=f"Expected {expected_asset}, got {actual_asset}. SQL: {sql[:100]}",
             metadata=metadata,
             extra={"expected_asset": expected_asset, "actual_asset": actual_asset},
+            question_id=question_id,
         ),
         source=CODE_SOURCE,
         metadata=metadata,

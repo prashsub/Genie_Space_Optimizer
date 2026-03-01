@@ -30,6 +30,7 @@ def repeatability_scorer(inputs: dict, outputs: dict, expectations: dict) -> Fee
     Compares ``outputs["response"]`` (current run) against
     ``expectations["previous_sql"]`` (reference from a prior iteration).
     """
+    question_id = inputs.get("question_id", "")
     previous_sql = (expectations or {}).get("previous_sql", "")
     current_sql = (outputs or {}).get("response", "")
 
@@ -41,6 +42,7 @@ def repeatability_scorer(inputs: dict, outputs: dict, expectations: dict) -> Fee
                 judge_name="repeatability",
                 value="yes",
                 rationale="No reference SQL available; first evaluation — marked consistent.",
+                question_id=question_id,
             ),
             source=CODE_SOURCE,
         )
@@ -62,6 +64,7 @@ def repeatability_scorer(inputs: dict, outputs: dict, expectations: dict) -> Fee
                 value="no",
                 rationale="Genie returned no SQL this run but did in the reference run.",
                 metadata=metadata,
+                question_id=question_id,
             ),
             source=CODE_SOURCE,
             metadata=metadata,
@@ -78,6 +81,7 @@ def repeatability_scorer(inputs: dict, outputs: dict, expectations: dict) -> Fee
                 judge_name="repeatability",
                 value="yes",
                 rationale=f"SQL identical to reference (hash={curr_hash}).",
+                question_id=question_id,
             ),
             source=CODE_SOURCE,
         )
@@ -108,6 +112,7 @@ def repeatability_scorer(inputs: dict, outputs: dict, expectations: dict) -> Fee
                 "previous_sql_preview": previous_sql[:200],
                 "current_sql_preview": current_sql[:200],
             },
+            question_id=question_id,
         ),
         source=CODE_SOURCE,
         metadata=metadata,

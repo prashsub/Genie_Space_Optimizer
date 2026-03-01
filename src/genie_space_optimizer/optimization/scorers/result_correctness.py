@@ -23,6 +23,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
 
     Reads ``outputs["comparison"]`` — does NOT call spark.sql().
     """
+    question_id = inputs.get("question_id", "")
     cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
     if cmp.get("error"):
@@ -41,6 +42,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                         "treated as matching empty results (null-result defense)."
                     ),
                     extra={"comparison": slim_comparison(cmp)},
+                    question_id=question_id,
                 ),
                 source=CODE_SOURCE,
             )
@@ -61,6 +63,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                         f"— excluded from accuracy denominator."
                     ),
                     extra={"comparison": slim_comparison(cmp)},
+                    question_id=question_id,
                 ),
                 source=CODE_SOURCE,
             )
@@ -80,6 +83,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                         f"— excluded from accuracy denominator."
                     ),
                     extra={"comparison": slim_comparison(cmp)},
+                    question_id=question_id,
                 ),
                 source=CODE_SOURCE,
             )
@@ -99,6 +103,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                 rationale=f"Comparison error: {cmp['error']}",
                 metadata=metadata,
                 extra={"comparison": slim_comparison(cmp)},
+                question_id=question_id,
             ),
             source=CODE_SOURCE,
             metadata=metadata,
@@ -117,6 +122,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                     f"Hash: {cmp.get('gt_hash', 'n/a')}."
                 ),
                 extra={"comparison": slim_comparison(cmp)},
+                question_id=question_id,
             ),
             source=CODE_SOURCE,
         )
@@ -135,6 +141,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                     "has no matching data. Treated as matching empty results."
                 ),
                 extra={"comparison": slim_comparison(cmp)},
+                question_id=question_id,
             ),
             source=CODE_SOURCE,
         )
@@ -153,6 +160,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
                     f"platform limitation, not a query error."
                 ),
                 extra={"comparison": slim_comparison(cmp), "row_cap_applied": True},
+                question_id=question_id,
             ),
             source=CODE_SOURCE,
         )
@@ -178,6 +186,7 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
             ),
             metadata=metadata,
             extra={"comparison": slim_comparison(cmp)},
+            question_id=question_id,
         ),
         source=CODE_SOURCE,
         metadata=metadata,
