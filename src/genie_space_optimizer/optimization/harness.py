@@ -1225,6 +1225,31 @@ def _run_lever_loop(
 
         patched_objects = apply_log.get("patched_objects", [])
 
+        # ── Check if the PATCH was actually deployed to the Genie Space ──
+        if not apply_log.get("patch_deployed", False) and apply_log.get("applied"):
+            _pe = apply_log.get("patch_error", "unknown")
+            _ve = apply_log.get("validation_errors", [])
+            _fail_lines = [
+                _section("PATCH DEPLOY FAILED", "!"),
+                _kv("Lever", lever),
+                _kv("Patches prepared", len(apply_log.get("applied", []))),
+                _kv("Error", _pe[:300] if _pe else "see logs"),
+            ]
+            if _ve:
+                _fail_lines.append(_kv("Validation errors", "; ".join(str(e) for e in _ve[:5])))
+            _fail_lines.append("")
+            _fail_lines.append("|  Patches were NOT applied to the remote Genie Space.")
+            _fail_lines.append("|  Skipping slice gate and continuing to next lever.")
+            _fail_lines.append(_bar("!"))
+            print("\n".join(_fail_lines))
+            write_stage(
+                spark, run_id, f"LEVER_{lever}_PATCH_FAILED", "ERROR",
+                task_key="lever_loop", lever=lever, iteration=iteration_counter,
+                error_message=_pe[:500] if _pe else "PATCH deploy failed",
+                catalog=catalog, schema=schema,
+            )
+            continue
+
         # ── Applied Patches Detail ────────────────────────────────
         _applied = apply_log.get("applied", [])
         if _applied:

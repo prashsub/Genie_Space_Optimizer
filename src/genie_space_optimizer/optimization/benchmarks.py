@@ -181,6 +181,16 @@ def validate_ground_truth_sql(
     if not resolved or not resolved.strip():
         return False, "Empty SQL"
 
+    from genie_space_optimizer.optimization.evaluation import _extract_sql_params
+
+    _params = _extract_sql_params(resolved)
+    if _params:
+        logger.warning(
+            "GT SQL contains parameterized placeholders %s — skipping EXPLAIN validation",
+            _params,
+        )
+        return True, ""
+
     try:
         _set_sql_context(spark, catalog, gold_schema)
         spark.sql(f"EXPLAIN {resolved}")

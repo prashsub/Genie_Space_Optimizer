@@ -21,6 +21,7 @@ from genie_space_optimizer.optimization.evaluation import (
     build_asi_metadata,
     build_temporal_note,
     format_asi_markdown,
+    get_registered_prompt_name,
 )
 
 if TYPE_CHECKING:
@@ -118,7 +119,7 @@ def _make_schema_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
         )
 
         try:
-            result = _call_llm_for_scoring(w, prompt)
+            result = _call_llm_for_scoring(w, prompt, prompt_name=get_registered_prompt_name("schema_accuracy"))
         except Exception as e:
             logger.error(
                 "\n"

@@ -317,6 +317,11 @@ _log(
     model_id=preflight_out["model_id"],
 )
 _banner("Task 1 Completed")
+dbutils.notebook.exit(json.dumps({
+    "run_id": run_id,
+    "benchmark_count": len(preflight_out["benchmarks"]),
+    "model_id": preflight_out["model_id"],
+}, default=str))
 
 # COMMAND ----------
 

@@ -74,7 +74,7 @@ _LABEL_TO_KEY: dict[str, str] = {v.lower(): k for k, v in SECTION_LABELS.items()
 
 LEVER_SECTION_OWNERSHIP: dict[int, set[str]] = {
     1: {"purpose", "best_for", "grain", "scd", "definition", "values", "synonyms"},
-    2: {"aggregation", "grain_note", "important_filters", "synonyms"},
+    2: {"definition", "values", "aggregation", "grain_note", "important_filters", "synonyms"},
     3: {"purpose", "best_for", "use_instead_of", "parameters", "example"},
     4: {"relationships", "join"},
     5: set(),

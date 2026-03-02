@@ -24,6 +24,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _extract_response_text,
     build_asi_metadata,
     format_asi_markdown,
+    get_registered_prompt_name,
 )
 
 if TYPE_CHECKING:
@@ -245,7 +246,7 @@ def _make_arbiter_scorer(
         )
 
         try:
-            result = _call_llm_for_scoring(w, prompt)
+            result = _call_llm_for_scoring(w, prompt, prompt_name=get_registered_prompt_name("arbiter"))
             verdict = result.get("verdict", "ground_truth_correct")
             valid_verdicts = {
                 "genie_correct",

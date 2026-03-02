@@ -81,6 +81,8 @@ LLM_SOURCE = AssessmentSource(
 
 _SCORER_FEEDBACK_CACHE: dict[tuple[str, str], dict] = {}
 
+_REGISTERED_PROMPT_NAMES: dict[str, str] = {}
+
 
 def _cache_scorer_feedback(
     question_id: str, judge_name: str, rationale: str, metadata: dict | None = None
@@ -202,12 +204,42 @@ def _extract_json(content: str) -> dict:
     raise _saved_err
 
 
+def get_registered_prompt_name(judge_name: str) -> str:
+    """Return the registered prompt name for a judge/lever, or empty string."""
+    return _REGISTERED_PROMPT_NAMES.get(judge_name, "")
+
+
+def _link_prompt_to_trace(prompt_name: str) -> None:
+    """Load a registered prompt inside the current trace to link it.
+
+    MLflow automatically associates ``load_prompt()`` calls with the
+    active trace, making the prompt version visible in the Linked Prompts
+    tab of the trace UI.  Failures are silently ignored so scoring continues.
+    """
+    if not prompt_name:
+        return
+    try:
+        mlflow.genai.load_prompt(f"prompts:/{prompt_name}@{PROMPT_ALIAS}")
+    except Exception:
+        try:
+            mlflow.genai.load_prompt(f"prompts:/{prompt_name}@latest")
+        except Exception:
+            logger.debug("Could not load prompt '%s' for trace linking", prompt_name)
+
+
 def _call_llm_for_scoring(
     w: WorkspaceClient,
     prompt: str,
     max_retries: int = LLM_MAX_RETRIES,
+    prompt_name: str = "",
 ) -> dict:
-    """Call LLM using Databricks SDK with retry + exponential backoff."""
+    """Call LLM using Databricks SDK with retry + exponential backoff.
+
+    If *prompt_name* is provided, loads the registered prompt first to
+    link it to the current MLflow trace (visible in Linked Prompts tab).
+    """
+    _link_prompt_to_trace(prompt_name)
+
     last_err: Exception | None = None
     for attempt in range(max_retries):
         try:
@@ -906,6 +938,20 @@ def _set_sql_context(
         spark.sql(f"USE SCHEMA {_quote_identifier(schema)}")
 
 
+_SQL_PARAM_RE = re.compile(
+    r"(?<![:\w])"     # not preceded by : or word char (avoids ::cast, timestamps)
+    r":([a-zA-Z_]\w*)"  # :param_name
+    r"(?!\s*:)"        # not followed by : (avoids :: cast operator)
+)
+
+
+def _extract_sql_params(sql: str) -> list[str]:
+    """Return SQL named-parameter placeholders (e.g. :min_amount) found in *sql*."""
+    if not sql:
+        return []
+    return _SQL_PARAM_RE.findall(sql)
+
+
 def _is_infrastructure_sql_error(message: str) -> bool:
     """Detect environment/config errors that should fail evaluation.
 
@@ -989,6 +1035,15 @@ def _precheck_benchmarks_for_eval(
         resolved_sql = resolve_sql(sql, catalog=catalog, gold_schema=gold_schema)
         if _mv_measures:
             resolved_sql = _rewrite_measure_refs(resolved_sql, _mv_measures)
+
+        if _extract_sql_params(resolved_sql):
+            logger.info(
+                "Benchmark %s has parameterized SQL — skipping EXPLAIN quarantine",
+                qid,
+            )
+            valid.append(benchmark)
+            continue
+
         try:
             _set_sql_context(spark, catalog, gold_schema)
             spark.sql(f"EXPLAIN {resolved_sql}")
@@ -1175,28 +1230,43 @@ def make_predict_fn(
                         "identical_sql": True,
                     }
                 else:
-                    try:
-                        _set_sql_context(spark, catalog, schema)
+                    _unbound_params = _extract_sql_params(gt_sql)
+                    if _unbound_params:
+                        logger.warning(
+                            "GT SQL contains unbound parameters %s — "
+                            "skipping result comparison for '%s'",
+                            _unbound_params, question[:80],
+                        )
+                        comparison["error"] = (
+                            f"GT SQL contains parameterized placeholders "
+                            f"({', '.join(':' + p for p in _unbound_params)}) "
+                            f"that cannot be executed directly"
+                        )
+                        comparison["error_type"] = "parameterized_sql"
 
-                        called_functions = _extract_sql_function_calls(gt_sql, catalog, schema)
-                        missing_gt_functions = sorted(f for f in called_functions if f not in known_functions)
-                        if missing_gt_functions:
-                            comparison["error"] = (
-                                "Missing function(s) in GT SQL for schema "
-                                f"{catalog}.{schema}: {', '.join(missing_gt_functions)}"
-                            )
-                            comparison["error_type"] = "permission_blocked"
-                        else:
-                            try:
-                                spark.sql(f"EXPLAIN {gt_sql}")
-                            except Exception as explain_exc:
-                                explain_msg = str(explain_exc)
-                                comparison["error"] = f"ground_truth SQL compilation failed: {explain_msg[:400]}"
-                                comparison["error_type"] = "infrastructure"
-                                comparison["sqlstate"] = _extract_sqlstate(explain_msg)
+                    if not comparison.get("error"):
+                        try:
+                            _set_sql_context(spark, catalog, schema)
 
-                            if not comparison["error"]:
-                                gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
+                            called_functions = _extract_sql_function_calls(gt_sql, catalog, schema)
+                            missing_gt_functions = sorted(f for f in called_functions if f not in known_functions)
+                            if missing_gt_functions:
+                                comparison["error"] = (
+                                    "Missing function(s) in GT SQL for schema "
+                                    f"{catalog}.{schema}: {', '.join(missing_gt_functions)}"
+                                )
+                                comparison["error_type"] = "permission_blocked"
+                            else:
+                                try:
+                                    spark.sql(f"EXPLAIN {gt_sql}")
+                                except Exception as explain_exc:
+                                    explain_msg = str(explain_exc)
+                                    comparison["error"] = f"ground_truth SQL compilation failed: {explain_msg[:400]}"
+                                    comparison["error_type"] = "infrastructure"
+                                    comparison["sqlstate"] = _extract_sqlstate(explain_msg)
+
+                                if not comparison["error"]:
+                                    gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
 
                                 genie_df = None
                                 if statement_id:
@@ -1658,6 +1728,7 @@ def register_judge_prompts(
                         "prompt_name": prompt_name,
                         "version": version.version,
                     }
+                    _REGISTERED_PROMPT_NAMES[name] = prompt_name
                     logger.info("[Prompt Registry] %s v%s", prompt_name, version.version)
                     break
                 except Exception as exc:
@@ -1720,6 +1791,7 @@ def register_judge_prompts(
                             "prompt_name": prompt_name,
                             "version": str(version.version),
                         }
+                        _REGISTERED_PROMPT_NAMES[name] = prompt_name
                         logger.info("[Prompt Registry] %s %s v%s", category_label, prompt_name, version.version)
                         break
                     except Exception:

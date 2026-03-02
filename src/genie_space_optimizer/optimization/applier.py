@@ -1374,13 +1374,23 @@ def apply_patch_set(
             "deploy_target": deploy_target,
             "patched_objects": list(patched_objects),
             "validation_errors": validation_errors,
+            "patch_deployed": False,
+            "patch_error": f"Validation failed: {validation_errors}",
         }
 
+    patch_deployed = False
+    patch_error: str = ""
     if w is not None and applied:
         try:
             patch_space_config(w, space_id, config)
-        except Exception:
-            logger.exception("Failed to PATCH Genie Space config")
+            patch_deployed = True
+        except Exception as exc:
+            patch_error = str(exc)
+            logger.exception(
+                "Failed to PATCH Genie Space config after %d retries — "
+                "patches were NOT deployed remotely",
+                2,
+            )
 
     return {
         "space_id": space_id,
@@ -1392,6 +1402,8 @@ def apply_patch_set(
         "deploy_target": deploy_target,
         "patched_objects": list(patched_objects),
         "validation_errors": [],
+        "patch_deployed": patch_deployed,
+        "patch_error": patch_error,
     }
 
 

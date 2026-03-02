@@ -280,6 +280,10 @@ _log(
     model_id=baseline_out["model_id"],
 )
 _banner("Task 2 Completed")
+dbutils.notebook.exit(json.dumps({
+    "overall_accuracy": baseline_out["overall_accuracy"],
+    "thresholds_met": baseline_out["thresholds_met"],
+}, default=str))
 
 # COMMAND ----------
 

@@ -423,11 +423,19 @@ def sort_genie_config(config: dict) -> dict:
     return config
 
 
-def patch_space_config(w: WorkspaceClient, space_id: str, config: dict) -> dict:
+def patch_space_config(
+    w: WorkspaceClient,
+    space_id: str,
+    config: dict,
+    *,
+    max_retries: int = 2,
+    retry_delay: float = 5.0,
+) -> dict:
     """PATCH a Genie Space with updated serialized_space config.
 
     Strips non-exportable fields, sorts arrays, and validates the payload
-    structure before sending.  Returns the raw API response.
+    structure before sending.  Retries on transient HTTP errors (429, 5xx).
+    Returns the raw API response.
     """
     from .genie_schema import validate_serialized_space
 
@@ -444,10 +452,40 @@ def patch_space_config(w: WorkspaceClient, space_id: str, config: dict) -> dict:
         raise ValueError(f"Genie config validation failed: {errors}")
 
     payload = {"serialized_space": json.dumps(clean)}
-    raw_resp = w.api_client.do("PATCH", f"/api/2.0/genie/spaces/{space_id}", body=payload)
-    if isinstance(raw_resp, dict):
-        return raw_resp
-    return {}
+    payload_size = len(payload["serialized_space"])
+    logger.info(
+        "PATCHing Genie Space %s (payload: %d chars)", space_id, payload_size,
+    )
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 2):
+        try:
+            raw_resp = w.api_client.do(
+                "PATCH", f"/api/2.0/genie/spaces/{space_id}", body=payload,
+            )
+            logger.info("PATCH succeeded for space %s on attempt %d", space_id, attempt)
+            if isinstance(raw_resp, dict):
+                return raw_resp
+            return {}
+        except Exception as exc:
+            last_exc = exc
+            _err_body = ""
+            if hasattr(exc, "response"):
+                resp = getattr(exc, "response", None)
+                if resp is not None:
+                    _err_body = f" | HTTP {getattr(resp, 'status_code', '?')}: {getattr(resp, 'text', '')[:500]}"
+            logger.warning(
+                "PATCH attempt %d/%d failed for space %s: %s%s",
+                attempt,
+                max_retries + 1,
+                space_id,
+                exc,
+                _err_body,
+            )
+            if attempt <= max_retries:
+                time.sleep(retry_delay * attempt)
+
+    raise last_exc  # type: ignore[misc]
 
 
 # ── Benchmark Publishing ──────────────────────────────────────────────
