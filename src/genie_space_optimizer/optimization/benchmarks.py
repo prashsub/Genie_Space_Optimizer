@@ -304,7 +304,6 @@ def validate_question_sql_alignment(
                 name=LLM_ENDPOINT,
                 messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
                 temperature=0.0,
-                max_tokens=4096,
             )
             choices = response.choices or []
             raw = (choices[0].message.content or "").strip() if choices and choices[0].message else ""

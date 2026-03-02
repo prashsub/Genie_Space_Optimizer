@@ -339,29 +339,38 @@ LEVER_1_2_COLUMN_PROMPT = (
     '## SQL Diffs (Expected vs Generated)\n'
     '{sql_diffs}\n'
     '\n'
-    '## Full Genie Space Schema (all tables, columns, descriptions, synonyms)\n'
+    '## Full Genie Space Schema\n'
     '{full_schema_context}\n'
     '\n'
-    '## Column Config Format\n'
-    'Genie Space column configs use this exact structure:\n'
-    '```json\n'
-    '{{"column_name": "store_number", "description": ["Store business key for human readability"], "synonyms": ["store id", "location number"]}}\n'
-    '```\n'
-    '- `description` is a list of strings. If the column already has an adequate\n'
-    '  description or should inherit its description from Unity Catalog, set to null.\n'
-    '- `synonyms` are alternative names users might use to refer to this column.\n'
-    '- Do NOT add a description to columns that already have a correct one.\n'
-    '  Prefer adding synonyms when the issue is naming/aliasing.\n'
-    '- Do NOT repeat existing synonyms.\n'
+    '## Structured Column Metadata\n'
+    'Below are the columns most relevant to the failure, showing current metadata\n'
+    'in structured sections. Sections marked [EDITABLE] may be updated by this\n'
+    'lever. Sections marked [LOCKED] are owned by another lever — do NOT modify.\n'
     '\n'
-    'Analyze the SQL diffs carefully. Identify which columns Genie confused or\n'
-    'could not resolve, then propose targeted description or synonym changes.\n'
+    '{structured_column_context}\n'
     '\n'
-    'Return JSON with one entry per column that needs fixing:\n'
+    '## How to Respond\n'
+    'For each column that needs fixing, provide ONLY the sections you want to change.\n'
+    'Use section keys exactly as shown: definition, values, synonyms, aggregation,\n'
+    'grain_note, purpose, best_for, grain, scd, join, important_filters.\n'
+    '\n'
+    '- **synonyms**: comma-separated alternative names (e.g. "store id, location number").\n'
+    '  Existing synonyms are automatically preserved; provide only NEW terms to add.\n'
+    '- **definition**: a concise business description of what the column represents.\n'
+    '- Other sections: provide the new value as a short text string.\n'
+    '\n'
+    'RULES:\n'
+    '- Only include sections you want to CHANGE. Omit sections that are correct.\n'
+    '- Only update sections marked [EDITABLE]. Never touch [LOCKED] sections.\n'
+    '- If a column already has a correct description, prefer adding synonyms.\n'
+    '- Do NOT repeat synonyms already shown in the current metadata.\n'
+    '- Be specific — reference actual table/column names from the SQL diffs.\n'
+    '\n'
+    'Return JSON:\n'
     '{{"changes": [\n'
-    '  {{"table": "<fully_qualified_table_name>", "column": "<column_name>",\n'
-    '    "description": ["<new description>"] or null,\n'
-    '    "synonyms": ["<term1>", "<term2>"] or null}}\n'
+    '  {{"table": "<fully_qualified_table>", "column": "<column_name>",\n'
+    '    "entity_type": "<column_dim|column_measure|column_key>",\n'
+    '    "sections": {{"definition": "new value", "synonyms": "term1, term2"}}}}\n'
     '], "rationale": "..."}}\n'
 )
 
@@ -1202,6 +1211,42 @@ JUDGE_PROMPTS = {
         "Return one of: genie_correct, ground_truth_correct, both_correct, neither_correct\n"
         'Respond with JSON: {"verdict": "...", "rationale": "explanation"}'
     ),
+    "response_quality": (
+        "You are evaluating the quality of a natural language response "
+        "from a Databricks Genie Space AI assistant.\n\n"
+        "User question: {{ inputs }}\n"
+        "Genie's natural language response:\n  {{ outputs }}\n"
+        "Genie's SQL query:\n  {{ sql }}\n"
+        "Expected SQL:\n  {{ expectations }}\n\n"
+        "Evaluate whether the natural language response:\n"
+        "1. Accurately describes what the SQL query does\n"
+        "2. Correctly answers the user's question\n"
+        "3. Does not make claims unsupported by the query/data\n\n"
+        'Respond with JSON only: {"accurate": true/false, '
+        '"failure_type": "<inaccurate_description|unsupported_claim|misleading_summary>", '
+        '"rationale": "<brief explanation>"}\n'
+        'If accurate, set failure_type to "".'
+    ),
+}
+
+# ── 20b. Lever Prompts (registered in MLflow for traceability) ─────────
+
+LEVER_PROMPTS: dict[str, str] = {
+    "lever_1_2_column": LEVER_1_2_COLUMN_PROMPT,
+    "lever_4_join_spec": LEVER_4_JOIN_SPEC_PROMPT,
+    "lever_4_join_discovery": LEVER_4_JOIN_DISCOVERY_PROMPT,
+    "lever_5_instruction": LEVER_5_INSTRUCTION_PROMPT,
+    "lever_5_holistic": LEVER_5_HOLISTIC_PROMPT,
+    "proposal_generation": PROPOSAL_GENERATION_PROMPT,
+}
+
+# ── 20c. Benchmark Prompts (registered in MLflow for traceability) ─────
+
+BENCHMARK_PROMPTS: dict[str, str] = {
+    "benchmark_generation": BENCHMARK_GENERATION_PROMPT,
+    "benchmark_correction": BENCHMARK_CORRECTION_PROMPT,
+    "benchmark_alignment_check": BENCHMARK_ALIGNMENT_CHECK_PROMPT,
+    "benchmark_coverage_gap": BENCHMARK_COVERAGE_GAP_PROMPT,
 }
 
 # ── 21. ASI Schema (12 fields) ─────────────────────────────────────────
@@ -1229,11 +1274,14 @@ _LEVER_TO_PATCH_TYPE: dict[tuple[str, int], str] = {
     ("wrong_table", 1): "update_description",
     ("description_mismatch", 1): "update_column_description",
     ("missing_synonym", 1): "add_column_synonym",
+    ("select_star", 1): "update_column_description",
+    ("missing_scd_filter", 1): "update_column_description",
     # Lever 2: Metric Views — route aggregation/measure issues to column descriptions
     ("wrong_aggregation", 2): "update_column_description",
     ("wrong_measure", 2): "update_column_description",
     ("missing_filter", 2): "update_mv_yaml",
     ("missing_temporal_filter", 2): "update_mv_yaml",
+    ("wrong_filter_condition", 2): "update_column_description",
     # Lever 3: Table-Valued Functions
     ("tvf_parameter_error", 3): "add_tvf_parameter",
     ("repeatability_issue", 3): "add_tvf_parameter",
@@ -1241,9 +1289,16 @@ _LEVER_TO_PATCH_TYPE: dict[tuple[str, int], str] = {
     ("wrong_join", 4): "update_join_spec",
     ("missing_join_spec", 4): "add_join_spec",
     ("wrong_join_spec", 4): "update_join_spec",
+    ("wrong_join_type", 4): "update_join_spec",
     # Lever 5: Genie Space Instructions (example SQL preferred over text)
     ("asset_routing_error", 5): "add_example_sql",
     ("missing_instruction", 5): "add_example_sql",
     ("ambiguous_question", 5): "add_example_sql",
     ("missing_filter", 5): "add_example_sql",
+    # Fallback for "other" failure types — avoids falling through to add_instruction
+    ("other", 1): "update_column_description",
+    ("other", 2): "update_column_description",
+    ("other", 3): "update_description",
+    ("other", 4): "add_join_spec",
+    ("other", 5): "add_example_sql",
 }

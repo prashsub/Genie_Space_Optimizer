@@ -1,0 +1,414 @@
+"""Structured metadata schema for Genie Space descriptions.
+
+Provides parse/render/update utilities so that table, column, metric view,
+and function descriptions follow a predictable ``**Section:** value`` format.
+Each lever owns specific sections, preventing collateral damage when one
+lever updates metadata that another lever depends on.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Literal
+
+# ---------------------------------------------------------------------------
+# Section Templates per Entity Type
+# ---------------------------------------------------------------------------
+
+TABLE_DESCRIPTION_SECTIONS: list[str] = [
+    "purpose", "best_for", "grain", "scd", "relationships",
+]
+
+COLUMN_DIMENSION_SECTIONS: list[str] = [
+    "definition", "values", "synonyms",
+]
+
+COLUMN_MEASURE_SECTIONS: list[str] = [
+    "definition", "aggregation", "grain_note", "synonyms",
+]
+
+COLUMN_KEY_SECTIONS: list[str] = [
+    "definition", "join", "synonyms",
+]
+
+FUNCTION_SECTIONS: list[str] = [
+    "purpose", "best_for", "use_instead_of", "parameters", "example",
+]
+
+MV_TABLE_SECTIONS: list[str] = [
+    "purpose", "best_for", "grain", "important_filters",
+]
+
+ENTITY_TYPE_TEMPLATES: dict[str, list[str]] = {
+    "table": TABLE_DESCRIPTION_SECTIONS,
+    "column_dim": COLUMN_DIMENSION_SECTIONS,
+    "column_measure": COLUMN_MEASURE_SECTIONS,
+    "column_key": COLUMN_KEY_SECTIONS,
+    "function": FUNCTION_SECTIONS,
+    "mv_table": MV_TABLE_SECTIONS,
+}
+
+SECTION_LABELS: dict[str, str] = {
+    "purpose": "Purpose",
+    "best_for": "Best for",
+    "grain": "Grain",
+    "scd": "SCD",
+    "relationships": "Relationships",
+    "definition": "Definition",
+    "values": "Values",
+    "aggregation": "Aggregation",
+    "grain_note": "Grain note",
+    "join": "Join",
+    "synonyms": "Synonyms",
+    "use_instead_of": "Use instead of",
+    "parameters": "Parameters",
+    "example": "Example",
+    "important_filters": "Important filters",
+}
+
+_LABEL_TO_KEY: dict[str, str] = {v.lower(): k for k, v in SECTION_LABELS.items()}
+
+# ---------------------------------------------------------------------------
+# Lever Section Ownership
+# ---------------------------------------------------------------------------
+
+LEVER_SECTION_OWNERSHIP: dict[int, set[str]] = {
+    1: {"purpose", "best_for", "grain", "scd", "definition", "values", "synonyms"},
+    2: {"aggregation", "grain_note", "important_filters", "synonyms"},
+    3: {"purpose", "best_for", "use_instead_of", "parameters", "example"},
+    4: {"relationships", "join"},
+    5: set(),
+}
+
+# Regex that matches ``**Label:** rest-of-line`` at start of a line
+_SECTION_RE = re.compile(
+    r"^\*\*(?P<label>[^*:]+?):\*\*\s*(?P<value>.*)$",
+    re.MULTILINE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Numeric / measure heuristics (mirrored from config.py to avoid circular)
+# ---------------------------------------------------------------------------
+
+_NUMERIC_TYPES = {
+    "DOUBLE", "FLOAT", "DECIMAL", "INT", "INTEGER", "BIGINT",
+    "SMALLINT", "TINYINT", "LONG", "SHORT", "BYTE", "NUMBER",
+}
+
+_MEASURE_PREFIXES = (
+    "avg_", "sum_", "count_", "total_", "pct_", "ratio_",
+    "min_", "max_", "num_", "mean_", "median_", "stddev_",
+)
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+def parse_structured_description(text: str | list[str] | None) -> dict[str, str]:
+    """Parse ``**Section:** value`` pairs from a description string.
+
+    Returns a dict mapping section keys (e.g. ``"purpose"``, ``"definition"``)
+    to their values.  Any text that does not belong to a recognized section is
+    stored under the ``"_preamble"`` key.
+
+    Handles both structured descriptions and legacy free-text (which all goes
+    into ``_preamble``).  Parsing an already-structured description and
+    re-rendering yields the same output (idempotent).
+    """
+    if text is None:
+        return {}
+    if isinstance(text, list):
+        text = "\n".join(text)
+    text = text.strip()
+    if not text:
+        return {}
+
+    sections: dict[str, str] = {}
+    preamble_lines: list[str] = []
+    current_key: str | None = None
+    current_lines: list[str] = []
+
+    for line in text.split("\n"):
+        m = _SECTION_RE.match(line)
+        if m:
+            if current_key is not None:
+                sections[current_key] = "\n".join(current_lines).strip()
+            elif current_lines:
+                preamble_lines.extend(current_lines)
+
+            label = m.group("label").strip().lower()
+            current_key = _LABEL_TO_KEY.get(label)
+            if current_key is None:
+                preamble_lines.append(line)
+                current_key = None
+                current_lines = []
+            else:
+                current_lines = [m.group("value").strip()]
+        else:
+            if current_key is not None:
+                current_lines.append(line)
+            else:
+                preamble_lines.append(line)
+
+    if current_key is not None:
+        sections[current_key] = "\n".join(current_lines).strip()
+    elif current_lines:
+        preamble_lines.extend(current_lines)
+
+    preamble = "\n".join(preamble_lines).strip()
+    if preamble:
+        sections["_preamble"] = preamble
+
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# Renderer
+# ---------------------------------------------------------------------------
+
+EntityType = Literal[
+    "table", "column_dim", "column_measure", "column_key", "function", "mv_table",
+]
+
+
+def render_structured_description(
+    sections: dict[str, str],
+    entity_type: EntityType,
+) -> list[str]:
+    """Render sections into the Genie API ``description`` format (``list[str]``).
+
+    Outputs lines like ``["**Purpose:** ...", "**Aggregation:** ..."]``.
+    Preserves ``_preamble`` at the top if present.
+    """
+    template = ENTITY_TYPE_TEMPLATES.get(entity_type, [])
+    lines: list[str] = []
+
+    preamble = sections.get("_preamble", "").strip()
+    if preamble:
+        lines.append(preamble)
+
+    for section_key in template:
+        value = sections.get(section_key, "").strip()
+        if not value:
+            continue
+        label = SECTION_LABELS[section_key]
+        lines.append(f"**{label}:** {value}")
+
+    return lines if lines else [""]
+
+
+# ---------------------------------------------------------------------------
+# Updater
+# ---------------------------------------------------------------------------
+
+class LeverOwnershipError(ValueError):
+    """Raised when a lever attempts to modify a section it does not own."""
+
+
+def update_section(
+    current_description: str | list[str] | None,
+    section: str,
+    new_value: str,
+    lever: int,
+    entity_type: EntityType,
+) -> list[str]:
+    """Update one section of a structured description.
+
+    Validates that *lever* owns *section* via ``LEVER_SECTION_OWNERSHIP``,
+    parses the current description, replaces just that section, and
+    re-renders.
+
+    Returns the new description as a ``list[str]`` suitable for the Genie API.
+
+    Raises ``LeverOwnershipError`` if the lever does not own the section.
+    """
+    allowed = LEVER_SECTION_OWNERSHIP.get(lever, set())
+    if section not in allowed:
+        raise LeverOwnershipError(
+            f"Lever {lever} cannot modify section '{section}' "
+            f"(allowed: {sorted(allowed)})"
+        )
+
+    sections = parse_structured_description(current_description)
+    sections[section] = new_value
+    return render_structured_description(sections, entity_type)
+
+
+def update_sections(
+    current_description: str | list[str] | None,
+    updates: dict[str, str],
+    lever: int,
+    entity_type: EntityType,
+) -> list[str]:
+    """Update multiple sections at once, validating lever ownership for each.
+
+    *updates* maps section keys to their new values.
+    """
+    allowed = LEVER_SECTION_OWNERSHIP.get(lever, set())
+    for section in updates:
+        if section not in allowed:
+            raise LeverOwnershipError(
+                f"Lever {lever} cannot modify section '{section}' "
+                f"(allowed: {sorted(allowed)})"
+            )
+
+    sections = parse_structured_description(current_description)
+    sections.update(updates)
+    return render_structured_description(sections, entity_type)
+
+
+# ---------------------------------------------------------------------------
+# Column Classifier
+# ---------------------------------------------------------------------------
+
+def classify_column(
+    col_name: str,
+    data_type: str,
+    *,
+    is_in_metric_view: bool = False,
+    enable_entity_matching: bool = False,
+) -> Literal["dimension", "measure", "key"]:
+    """Classify a column as dimension, measure, or key.
+
+    Uses naming conventions, data type, and contextual flags to determine
+    which structured description template to apply.
+    """
+    lower = col_name.lower()
+    if lower.endswith("_key") or lower.endswith("_id") or lower == "id":
+        return "key"
+
+    dt_upper = (data_type or "").upper().split("(")[0].strip()
+    if dt_upper in _NUMERIC_TYPES:
+        if any(lower.startswith(p) for p in _MEASURE_PREFIXES):
+            return "measure"
+        if is_in_metric_view and not enable_entity_matching:
+            return "measure"
+
+    if enable_entity_matching:
+        return "dimension"
+
+    if dt_upper in _NUMERIC_TYPES and not enable_entity_matching:
+        return "measure"
+
+    return "dimension"
+
+
+def entity_type_for_column(
+    col_name: str,
+    data_type: str,
+    *,
+    is_in_metric_view: bool = False,
+    enable_entity_matching: bool = False,
+) -> EntityType:
+    """Return the ``EntityType`` string for a column classification."""
+    kind = classify_column(
+        col_name, data_type,
+        is_in_metric_view=is_in_metric_view,
+        enable_entity_matching=enable_entity_matching,
+    )
+    return {
+        "dimension": "column_dim",
+        "measure": "column_measure",
+        "key": "column_key",
+    }[kind]
+
+
+# ---------------------------------------------------------------------------
+# Synonyms Helpers
+# ---------------------------------------------------------------------------
+
+def extract_synonyms_section(sections: dict[str, str]) -> list[str]:
+    """Parse the ``synonyms`` section into a list of individual terms.
+
+    The section stores synonyms as a comma-separated string,
+    e.g. ``"store id, location number"``.
+    """
+    raw = sections.get("synonyms", "").strip()
+    if not raw:
+        return []
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def format_synonyms_section(synonyms: list[str]) -> str:
+    """Format a list of synonym terms into the structured section value."""
+    return ", ".join(s.strip() for s in synonyms if s.strip())
+
+
+def merge_synonyms(existing: list[str], proposed: list[str]) -> list[str]:
+    """Merge proposed synonyms into an existing list, avoiding duplicates."""
+    seen = {s.lower() for s in existing}
+    merged = list(existing)
+    for s in proposed:
+        if s.strip() and s.strip().lower() not in seen:
+            merged.append(s.strip())
+            seen.add(s.strip().lower())
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Convenience: format a column's current description as a structured prompt
+# ---------------------------------------------------------------------------
+
+def format_column_for_prompt(
+    col_name: str,
+    description: str | list[str] | None,
+    synonyms: list[str] | None,
+    data_type: str,
+    uc_comment: str = "",
+    *,
+    is_in_metric_view: bool = False,
+    enable_entity_matching: bool = False,
+) -> str:
+    """Format a column's current metadata as structured sections for the LLM.
+
+    Used to build the "current state" portion of a slot-filling prompt.
+    Shows each section with its current value (or ``(empty)`` if not set).
+    """
+    etype = entity_type_for_column(
+        col_name, data_type,
+        is_in_metric_view=is_in_metric_view,
+        enable_entity_matching=enable_entity_matching,
+    )
+    template_sections = ENTITY_TYPE_TEMPLATES[etype]
+
+    desc_text = description
+    if isinstance(desc_text, list):
+        desc_text = "\n".join(desc_text)
+    if not desc_text and uc_comment:
+        desc_text = uc_comment
+
+    sections = parse_structured_description(desc_text)
+
+    if synonyms:
+        existing_syn = extract_synonyms_section(sections)
+        all_syns = merge_synonyms(existing_syn, synonyms)
+        sections["synonyms"] = format_synonyms_section(all_syns)
+
+    kind = classify_column(
+        col_name, data_type,
+        is_in_metric_view=is_in_metric_view,
+        enable_entity_matching=enable_entity_matching,
+    )
+
+    lines: list[str] = [
+        f"Column: `{col_name}` ({data_type or 'unknown'}) [type: {kind}]",
+    ]
+    for section_key in template_sections:
+        label = SECTION_LABELS[section_key]
+        value = sections.get(section_key, "").strip()
+        lines.append(f"  **{label}:** {value if value else '(empty)'}")
+
+    preamble = sections.get("_preamble", "").strip()
+    if preamble:
+        lines.append(f"  [Legacy text]: {preamble}")
+
+    return "\n".join(lines)
+
+
+def sections_for_lever(lever: int, entity_type: EntityType) -> list[str]:
+    """Return the section keys that a lever is allowed to fill for an entity type."""
+    owned = LEVER_SECTION_OWNERSHIP.get(lever, set())
+    template = ENTITY_TYPE_TEMPLATES.get(entity_type, [])
+    return [s for s in template if s in owned]

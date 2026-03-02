@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_runs (
     experiment_id       STRING                 COMMENT 'MLflow experiment ID',
     config_snapshot     STRING                 COMMENT 'JSON: Genie Space config at run start',
     triggered_by        STRING                 COMMENT 'User email who initiated the run',
+    labeling_session_name STRING               COMMENT 'MLflow labeling session name for human review',
+    labeling_session_run_id STRING             COMMENT 'MLflow run ID associated with the labeling session',
     updated_at          TIMESTAMP     NOT NULL COMMENT 'Last update timestamp'
 )
 USING DELTA
@@ -267,6 +269,9 @@ def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None
     migrations = [
         (TABLE_RUNS, "job_id", "STRING COMMENT 'Databricks Job definition ID'"),
         (TABLE_PATCHES, "provenance_json", "STRING COMMENT 'JSON: full provenance chain from judge verdicts to this patch'"),
+        (TABLE_ASI, "mlflow_run_id", "STRING COMMENT 'MLflow run ID from the evaluation that produced this ASI row'"),
+        (TABLE_RUNS, "labeling_session_name", "STRING COMMENT 'MLflow labeling session name for human review'"),
+        (TABLE_RUNS, "labeling_session_run_id", "STRING COMMENT 'MLflow run ID associated with the labeling session'"),
     ]
     for table, col, col_def in migrations:
         fqn = _fqn(catalog, schema, table)
@@ -361,6 +366,8 @@ def update_run_status(
     job_id: str | None = None,
     experiment_name: str | None = None,
     experiment_id: str | None = None,
+    labeling_session_name: str | None = None,
+    labeling_session_run_id: str | None = None,
 ) -> None:
     """Update ``genie_opt_runs`` — only sets non-None fields."""
     now = datetime.now(timezone.utc).isoformat()
@@ -390,6 +397,10 @@ def update_run_status(
         updates["experiment_name"] = experiment_name
     if experiment_id is not None:
         updates["experiment_id"] = experiment_id
+    if labeling_session_name is not None:
+        updates["labeling_session_name"] = labeling_session_name
+    if labeling_session_run_id is not None:
+        updates["labeling_session_run_id"] = labeling_session_run_id
 
     update_row(spark, catalog, schema, TABLE_RUNS, {"run_id": run_id}, updates)
 

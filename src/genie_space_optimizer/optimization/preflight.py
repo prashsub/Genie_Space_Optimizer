@@ -9,6 +9,7 @@ LoggedModel (iteration 0).
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -43,7 +44,7 @@ from genie_space_optimizer.optimization.evaluation import (
     register_judge_prompts,
 )
 from genie_space_optimizer.optimization.models import create_genie_model_version
-from genie_space_optimizer.optimization.state import load_run, write_stage
+from genie_space_optimizer.optimization.state import load_run, load_runs_for_space, write_stage
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
@@ -159,6 +160,8 @@ def run_preflight(
     Returns:
         (config, benchmarks, model_id, experiment_name)
     """
+    domain = re.sub(r"[^a-z0-9_]+", "_", domain.lower()).strip("_") or "default"
+
     write_stage(
         spark, run_id, "PREFLIGHT_STARTED", "STARTED",
         task_key="preflight", catalog=catalog, schema=schema,
@@ -616,6 +619,7 @@ def run_preflight(
     create_evaluation_dataset(
         spark, benchmarks, uc_schema, domain,
         space_id=space_id, catalog=catalog, gold_schema=schema,
+        experiment_id=experiment_id,
     )
 
     _human_corrections: list[dict] = []
@@ -627,20 +631,25 @@ def run_preflight(
         )
         ensure_labeling_schemas()
 
-        prior_run = load_run(spark, run_id, catalog, schema) if run_id else None
-        _prior_session_id = (prior_run or {}).get("labeling_session_run_id", "")
-        if _prior_session_id:
-            feedback = ingest_human_feedback(experiment_name, _prior_session_id)
+        prior_runs = load_runs_for_space(spark, space_id, catalog, schema)
+        _prior_session_name = ""
+        if not prior_runs.empty:
+            completed = prior_runs[
+                (prior_runs["run_id"] != run_id)
+                & (prior_runs["status"].isin(["CONVERGED", "STALLED", "MAX_ITERATIONS"]))
+            ]
+            if not completed.empty:
+                _prior_session_name = completed.iloc[0].get("labeling_session_name", "") or ""
+        if _prior_session_name:
+            _benchmark_table = f"{uc_schema}.genie_benchmarks_{domain}"
+            sync_corrections_to_dataset(_prior_session_name, _benchmark_table)
+            feedback = ingest_human_feedback(_prior_session_name)
             _human_corrections = feedback.get("corrections", [])
             if _human_corrections:
                 logger.info(
-                    "Loaded %d human corrections from prior labeling session %s",
-                    len(_human_corrections), _prior_session_id,
+                    "Loaded %d human corrections from prior labeling session '%s'",
+                    len(_human_corrections), _prior_session_name,
                 )
-                _benchmark_table = f"{uc_schema}.genie_benchmarks_{domain}"
-                _sql_corrections = [c for c in _human_corrections if c["type"] == "benchmark_correction"]
-                if _sql_corrections:
-                    sync_corrections_to_dataset(_prior_session_id, _benchmark_table)
     except Exception:
         logger.debug("Human feedback ingestion skipped (no prior session or module unavailable)", exc_info=True)
 

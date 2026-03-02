@@ -801,7 +801,7 @@ def do_start_optimization(
 
     if space_snapshot:
         title = str(space_snapshot.get("title", "") or "")
-        domain = title.lower().replace(" ", "_").replace("-", "_") if title else "default"
+        domain = re.sub(r"[^a-z0-9_]+", "_", title.lower().replace(" ", "_").replace("-", "_")).strip("_") if title else "default"
     else:
         domain = _infer_domain(_genie_client(ws, sp_ws), space_id)
 
@@ -1006,7 +1006,8 @@ def _infer_domain(w, space_id: str) -> str:
     try:
         space = w.api_client.do("GET", f"/api/2.0/genie/spaces/{space_id}")
         title = space.get("title", "")
-        return title.lower().replace(" ", "_").replace("-", "_")
+        raw = title.lower().replace(" ", "_").replace("-", "_")
+        return re.sub(r"[^a-z0-9_]+", "_", raw).strip("_") or "default"
     except Exception:
         return "default"
 

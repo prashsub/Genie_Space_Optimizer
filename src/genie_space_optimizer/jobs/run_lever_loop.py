@@ -180,6 +180,8 @@ max_iterations = int(dbutils.jobs.taskValues.get(taskKey="preflight", key="max_i
 levers = json.loads(dbutils.jobs.taskValues.get(taskKey="preflight", key="levers"))
 apply_mode = dbutils.jobs.taskValues.get(taskKey="preflight", key="apply_mode")
 
+triggered_by = dbutils.jobs.taskValues.get(taskKey="preflight", key="triggered_by", default="")
+
 scores_json = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="scores")
 prev_scores = json.loads(scores_json)
 prev_accuracy = float(dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="overall_accuracy"))
@@ -202,6 +204,7 @@ _log(
     baseline_accuracy=prev_accuracy,
     baseline_thresholds_met=thresholds_met,
     baseline_model_id=prev_model_id,
+    triggered_by=triggered_by,
 )
 
 # COMMAND ----------
@@ -292,6 +295,7 @@ try:
         prev_scores, prev_accuracy, prev_model_id, config,
         catalog, schema, levers, max_iterations,
         apply_mode=apply_mode,
+        triggered_by=triggered_by,
     )
     _log(
         "Lever loop finished",

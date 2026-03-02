@@ -30,6 +30,16 @@ from genie_space_optimizer.common.config import (
     PATCH_TYPES,
     _LEVER_TO_PATCH_TYPE,
 )
+from genie_space_optimizer.optimization.structured_metadata import (
+    LeverOwnershipError,
+    entity_type_for_column,
+    extract_synonyms_section,
+    format_synonyms_section,
+    merge_synonyms,
+    parse_structured_description,
+    render_structured_description,
+    update_sections,
+)
 from genie_space_optimizer.common.genie_client import (
     patch_space_config,
     sort_genie_config,
@@ -493,10 +503,48 @@ def proposals_to_patches(proposals: list[dict]) -> list[dict]:
             fixes = [fixes]
         new_text = p.get("proposed_value") or (fixes[0] if fixes else p.get("change_description", ""))
 
+        col_sections = p.get("column_sections")
         col_desc = p.get("column_description")
         col_syns = p.get("column_synonyms")
         tbl_id = p.get("table", "")
         col_name = p.get("column", "")
+
+        if isinstance(col_sections, dict) and col_sections and tbl_id and col_name:
+            base = {
+                "lever": lever,
+                "risk_level": classify_risk(patch_type),
+                "predicted_affected_questions": p.get("questions_fixed", 0),
+                "grounded_in": p.get("grounded_in", []),
+                "source_proposal_id": p.get("proposal_id", ""),
+                "table": tbl_id,
+                "column": col_name,
+            }
+            non_synonym_sections = {
+                k: v for k, v in col_sections.items() if k != "synonyms"
+            }
+            synonym_value = col_sections.get("synonyms", "")
+            if non_synonym_sections:
+                patches.append({
+                    **base,
+                    "type": "update_column_description",
+                    "target": tbl_id,
+                    "new_text": "",
+                    "old_text": "",
+                    "structured_sections": non_synonym_sections,
+                    "column_entity_type": p.get("column_entity_type", ""),
+                })
+            if synonym_value:
+                new_syns = [s.strip() for s in synonym_value.split(",") if s.strip()]
+                if new_syns:
+                    patches.append({
+                        **base,
+                        "type": "add_column_synonym",
+                        "target": tbl_id,
+                        "new_text": "",
+                        "old_text": "",
+                        "synonyms": new_syns,
+                    })
+            continue
 
         if (col_desc is not None or col_syns is not None) and tbl_id and col_name:
             base = {
@@ -659,6 +707,21 @@ def render_patch(patch: dict, space_id: str, space_config: dict) -> dict:
             json.dumps({"op": "remove", "section": "column_configs", "table": table_id, "column": column_name, "value": new_text}),
         )
     if patch_type == "update_column_description":
+        structured_sections = patch.get("structured_sections")
+        if isinstance(structured_sections, dict) and structured_sections:
+            cmd_fwd: dict = {
+                "op": "update", "section": "column_configs",
+                "table": table_id, "column": column_name,
+                "structured_sections": structured_sections,
+                "lever": patch.get("lever", 0),
+                "column_entity_type": patch.get("column_entity_type", ""),
+            }
+            cmd_rev: dict = {
+                "op": "update", "section": "column_configs",
+                "table": table_id, "column": column_name,
+                "old_text": "", "new_text": "",
+            }
+            return action(json.dumps(cmd_fwd), json.dumps(cmd_rev))
         return action(
             json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "old_text": old_text, "new_text": new_text}),
             json.dumps({"op": "update", "section": "column_configs", "table": table_id, "column": column_name, "old_text": new_text, "new_text": old_text}),
@@ -990,6 +1053,28 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
                 return True
             cc["description"] = [val] if isinstance(val, str) else val
             return True
+        if op == "update" and "structured_sections" in cmd:
+            sections_update = cmd["structured_sections"]
+            lever_num = cmd.get("lever", 0)
+            etype_str = cmd.get("column_entity_type", "")
+            if not etype_str:
+                data_type = cc.get("data_type", "")
+                etype_str = entity_type_for_column(col_name, data_type)
+            try:
+                new_desc = update_sections(
+                    cc.get("description"),
+                    sections_update,
+                    lever_num,
+                    etype_str,
+                )
+                cc["description"] = new_desc
+                return True
+            except LeverOwnershipError:
+                logger.warning(
+                    "Lever %d tried to update locked sections on %s.%s — skipped",
+                    lever_num, table_id, col_name,
+                )
+                return False
         if op == "update" and "new_text" in cmd:
             if not cmd["new_text"]:
                 return True
@@ -1156,7 +1241,19 @@ def _apply_action_to_uc(w: WorkspaceClient, action: dict) -> bool:
         if patch_type == "update_column_description":
             table = cmd.get("table", "")
             column = cmd.get("column", "")
+            structured_sections = cmd.get("structured_sections")
             new_text = cmd.get("new_text", "")
+            if table and column and isinstance(structured_sections, dict) and structured_sections:
+                etype = cmd.get("column_entity_type") or entity_type_for_column(column, "")
+                rendered = render_structured_description(structured_sections, etype)
+                flat = "\n".join(rendered)
+                escaped = flat.replace("'", "\\'")
+                w.statement_execution.execute_statement(
+                    statement=f"ALTER TABLE {table} ALTER COLUMN {column} COMMENT '{escaped}'",
+                    warehouse_id=warehouse_id,
+                    wait_timeout="30s",
+                )
+                return True
             if table and column and new_text:
                 escaped = new_text.replace("'", "\\'")
                 w.statement_execution.execute_statement(

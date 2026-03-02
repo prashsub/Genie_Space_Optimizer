@@ -656,6 +656,257 @@ def _extract_arbiter_actions_from_baseline(
     return actions
 
 
+def _analyze_and_distribute(
+    spark: Any,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    metadata_snapshot: dict,
+    iteration_counter: int,
+    lever_label: int,
+    *,
+    verbose: bool = True,
+) -> dict:
+    """Analyze failures once, cluster, and distribute clusters to levers.
+
+    Returns a dict with:
+      - ``lever_assignments``: ``{lever_int: [clusters]}``
+      - ``all_clusters``: all hard-failure clusters (flat list)
+      - ``soft_signal_clusters``: soft-signal clusters
+      - ``summary``: printable summary lines
+      - ``asi_rows``: ASI rows for Delta
+      - ``prov_rows``: provenance rows for Delta
+    """
+    from genie_space_optimizer.optimization.optimizer import (
+        _map_to_lever,
+        cluster_failures,
+    )
+
+    failure_rows = _get_failure_rows(spark, run_id, catalog, schema)
+
+    _NON_ACTIONABLE_VERDICTS = {"genie_correct", "both_correct"}
+    arbiter_counts: dict[str, int] = {}
+    arbiter_excluded: list[str] = []
+    soft_signal_qids: list[str] = []
+    filtered_failure_rows: list[dict] = []
+    soft_signal_rows: list[dict] = []
+    for row in failure_rows:
+        av = str(
+            row.get("arbiter/value")
+            or row.get("feedback/arbiter/value")
+            or (row.get("arbiter") if isinstance(row.get("arbiter"), str) else "")
+            or "skipped"
+        ).lower()
+        arbiter_counts[av] = arbiter_counts.get(av, 0) + 1
+        if av in _NON_ACTIONABLE_VERDICTS:
+            _rq = row.get("request") or {}
+            if isinstance(_rq, str):
+                try:
+                    _rq = json.loads(_rq)
+                except (json.JSONDecodeError, TypeError):
+                    _rq = {}
+            _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
+            qid = str(
+                row.get("inputs/question_id")
+                or (row.get("inputs") or {}).get("question_id", "")
+                or row.get("question_id")
+                or _rqk.get("question_id")
+                or (_rq.get("question_id") if isinstance(_rq, dict) else None)
+                or "?"
+            )
+            if _has_individual_judge_failure(row):
+                soft_signal_rows.append(row)
+                soft_signal_qids.append(qid)
+            else:
+                arbiter_excluded.append(qid)
+        else:
+            filtered_failure_rows.append(row)
+
+    # ── Print failure analysis summary ─────────────────────────────
+    _arbiter_summary = "  ".join(f"{k}={v}" for k, v in sorted(arbiter_counts.items()))
+    _fa_lines = [
+        _section("Failure Analysis", "-"),
+        _kv("Total rows loaded", len(failure_rows)),
+        _kv("Arbiter verdicts", _arbiter_summary),
+    ]
+    if arbiter_excluded:
+        _fa_lines.append(_kv("Excluded (fully correct)", f"{len(arbiter_excluded)} question(s)"))
+    if soft_signal_rows:
+        _fa_lines.append(_kv("Soft signals (correct but judges failed)", f"{len(soft_signal_rows)} question(s)"))
+        _fa_lines.append(_kv("  Soft signal question IDs", ", ".join(soft_signal_qids[:10])))
+        for _ss_row, _ss_qid in zip(soft_signal_rows[:10], soft_signal_qids[:10]):
+            _failed_judges = _get_failed_judges(_ss_row)
+            _fa_lines.append(f"  |    {_ss_qid}: failed judges = {', '.join(_failed_judges) if _failed_judges else '(none detected)'}")
+    _fa_lines.append(_kv("Hard failure rows for clustering", len(filtered_failure_rows)))
+    _fa_lines.append(_bar("-"))
+    print("\n".join(_fa_lines))
+
+    # ── Cluster hard failures ──────────────────────────────────────
+    eval_result_for_clustering = {"rows": filtered_failure_rows}
+    clusters = cluster_failures(
+        eval_result_for_clustering, metadata_snapshot,
+        spark=spark, run_id=run_id, catalog=catalog, schema=schema,
+    )
+
+    # ── Cluster soft signals ───────────────────────────────────────
+    soft_clusters: list[dict] = []
+    if soft_signal_rows:
+        soft_eval = {"rows": soft_signal_rows}
+        soft_clusters = cluster_failures(
+            soft_eval, metadata_snapshot,
+            spark=spark, run_id=run_id, catalog=catalog, schema=schema,
+            verbose=False,
+        )
+        for sc in soft_clusters:
+            sc["signal_type"] = "soft"
+        _soft_qids_total = sum(len(sc.get("question_ids", [])) for sc in soft_clusters)
+        _soft_lines = [
+            _section("Soft Signal Clusters (correct-but-suboptimal)", "-"),
+            _kv("Soft signal rows", len(soft_signal_rows)),
+            _kv("Soft clusters formed", len(soft_clusters)),
+            _kv("Soft cluster questions", _soft_qids_total),
+            "|",
+        ]
+        for si, sc in enumerate(soft_clusters, 1):
+            sc_judge = sc.get("affected_judge", "?")
+            sc_cause = sc.get("root_cause", "?")
+            sc_asi = sc.get("asi_failure_type", "n/a")
+            sc_qids = sc.get("question_ids", [])
+            sc_blame = sc.get("asi_blame_set", sc.get("blame_set", []))
+            blame_str = ", ".join(sc_blame) if isinstance(sc_blame, list) and sc_blame else str(sc_blame) if sc_blame else "(none)"
+            _soft_lines.append(f"|  Soft cluster {si} / {len(soft_clusters)}")
+            _soft_lines.append(f"|    {'Judge:':<24s} {sc_judge}")
+            _soft_lines.append(f"|    {'Root cause:':<24s} {sc_cause}")
+            _soft_lines.append(f"|    {'ASI failure type:':<24s} {sc_asi}")
+            _soft_lines.append(f"|    {'Blame:':<24s} {blame_str}")
+            _soft_lines.append(f"|    Questions ({len(sc_qids)}):")
+            for qid in sc_qids:
+                _soft_lines.append(f"|      {qid}")
+            _soft_lines.append("|")
+        _soft_lines.append(_bar("-"))
+        print("\n".join(_soft_lines))
+
+    # ── Map clusters to levers ─────────────────────────────────────
+    lever_assignments: dict[int, list[dict]] = {}
+    cluster_lines = [_section(f"Failure Clusters ({len(clusters)} total)", "-"), "|"]
+    _root_cause_counter: Counter[str] = Counter()
+    _lever_counter: Counter[int] = Counter()
+    _all_cluster_qids: set[str] = set()
+    _clusters_with_asi = 0
+    _clusters_with_blame = 0
+    for ci, c in enumerate(clusters, 1):
+        mapped = _map_to_lever(
+            c["root_cause"],
+            asi_failure_type=c.get("asi_failure_type"),
+            blame_set=c.get("asi_blame_set"),
+            judge=c.get("affected_judge"),
+        )
+        c["_mapped_lever"] = mapped
+        lever_assignments.setdefault(mapped, []).append(c)
+        blame = c.get("asi_blame_set", c.get("blame_set", []))
+        qids = c["question_ids"]
+        asi_ft = c.get("asi_failure_type", "n/a")
+        cluster_lines.append(f"|  Cluster {ci} / {len(clusters)}")
+        cluster_lines.append(f"|    {'Judge:':<24s} {c['affected_judge']}")
+        cluster_lines.append(f"|    {'Root cause:':<24s} {c['root_cause']}")
+        cluster_lines.append(f"|    {'ASI failure type:':<24s} {asi_ft}")
+        cluster_lines.append(f"|    {'Mapped lever:':<24s} {mapped}")
+        blame_str = ", ".join(blame) if isinstance(blame, list) and blame else str(blame) if blame else "(none)"
+        cluster_lines.append(f"|    {'Blame:':<24s} {blame_str}")
+        cluster_lines.append(f"|    Questions ({len(qids)}):")
+        for qid in qids:
+            cluster_lines.append(f"|      {qid}")
+        cluster_lines.append("|")
+        _root_cause_counter[c["root_cause"]] += 1
+        _lever_counter[mapped] += 1
+        _all_cluster_qids.update(qids)
+        if asi_ft and asi_ft != "n/a":
+            _clusters_with_asi += 1
+        if blame and blame != []:
+            _clusters_with_blame += 1
+
+    _lever_summary = ", ".join(f"lever {k} = {v}" for k, v in sorted(_lever_counter.items()))
+    _top_causes = ", ".join(f"{k} ({v})" for k, v in _root_cause_counter.most_common(5))
+    cluster_lines.append("|  --- Summary ---")
+    cluster_lines.append(f"|    {'Clusters by lever:':<24s} {_lever_summary}")
+    cluster_lines.append(f"|    {'Unique questions:':<24s} {len(_all_cluster_qids)}")
+    cluster_lines.append(f"|    {'Top root causes:':<24s} {_top_causes}")
+    cluster_lines.append(f"|    {'Clusters with ASI:':<24s} {_clusters_with_asi} of {len(clusters)}")
+    cluster_lines.append(f"|    {'Clusters with blame:':<24s} {_clusters_with_blame} of {len(clusters)}")
+    cluster_lines.append(_bar("-"))
+    print("\n".join(cluster_lines))
+
+    # ── ASI / provenance rows for Delta ────────────────────────────
+    all_clusters_for_asi = clusters + soft_clusters
+    _asi_rows: list[dict] = []
+    _prov_rows: list[dict] = []
+    for c in all_clusters_for_asi:
+        sig_type = c.get("signal_type", "hard")
+        for qt in c.get("question_traces", []):
+            qid = qt.get("question_id", "")
+            for jt in qt.get("failed_judges", []):
+                _asi_rows.append({
+                    "question_id": qid,
+                    "judge": jt.get("judge", ""),
+                    "value": "no",
+                    "failure_type": jt.get("asi_failure_type_raw"),
+                    "blame_set": jt.get("blame_set"),
+                    "counterfactual_fix": jt.get("counterfactual_fix"),
+                    "wrong_clause": jt.get("wrong_clause"),
+                })
+                _prov_rows.append({
+                    "question_id": qid,
+                    "signal_type": sig_type,
+                    "judge": jt.get("judge", ""),
+                    "judge_verdict": jt.get("verdict", "FAIL"),
+                    "asi_failure_type_raw": jt.get("asi_failure_type_raw"),
+                    "resolved_root_cause": jt.get("resolved_root_cause", "other"),
+                    "resolution_method": jt.get("resolution_method", "unknown"),
+                    "blame_set": jt.get("blame_set"),
+                    "counterfactual_fix": jt.get("counterfactual_fix"),
+                    "wrong_clause": jt.get("wrong_clause"),
+                    "rationale_snippet": jt.get("rationale_snippet"),
+                    "cluster_id": c.get("cluster_id", ""),
+                })
+
+    # ── Pipeline lineage summary ───────────────────────────────────
+    _lineage_lines = ["\n== PIPELINE LINEAGE ==========================================================", "|"]
+    for c in clusters:
+        mapped = c.get("_mapped_lever", _map_to_lever(
+            c["root_cause"],
+            asi_failure_type=c.get("asi_failure_type"),
+            blame_set=c.get("asi_blame_set"),
+            judge=c.get("affected_judge"),
+        ))
+        for qt in c.get("question_traces", []):
+            qid = qt.get("question_id", "")
+            judges_info = ", ".join(
+                f"{jt['judge']} ({jt.get('resolved_root_cause', '?')})"
+                for jt in qt.get("failed_judges", [])
+            )
+            blame = c.get("asi_blame_set") or "(none)"
+            cfix_list = c.get("asi_counterfactual_fixes", [])
+            cfix = str(cfix_list[0])[:120] if cfix_list else "(none)"
+            _lineage_lines.append(f"|  Q: {qid}")
+            _lineage_lines.append(f"|    Failed judges:         {judges_info}")
+            _lineage_lines.append(f"|    Dominant root cause:   {c['root_cause']}")
+            _lineage_lines.append(f"|    Blame:                 {blame}")
+            _lineage_lines.append(f"|    Counterfactual:        \"{cfix}\"")
+            _lineage_lines.append(f"|    -> Cluster {c['cluster_id']} -> Lever {mapped} ({LEVER_NAMES.get(mapped, '?')})")
+            _lineage_lines.append("|")
+    _lineage_lines.append("=" * 78)
+    print("\n".join(_lineage_lines))
+
+    return {
+        "lever_assignments": lever_assignments,
+        "all_clusters": clusters,
+        "soft_signal_clusters": soft_clusters,
+        "asi_rows": _asi_rows,
+        "prov_rows": _prov_rows,
+        "lever_counter": dict(_lever_counter),
+    }
+
+
 def _run_lever_loop(
     w: WorkspaceClient,
     spark: SparkSession,
@@ -674,6 +925,7 @@ def _run_lever_loop(
     max_iterations: int = MAX_ITERATIONS,
     thresholds: dict[str, float] | None = None,
     apply_mode: str = APPLY_MODE,
+    triggered_by: str = "",
 ) -> dict:
     """Stage 3: Iterate levers with convergence checking.
 
@@ -715,7 +967,12 @@ def _run_lever_loop(
     _ensure_sql_context(spark, catalog, schema)
     from genie_space_optimizer.optimization.evaluation import build_metric_view_measures
     _mv_measures = build_metric_view_measures(config)
-    predict_fn = make_predict_fn(w, space_id, spark, catalog, schema, metric_view_measures=_mv_measures)
+    predict_fn = make_predict_fn(
+        w, space_id, spark, catalog, schema,
+        metric_view_measures=_mv_measures,
+        optimization_run_id=run_id,
+        triggered_by=triggered_by,
+    )
     scorers = make_all_scorers(w, spark, catalog, schema)
     uc_schema = f"{catalog}.{schema}"
     metadata_snapshot = config.get("_parsed_space", config)
@@ -779,6 +1036,24 @@ def _run_lever_loop(
             f"(below threshold {ARBITER_CORRECTION_TRIGGER}, no corrections applied)"
         )
 
+    # ── Analyze failures once before the lever loop ─────────────────
+    _analysis = _analyze_and_distribute(
+        spark, run_id, catalog, schema, metadata_snapshot,
+        iteration_counter, lever_label=0,
+    )
+    lever_assignments = _analysis["lever_assignments"]
+    clusters = _analysis["all_clusters"]
+    soft_signal_clusters = _analysis["soft_signal_clusters"]
+
+    try:
+        write_asi_results(spark, run_id, iteration_counter, _analysis["asi_rows"], catalog, schema, mlflow_run_id="")
+    except Exception:
+        logger.debug("Failed to write ASI results", exc_info=True)
+    try:
+        write_provenance(spark, run_id, iteration_counter, 0, _analysis["prov_rows"], catalog, schema)
+    except Exception:
+        logger.debug("Failed to write provenance rows", exc_info=True)
+
     for lever in levers:
         if lever <= start_lever:
             continue
@@ -809,232 +1084,14 @@ def _run_lever_loop(
             catalog=catalog, schema=schema,
         )
 
-        failure_rows = _get_failure_rows(spark, run_id, catalog, schema)
-
-        _NON_ACTIONABLE_VERDICTS = {"genie_correct", "both_correct"}
-        arbiter_counts: dict[str, int] = {}
-        arbiter_excluded: list[str] = []
-        soft_signal_qids: list[str] = []
-        filtered_failure_rows: list[dict] = []
-        soft_signal_rows: list[dict] = []
-        for row in failure_rows:
-            av = str(
-                row.get("arbiter/value")
-                or row.get("feedback/arbiter/value")
-                or (row.get("arbiter") if isinstance(row.get("arbiter"), str) else "")
-                or "skipped"
-            ).lower()
-            arbiter_counts[av] = arbiter_counts.get(av, 0) + 1
-            if av in _NON_ACTIONABLE_VERDICTS:
-                _rq = row.get("request") or {}
-                if isinstance(_rq, str):
-                    try:
-                        _rq = json.loads(_rq)
-                    except (json.JSONDecodeError, TypeError):
-                        _rq = {}
-                _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
-                qid = str(
-                    row.get("inputs/question_id")
-                    or (row.get("inputs") or {}).get("question_id", "")
-                    or row.get("question_id")
-                    or _rqk.get("question_id")
-                    or (_rq.get("question_id") if isinstance(_rq, dict) else None)
-                    or "?"
-                )
-                if _has_individual_judge_failure(row):
-                    soft_signal_rows.append(row)
-                    soft_signal_qids.append(qid)
-                else:
-                    arbiter_excluded.append(qid)
-            else:
-                filtered_failure_rows.append(row)
-
-        _arbiter_summary = "  ".join(f"{k}={v}" for k, v in sorted(arbiter_counts.items()))
-        _excluded_breakdown = "  ".join(
-            f"{k}={v}" for k, v in sorted(arbiter_counts.items()) if k in _NON_ACTIONABLE_VERDICTS
-        )
-        _fa_lines = [
-            _section("Failure Analysis", "-"),
-            _kv("Total rows loaded", len(failure_rows)),
-            _kv("Arbiter verdicts", _arbiter_summary),
-        ]
-        if arbiter_excluded:
-            _fa_lines.append(_kv("Excluded (fully correct)", f"{len(arbiter_excluded)} question(s)"))
-        if soft_signal_rows:
-            _fa_lines.append(_kv("Soft signals (correct but judges failed)", f"{len(soft_signal_rows)} question(s)"))
-            _fa_lines.append(_kv("  Soft signal question IDs", ", ".join(soft_signal_qids[:10])))
-            for _ss_row, _ss_qid in zip(soft_signal_rows[:10], soft_signal_qids[:10]):
-                _failed_judges = _get_failed_judges(_ss_row)
-                _fa_lines.append(f"  |    {_ss_qid}: failed judges = {', '.join(_failed_judges) if _failed_judges else '(none detected)'}")
-        _fa_lines.append(_kv("Hard failure rows for clustering", len(filtered_failure_rows)))
-        _fa_lines.append(_bar("-"))
-        print("\n".join(_fa_lines))
-
-        eval_result_for_clustering = {"rows": filtered_failure_rows}
-        clusters = cluster_failures(
-            eval_result_for_clustering, metadata_snapshot,
-            spark=spark, run_id=run_id, catalog=catalog, schema=schema,
-        )
-
-        soft_signal_clusters: list[dict] = []
-        if soft_signal_rows:
-            soft_eval = {"rows": soft_signal_rows}
-            soft_signal_clusters = cluster_failures(
-                soft_eval, metadata_snapshot,
-                spark=spark, run_id=run_id, catalog=catalog, schema=schema,
-            )
-            for sc in soft_signal_clusters:
-                sc["signal_type"] = "soft"
-            _soft_qids_total = sum(len(sc.get("question_ids", [])) for sc in soft_signal_clusters)
-            _soft_lines = [
-                _section("Soft Signal Clusters (correct-but-suboptimal)", "-"),
-                _kv("Soft signal rows", len(soft_signal_rows)),
-                _kv("Soft clusters formed", len(soft_signal_clusters)),
-                _kv("Soft cluster questions", _soft_qids_total),
-                "|",
-            ]
-            for si, sc in enumerate(soft_signal_clusters, 1):
-                sc_judge = sc.get("affected_judge", "?")
-                sc_cause = sc.get("root_cause", "?")
-                sc_asi = sc.get("asi_failure_type", "n/a")
-                sc_qids = sc.get("question_ids", [])
-                sc_blame = sc.get("asi_blame_set", sc.get("blame_set", []))
-                blame_str = ", ".join(sc_blame) if isinstance(sc_blame, list) and sc_blame else str(sc_blame) if sc_blame else "(none)"
-                _soft_lines.append(f"|  Soft cluster {si} / {len(soft_signal_clusters)}")
-                _soft_lines.append(f"|    {'Judge:':<24s} {sc_judge}")
-                _soft_lines.append(f"|    {'Root cause:':<24s} {sc_cause}")
-                _soft_lines.append(f"|    {'ASI failure type:':<24s} {sc_asi}")
-                _soft_lines.append(f"|    {'Blame:':<24s} {blame_str}")
-                _soft_lines.append(f"|    Questions ({len(sc_qids)}):")
-                for qid in sc_qids:
-                    _soft_lines.append(f"|      {qid}")
-                _soft_lines.append("|")
-            _soft_lines.append(_bar("-"))
-            print("\n".join(_soft_lines))
-
-        from genie_space_optimizer.optimization.optimizer import _map_to_lever
-
-        cluster_lines = [_section(f"Failure Clusters ({len(clusters)} total)", "-"), "|"]
-        _root_cause_counter: Counter[str] = Counter()
-        _lever_counter: Counter[int] = Counter()
-        _all_cluster_qids: set[str] = set()
-        _clusters_with_asi = 0
-        _clusters_with_blame = 0
-        for ci, c in enumerate(clusters, 1):
-            mapped = _map_to_lever(
-                c["root_cause"],
-                asi_failure_type=c.get("asi_failure_type"),
-                blame_set=c.get("asi_blame_set"),
-                judge=c.get("affected_judge"),
-            )
-            blame = c.get("asi_blame_set", c.get("blame_set", []))
-            qids = c["question_ids"]
-            asi_ft = c.get("asi_failure_type", "n/a")
-            cluster_lines.append(f"|  Cluster {ci} / {len(clusters)}")
-            cluster_lines.append(f"|    {'Judge:':<24s} {c['affected_judge']}")
-            cluster_lines.append(f"|    {'Root cause:':<24s} {c['root_cause']}")
-            cluster_lines.append(f"|    {'ASI failure type:':<24s} {asi_ft}")
-            cluster_lines.append(f"|    {'Mapped lever:':<24s} {mapped}")
-            blame_str = ", ".join(blame) if isinstance(blame, list) and blame else str(blame) if blame else "(none)"
-            cluster_lines.append(f"|    {'Blame:':<24s} {blame_str}")
-            cluster_lines.append(f"|    Questions ({len(qids)}):")
-            for qid in qids:
-                cluster_lines.append(f"|      {qid}")
-            cluster_lines.append("|")
-            _root_cause_counter[c["root_cause"]] += 1
-            _lever_counter[mapped] += 1
-            _all_cluster_qids.update(qids)
-            if asi_ft and asi_ft != "n/a":
-                _clusters_with_asi += 1
-            if blame and blame != []:
-                _clusters_with_blame += 1
-
-        _lever_summary = ", ".join(f"lever {k} = {v}" for k, v in sorted(_lever_counter.items()))
-        _top_causes = ", ".join(f"{k} ({v})" for k, v in _root_cause_counter.most_common(5))
-        cluster_lines.append("|  --- Summary ---")
-        cluster_lines.append(f"|    {'Clusters by lever:':<24s} {_lever_summary}")
-        cluster_lines.append(f"|    {'Unique questions:':<24s} {len(_all_cluster_qids)}")
-        cluster_lines.append(f"|    {'Top root causes:':<24s} {_top_causes}")
-        cluster_lines.append(f"|    {'Clusters with ASI:':<24s} {_clusters_with_asi} of {len(clusters)}")
-        cluster_lines.append(f"|    {'Clusters with blame:':<24s} {_clusters_with_blame} of {len(clusters)}")
-        cluster_lines.append(_bar("-"))
-        print("\n".join(cluster_lines))
-
-        # ── Write ASI results to Delta ───────────────────────────────
-        all_clusters_for_asi = clusters + soft_signal_clusters
-        _asi_rows: list[dict] = []
-        _prov_rows: list[dict] = []
-        for c in all_clusters_for_asi:
-            sig_type = c.get("signal_type", "hard")
-            for qt in c.get("question_traces", []):
-                qid = qt.get("question_id", "")
-                for jt in qt.get("failed_judges", []):
-                    _asi_rows.append({
-                        "question_id": qid,
-                        "judge": jt.get("judge", ""),
-                        "value": "no",
-                        "failure_type": jt.get("asi_failure_type_raw"),
-                        "blame_set": jt.get("blame_set"),
-                        "counterfactual_fix": jt.get("counterfactual_fix"),
-                        "wrong_clause": jt.get("wrong_clause"),
-                    })
-                    _prov_rows.append({
-                        "question_id": qid,
-                        "signal_type": sig_type,
-                        "judge": jt.get("judge", ""),
-                        "judge_verdict": jt.get("verdict", "FAIL"),
-                        "asi_failure_type_raw": jt.get("asi_failure_type_raw"),
-                        "resolved_root_cause": jt.get("resolved_root_cause", "other"),
-                        "resolution_method": jt.get("resolution_method", "unknown"),
-                        "blame_set": jt.get("blame_set"),
-                        "counterfactual_fix": jt.get("counterfactual_fix"),
-                        "wrong_clause": jt.get("wrong_clause"),
-                        "rationale_snippet": jt.get("rationale_snippet"),
-                        "cluster_id": c.get("cluster_id", ""),
-                    })
-        try:
-            write_asi_results(spark, run_id, iteration_counter, _asi_rows, catalog, schema, mlflow_run_id="")
-        except Exception:
-            logger.debug("Failed to write ASI results", exc_info=True)
-        try:
-            write_provenance(spark, run_id, iteration_counter, lever, _prov_rows, catalog, schema)
-        except Exception:
-            logger.debug("Failed to write provenance rows", exc_info=True)
-
-        # ── 8d. Pipeline Lineage summary ─────────────────────────────
-        _lineage_lines = ["\n== PIPELINE LINEAGE ==========================================================", "|"]
-        for c in clusters:
-            mapped = _map_to_lever(
-                c["root_cause"],
-                asi_failure_type=c.get("asi_failure_type"),
-                blame_set=c.get("asi_blame_set"),
-                judge=c.get("affected_judge"),
-            )
-            for qt in c.get("question_traces", []):
-                qid = qt.get("question_id", "")
-                judges_info = ", ".join(
-                    f"{jt['judge']} ({jt.get('resolved_root_cause', '?')})"
-                    for jt in qt.get("failed_judges", [])
-                )
-                blame = c.get("asi_blame_set") or "(none)"
-                cfix_list = c.get("asi_counterfactual_fixes", [])
-                cfix = str(cfix_list[0])[:120] if cfix_list else "(none)"
-                _lineage_lines.append(f"|  Q: {qid}")
-                _lineage_lines.append(f"|    Failed judges:         {judges_info}")
-                _lineage_lines.append(f"|    Dominant root cause:   {c['root_cause']}")
-                _lineage_lines.append(f"|    Blame:                 {blame}")
-                _lineage_lines.append(f"|    Counterfactual:        \"{cfix}\"")
-                _lineage_lines.append(f"|    -> Cluster {c['cluster_id']} -> Lever {mapped} ({LEVER_NAMES.get(mapped, '?')})")
-                _lineage_lines.append("|")
-        _lineage_lines.append("=" * 78)
-        print("\n".join(_lineage_lines))
-
-        matching_count = _lever_counter.get(lever, 0)
+        # ── Use pre-computed lever assignments ─────────────────────
+        assigned = list(lever_assignments.get(lever, []))
         _failed_lever_set = set(levers_rolled_back)
         if lever == 5:
-            matching_count += sum(
-                _lever_counter.get(fl, 0) for fl in _failed_lever_set
-            )
+            for fl in _failed_lever_set:
+                assigned.extend(lever_assignments.get(fl, []))
+
+        matching_count = len(assigned)
         if matching_count == 0 and lever not in (4, 5):
             print(_section(f"No clusters match lever {lever} -- SKIPPING", "-"))
             logger.info("No clusters match lever %d — skipping", lever)
@@ -1052,18 +1109,18 @@ def _run_lever_loop(
             print(_section("Lever 5: running holistic instruction synthesis", "-"))
             logger.info("Lever 5: no direct clusters — proceeding with holistic instruction synthesis")
 
-        effective_clusters = clusters
+        effective_clusters = assigned if assigned else clusters
         if lever in (4, 5) and soft_signal_clusters:
-            effective_clusters = clusters + soft_signal_clusters
+            effective_clusters = effective_clusters + soft_signal_clusters
             print(
                 _kv(
                     f"Lever {lever}: enriched with soft signals",
-                    f"{len(clusters)} hard + {len(soft_signal_clusters)} soft = {len(effective_clusters)} total clusters",
+                    f"{len(effective_clusters) - len(soft_signal_clusters)} hard + {len(soft_signal_clusters)} soft = {len(effective_clusters)} total clusters",
                 )
             )
             logger.info(
-                "Lever %d: enriched with %d soft-signal clusters (%d hard + %d soft)",
-                lever, len(soft_signal_clusters), len(clusters), len(soft_signal_clusters),
+                "Lever %d: enriched with %d soft-signal clusters (%d assigned + %d soft)",
+                lever, len(soft_signal_clusters), len(assigned), len(soft_signal_clusters),
             )
 
         proposals = generate_metadata_proposals(
@@ -1081,6 +1138,9 @@ def _run_lever_loop(
             ptype = p.get("type", p.get("patch_type", "?"))
             target = p.get("target", p.get("target_object", "")) or "(none)"
             rationale = str(p.get("rationale", ""))
+            proposed_value = str(p.get("proposed_value", ""))
+            table = p.get("table", "")
+            column = p.get("column", "")
             is_failed = "not valid JSON" in rationale or "non-JSON" in rationale.lower()
             status = "FAILED (non-JSON)" if is_failed else "OK"
             if is_failed:
@@ -1091,7 +1151,14 @@ def _run_lever_loop(
             proposal_lines.append(f"|  Proposal {pi} / {len(proposals)}  [from cluster {cluster_id}]")
             proposal_lines.append(f"|    {'Type:':<24s} {ptype}")
             proposal_lines.append(f"|    {'Target:':<24s} {target}")
+            if table:
+                proposal_lines.append(f"|    {'Table:':<24s} {table}")
+            if column:
+                proposal_lines.append(f"|    {'Column:':<24s} {column}")
             proposal_lines.append(f"|    {'Rationale:':<24s} {rationale[:200]}")
+            if proposed_value:
+                _val_preview = proposed_value.replace("\n", "\\n")
+                proposal_lines.append(f"|    {'Value (preview):':<24s} {_val_preview[:300]}")
             proposal_lines.append(f"|    {'Status:':<24s} {status}")
             proposal_lines.append("|")
 
@@ -1157,6 +1224,49 @@ def _run_lever_loop(
             )
 
         patched_objects = apply_log.get("patched_objects", [])
+
+        # ── Applied Patches Detail ────────────────────────────────
+        _applied = apply_log.get("applied", [])
+        if _applied:
+            _ap_lines = [_section(f"Applied Patches Detail ({len(_applied)} patches)", "-")]
+            for ai, aentry in enumerate(_applied, 1):
+                _ap = aentry.get("patch", {})
+                _aa = aentry.get("action", {})
+                _ap_type = _ap.get("type", _aa.get("action_type", "?"))
+                _ap_target = _aa.get("target", _ap.get("target", ""))
+                _ap_table = _ap.get("table", "")
+                _ap_column = _ap.get("column", "")
+                _ap_new_text = _ap.get("new_text", "")
+                _ap_join_spec = _ap.get("join_spec")
+                _ap_example_q = _ap.get("example_question", "")
+                _ap_example_sql = _ap.get("example_sql", "")
+                _ap_lines.append(f"|")
+                _ap_lines.append(f"|  Patch {ai} / {len(_applied)}")
+                _ap_lines.append(f"|    {'Type:':<22s} {_ap_type}")
+                if _ap_target:
+                    _ap_lines.append(f"|    {'Target:':<22s} {_ap_target}")
+                if _ap_table:
+                    _ap_lines.append(f"|    {'Table:':<22s} {_ap_table}")
+                if _ap_column:
+                    _ap_lines.append(f"|    {'Column:':<22s} {_ap_column}")
+                _ap_lines.append(f"|    {'Risk:':<22s} {_ap.get('risk_level', _aa.get('risk_level', '?'))}")
+                if _ap_new_text:
+                    _val = _ap_new_text.replace("\n", "\\n")
+                    for chunk_start in range(0, len(_val), 120):
+                        chunk = _val[chunk_start:chunk_start + 120]
+                        if chunk_start == 0:
+                            _ap_lines.append(f"|    {'Value:':<22s} {chunk}")
+                        else:
+                            _ap_lines.append(f"|    {'':22s} {chunk}")
+                if _ap_example_q:
+                    _ap_lines.append(f"|    {'Example Q:':<22s} {_ap_example_q[:120]}")
+                if _ap_example_sql:
+                    _ap_lines.append(f"|    {'Example SQL:':<22s} {_ap_example_sql[:120]}")
+                if _ap_join_spec:
+                    _ap_lines.append(f"|    {'Join Spec:':<22s} {json.dumps(_ap_join_spec)[:200]}")
+            _ap_lines.append("|")
+            _ap_lines.append(_bar("-"))
+            print("\n".join(_ap_lines))
 
         noise_floor = 100.0 / max(len(benchmarks), 1)
 
@@ -1559,6 +1669,25 @@ def _run_lever_loop(
             catalog=catalog, schema=schema,
         )
 
+        # Re-analyze failures after accepted patches change the landscape
+        metadata_snapshot = apply_log.get("post_snapshot", metadata_snapshot)
+        print(_section("Re-analyzing failures after accepted patches", "-"))
+        _analysis = _analyze_and_distribute(
+            spark, run_id, catalog, schema, metadata_snapshot,
+            iteration_counter, lever_label=lever,
+        )
+        lever_assignments = _analysis["lever_assignments"]
+        clusters = _analysis["all_clusters"]
+        soft_signal_clusters = _analysis["soft_signal_clusters"]
+        try:
+            write_asi_results(spark, run_id, iteration_counter, _analysis["asi_rows"], catalog, schema, mlflow_run_id="")
+        except Exception:
+            logger.debug("Failed to write ASI results (re-analysis)", exc_info=True)
+        try:
+            write_provenance(spark, run_id, iteration_counter, lever, _analysis["prov_rows"], catalog, schema)
+        except Exception:
+            logger.debug("Failed to write provenance rows (re-analysis)", exc_info=True)
+
     write_stage(
         spark, run_id, "LEVER_LOOP_STARTED", "COMPLETE",
         task_key="lever_loop",
@@ -1578,15 +1707,23 @@ def _run_lever_loop(
                 run_id=run_id,
                 domain=domain,
                 experiment_name=exp_name,
+                uc_schema=f"{catalog}.{schema}",
                 failure_trace_ids=list(dict.fromkeys(all_failure_trace_ids)),
                 regression_trace_ids=list(dict.fromkeys(all_regression_trace_ids)),
             )
-            if session_info.get("session_url"):
+            _sname = session_info.get("session_name", "")
+            _srun = session_info.get("session_run_id", "")
+            if _sname:
                 print(
                     f"\n[MLflow Review] Labeling session created for human review:\n"
-                    f"  URL: {session_info['session_url']}\n"
-                    f"  Name: {session_info.get('session_name', '')}\n"
+                    f"  Name: {_sname}\n"
                     f"  Traces: {session_info.get('trace_count', 0)}\n"
+                )
+            if _sname or _srun:
+                update_run_status(
+                    spark, run_id, catalog, schema,
+                    labeling_session_name=_sname,
+                    labeling_session_run_id=_srun,
                 )
         except Exception:
             logger.debug("Failed to create labeling session", exc_info=True)
@@ -2249,6 +2386,7 @@ def optimize_genie_space(
                 w, spark, run_id_str, space_id, domain, benchmarks, exp_name,
                 prev_scores, prev_accuracy, model_id, config,
                 catalog, schema, levers, max_iterations, thresholds, apply_mode,
+                triggered_by=triggered_by or "",
             )
             result.levers_attempted = cast(list[int], loop_out["levers_attempted"])
             result.levers_accepted = cast(list[int], loop_out["levers_accepted"])

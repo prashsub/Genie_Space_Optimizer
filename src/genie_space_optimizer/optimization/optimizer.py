@@ -408,6 +408,7 @@ def cluster_failures(
     run_id: str = "",
     catalog: str = "",
     schema: str = "",
+    verbose: bool = True,
 ) -> list[dict]:
     """Group evaluation failures into actionable clusters.
 
@@ -612,32 +613,42 @@ def cluster_failures(
     _cluster_debug = os.environ.get("CLUSTER_DEBUG", "1").lower() not in ("0", "false", "no")
     if _cluster_debug and question_profiles:
         lines = ["\n== ASI EXTRACTION TRACE ======================================================"]
-        for qid, profile in question_profiles.items():
-            lines.append(f"\n--- Q: {qid} " + "-" * max(1, 60 - len(qid)))
-            for f in profile["failures"]:
-                judge = f["judge"]
-                verdict = "FAIL"
-                asi_ft = f.get("asi_failure_type")
-                blame = f.get("asi_blame_set")
-                cfix = f.get("asi_counterfactual_fix")
-                wclause = f.get("asi_wrong_clause")
-                resolved = f.get("_resolved_root_cause", "other")
-                method = f.get("_resolution_method", "unknown")
-                lines.append(f"|  Judge: {judge:<24s}|  Verdict: {verdict}")
-                has_asi = bool(asi_ft)
-                lines.append(f"|    ASI metadata found:      {'YES' if has_asi else 'NO'}")
-                if has_asi:
-                    lines.append(f"|      failure_type (raw):    {asi_ft}")
-                    if blame:
-                        lines.append(f"|      blame_set:             {blame}")
-                    if cfix:
-                        lines.append(f"|      counterfactual_fix:    \"{str(cfix)[:120]}\"")
-                    if wclause:
-                        lines.append(f"|      wrong_clause:          {wclause}")
-                lines.append(f"|    Final root cause:        {resolved}  (via {method})")
-            lines.append(f"|  Dominant root cause:       {profile['dominant_root_cause']}")
-            blame_key = "|".join(sorted(profile["blame_sets"])) if profile["blame_sets"] else "(none)"
-            lines.append(f"|  Cluster group key:         ({profile['dominant_root_cause']}, \"{blame_key}\")")
+        if verbose:
+            for qid, profile in question_profiles.items():
+                lines.append(f"\n--- Q: {qid} " + "-" * max(1, 60 - len(qid)))
+                for f in profile["failures"]:
+                    judge = f["judge"]
+                    verdict = "FAIL"
+                    asi_ft = f.get("asi_failure_type")
+                    blame = f.get("asi_blame_set")
+                    cfix = f.get("asi_counterfactual_fix")
+                    wclause = f.get("asi_wrong_clause")
+                    resolved = f.get("_resolved_root_cause", "other")
+                    method = f.get("_resolution_method", "unknown")
+                    lines.append(f"|  Judge: {judge:<24s}|  Verdict: {verdict}")
+                    has_asi = bool(asi_ft)
+                    lines.append(f"|    ASI metadata found:      {'YES' if has_asi else 'NO'}")
+                    if has_asi:
+                        lines.append(f"|      failure_type (raw):    {asi_ft}")
+                        if blame:
+                            lines.append(f"|      blame_set:             {blame}")
+                        if cfix:
+                            lines.append(f"|      counterfactual_fix:    \"{str(cfix)[:120]}\"")
+                        if wclause:
+                            lines.append(f"|      wrong_clause:          {wclause}")
+                    lines.append(f"|    Final root cause:        {resolved}  (via {method})")
+                lines.append(f"|  Dominant root cause:       {profile['dominant_root_cause']}")
+                blame_key = "|".join(sorted(profile["blame_sets"])) if profile["blame_sets"] else "(none)"
+                lines.append(f"|  Cluster group key:         ({profile['dominant_root_cause']}, \"{blame_key}\")")
+        else:
+            lines.append(f"|  (compact mode — {len(question_profiles)} questions)")
+            for qid, profile in question_profiles.items():
+                judges = ", ".join(sorted(profile["judges"]))
+                blame_key = "|".join(sorted(profile["blame_sets"])) if profile["blame_sets"] else "(none)"
+                lines.append(
+                    f"|  {qid}: root={profile['dominant_root_cause']}  "
+                    f"judges=[{judges}]  blame={blame_key}"
+                )
         lines.append("-" * 78)
         print("\n".join(lines))
 
@@ -1238,6 +1249,125 @@ def _format_full_schema_context(metadata_snapshot: dict) -> str:
     return "\n".join(lines) if lines else "(no schema available)"
 
 
+def _format_structured_column_context(
+    metadata_snapshot: dict,
+    blame_set: Any,
+    lever: int,
+) -> str:
+    """Build structured column metadata with editability markers for the LLM.
+
+    Shows each relevant column's current structured sections with [EDITABLE]
+    or [LOCKED] markers based on lever ownership.  Falls back to all tables
+    when blame_set is empty.
+    """
+    from genie_space_optimizer.optimization.structured_metadata import (
+        ENTITY_TYPE_TEMPLATES,
+        LEVER_SECTION_OWNERSHIP,
+        SECTION_LABELS,
+        classify_column,
+        entity_type_for_column,
+        extract_synonyms_section,
+        merge_synonyms,
+        parse_structured_description,
+    )
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+    mvs = ds.get("metric_views", []) or []
+
+    mv_identifiers = {
+        (m.get("identifier") or "").rsplit(".", 1)[-1].lower()
+        for m in mvs
+    }
+
+    blame_lower: set[str] = set()
+    if blame_set:
+        items = blame_set if isinstance(blame_set, list) else [str(blame_set)]
+        for b in items:
+            bl = b.lower().strip()
+            blame_lower.add(bl)
+            if "." in bl:
+                blame_lower.add(bl.rsplit(".", 1)[-1])
+
+    owned_sections = LEVER_SECTION_OWNERSHIP.get(lever, set())
+    lines: list[str] = []
+    columns_shown = 0
+    max_columns = 40
+
+    for tbl in tables:
+        identifier = tbl.get("identifier", "")
+        short_name = identifier.rsplit(".", 1)[-1].lower() if identifier else ""
+        is_mv = short_name in mv_identifiers
+
+        if blame_lower:
+            tbl_match = short_name in blame_lower or identifier.lower() in blame_lower
+            col_match = any(
+                (cc.get("column_name") or "").lower() in blame_lower
+                for cc in tbl.get("column_configs", [])
+            )
+            if not tbl_match and not col_match:
+                continue
+
+        lines.append(f"### Table: {identifier}")
+
+        for cc in tbl.get("column_configs", []):
+            if columns_shown >= max_columns:
+                break
+            col_name = cc.get("column_name", "")
+            if not col_name:
+                continue
+
+            data_type = cc.get("data_type", "")
+            desc = cc.get("description", [])
+            syns = cc.get("synonyms", [])
+            uc_comment = cc.get("uc_comment", "")
+
+            desc_text = desc
+            if isinstance(desc_text, list):
+                desc_text = "\n".join(desc_text)
+            if not desc_text and uc_comment:
+                desc_text = uc_comment
+
+            sections = parse_structured_description(desc_text)
+
+            if syns:
+                existing_syn = extract_synonyms_section(sections)
+                all_syns = merge_synonyms(existing_syn, syns)
+                from genie_space_optimizer.optimization.structured_metadata import (
+                    format_synonyms_section,
+                )
+
+                sections["synonyms"] = format_synonyms_section(all_syns)
+
+            etype = entity_type_for_column(
+                col_name, data_type, is_in_metric_view=is_mv,
+            )
+            kind = classify_column(col_name, data_type, is_in_metric_view=is_mv)
+            template_sections = ENTITY_TYPE_TEMPLATES.get(etype, [])
+
+            lines.append(f"  Column: `{col_name}` ({data_type or 'unknown'}) [type: {kind}]")
+            for sk in template_sections:
+                label = SECTION_LABELS[sk]
+                value = sections.get(sk, "").strip()
+                marker = "[EDITABLE]" if sk in owned_sections else "[LOCKED]"
+                lines.append(
+                    f"    {marker} **{label}:** {value if value else '(empty)'}"
+                )
+            preamble = sections.get("_preamble", "").strip()
+            if preamble:
+                lines.append(f"    [Legacy text]: {preamble}")
+            lines.append("")
+            columns_shown += 1
+
+        if columns_shown >= max_columns:
+            lines.append("  ... (additional columns omitted for brevity)")
+            break
+
+    return "\n".join(lines) if lines else "(no structured column metadata available)"
+
+
 def _describe_patch_type(patch_type: str) -> str:
     """Human-readable description of a patch type."""
     pt_info = PATCH_TYPES.get(patch_type)
@@ -1606,6 +1736,11 @@ def _call_llm_for_proposal(
         ],
     }
 
+    if lever in (1, 2):
+        format_kwargs["structured_column_context"] = _format_structured_column_context(
+            metadata_snapshot, blame, lever,
+        )
+
     try:
         prompt = prompt_template.format(**format_kwargs)
     except KeyError:
@@ -1767,6 +1902,8 @@ def _call_llm_for_join_discovery(
 
     Returns a list of ``{"join_spec": {...}, "rationale": str}`` dicts.
     """
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
         ds = {}
@@ -1796,15 +1933,23 @@ def _call_llm_for_join_discovery(
 
     from databricks.sdk import WorkspaceClient as _WC
 
+    system_msg = (
+        "You are a JSON API. You MUST respond with ONLY a valid JSON object. "
+        "Do NOT include any explanation, analysis, or markdown outside the JSON. "
+        "Your entire response must be parseable by json.loads()."
+    )
+
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
             wc = w or _WC()
             response = wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
-                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+                messages=[
+                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
                 temperature=LLM_TEMPERATURE,
-                max_tokens=2048,
             )
             choices = getattr(response, "choices", None) or []
             if not choices:
@@ -1815,10 +1960,7 @@ def _call_llm_for_join_discovery(
             if not content:
                 raise ValueError("LLM response content is empty")
             text = str(content).strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\s*", "", text)
-                text = re.sub(r"\s*```$", "", text)
-            result = json.loads(text)
+            result = _extract_json(text)
             specs = result.get("join_specs", [])
             rationale = result.get("rationale", "")
             out = [
@@ -1837,12 +1979,12 @@ def _call_llm_for_join_discovery(
             return out
         except json.JSONDecodeError:
             logger.warning(
-                "\n"
-                "┌─── OPTIMIZER LLM [JOIN_DISCOVERY] RESPONSE (non-JSON) ──────────────\n"
-                "│ Raw text: %s\n"
-                "└─────────────────────────────────────────────────────────────────────────",
-                text[:500],
+                "JOIN_DISCOVERY non-JSON response (attempt %d/%d): %.500s",
+                attempt + 1, LLM_MAX_RETRIES, text,
             )
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(2**attempt)
+                continue
             return []
         except Exception:
             if attempt < LLM_MAX_RETRIES - 1:
@@ -1857,6 +1999,44 @@ def _call_llm_for_join_discovery(
                 )
                 return []
     return []
+
+
+def _repair_truncated_holistic_json(text: str) -> dict:
+    """Extract instruction_text from a truncated JSON response.
+
+    When the LLM output exceeds max_tokens, the JSON is cut off mid-string.
+    This attempts to salvage the instruction_text field.
+    """
+    m = re.search(r'"instruction_text"\s*:\s*"', text)
+    if not m:
+        raise json.JSONDecodeError("No instruction_text field found", text, 0)
+    start = m.end()
+    depth = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            i += 2
+            continue
+        if ch == '"' and depth == 0:
+            break
+        i += 1
+    else:
+        i = len(text)
+    instruction_text = text[start:i]
+    try:
+        instruction_text = json.loads(f'"{instruction_text}"')
+    except (json.JSONDecodeError, ValueError):
+        instruction_text = instruction_text.replace('\\"', '"').replace("\\n", "\n")
+    logger.warning(
+        "Repaired truncated holistic JSON — extracted %d chars of instruction_text",
+        len(instruction_text),
+    )
+    return {
+        "instruction_text": instruction_text,
+        "example_sql_proposals": [],
+        "rationale": "Recovered from truncated JSON response",
+    }
 
 
 def _call_llm_for_holistic_instructions(
@@ -1917,15 +2097,26 @@ def _call_llm_for_holistic_instructions(
 
     from databricks.sdk import WorkspaceClient as _WC
 
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+
+    holistic_system_msg = (
+        "You are a JSON API. You MUST respond with ONLY a valid JSON object. "
+        "Do NOT include any explanation, analysis, or markdown outside the JSON. "
+        "Your entire response must be parseable by json.loads(). "
+        "The JSON must contain an 'instruction_text' string field."
+    )
+
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
             wc = w or _WC()
             response = wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
-                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+                messages=[
+                    ChatMessage(role=ChatMessageRole.SYSTEM, content=holistic_system_msg),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
                 temperature=LLM_TEMPERATURE,
-                max_tokens=4096,
             )
             choices = getattr(response, "choices", None) or []
             if not choices:
@@ -1936,10 +2127,10 @@ def _call_llm_for_holistic_instructions(
             if not content:
                 raise ValueError("LLM response content is empty")
             text = str(content).strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\s*", "", text)
-                text = re.sub(r"\s*```$", "", text)
-            result = json.loads(text)
+            try:
+                result = _extract_json(text)
+            except json.JSONDecodeError:
+                result = _repair_truncated_holistic_json(text)
 
             instruction_text = result.get("instruction_text", "")
             example_proposals = result.get("example_sql_proposals", [])
@@ -2687,37 +2878,67 @@ def generate_metadata_proposals(
                     continue
                 tbl = change.get("table", "")
                 col = change.get("column", "")
-                desc = change.get("description")
-                syns = change.get("synonyms")
                 if not tbl or not col:
                     continue
-                change_desc = f"Update {tbl}.{col}"
-                if desc:
-                    change_desc += f" description={desc}"
-                if syns:
-                    change_desc += f" synonyms={syns}"
-                proposals.append({
-                    "proposal_id": f"P{len(proposals) + 1:03d}",
-                    "cluster_id": cluster["cluster_id"],
-                    "lever": lever,
-                    "scope": scope,
-                    "patch_type": patch_type,
-                    "change_description": change_desc,
-                    "proposed_value": desc[0] if isinstance(desc, list) and desc else "",
-                    "rationale": rationale,
-                    "dual_persistence": DUAL_PERSIST_PATHS.get(lever, DUAL_PERSIST_PATHS[5]),
-                    "confidence": confidence,
-                    "questions_fixed": q_fixed,
-                    "questions_at_risk": 0,
-                    "net_impact": net_impact,
-                    "asi": asi_block,
-                    "provenance": _build_provenance(cluster, lever, patch_type),
-                    "table": tbl,
-                    "column": col,
-                    "column_description": desc,
-                    "column_synonyms": syns,
-                    **extra_fields,
-                })
+
+                sections = change.get("sections")
+                entity_type = change.get("entity_type", "")
+
+                if isinstance(sections, dict) and sections:
+                    section_keys = list(sections.keys())
+                    change_desc = f"Update {tbl}.{col} sections={section_keys}"
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": cluster["cluster_id"],
+                        "lever": lever,
+                        "scope": scope,
+                        "patch_type": patch_type,
+                        "change_description": change_desc,
+                        "proposed_value": "",
+                        "rationale": rationale,
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(lever, DUAL_PERSIST_PATHS[5]),
+                        "confidence": confidence,
+                        "questions_fixed": q_fixed,
+                        "questions_at_risk": 0,
+                        "net_impact": net_impact,
+                        "asi": asi_block,
+                        "provenance": _build_provenance(cluster, lever, patch_type),
+                        "table": tbl,
+                        "column": col,
+                        "column_sections": sections,
+                        "column_entity_type": entity_type,
+                        **extra_fields,
+                    })
+                else:
+                    desc = change.get("description")
+                    syns = change.get("synonyms")
+                    change_desc = f"Update {tbl}.{col}"
+                    if desc:
+                        change_desc += f" description={desc}"
+                    if syns:
+                        change_desc += f" synonyms={syns}"
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": cluster["cluster_id"],
+                        "lever": lever,
+                        "scope": scope,
+                        "patch_type": patch_type,
+                        "change_description": change_desc,
+                        "proposed_value": desc[0] if isinstance(desc, list) and desc else "",
+                        "rationale": rationale,
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(lever, DUAL_PERSIST_PATHS[5]),
+                        "confidence": confidence,
+                        "questions_fixed": q_fixed,
+                        "questions_at_risk": 0,
+                        "net_impact": net_impact,
+                        "asi": asi_block,
+                        "provenance": _build_provenance(cluster, lever, patch_type),
+                        "table": tbl,
+                        "column": col,
+                        "column_description": desc,
+                        "column_synonyms": syns,
+                        **extra_fields,
+                    })
         else:
             proposed_value = (
                 llm_result.get("proposed_value")

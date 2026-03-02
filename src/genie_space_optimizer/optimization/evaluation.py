@@ -37,6 +37,7 @@ from genie_space_optimizer.common.config import (
     BENCHMARK_CORRECTION_PROMPT,
     BENCHMARK_COVERAGE_GAP_PROMPT,
     BENCHMARK_GENERATION_PROMPT,
+    BENCHMARK_PROMPTS,
     CODE_SOURCE_ID,
     COVERAGE_GAP_SOFT_CAP_FACTOR,
     DEFAULT_THRESHOLDS,
@@ -44,6 +45,7 @@ from genie_space_optimizer.common.config import (
     INSTRUCTION_PROMPT_ALIAS,
     INSTRUCTION_PROMPT_NAME_TEMPLATE,
     JUDGE_PROMPTS,
+    LEVER_PROMPTS,
     LLM_ENDPOINT,
     LLM_MAX_RETRIES,
     LLM_SOURCE_ID_TEMPLATE,
@@ -1073,6 +1075,7 @@ def make_predict_fn(
     iteration: int | None = None,
     lever: int | None = None,
     eval_scope: str = "",
+    triggered_by: str = "",
 ):
     """Return a predict function with bound workspace/spark context.
 
@@ -1108,7 +1111,15 @@ def make_predict_fn(
                 _trace_tags["genie.lever"] = str(lever)
             if eval_scope:
                 _trace_tags["genie.eval_scope"] = eval_scope
-            mlflow.update_current_trace(tags=_trace_tags)
+            _trace_metadata: dict[str, str] = {}
+            if triggered_by:
+                _trace_metadata["mlflow.trace.user"] = triggered_by
+            if optimization_run_id:
+                _trace_metadata["mlflow.trace.session"] = optimization_run_id
+            if _trace_metadata:
+                mlflow.update_current_trace(tags=_trace_tags, metadata=_trace_metadata)
+            else:
+                mlflow.update_current_trace(tags=_trace_tags)
         except Exception:
             pass
 
@@ -1684,6 +1695,42 @@ def register_judge_prompts(
                     "attempts": attempt_failures,
                 }
 
+    if register_registry:
+        _all_extra: dict[str, dict[str, str]] = {}
+        for category_label, prompt_dict, tag_type in [
+            ("lever", LEVER_PROMPTS, "lever"),
+            ("benchmark", BENCHMARK_PROMPTS, "benchmark"),
+        ]:
+            for name, template in prompt_dict.items():
+                candidates = _prompt_name_candidates(uc_schema=uc_schema, domain=domain, judge_name=name)
+                for prompt_name in candidates:
+                    try:
+                        version = mlflow.genai.register_prompt(
+                            name=prompt_name,
+                            template=template,
+                            commit_message=f"Genie {category_label}: {name} (domain: {domain})",
+                            tags={"domain": domain, "type": tag_type},
+                        )
+                        mlflow.genai.set_prompt_alias(
+                            name=prompt_name,
+                            alias=PROMPT_ALIAS,
+                            version=version.version,
+                        )
+                        _all_extra[name] = {
+                            "prompt_name": prompt_name,
+                            "version": str(version.version),
+                        }
+                        logger.info("[Prompt Registry] %s %s v%s", category_label, prompt_name, version.version)
+                        break
+                    except Exception:
+                        logger.debug(
+                            "Prompt registration attempt failed for %s=%s name=%s",
+                            category_label, name, prompt_name, exc_info=True,
+                        )
+                if name not in _all_extra:
+                    logger.warning("Could not register %s prompt: %s", category_label, name)
+        registered.update(_all_extra)
+
     active = mlflow.active_run()
     if active:
         _log_judge_prompt_artifacts(
@@ -1734,9 +1781,11 @@ def register_judge_prompts(
             + root_cause_hint,
         )
 
+    total_prompt_count = len(JUDGE_PROMPTS) + len(LEVER_PROMPTS) + len(BENCHMARK_PROMPTS)
     logger.info(
-        "Registered %d prompts (registry=%s, artifacts=True)",
-        len(JUDGE_PROMPTS),
+        "Registered %d/%d prompts (judges=%d, levers=%d, benchmarks=%d, registry=%s)",
+        len(registered), total_prompt_count,
+        len(JUDGE_PROMPTS), len(LEVER_PROMPTS), len(BENCHMARK_PROMPTS),
         bool(register_registry and uc_schema),
     )
     return registered
@@ -1947,7 +1996,10 @@ def _patch_mlflow_harness_none_trace() -> None:
             trace = getattr(eval_item, "trace", None)
             if trace is None or getattr(trace, "info", None) is None:
                 return []
-            return _orig_get_new_expectations(eval_item)
+            try:
+                return _orig_get_new_expectations(eval_item)
+            except Exception:
+                return []
 
         _harness_mod._get_new_expectations = _safe_get_new_expectations  # type: ignore[assignment]
         patched.append("_get_new_expectations")
@@ -2094,7 +2146,17 @@ def _run_evaluate_sequential_fallback(
     _patch_mlflow_harness_none_trace()
 
     data = evaluate_kwargs.get("data")
-    if not isinstance(data, pd.DataFrame) or data.empty:
+    if not isinstance(data, pd.DataFrame):
+        logger.info("Sequential fallback: converting non-DataFrame data to DataFrame")
+        if hasattr(data, "to_dataframe"):
+            data = data.to_dataframe()
+        elif hasattr(data, "to_df"):
+            data = data.to_df()
+        else:
+            raise RuntimeError("Sequential fallback requires DataFrame-convertible input")
+        evaluate_kwargs = dict(evaluate_kwargs)
+        evaluate_kwargs["data"] = data
+    if data.empty:
         raise RuntimeError("Sequential fallback requires non-empty DataFrame input")
 
     metrics_accumulator: dict[str, list[float]] = {}
@@ -2221,19 +2283,45 @@ def create_evaluation_dataset(
     space_id: str = "",
     catalog: str = "",
     gold_schema: str = "",
+    experiment_id: str = "",
 ) -> Any | None:
     """Create or update the MLflow UC evaluation dataset from benchmarks.
 
     Uses ``merge_records`` (upsert by question_id) to preserve version history
     rather than dropping and recreating each run.
+
+    Pass *experiment_id* to link the dataset to the experiment so it appears
+    in the experiment's Datasets tab in the UI.
     """
     uc_table_name = f"{uc_schema}.genie_benchmarks_{domain}"
+    exp_ids = [experiment_id] if experiment_id else None
     try:
-        eval_dataset = mlflow.genai.datasets.create_dataset(
-            uc_table_name=uc_table_name,
-        )
+        try:
+            eval_dataset = mlflow.genai.datasets.get_dataset(name=uc_table_name)
+            logger.info("Reusing existing evaluation dataset: %s", uc_table_name)
+        except Exception:
+            create_kwargs: dict[str, Any] = {"name": uc_table_name}
+            if exp_ids:
+                create_kwargs["experiment_id"] = exp_ids
+            eval_dataset = mlflow.genai.datasets.create_dataset(**create_kwargs)
+            logger.info(
+                "Created new evaluation dataset: %s (experiment_id=%s)",
+                uc_table_name, exp_ids,
+            )
         records = []
         for b in benchmarks:
+            expectations = {
+                "expected_response": b.get("expected_sql", ""),
+                "expected_asset": b.get("expected_asset", "TABLE"),
+                "category": b.get("category", ""),
+                "source": b.get("source", ""),
+                "provenance": b.get("provenance", ""),
+                "validation_status": b.get("validation_status", ""),
+                "validation_reason_code": b.get("validation_reason_code", ""),
+                "validation_error": b.get("validation_error", ""),
+                "correction_source": b.get("correction_source", ""),
+            }
+            expectations = {k: v for k, v in expectations.items() if v is not None}
             records.append(
                 {
                     "inputs": {
@@ -2244,20 +2332,7 @@ def create_evaluation_dataset(
                         "catalog": catalog,
                         "gold_schema": gold_schema,
                     },
-                    "expectations": {
-                        "expected_response": b.get("expected_sql", ""),
-                        "expected_asset": b.get("expected_asset", "TABLE"),
-                        "category": b.get("category", ""),
-                        "required_tables": b.get("required_tables", []),
-                        "required_columns": b.get("required_columns", []),
-                        "expected_facts": b.get("expected_facts", []),
-                        "source": b.get("source", ""),
-                        "provenance": b.get("provenance", ""),
-                        "validation_status": b.get("validation_status", ""),
-                        "validation_reason_code": b.get("validation_reason_code", ""),
-                        "validation_error": b.get("validation_error"),
-                        "correction_source": b.get("correction_source", ""),
-                    },
+                    "expectations": expectations,
                 }
             )
         eval_dataset.merge_records(records)
@@ -2540,6 +2615,9 @@ def run_evaluation(
     overall_accuracy, per_judge, thresholds_passed, failure_question_ids,
     arbiter_verdicts, etc.
     """
+    import re as _re
+    domain = _re.sub(r"[^a-z0-9_]+", "_", domain.lower()).strip("_") or "default"
+
     mlflow.set_experiment(experiment_name)
     exp = mlflow.get_experiment_by_name(experiment_name)
     mlflow_model_id = (
@@ -2576,13 +2654,18 @@ def run_evaluation(
             _version_tags["genie.lever"] = "baseline"
         mlflow.set_tags(_version_tags)
 
+        _eval_dataset_obj = None
         try:
             _ds_table = f"{uc_schema}.genie_benchmarks_{domain}" if uc_schema and domain else ""
             if _ds_table:
-                _dataset_ref = mlflow.genai.datasets.create_dataset(uc_table_name=_ds_table)
-                mlflow.log_input(_dataset_ref, context=eval_scope or "evaluation")
-        except Exception:
-            logger.debug("Failed to link dataset to evaluation run", exc_info=True)
+                _eval_dataset_obj = mlflow.genai.datasets.get_dataset(name=_ds_table)
+                logger.info("Loaded evaluation dataset '%s' for linking", _ds_table)
+        except Exception as _ds_err:
+            logger.warning(
+                "Failed to load evaluation dataset '%s': %s — "
+                "will use plain DataFrame (dataset won't appear in experiment Datasets tab)",
+                _ds_table, _ds_err,
+            )
 
         if spark is not None:
             known_functions = _load_known_functions(spark, catalog, gold_schema)
@@ -2702,7 +2785,7 @@ def run_evaluation(
 
         evaluate_kwargs: dict[str, Any] = {
             "predict_fn": predict_fn,
-            "data": eval_data,
+            "data": _eval_dataset_obj if _eval_dataset_obj is not None else eval_data,
             "scorers": scorers,
         }
         if mlflow_model_id:
@@ -2988,6 +3071,13 @@ def run_evaluation(
         permission_blocked_count = (
             precheck_counts["permission_blocked_count"] + row_permission_blocked_count
         )
+        mlflow.log_metrics({
+            "overall_accuracy": arbiter_adjusted_accuracy,
+            "correct_count": float(arbiter_adjusted_correct),
+            "total_questions": float(len(filtered)),
+            "failure_count": float(len(failure_ids)),
+            "excluded_count": float(excluded_count),
+        })
         mlflow.set_tags(
             {
                 "evaluation_status": "success",

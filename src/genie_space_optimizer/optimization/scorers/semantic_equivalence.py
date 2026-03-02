@@ -106,8 +106,9 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
             f"{cmp_summary}{column_note}{empty_data_note}{build_temporal_note(cmp)}\n"
             'Respond with JSON only: {"equivalent": true/false, "failure_type": "<different_metric|different_grain|different_scope>", '
             '"blame_set": ["<metric_or_dimension>"], '
+            '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
             '"rationale": "<brief explanation>"}\n'
-            'If equivalent, set failure_type to "" and blame_set to [].'
+            'If equivalent, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
         )
 
         logger.info(
@@ -236,7 +237,10 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
             severity="major",
             confidence=base_confidence,
             blame_set=result.get("blame_set", []),
-            counterfactual_fix="Review measure definitions and grain in Genie metadata",
+            counterfactual_fix=result.get("counterfactual_fix") or (
+                f"Fix {result.get('failure_type', 'semantic mismatch')} "
+                f"involving {', '.join(result.get('blame_set', ['unknown']))}"
+            ),
         )
         return Feedback(
             name="semantic_equivalence",
