@@ -8,13 +8,15 @@ Get the Genie Space Optimizer running in your Databricks workspace in under 15 m
 
 Before you start, ensure you have the following installed and configured:
 
-| Tool | Version | Install |
-|------|---------|---------|
-| Python | 3.11+ | [python.org](https://www.python.org/downloads/) |
-| uv | latest | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| bun | latest | `curl -fsSL https://bun.sh/install \| bash` |
-| apx | latest | `uv tool install apx` |
-| Databricks CLI | latest | `curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh \| sh` |
+
+| Tool           | Version | Install                                                                                  |
+| -------------- | ------- | ---------------------------------------------------------------------------------------- |
+| Python         | 3.11+   | [python.org](https://www.python.org/downloads/)                                          |
+| uv             | latest  | `curl -LsSf https://astral.sh/uv/install.sh | sh`                                        |
+| bun            | latest  | `curl -fsSL https://bun.sh/install | bash`                                               |
+| apx            | latest  | `uv tool install apx`                                                                    |
+| Databricks CLI | latest  | `curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh` |
+
 
 ### Databricks Workspace Requirements
 
@@ -85,6 +87,7 @@ make deploy PROFILE=<your-profile>
 ```
 
 This runs four steps automatically:
+
 1. **clean-wheels** -- Removes stale `.whl` files from the workspace to prevent cache issues
 2. **bundle deploy** -- Builds the wheel via `apx build`, removes `.build/.gitignore`, syncs files to workspace
 3. **apps deploy** -- Creates a new deployment snapshot and restarts the app with the synced code
@@ -93,6 +96,7 @@ This runs four steps automatically:
 Both `databricks bundle deploy` (file sync) and `databricks apps deploy` (snapshot + restart) are required. The bundle deploy syncs files but does not restart the app; the apps deploy creates an immutable snapshot from the synced files and restarts.
 
 This provisions:
+
 - A **Databricks App** at `https://<workspace>/apps/genie-space-optimizer`
 - A **PostgreSQL database** instance (Lakebase, CU_1 capacity)
 - Two **Databricks Jobs**: the main optimization pipeline and a standalone evaluation job
@@ -135,6 +139,7 @@ The dashboard shows all Genie Spaces you have edit access to. Each card displays
 ### Step 2: Select a Space
 
 Click a space card to view its details:
+
 - **Tables** -- Registered tables with column counts and descriptions
 - **Instructions** -- Current Genie instructions
 - **Sample Questions** -- Configured example queries
@@ -144,13 +149,15 @@ Click a space card to view its details:
 
 Click **Optimize** to kick off the pipeline. This submits a multi-task Databricks Job with 5 stages:
 
-| Stage | Duration | What Happens |
-|-------|----------|-------------|
-| Preflight | ~1 min | Validates config, collects UC metadata |
-| Baseline Eval | ~5-15 min | Generates 20 benchmark questions, runs through Genie, scores with 9 LLM judges |
-| Lever Loop | ~10-30 min | Stage 2.5 prompt matching, arbiter benchmark corrections, then 5 levers with tiered failure analysis |
-| Finalize | ~5-10 min | Repeatability testing, final scoring, report generation |
-| Deploy | ~1 min | (Optional) Deploys optimized config to version control |
+
+| Stage         | Duration   | What Happens                                                                                         |
+| ------------- | ---------- | ---------------------------------------------------------------------------------------------------- |
+| Preflight     | ~1 min     | Validates config, collects UC metadata                                                               |
+| Baseline Eval | ~5-15 min  | Generates 20 benchmark questions, runs through Genie, scores with 9 LLM judges                       |
+| Lever Loop    | ~10-30 min | Stage 2.5 prompt matching, arbiter benchmark corrections, then 5 levers with tiered failure analysis |
+| Finalize      | ~5-10 min  | Repeatability testing, final scoring, report generation                                              |
+| Deploy        | ~1 min     | (Optional) Deploys optimized config to version control                                               |
+
 
 **Total time: 20-60 minutes** depending on space complexity and number of tables.
 
@@ -172,13 +179,13 @@ When the pipeline completes (status: `CONVERGED`, `STALLED`, or `MAX_ITERATIONS`
 
 1. Navigate to the **Comparison** view
 2. Review the side-by-side diff:
-   - Original vs. optimized **instructions**
-   - Original vs. optimized **sample questions**
-   - Original vs. optimized **table descriptions**
-   - Per-dimension score improvements
+  - Original vs. optimized **instructions**
+  - Original vs. optimized **sample questions**
+  - Original vs. optimized **table descriptions**
+  - Per-dimension score improvements
 3. Choose an action:
-   - **Apply** -- Keep the optimized configuration (marks run as `APPLIED`)
-   - **Discard** -- Roll back all patches to the original configuration (marks run as `DISCARDED`)
+  - **Apply** -- Keep the optimized configuration (marks run as `APPLIED`)
+  - **Discard** -- Roll back all patches to the original configuration (marks run as `DISCARDED`)
 
 ---
 
@@ -202,9 +209,11 @@ curl -s -X POST "${APP_URL}/api/genie/trigger" \
 
 **Known Space IDs (genie-test profile):**
 
-| Space | ID |
-|-------|-----|
+
+| Space                           | ID                                 |
+| ------------------------------- | ---------------------------------- |
 | Revenue & Property Intelligence | `01f10e84df3b14d993c30773abde7f44` |
+
 
 **Poll run status:**
 
@@ -246,6 +255,7 @@ apx dev start
 ```
 
 This starts three processes in the background:
+
 - **Backend** (FastAPI) on port 8000
 - **Frontend** (Vite) on port 5173
 - **OpenAPI watcher** that regenerates `ui/lib/api.ts` on backend changes
@@ -428,6 +438,7 @@ Not all Genie Spaces benefit from metadata optimization. If the baseline score i
 ```
 
 **Data flow:**
+
 1. User clicks **Optimize** in the React frontend
 2. Backend creates a `QUEUED` run in Delta and submits the Databricks Job
 3. Job tasks execute sequentially: preflight → baseline → lever loop → finalize
@@ -435,3 +446,4 @@ Not all Genie Spaces benefit from metadata optimization. If the baseline score i
 5. LLM judges (via Foundation Model API) score each evaluation
 6. Frontend polls the backend every 5 seconds for updated pipeline status
 7. On completion, user reviews the comparison and applies or discards
+

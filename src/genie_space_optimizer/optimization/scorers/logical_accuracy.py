@@ -92,8 +92,9 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
             f"{cmp_summary}{empty_data_note}{build_temporal_note(cmp)}\n"
             'Respond with JSON only: {"correct": true/false, "failure_type": "<wrong_aggregation|wrong_filter|wrong_groupby|wrong_orderby>", '
             '"wrong_clause": "<the problematic SQL clause>", "blame_set": ["<column_or_function>"], '
+            '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
             '"rationale": "<brief explanation>"}\n'
-            'If correct, set failure_type to "" and blame_set to [].'
+            'If correct, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
         )
 
         logger.info(
@@ -213,7 +214,10 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
             confidence=base_confidence,
             wrong_clause=result.get("wrong_clause", ""),
             blame_set=result.get("blame_set", []),
-            counterfactual_fix="Review aggregation/filter logic in Genie metadata",
+            counterfactual_fix=result.get("counterfactual_fix") or (
+                f"Fix {result.get('failure_type', 'logic issue')} "
+                f"involving {', '.join(result.get('blame_set', ['unknown']))}"
+            ),
         )
         return Feedback(
             name="logical_accuracy",

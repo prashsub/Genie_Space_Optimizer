@@ -165,13 +165,19 @@ def result_correctness_scorer(inputs: dict, outputs: dict, expectations: dict) -
             source=CODE_SOURCE,
         )
 
+    _cfix = (
+        f"Result mismatch: expected {cmp.get('gt_rows', '?')} rows "
+        f"(hash={cmp.get('gt_hash', '?')}), got {cmp.get('genie_rows', '?')} rows "
+        f"(hash={cmp.get('genie_hash', '?')}). "
+        f"Check joins, filters, or aggregation logic in the generated SQL."
+    )
     metadata = build_asi_metadata(
         failure_type="wrong_aggregation",
         severity="major",
         confidence=0.8,
         expected_value=f"rows={cmp.get('gt_rows')}, hash={cmp.get('gt_hash')}",
         actual_value=f"rows={cmp.get('genie_rows')}, hash={cmp.get('genie_hash')}",
-        counterfactual_fix="Review Genie metadata for missing joins, filters, or aggregation logic",
+        counterfactual_fix=_cfix,
     )
     return Feedback(
         name="result_correctness",

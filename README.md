@@ -61,7 +61,7 @@ Lever 4 always runs its join discovery path, even without explicit join failures
 | Result Correctness | 85% | Correct final result values |
 | Asset Routing | 95% | Correct asset type (table, metric view, TVF) selected |
 
-Plus **Response Quality** (LLM analysis accuracy), **Repeatability** (variance detection across repeated runs), and an **Arbiter** (tiebreaker judge for conflicting scorer verdicts).
+Plus **Response Quality** (LLM analysis accuracy), **Repeatability** (variance detection across repeated runs), and an **Arbiter** (tiebreaker judge for conflicting scorer verdicts). All judges return structured JSON with `failure_type`, `blame_set`, `counterfactual_fix`, and `rationale` for direct ASI metadata flow.
 
 ---
 

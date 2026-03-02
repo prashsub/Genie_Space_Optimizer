@@ -102,8 +102,9 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
             f"{cmp_summary}{column_note}{empty_data_note}{build_temporal_note(cmp)}\n"
             'Respond with JSON only: {"complete": true/false, "failure_type": "<missing_column|missing_filter|missing_temporal_filter|missing_aggregation|partial_answer>", '
             '"blame_set": ["<missing_element>"], '
+            '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
             '"rationale": "<brief explanation>"}\n'
-            'If complete, set failure_type to "" and blame_set to [].'
+            'If complete, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
         )
 
         logger.info(
@@ -232,7 +233,10 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
             severity="major",
             confidence=base_confidence,
             blame_set=result.get("blame_set", []),
-            counterfactual_fix="Review column visibility and filter completeness in Genie metadata",
+            counterfactual_fix=result.get("counterfactual_fix") or (
+                f"Fix {result.get('failure_type', 'completeness issue')} "
+                f"involving {', '.join(result.get('blame_set', ['unknown']))}"
+            ),
         )
         return Feedback(
             name="completeness",

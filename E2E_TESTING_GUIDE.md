@@ -488,6 +488,8 @@ Click "View Results" button → navigates to `/runs/{runId}/comparison`.
 
 **Response quality** evaluates whether Genie's natural language analysis/explanation accurately describes the SQL query and answers the user's question. Returns `unknown` when no analysis text is available (Genie does not always include the text attachment), so this scorer never penalizes runs where the NL response is absent.
 
+All judges (except `syntax_validity` and `asset_routing`) now return **structured JSON** with `failure_type`, `blame_set`, `counterfactual_fix`, `wrong_clause`, and `rationale` fields. These flow directly into ASI metadata and provenance without separate rationale-pattern extraction.
+
 The **arbiter** judge does not contribute to the overall quality score but its verdicts drive three mechanisms: (1) benchmark correction before the lever loop (rewriting stale gold SQL for `genie_correct` verdicts), (2) hard failure filtering (excluding `genie_correct` and `both_correct` verdicts from the main failure cluster), and (3) tiered soft signal extraction (`genie_correct`/`both_correct` rows where individual judges still failed are clustered separately as best-practice signals for Levers 4 and 5).
 
 ### Config Diff Tabs

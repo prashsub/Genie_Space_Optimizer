@@ -1168,8 +1168,13 @@ JUDGE_PROMPTS = {
         "User question: {{ inputs }}\n"
         "Generated SQL: {{ outputs }}\n"
         "Expected SQL: {{ expectations }}\n\n"
-        "Respond with yes if the generated SQL references the correct tables, columns, "
-        "and joins for the question, or no if it does not."
+        'Respond with JSON only: {"correct": true/false, '
+        '"failure_type": "<wrong_table|wrong_column|wrong_join|missing_column>", '
+        '"wrong_clause": "<the problematic SQL clause>", '
+        '"blame_set": ["<table_or_column>"], '
+        '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
+        '"rationale": "<brief explanation>"}\n'
+        'If correct, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
     ),
     "logical_accuracy": (
         "You are a SQL logic expert evaluating SQL for a Databricks Genie Space.\n"
@@ -1178,8 +1183,13 @@ JUDGE_PROMPTS = {
         "User question: {{ inputs }}\n"
         "Generated SQL: {{ outputs }}\n"
         "Expected SQL: {{ expectations }}\n\n"
-        "Respond with yes if the generated SQL applies the correct logic "
-        "for the question, or no if it does not."
+        'Respond with JSON only: {"correct": true/false, '
+        '"failure_type": "<wrong_aggregation|wrong_filter|wrong_groupby|wrong_orderby>", '
+        '"wrong_clause": "<the problematic SQL clause>", '
+        '"blame_set": ["<column_or_function>"], '
+        '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
+        '"rationale": "<brief explanation>"}\n'
+        'If correct, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
     ),
     "semantic_equivalence": (
         "You are a SQL semantics expert evaluating SQL for a Databricks Genie Space.\n"
@@ -1188,8 +1198,12 @@ JUDGE_PROMPTS = {
         "User question: {{ inputs }}\n"
         "Generated SQL: {{ outputs }}\n"
         "Expected SQL: {{ expectations }}\n\n"
-        "Respond with yes if the two queries are semantically equivalent "
-        "for the question, or no if they are not."
+        'Respond with JSON only: {"equivalent": true/false, '
+        '"failure_type": "<different_metric|different_grain|different_scope>", '
+        '"blame_set": ["<metric_or_dimension>"], '
+        '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
+        '"rationale": "<brief explanation>"}\n'
+        'If equivalent, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
     ),
     "completeness": (
         "You are a SQL completeness expert evaluating SQL for a Databricks Genie Space.\n"
@@ -1198,8 +1212,12 @@ JUDGE_PROMPTS = {
         "User question: {{ inputs }}\n"
         "Generated SQL: {{ outputs }}\n"
         "Expected SQL: {{ expectations }}\n\n"
-        "Respond with yes if the generated SQL fully answers the question, "
-        "or no if it is missing dimensions, measures, or filters."
+        'Respond with JSON only: {"complete": true/false, '
+        '"failure_type": "<missing_column|missing_filter|missing_temporal_filter|missing_aggregation|partial_answer>", '
+        '"blame_set": ["<missing_element>"], '
+        '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
+        '"rationale": "<brief explanation>"}\n'
+        'If complete, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
     ),
     "arbiter": (
         "You are a senior SQL arbiter for a Databricks Genie Space evaluation.\n"
@@ -1208,8 +1226,10 @@ JUDGE_PROMPTS = {
         "User question and expected SQL: {{ inputs }}\n"
         "Genie response and comparison: {{ outputs }}\n"
         "Expected result: {{ expectations }}\n\n"
-        "Return one of: genie_correct, ground_truth_correct, both_correct, neither_correct\n"
-        'Respond with JSON: {"verdict": "...", "rationale": "explanation"}'
+        'Respond with JSON only: {"verdict": "<genie_correct|ground_truth_correct|both_correct|neither_correct>", '
+        '"failure_type": "<wrong_aggregation|wrong_filter|wrong_table|other>", '
+        '"blame_set": ["<blamed_object>"], '
+        '"rationale": "<brief explanation>"}'
     ),
     "response_quality": (
         "You are evaluating the quality of a natural language response "
@@ -1224,8 +1244,9 @@ JUDGE_PROMPTS = {
         "3. Does not make claims unsupported by the query/data\n\n"
         'Respond with JSON only: {"accurate": true/false, '
         '"failure_type": "<inaccurate_description|unsupported_claim|misleading_summary>", '
+        '"counterfactual_fix": "<specific change to Genie Space metadata or instructions that would fix this response quality issue>", '
         '"rationale": "<brief explanation>"}\n'
-        'If accurate, set failure_type to "".'
+        'If accurate, set failure_type to "" and counterfactual_fix to "".'
     ),
 }
 

@@ -6,6 +6,22 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Dynamic Counterfactual Fixes in Judge Prompts
+- **Structured judge responses** (`config.py`): all LLM judge prompts
+  (`schema_accuracy`, `logical_accuracy`, `completeness`, `semantic_equivalence`,
+  `arbiter`, `response_quality`) now require structured JSON responses with
+  `failure_type`, `blame_set`, `counterfactual_fix`, `wrong_clause`, and `rationale`
+  fields instead of simple yes/no answers
+- **Dynamic counterfactual extraction** (scorers): `completeness`, `logical_accuracy`,
+  `result_correctness`, `schema_accuracy`, and `response_quality` scorers now extract
+  LLM-provided `counterfactual_fix` from the structured response; falls back to a
+  generated fix using `failure_type` and `blame_set` when the LLM omits it
+- **Richer ASI metadata**: judge-provided blame sets and counterfactual fixes flow
+  directly into ASI metadata, failure clustering, and provenance — eliminating the need
+  for separate rationale-pattern extraction for these fields
+
+---
+
 ### Added — MLflow Provenance, Labeling Sessions, Trace Tagging, SCD Filters
 - **End-to-end provenance table** (`state.py`): new `genie_opt_provenance` Delta table
   linking every patch back to originating judge verdicts, failure clusters, and gate

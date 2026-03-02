@@ -94,8 +94,9 @@ def _make_schema_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
             f"{cmp_summary}{empty_data_note}{build_temporal_note(cmp)}\n"
             'Respond with JSON only: {"correct": true/false, "failure_type": "<wrong_table|wrong_column|wrong_join|missing_column>", '
             '"wrong_clause": "<the problematic SQL clause>", "blame_set": ["<table_or_column>"], '
+            '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
             '"rationale": "<brief explanation>"}\n'
-            'If correct, set failure_type to "" and blame_set to [].'
+            'If correct, set failure_type to "", blame_set to [], and counterfactual_fix to "".'
         )
 
         logger.info(
@@ -215,7 +216,10 @@ def _make_schema_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
             confidence=base_confidence,
             wrong_clause=result.get("wrong_clause", ""),
             blame_set=result.get("blame_set", []),
-            counterfactual_fix="Review table/column references in Genie metadata",
+            counterfactual_fix=result.get("counterfactual_fix") or (
+                f"Fix {result.get('failure_type', 'schema issue')} "
+                f"involving {', '.join(result.get('blame_set', ['unknown']))}"
+            ),
         )
         return Feedback(
             name="schema_accuracy",
