@@ -619,6 +619,403 @@ def _run_description_enrichment(
         return result
 
 
+# ── Stage 2.85: PROACTIVE JOIN DISCOVERY ─────────────────────────────
+
+
+def _run_proactive_join_discovery(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    config: dict,
+    metadata_snapshot: dict,
+    catalog: str,
+    schema: str,
+) -> dict:
+    """Stage 2.85: Discover execution-proven joins from baseline eval.
+
+    Parses JOIN clauses from successful baseline eval queries (arbiter =
+    ``both_correct`` or ``genie_correct``), corroborates with UC column
+    type metadata, and codifies them as Genie Space join specifications.
+
+    Only proposes joins that have Tier 1 (execution-proven) evidence.
+    """
+    from genie_space_optimizer.common.genie_client import (
+        fetch_space_config,
+        patch_space_config,
+    )
+    from genie_space_optimizer.optimization.optimizer import (
+        _build_join_specs_from_proven,
+        _convert_fk_to_candidates,
+        _corroborate_with_uc_metadata,
+        _extract_proven_joins,
+        _short_name,
+    )
+
+    write_stage(
+        spark, run_id, "JOIN_DISCOVERY", "STARTED",
+        task_key="join_discovery", catalog=catalog, schema=schema,
+    )
+
+    result: dict = {
+        "existing_specs": 0,
+        "fk_candidates": 0,
+        "execution_candidates": 0,
+        "candidates_found": 0,
+        "already_defined": 0,
+        "type_incompatible": 0,
+        "total_applied": 0,
+        "total_skipped": 0,
+    }
+
+    try:
+        # 1. Load baseline eval rows
+        baseline_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
+        if not baseline_iter:
+            print(
+                f"\n-- JOIN DISCOVERY " + "-" * 34 + "\n"
+                f"  No baseline eval rows found — skipping.\n"
+                + "-" * 52
+            )
+            write_stage(
+                spark, run_id, "JOIN_DISCOVERY", "COMPLETE",
+                task_key="join_discovery", detail=result,
+                catalog=catalog, schema=schema,
+            )
+            return result
+
+        rows_json = baseline_iter.get("rows_json")
+        if isinstance(rows_json, str):
+            try:
+                rows_json = json.loads(rows_json)
+            except (json.JSONDecodeError, TypeError):
+                rows_json = []
+        if not isinstance(rows_json, list):
+            rows_json = []
+
+        if not rows_json:
+            print(
+                f"\n-- JOIN DISCOVERY " + "-" * 34 + "\n"
+                f"  Baseline eval has 0 rows — skipping.\n"
+                + "-" * 52
+            )
+            write_stage(
+                spark, run_id, "JOIN_DISCOVERY", "COMPLETE",
+                task_key="join_discovery", detail=result,
+                catalog=catalog, schema=schema,
+            )
+            return result
+
+        # 2. Gather existing join specs
+        _inst = metadata_snapshot.get("instructions", {})
+        if not isinstance(_inst, dict):
+            _inst = {}
+        existing_specs = _inst.get("join_specs", [])
+        if not isinstance(existing_specs, list):
+            existing_specs = []
+        result["existing_specs"] = len(existing_specs)
+
+        existing_pairs: set[tuple[str, str]] = set()
+        for spec in existing_specs:
+            if not isinstance(spec, dict):
+                continue
+            left_obj = spec.get("left", {})
+            right_obj = spec.get("right", {})
+            lt = left_obj.get("identifier", "") if isinstance(left_obj, dict) else ""
+            rt = right_obj.get("identifier", "") if isinstance(right_obj, dict) else ""
+            if lt and rt:
+                existing_pairs.add(tuple(sorted((lt, rt))))
+
+        # 3a. Tier 0: FK constraint candidates (authoritative)
+        fk_rows = config.get("_uc_foreign_keys") or []
+        fk_candidates = _convert_fk_to_candidates(fk_rows) if fk_rows else []
+        result["fk_candidates"] = len(fk_candidates)
+
+        # 3b. Tier 1: Execution-proven joins from baseline eval
+        exec_candidates = _extract_proven_joins(rows_json, metadata_snapshot)
+        result["execution_candidates"] = len(exec_candidates)
+
+        # 3c. Merge: FK candidates take precedence for shared table pairs.
+        #     For pairs that appear in both, keep the FK candidate's ON
+        #     condition (authoritative) but inherit frequency/agreed from
+        #     the execution-proven candidate.
+        fk_pairs: dict[tuple[str, str], dict] = {}
+        for fc in fk_candidates:
+            key = tuple(sorted((fc["left_table"], fc["right_table"])))
+            fk_pairs[key] = fc
+
+        merged: list[dict] = list(fk_candidates)
+        for ec in exec_candidates:
+            key = tuple(sorted((ec["left_table"], ec["right_table"])))
+            if key in fk_pairs:
+                fk_pairs[key]["frequency"] = ec.get("frequency", 0)
+                fk_pairs[key]["agreed"] = ec.get("agreed", False)
+                fk_pairs[key]["source_questions"] = ec.get("source_questions", [])
+            else:
+                merged.append(ec)
+
+        candidates = merged
+        result["candidates_found"] = len(candidates)
+
+        # 4. Filter out already-defined pairs
+        new_candidates = []
+        for cand in candidates:
+            pair_key = tuple(sorted((cand["left_table"], cand["right_table"])))
+            if pair_key in existing_pairs:
+                result["already_defined"] += 1
+            else:
+                new_candidates.append(cand)
+
+        # 5. Corroborate with UC metadata (type check).
+        #    FK-sourced candidates bypass this check — the database's own
+        #    constraints are authoritative about type compatibility.
+        fk_cands = [c for c in new_candidates if c.get("fk_constraint")]
+        exec_cands = [c for c in new_candidates if not c.get("fk_constraint")]
+        before_uc = len(exec_cands)
+        exec_cands = _corroborate_with_uc_metadata(exec_cands, metadata_snapshot)
+        result["type_incompatible"] = before_uc - len(exec_cands)
+        new_candidates = fk_cands + exec_cands
+
+        # 6. Build join specs
+        new_specs = _build_join_specs_from_proven(new_candidates, metadata_snapshot)
+
+        # 7. Gate: nothing to apply
+        if not new_specs:
+            print(
+                f"\n-- JOIN DISCOVERY " + "-" * 34 + "\n"
+                f"  Existing join specs: {result['existing_specs']}\n"
+                f"  FK constraint candidates: {result['fk_candidates']}\n"
+                f"  Execution-proven candidates: {result['execution_candidates']}\n"
+                f"  Merged candidates: {result['candidates_found']}\n"
+                f"  Already defined: {result['already_defined']}\n"
+                f"  Type-incompatible: {result['type_incompatible']}\n"
+                f"  New joins to apply: 0\n"
+                + "-" * 52
+            )
+            write_stage(
+                spark, run_id, "JOIN_DISCOVERY", "COMPLETE",
+                task_key="join_discovery", detail=result,
+                catalog=catalog, schema=schema,
+            )
+            return result
+
+        # 8. Apply join specs to config
+        parsed = config.get("_parsed_space", config)
+        inst_block = parsed.setdefault("instructions", {})
+        spec_list = inst_block.setdefault("join_specs", [])
+
+        applied_lines: list[str] = []
+        for spec in new_specs:
+            meta = spec.pop("_proactive_metadata", {})
+            spec_list.append(spec)
+
+            left_short = _short_name(spec["left"]["identifier"])
+            right_short = _short_name(spec["right"]["identifier"])
+            freq = meta.get("frequency", 0)
+            agreed_tag = "agreed" if meta.get("agreed") else "single_source"
+            applied_lines.append(
+                f"    {left_short} <-> {right_short}"
+                f" ON {spec['sql'][0][:60] if spec.get('sql') else '?'}"
+                f" (freq={freq}, {agreed_tag})"
+            )
+            result["total_applied"] += 1
+
+        # 9. PATCH Genie Space
+        patch_space_config(w, space_id, parsed)
+
+        # 10. Write patch provenance
+        for idx, spec in enumerate(new_specs):
+            write_patch(
+                spark, run_id, 0, 0, idx,
+                {
+                    "patch_type": "proactive_join_discovery",
+                    "scope": "genie_config",
+                    "risk_level": "low",
+                    "target_object": (
+                        f"{spec['left']['identifier']}"
+                        f" <-> {spec['right']['identifier']}"
+                    ),
+                    "patch": spec,
+                    "command": None,
+                },
+                catalog=catalog, schema=schema,
+            )
+
+        # 11. Summary
+        print(
+            f"\n-- JOIN DISCOVERY " + "-" * 34 + "\n"
+            f"  Existing join specs: {result['existing_specs']}\n"
+            f"  FK constraint candidates: {result['fk_candidates']}\n"
+            f"  Execution-proven candidates: {result['execution_candidates']}\n"
+            f"  Merged candidates: {result['candidates_found']}\n"
+            f"  Already defined: {result['already_defined']}\n"
+            f"  Type-incompatible: {result['type_incompatible']}\n"
+            f"  New joins applied: {result['total_applied']}\n"
+            + "\n".join(applied_lines) + "\n"
+            f"  Genie Space API PATCH sent: YES\n"
+            + "-" * 52
+        )
+
+        write_stage(
+            spark, run_id, "JOIN_DISCOVERY", "COMPLETE",
+            task_key="join_discovery", detail=result,
+            catalog=catalog, schema=schema,
+        )
+        return result
+
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("JOIN_DISCOVERY FAILED for run %s", run_id)
+        write_stage(
+            spark, run_id, "JOIN_DISCOVERY", "FAILED",
+            task_key="join_discovery",
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        return result
+
+
+# ── Stage 2.9: PROACTIVE SPACE METADATA ENRICHMENT ──────────────────
+
+
+def _run_space_metadata_enrichment(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    config: dict,
+    metadata_snapshot: dict,
+    catalog: str,
+    schema: str,
+) -> dict:
+    """Stage 2.9: Generate Space description and sample questions if empty.
+
+    Runs after join discovery and before the lever loop.  Only fires when
+    the top-level ``description`` or ``config.sample_questions`` are absent.
+    """
+    from genie_space_optimizer.common.genie_client import (
+        patch_space_config,
+        update_space_description,
+    )
+    from genie_space_optimizer.optimization.optimizer import (
+        _generate_sample_questions,
+        _generate_space_description,
+    )
+
+    needs_description = not (config.get("description") or "").strip()
+    parsed = config.get("_parsed_space", config)
+    existing_sqs = (parsed.get("config") or {}).get("sample_questions")
+    needs_questions = not existing_sqs
+
+    result: dict = {
+        "description_generated": False,
+        "questions_generated": False,
+        "questions_count": 0,
+    }
+
+    if not needs_description and not needs_questions:
+        print(
+            f"\n-- SPACE METADATA ENRICHMENT " + "-" * 24 + "\n"
+            f"  Description: already present\n"
+            f"  Sample questions: already present ({len(existing_sqs or [])})\n"
+            f"  No enrichment needed.\n"
+            + "-" * 52
+        )
+        return result
+
+    write_stage(
+        spark, run_id, "SPACE_METADATA_ENRICHMENT", "STARTED",
+        task_key="space_metadata_enrichment", catalog=catalog, schema=schema,
+    )
+
+    try:
+        desc_text = ""
+        if needs_description:
+            desc_text = _generate_space_description(metadata_snapshot, w)
+            if desc_text:
+                try:
+                    update_space_description(w, space_id, desc_text)
+                    result["description_generated"] = True
+                    write_patch(
+                        spark, run_id, 0, 0, 0,
+                        {
+                            "patch_type": "proactive_space_description",
+                            "scope": "genie_space",
+                            "risk_level": "low",
+                            "target_object": "space.description",
+                            "patch": {"description": desc_text[:200] + "..."},
+                            "command": None,
+                            "rollback": None,
+                            "proposal_id": "space_metadata_enrichment",
+                        },
+                        catalog, schema,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Space metadata enrichment: description PATCH failed",
+                        exc_info=True,
+                    )
+
+        effective_desc = desc_text or (config.get("description") or "")
+
+        new_sqs: list[dict] = []
+        if needs_questions:
+            new_sqs = _generate_sample_questions(metadata_snapshot, effective_desc, w)
+            if new_sqs:
+                cfg_block = parsed.setdefault("config", {})
+                cfg_block["sample_questions"] = new_sqs
+                try:
+                    patch_space_config(w, space_id, parsed)
+                    result["questions_generated"] = True
+                    result["questions_count"] = len(new_sqs)
+                    for idx, sq in enumerate(new_sqs):
+                        q_text = sq.get("question", [""])[0] if sq.get("question") else ""
+                        write_patch(
+                            spark, run_id, 0, 0, idx + 1,
+                            {
+                                "patch_type": "proactive_sample_question",
+                                "scope": "genie_config",
+                                "risk_level": "low",
+                                "target_object": f"config.sample_questions[{idx}]",
+                                "patch": {"question": q_text[:100]},
+                                "command": None,
+                                "rollback": None,
+                                "proposal_id": "space_metadata_enrichment",
+                            },
+                            catalog, schema,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Space metadata enrichment: sample_questions PATCH failed",
+                        exc_info=True,
+                    )
+
+        print(
+            f"\n-- SPACE METADATA ENRICHMENT " + "-" * 24 + "\n"
+            f"  Description: {'generated (' + str(len(desc_text)) + ' chars)' if result['description_generated'] else ('already present' if not needs_description else 'generation failed')}\n"
+            f"  Sample questions: {'generated (' + str(len(new_sqs)) + ')' if result['questions_generated'] else ('already present' if not needs_questions else 'generation failed')}\n"
+            + "-" * 52
+        )
+
+        write_stage(
+            spark, run_id, "SPACE_METADATA_ENRICHMENT", "COMPLETE",
+            task_key="space_metadata_enrichment",
+            detail=result, catalog=catalog, schema=schema,
+        )
+        return result
+
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("SPACE_METADATA_ENRICHMENT FAILED for run %s", run_id)
+        write_stage(
+            spark, run_id, "SPACE_METADATA_ENRICHMENT", "FAILED",
+            task_key="space_metadata_enrichment",
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        return result
+
+
 # ── Stage 2.5b: PREPARE LEVER LOOP ──────────────────────────────────
 
 
@@ -1172,9 +1569,14 @@ def _run_gate_checks(
             reference_sqls=reference_sqls if reference_sqls else None,
         )
         slice_scores = slice_result.get("scores", {})
+        slice_accuracy = slice_result.get("overall_accuracy", 0.0)
         effective_slice_tol = max(SLICE_GATE_TOLERANCE, noise_floor + 2.0)
+        _informational_judges = {j for j, t in DEFAULT_THRESHOLDS.items() if t == 0.0}
+        if slice_accuracy >= best_accuracy - 2 * noise_floor:
+            _informational_judges.add("asset_routing")
         slice_drops = detect_regressions(
             slice_scores, best_scores, threshold=effective_slice_tol,
+            skip_judges=_informational_judges,
         )
 
         if slice_drops:
@@ -1285,8 +1687,12 @@ def _run_gate_checks(
     )
 
     effective_regression_tol = max(REGRESSION_THRESHOLD, noise_floor)
+    _informational_judges = {j for j, t in DEFAULT_THRESHOLDS.items() if t == 0.0}
+    if full_accuracy >= best_accuracy - 2 * noise_floor:
+        _informational_judges.add("asset_routing")
     regressions = detect_regressions(
         full_scores, best_scores, threshold=effective_regression_tol,
+        skip_judges=_informational_judges,
     )
 
     accuracy_drop = best_accuracy - full_accuracy
@@ -1443,6 +1849,30 @@ def _run_lever_loop(
         w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
     )
     if enrichment_result.get("total_enriched", 0) > 0:
+        from genie_space_optimizer.common.genie_client import fetch_space_config
+        config = fetch_space_config(w, space_id)
+        config["_uc_columns"] = uc_columns
+        metadata_snapshot = config.get("_parsed_space", config)
+        if uc_columns:
+            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+    # Stage 2.85: Proactive join discovery from baseline eval
+    join_result = _run_proactive_join_discovery(
+        w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+    )
+    if join_result.get("total_applied", 0) > 0:
+        from genie_space_optimizer.common.genie_client import fetch_space_config
+        config = fetch_space_config(w, space_id)
+        config["_uc_columns"] = uc_columns
+        metadata_snapshot = config.get("_parsed_space", config)
+        if uc_columns:
+            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+    # Stage 2.9: Proactive space metadata enrichment
+    meta_result = _run_space_metadata_enrichment(
+        w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+    )
+    if meta_result.get("description_generated") or meta_result.get("questions_generated"):
         from genie_space_optimizer.common.genie_client import fetch_space_config
         config = fetch_space_config(w, space_id)
         config["_uc_columns"] = uc_columns

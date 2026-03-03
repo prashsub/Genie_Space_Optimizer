@@ -1,7 +1,11 @@
 """Structured metadata schema for Genie Space descriptions.
 
 Provides parse/render/update utilities so that table, column, metric view,
-and function descriptions follow a predictable ``**Section:** value`` format.
+and function descriptions follow a predictable plain-text format with
+ALL-CAPS section headers (e.g. ``PURPOSE:\\nvalue``).  Legacy Markdown
+``**Section:** value`` descriptions are still parsed for backward
+compatibility and re-rendered in the new format on the next write.
+
 Each lever owns specific sections, preventing collateral damage when one
 lever updates metadata that another lever depends on.
 """
@@ -70,6 +74,7 @@ SECTION_LABELS: dict[str, str] = {
 }
 
 _LABEL_TO_KEY: dict[str, str] = {v.lower(): k for k, v in SECTION_LABELS.items()}
+_UPPER_LABEL_TO_KEY: dict[str, str] = {v.upper(): k for k, v in SECTION_LABELS.items()}
 
 # ---------------------------------------------------------------------------
 # Lever Section Ownership
@@ -88,10 +93,15 @@ LEVER_SECTION_OWNERSHIP: dict[int, set[str]] = {
     5: set(),
 }
 
-# Regex that matches ``**Label:** rest-of-line`` at start of a line
+# Regex that matches legacy ``**Label:** rest-of-line`` at start of a line
 _SECTION_RE = re.compile(
     r"^\*\*(?P<label>[^*:]+?):\*\*\s*(?P<value>.*)$",
     re.MULTILINE,
+)
+
+# Regex that matches plain-text ``LABEL:`` on its own line (ALL-CAPS header)
+_PLAINTEXT_SECTION_RE = re.compile(
+    r"^(?P<label>[A-Z][A-Z ]+?):\s*$",
 )
 
 
@@ -115,15 +125,20 @@ _MEASURE_PREFIXES = (
 # ---------------------------------------------------------------------------
 
 def parse_structured_description(text: str | list[str] | None) -> dict[str, str]:
-    """Parse ``**Section:** value`` pairs from a description string.
+    """Parse structured description sections from a description string.
+
+    Supports two formats:
+
+    * **Legacy Markdown**: ``**Purpose:** value`` (inline on one line)
+    * **Plain-text ALL-CAPS**: ``PURPOSE:\\nvalue`` (header on own line,
+      value on subsequent lines)
 
     Returns a dict mapping section keys (e.g. ``"purpose"``, ``"definition"``)
     to their values.  Any text that does not belong to a recognized section is
     stored under the ``"_preamble"`` key.
 
-    Handles both structured descriptions and legacy free-text (which all goes
-    into ``_preamble``).  Parsing an already-structured description and
-    re-rendering yields the same output (idempotent).
+    Parsing an already-structured description and re-rendering yields the
+    same output (idempotent).
     """
     if text is None:
         return {}
@@ -138,32 +153,48 @@ def parse_structured_description(text: str | list[str] | None) -> dict[str, str]
     current_key: str | None = None
     current_lines: list[str] = []
 
-    for line in text.split("\n"):
-        m = _SECTION_RE.match(line)
-        if m:
-            if current_key is not None:
-                sections[current_key] = "\n".join(current_lines).strip()
-            elif current_lines:
-                preamble_lines.extend(current_lines)
+    def _flush() -> None:
+        nonlocal current_key, current_lines
+        if current_key is not None:
+            sections[current_key] = "\n".join(current_lines).strip()
+        elif current_lines:
+            preamble_lines.extend(current_lines)
+        current_key = None
+        current_lines = []
 
-            label = m.group("label").strip().lower()
+    for line in text.split("\n"):
+        m_md = _SECTION_RE.match(line)
+        m_pt = _PLAINTEXT_SECTION_RE.match(line) if not m_md else None
+
+        if m_md:
+            _flush()
+            label = m_md.group("label").strip().lower()
             current_key = _LABEL_TO_KEY.get(label)
             if current_key is None:
                 preamble_lines.append(line)
                 current_key = None
                 current_lines = []
             else:
-                current_lines = [m.group("value").strip()]
+                current_lines = [m_md.group("value").strip()]
+        elif m_pt:
+            label_upper = m_pt.group("label").strip()
+            resolved_key = _UPPER_LABEL_TO_KEY.get(label_upper)
+            if resolved_key is not None:
+                _flush()
+                current_key = resolved_key
+                current_lines = []
+            else:
+                if current_key is not None:
+                    current_lines.append(line)
+                else:
+                    preamble_lines.append(line)
         else:
             if current_key is not None:
                 current_lines.append(line)
             else:
                 preamble_lines.append(line)
 
-    if current_key is not None:
-        sections[current_key] = "\n".join(current_lines).strip()
-    elif current_lines:
-        preamble_lines.extend(current_lines)
+    _flush()
 
     preamble = "\n".join(preamble_lines).strip()
     if preamble:
@@ -187,7 +218,15 @@ def render_structured_description(
 ) -> list[str]:
     """Render sections into the Genie API ``description`` format (``list[str]``).
 
-    Outputs lines like ``["**Purpose:** ...", "**Aggregation:** ..."]``.
+    Outputs plain-text with ALL-CAPS section headers on their own line,
+    value on the next line, and a blank line separator between sections::
+
+        PURPOSE:
+        SCD Type 2 property dimension...
+
+        BEST FOR:
+        Property lookups, pricing analysis.
+
     Preserves ``_preamble`` at the top if present.
     """
     template = ENTITY_TYPE_TEMPLATES.get(entity_type, [])
@@ -196,13 +235,19 @@ def render_structured_description(
     preamble = sections.get("_preamble", "").strip()
     if preamble:
         lines.append(preamble)
+        lines.append("")
 
     for section_key in template:
         value = sections.get(section_key, "").strip()
         if not value:
             continue
         label = SECTION_LABELS[section_key]
-        lines.append(f"**{label}:** {value}")
+        lines.append(f"{label.upper()}:")
+        lines.append(value)
+        lines.append("")
+
+    if lines and lines[-1] == "":
+        lines.pop()
 
     return lines if lines else [""]
 

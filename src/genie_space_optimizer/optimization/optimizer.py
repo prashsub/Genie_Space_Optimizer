@@ -22,6 +22,7 @@ from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 from genie_space_optimizer.common.config import (
     APPLY_MODE,
     CONFLICT_RULES,
+    DEFAULT_THRESHOLDS,
     DESCRIPTION_ENRICHMENT_PROMPT,
     FAILURE_TAXONOMY,
     GENERIC_FIX_PREFIXES,
@@ -45,12 +46,15 @@ from genie_space_optimizer.common.config import (
     PROPOSAL_GENERATION_PROMPT,
     REGRESSION_THRESHOLD,
     REPEATABILITY_FIX_BY_ASSET,
+    SAMPLE_QUESTIONS_PROMPT,
+    SPACE_DESCRIPTION_PROMPT,
     STRATEGIST_DETAIL_PROMPT,
     STRATEGIST_PROMPT,
     STRATEGIST_TRIAGE_PROMPT,
     _LEVER_TO_PATCH_TYPE,
     format_mlflow_template,
 )
+from genie_space_optimizer.common.genie_schema import ensure_join_spec_fields
 
 logger = logging.getLogger(__name__)
 
@@ -812,6 +816,10 @@ def enrich_metadata_with_uc_types(
         col = str(row.get("column_name") or row.get("column") or "").strip().lower()
         if tbl and col:
             uc_lookup[(tbl, col)] = row
+        cat = str(row.get("catalog_name") or "").strip().lower()
+        sch = str(row.get("schema_name") or "").strip().lower()
+        if cat and sch and tbl and col:
+            uc_lookup[(f"{cat}.{sch}.{tbl}", col)] = row
 
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
@@ -824,11 +832,12 @@ def enrich_metadata_with_uc_types(
             continue
         ident = tbl.get("identifier", "") or tbl.get("name", "")
         short = ident.rsplit(".", 1)[-1].lower() if ident else ""
+        fqn_lower = ident.lower() if ident else ""
         for cc in tbl.get("column_configs", tbl.get("columns", [])):
             if not isinstance(cc, dict):
                 continue
             col_name = (cc.get("column_name") or cc.get("name", "")).lower()
-            uc_row = uc_lookup.get((short, col_name))
+            uc_row = uc_lookup.get((fqn_lower, col_name)) or uc_lookup.get((short, col_name))
             if uc_row is None:
                 continue
             if not cc.get("data_type"):
@@ -1068,6 +1077,191 @@ def _enrich_blank_descriptions(
         len(all_patches), len(blanks),
     )
     return all_patches
+
+
+# ── Proactive Space Metadata Generation ──────────────────────────────
+
+
+def _build_space_schema_context(metadata_snapshot: dict) -> dict[str, str]:
+    """Build context strings for tables, metric views, and instructions."""
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", [])
+    mvs = ds.get("metric_views", [])
+
+    table_lines: list[str] = []
+    for tbl in tables:
+        if not isinstance(tbl, dict):
+            continue
+        ident = tbl.get("identifier", "")
+        desc = tbl.get("description", "")
+        cols = tbl.get("column_configs", tbl.get("columns", []))
+        col_names = [
+            c.get("column_name", c.get("name", ""))
+            for c in cols if isinstance(c, dict)
+        ]
+        line = f"- {ident}"
+        if desc:
+            line += f": {desc[:120]}"
+        if col_names:
+            line += f"\n  Columns: {', '.join(col_names[:20])}"
+            if len(col_names) > 20:
+                line += f" (+{len(col_names) - 20} more)"
+        table_lines.append(line)
+
+    mv_lines: list[str] = []
+    for mv in mvs:
+        if not isinstance(mv, dict):
+            continue
+        ident = mv.get("identifier", "")
+        desc = mv.get("description", "")
+        cols = mv.get("column_configs", mv.get("columns", []))
+        col_names = [
+            c.get("column_name", c.get("name", ""))
+            for c in cols if isinstance(c, dict)
+        ]
+        line = f"- {ident}"
+        if desc:
+            line += f": {desc[:120]}"
+        if col_names:
+            line += f"\n  Columns: {', '.join(col_names[:15])}"
+        mv_lines.append(line)
+
+    instr = metadata_snapshot.get("instructions", {})
+    ti_list = instr.get("text_instructions", []) if isinstance(instr, dict) else []
+    instr_text = "\n".join(
+        ti.get("content", "")[:200] for ti in ti_list if isinstance(ti, dict) and ti.get("content")
+    ) or "(none)"
+
+    return {
+        "tables_context": "\n".join(table_lines) or "(none)",
+        "metric_views_context": "\n".join(mv_lines) or "(none)",
+        "instructions_context": instr_text,
+    }
+
+
+def _generate_space_description(
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> str:
+    """Generate a structured description for a Genie Space from its schema.
+
+    Returns the description text, or ``""`` on failure.
+    """
+    from databricks.sdk import WorkspaceClient as _WC
+
+    ctx = _build_space_schema_context(metadata_snapshot)
+    format_kwargs = _truncate_to_budget(
+        ctx, SPACE_DESCRIPTION_PROMPT,
+        priority_keys=["tables_context"],
+    )
+    prompt = format_mlflow_template(SPACE_DESCRIPTION_PROMPT, **format_kwargs)
+
+    try:
+        if w is None:
+            w = _WC()
+        response = w.serving_endpoints.query(
+            name=LLM_ENDPOINT,
+            messages=[
+                ChatMessage(
+                    role=ChatMessageRole.SYSTEM,
+                    content="You generate structured descriptions for Databricks Genie Spaces.",
+                ),
+                ChatMessage(role=ChatMessageRole.USER, content=prompt),
+            ],
+            temperature=LLM_TEMPERATURE,
+            max_tokens=2048,
+        )
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            logger.warning("Space description generation: empty LLM response")
+            return ""
+        message = choices[0].message if hasattr(choices[0], "message") else choices[0]
+        content = getattr(message, "content", None)
+        if not content:
+            logger.warning("Space description generation: LLM content is empty")
+            return ""
+        text = str(content).strip()
+        text = re.sub(r"```[a-z]*\n?", "", text).strip().rstrip("`")
+        if len(text) < 30:
+            logger.warning("Space description generation: result too short (%d chars)", len(text))
+            return ""
+        logger.info("Space description generation: produced %d chars", len(text))
+        return text
+    except Exception:
+        logger.warning("Space description generation: LLM call failed", exc_info=True)
+        return ""
+
+
+def _generate_sample_questions(
+    metadata_snapshot: dict,
+    description: str = "",
+    w: WorkspaceClient | None = None,
+) -> list[dict]:
+    """Generate sample questions for a Genie Space from its schema.
+
+    Returns a list of ``{"id": "<hex>", "question": ["<text>"]}`` dicts,
+    or ``[]`` on failure.
+    """
+    from databricks.sdk import WorkspaceClient as _WC
+    from genie_space_optimizer.common.genie_schema import generate_genie_id
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+
+    ctx = _build_space_schema_context(metadata_snapshot)
+    ctx["description_context"] = description or "(none)"
+    format_kwargs = _truncate_to_budget(
+        ctx, SAMPLE_QUESTIONS_PROMPT,
+        priority_keys=["tables_context"],
+    )
+    prompt = format_mlflow_template(SAMPLE_QUESTIONS_PROMPT, **format_kwargs)
+
+    try:
+        if w is None:
+            w = _WC()
+        response = w.serving_endpoints.query(
+            name=LLM_ENDPOINT,
+            messages=[
+                ChatMessage(
+                    role=ChatMessageRole.SYSTEM,
+                    content="You generate sample questions for Databricks Genie Spaces.",
+                ),
+                ChatMessage(role=ChatMessageRole.USER, content=prompt),
+            ],
+            temperature=LLM_TEMPERATURE,
+            max_tokens=2048,
+        )
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            logger.warning("Sample question generation: empty LLM response")
+            return []
+        message = choices[0].message if hasattr(choices[0], "message") else choices[0]
+        content = getattr(message, "content", None)
+        if not content:
+            logger.warning("Sample question generation: LLM content is empty")
+            return []
+        text = str(content).strip()
+        result = _extract_json(text)
+    except Exception:
+        logger.warning("Sample question generation: LLM call failed", exc_info=True)
+        return []
+
+    questions = result.get("questions", [])
+    if not isinstance(questions, list) or not questions:
+        logger.warning("Sample question generation: no questions in LLM response")
+        return []
+
+    sample_questions: list[dict] = []
+    for q in questions:
+        if not isinstance(q, str) or not q.strip():
+            continue
+        sample_questions.append({
+            "id": generate_genie_id(),
+            "question": [q.strip()],
+        })
+
+    logger.info("Sample question generation: produced %d questions", len(sample_questions))
+    return sample_questions
 
 
 _JOIN_KEY_SUFFIXES = ("_key", "_id", "_code", "_fk", "_ref", "_num", "_no", "_sk", "_pk")
@@ -1361,6 +1555,416 @@ def discover_join_candidates(
         len(hints), len(existing_pairs) // 2,
     )
     return hints
+
+
+# ── Proactive Join Discovery (execution-proven) ──────────────────────
+
+_FACT_PREFIXES = ("fact_", "fct_")
+
+_JOIN_FQN_RE = re.compile(
+    r"\bJOIN\s+"
+    r"((?:`[^`]+`\.`[^`]+`\.`[^`]+`)"
+    r"|(?:[A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*))"
+    r"\s+(?:AS\s+)?(\w+)?"
+    r"\s*ON\s+(.+?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|;|\Z)",
+    re.I | re.S,
+)
+
+_SQL_FROM_TABLE_RE = re.compile(
+    r"\bFROM\s+"
+    r"((?:`[^`]+`\.`[^`]+`\.`[^`]+`)"
+    r"|(?:[A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*))",
+    re.I,
+)
+
+
+def _convert_fk_to_candidates(
+    fk_rows: list[dict],
+    short_to_fqn: dict[str, str] | None = None,
+) -> list[dict]:
+    """Convert FK constraint dicts into the join candidate format.
+
+    Each FK dict (from ``get_foreign_keys_for_tables_rest`` or its Spark
+    fallback) has ``child_table``, ``child_columns``, ``parent_table``,
+    ``parent_columns``, ``constraint_name``.
+
+    Returns candidates compatible with the pipeline used by
+    ``_corroborate_with_uc_metadata`` and ``_build_join_specs_from_proven``,
+    with an extra ``fk_constraint: True`` flag so downstream logic can
+    recognise their authoritative provenance.
+    """
+    candidates: list[dict] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for fk in fk_rows:
+        child_fqn = fk.get("child_table", "")
+        parent_fqn = fk.get("parent_table", "")
+        child_cols = fk.get("child_columns", [])
+        parent_cols = fk.get("parent_columns", [])
+        if not (child_fqn and parent_fqn and child_cols and parent_cols):
+            continue
+        if len(child_cols) != len(parent_cols):
+            continue
+
+        child_short = _short_name(child_fqn).lower()
+        parent_short = _short_name(parent_fqn).lower()
+
+        on_parts = [
+            f"`{child_short}`.`{cc}` = `{parent_short}`.`{pc}`"
+            for cc, pc in zip(child_cols, parent_cols)
+        ]
+        on_condition = " AND ".join(on_parts)
+
+        pair_key = tuple(sorted((child_fqn, parent_fqn)))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+
+        candidates.append({
+            "left_table": child_fqn,
+            "right_table": parent_fqn,
+            "on_condition": on_condition,
+            "frequency": 0,
+            "agreed": False,
+            "source_questions": [],
+            "fk_constraint": True,
+            "constraint_name": fk.get("constraint_name", ""),
+        })
+
+    logger.info(
+        "FK→candidates: converted %d FK constraints into %d join candidates",
+        len(fk_rows), len(candidates),
+    )
+    return candidates
+
+
+def _extract_proven_joins(
+    rows: list[dict],
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Extract execution-validated join paths from baseline eval rows.
+
+    Only considers rows where the arbiter verdict is ``both_correct`` or
+    ``genie_correct``.  Parses JOIN…ON clauses from both Genie SQL and
+    ground-truth SQL, resolves short table names to FQN identifiers, and
+    returns deduplicated candidates sorted by frequency.
+    """
+    _POSITIVE_VERDICTS = {"both_correct", "genie_correct"}
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+    mvs = ds.get("metric_views", [])
+
+    short_to_fqn: dict[str, str] = {}
+    _ambiguous_shorts: set[str] = set()
+    for t in list(tables) + list(mvs):
+        if not isinstance(t, dict):
+            continue
+        ident = t.get("identifier", "") or t.get("name", "")
+        if ident:
+            short = _short_name(ident).lower().strip("`")
+            if short in short_to_fqn and short_to_fqn[short] != ident:
+                _ambiguous_shorts.add(short)
+            short_to_fqn[short] = ident
+            fqn_lower = ident.lower().strip("`")
+            short_to_fqn[fqn_lower] = ident
+
+    candidates: dict[tuple[str, str], dict] = {}
+
+    for row in rows:
+        arbiter = (
+            row.get("arbiter/value")
+            or row.get("feedback/arbiter/value")
+            or row.get("arbiter")
+            or ""
+        )
+        if str(arbiter).lower() not in _POSITIVE_VERDICTS:
+            continue
+
+        qid = _row_qid(row)
+
+        _req = row.get("request") or {}
+        if isinstance(_req, str):
+            try:
+                _req = json.loads(_req)
+            except (json.JSONDecodeError, TypeError):
+                _req = {}
+        _resp = row.get("response") or {}
+        if isinstance(_resp, str):
+            try:
+                _resp = json.loads(_resp)
+            except (json.JSONDecodeError, TypeError):
+                _resp = {}
+
+        gt_sql = (
+            (_req.get("expected_sql", "") if isinstance(_req, dict) else "")
+            or row.get("inputs/expected_sql", "")
+            or ""
+        )
+        genie_sql = (
+            (_resp.get("response", "") if isinstance(_resp, dict) else "")
+            or row.get("outputs/response", "")
+            or ""
+        )
+
+        for sql, source_label in [(gt_sql, "gt"), (genie_sql, "genie")]:
+            if not sql:
+                continue
+
+            from_m = _SQL_FROM_TABLE_RE.search(sql)
+            from_table_raw = from_m.group(1).replace("`", "").lower() if from_m else ""
+            from_fqn = ""
+            if from_table_raw:
+                from_fqn = short_to_fqn.get(from_table_raw, "")
+                if not from_fqn:
+                    from_short = _short_name(from_table_raw).lower()
+                    if from_short not in _ambiguous_shorts:
+                        from_fqn = short_to_fqn.get(from_short, "")
+                    elif "." in from_table_raw and from_table_raw.count(".") >= 2:
+                        from_fqn = from_table_raw
+
+            for m in _JOIN_FQN_RE.finditer(sql):
+                joined_table_raw = m.group(1).replace("`", "").lower()
+                alias = (m.group(2) or "").lower()
+                on_clause = m.group(3).strip()
+
+                joined_fqn = short_to_fqn.get(joined_table_raw, "")
+                if not joined_fqn:
+                    joined_short = _short_name(joined_table_raw).lower()
+                    if joined_short not in _ambiguous_shorts:
+                        joined_fqn = short_to_fqn.get(joined_short, "")
+                    elif "." in joined_table_raw and joined_table_raw.count(".") >= 2:
+                        joined_fqn = joined_table_raw
+
+                if not joined_fqn:
+                    if "." in joined_table_raw and joined_table_raw.count(".") >= 2:
+                        joined_fqn = joined_table_raw
+                    else:
+                        continue
+
+                left_fqn = from_fqn or ""
+                if not left_fqn:
+                    continue
+
+                pair_key = tuple(sorted((left_fqn, joined_fqn)))
+                if pair_key[0] == pair_key[1]:
+                    continue
+
+                if pair_key not in candidates:
+                    candidates[pair_key] = {
+                        "left_table": pair_key[0],
+                        "right_table": pair_key[1],
+                        "on_conditions": {},
+                        "frequency": 0,
+                        "source_questions": [],
+                        "from_gt": set(),
+                        "from_genie": set(),
+                    }
+
+                entry = candidates[pair_key]
+                entry["frequency"] += 1
+                if qid not in entry["source_questions"]:
+                    entry["source_questions"].append(qid)
+                entry[f"from_{source_label}"].add(qid)
+
+                on_norm = re.sub(r"\s+", " ", on_clause).strip()
+                if on_norm:
+                    entry["on_conditions"][on_norm] = entry["on_conditions"].get(on_norm, 0) + 1
+
+    result: list[dict] = []
+    for pair_key, entry in candidates.items():
+        gt_qs = entry.pop("from_gt")
+        genie_qs = entry.pop("from_genie")
+        agreed_qs = gt_qs & genie_qs
+        entry["agreed"] = len(agreed_qs) > 0
+
+        best_condition = ""
+        if entry["on_conditions"]:
+            best_condition = max(entry["on_conditions"], key=entry["on_conditions"].get)
+        entry["on_condition"] = best_condition
+        del entry["on_conditions"]
+
+        result.append(entry)
+
+    result.sort(key=lambda x: (-int(x.get("agreed", False)), -x["frequency"]))
+
+    logger.info(
+        "Proactive join discovery: %d execution-proven candidates from %d rows",
+        len(result), len(rows),
+    )
+    return result
+
+
+def _corroborate_with_uc_metadata(
+    candidates: list[dict],
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Filter proven join candidates by UC column type compatibility.
+
+    Rejects candidates whose join columns have known incompatible types.
+    Candidates with unknown types pass through (benefit of the doubt for
+    execution-proven joins).
+
+    Builds the type lookup using both short-name and FQN keys to avoid
+    mismatches in multi-catalog environments.
+    """
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+
+    col_types: dict[tuple[str, str], str] = {}
+    for tbl in tables:
+        if not isinstance(tbl, dict):
+            continue
+        ident = tbl.get("identifier", "") or tbl.get("name", "")
+        short = _short_name(ident).lower()
+        fqn_lower = ident.lower()
+        for cc in tbl.get("column_configs", tbl.get("columns", [])):
+            col_name = (cc.get("column_name") or cc.get("name", "")).lower()
+            dt = cc.get("data_type", "")
+            if col_name and dt:
+                col_types[(short, col_name)] = str(dt).upper()
+                col_types[(fqn_lower, col_name)] = str(dt).upper()
+
+    validated: list[dict] = []
+    for cand in candidates:
+        on_cond = cand.get("on_condition", "")
+        if not on_cond:
+            validated.append(cand)
+            continue
+
+        pattern = r"`?(\w+)`?\s*\.\s*`?(\w+)`?\s*=\s*`?(\w+)`?\s*\.\s*`?(\w+)`?"
+        match = re.search(pattern, on_cond)
+        if not match:
+            validated.append(cand)
+            continue
+
+        alias_l, col_l = match.group(1).lower(), match.group(2).lower()
+        alias_r, col_r = match.group(3).lower(), match.group(4).lower()
+
+        left_fqn = cand.get("left_table", "").lower()
+        right_fqn = cand.get("right_table", "").lower()
+        type_l = (
+            col_types.get((left_fqn, col_l), "")
+            or col_types.get((alias_l, col_l), "")
+        )
+        type_r = (
+            col_types.get((right_fqn, col_r), "")
+            or col_types.get((alias_r, col_r), "")
+        )
+
+        if type_l and type_r and not _types_compatible(type_l, type_r):
+            logger.info(
+                "Proactive join: rejecting %s <-> %s — type mismatch %s(%s) vs %s(%s)",
+                cand["left_table"], cand["right_table"],
+                col_l, type_l, col_r, type_r,
+            )
+            continue
+
+        cand["type_compatible"] = True
+        validated.append(cand)
+
+    logger.info(
+        "Proactive join: %d/%d candidates passed UC type check",
+        len(validated), len(candidates),
+    )
+    return validated
+
+
+def _build_join_specs_from_proven(
+    candidates: list[dict],
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Convert validated candidates into proper Genie API join_spec dicts.
+
+    Assigns relationship types heuristically: fact→dim gets MANY_TO_ONE,
+    everything else defaults to MANY_TO_ONE as it is the most common
+    star-schema pattern.
+    """
+    from genie_space_optimizer.common.genie_schema import ensure_join_spec_fields
+    from genie_space_optimizer.optimization.applier import _validate_join_spec_entry
+
+    specs: list[dict] = []
+    for cand in candidates:
+        left_fqn = cand["left_table"]
+        right_fqn = cand["right_table"]
+        on_condition = cand.get("on_condition", "")
+
+        left_short = _short_name(left_fqn).lower()
+        right_short = _short_name(right_fqn).lower()
+
+        left_is_fact = any(left_short.startswith(p) for p in _FACT_PREFIXES)
+        right_is_fact = any(right_short.startswith(p) for p in _FACT_PREFIXES)
+
+        if left_is_fact and not right_is_fact:
+            rt = "FROM_RELATIONSHIP_TYPE_MANY_TO_ONE"
+        elif right_is_fact and not left_is_fact:
+            left_fqn, right_fqn = right_fqn, left_fqn
+            left_short, right_short = right_short, left_short
+            rt = "FROM_RELATIONSHIP_TYPE_MANY_TO_ONE"
+        else:
+            rt = "FROM_RELATIONSHIP_TYPE_MANY_TO_ONE"
+
+        sql_parts = []
+        if on_condition:
+            normalized = re.sub(
+                r"`?\w+`?\.",
+                lambda m: m.group(0),
+                on_condition,
+            )
+            has_backticks = "`" in normalized
+            if not has_backticks:
+                normalized = re.sub(
+                    r"(\w+)\.(\w+)",
+                    r"`\1`.`\2`",
+                    normalized,
+                )
+            sql_parts.append(normalized)
+        sql_parts.append(f"--rt={rt}--")
+
+        spec = {
+            "left": {"identifier": left_fqn, "alias": left_short},
+            "right": {"identifier": right_fqn, "alias": right_short},
+            "sql": sql_parts,
+        }
+        spec = ensure_join_spec_fields(spec)
+
+        if not _validate_join_spec_entry(spec):
+            logger.info(
+                "Proactive join: spec rejected by validation — %s <-> %s",
+                left_fqn, right_fqn,
+            )
+            continue
+
+        valid, reason = validate_join_spec_types(spec, metadata_snapshot)
+        if not valid:
+            logger.info(
+                "Proactive join: spec rejected by type check — %s <-> %s: %s",
+                left_fqn, right_fqn, reason,
+            )
+            continue
+
+        spec["_proactive_metadata"] = {
+            "frequency": cand.get("frequency", 0),
+            "agreed": cand.get("agreed", False),
+            "source_questions": cand.get("source_questions", []),
+        }
+        specs.append(spec)
+
+    specs.sort(
+        key=lambda s: (
+            -int(s.get("_proactive_metadata", {}).get("agreed", False)),
+            -s.get("_proactive_metadata", {}).get("frequency", 0),
+        )
+    )
+
+    logger.info(
+        "Proactive join: built %d valid join specs from %d candidates",
+        len(specs), len(candidates),
+    )
+    return specs
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2700,6 +3304,25 @@ def _format_discovery_hints(hints: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_JOIN_PROSE_SPLIT_RE = re.compile(
+    r",\s*(?:MANY_TO_|ONE_TO_|Use this|This join|Always|Note:)",
+    re.IGNORECASE,
+)
+_SENTENCE_BOUNDARY_RE = re.compile(r"\.\s+[A-Z]")
+
+
+def _sanitize_join_sql(sql_str: str) -> str:
+    """Strip prose and cardinality labels from a join condition SQL string.
+
+    LLMs sometimes embed descriptive text like ``MANY_TO_ONE. Use this join
+    to connect...`` after the actual ON-clause expression.  This function
+    keeps only the SQL portion.
+    """
+    cleaned = _JOIN_PROSE_SPLIT_RE.split(sql_str, maxsplit=1)[0]
+    cleaned = _SENTENCE_BOUNDARY_RE.split(cleaned, maxsplit=1)[0]
+    return cleaned.strip().rstrip(",").rstrip(".")
+
+
 def _call_llm_for_join_discovery(
     metadata_snapshot: dict,
     hints: list[dict],
@@ -2798,6 +3421,12 @@ def _call_llm_for_join_discovery(
             result = _extract_json(text)
             specs = result.get("join_specs", [])
             rationale = result.get("rationale", "")
+            for s in specs:
+                if isinstance(s, dict) and "sql" in s:
+                    s["sql"] = [
+                        _sanitize_join_sql(part) for part in s["sql"]
+                        if isinstance(part, str)
+                    ]
             out = [
                 {"join_spec": s, "rationale": rationale}
                 for s in specs
@@ -3205,8 +3834,21 @@ def _format_soft_signal_summary(soft_clusters: list[dict]) -> str:
     """Compact summary of soft-signal clusters for the strategist prompt."""
     if not soft_clusters:
         return "(No soft signals.)"
+    _info_judges = {j for j, t in DEFAULT_THRESHOLDS.items() if t == 0.0}
+    filtered: list[dict] = []
+    for sc in soft_clusters:
+        judges_in_cluster = {
+            fj.get("judge", "")
+            for qt in sc.get("question_traces", [])
+            for fj in qt.get("failed_judges", [])
+        }
+        if judges_in_cluster and judges_in_cluster <= _info_judges:
+            continue
+        filtered.append(sc)
+    if not filtered:
+        return "(No actionable soft signals.)"
     lines: list[str] = []
-    for sc in soft_clusters[:10]:
+    for sc in filtered[:10]:
         cid = sc.get("cluster_id", "?")
         rc = sc.get("root_cause", "unknown")
         qids = sc.get("question_ids", [])
@@ -3987,26 +4629,33 @@ def validate_join_spec_types(
     cond_left_alias, cond_left_col = match.group(1), match.group(2)
     cond_right_alias, cond_right_col = match.group(3), match.group(4)
 
-    # Build column type lookup from metadata
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
         ds = {}
     tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
 
-    col_types: dict[tuple[str, str], str] = {}  # (short_table, col_name) -> data_type
+    col_types: dict[tuple[str, str], str] = {}
     for tbl in tables:
         if not isinstance(tbl, dict):
             continue
         ident = tbl.get("identifier", "") or tbl.get("name", "")
         short = _short_name(ident).lower()
+        fqn_lower = ident.lower()
         for cc in tbl.get("column_configs", tbl.get("columns", [])):
             col_name = (cc.get("column_name") or cc.get("name", "")).lower()
             dt = cc.get("data_type", "")
             if col_name and dt:
                 col_types[(short, col_name)] = str(dt).upper()
+                col_types[(fqn_lower, col_name)] = str(dt).upper()
 
-    left_type = col_types.get((cond_left_alias.lower(), cond_left_col.lower()), "")
-    right_type = col_types.get((cond_right_alias.lower(), cond_right_col.lower()), "")
+    left_type = (
+        col_types.get((left_ident.lower(), cond_left_col.lower()), "")
+        or col_types.get((cond_left_alias.lower(), cond_left_col.lower()), "")
+    )
+    right_type = (
+        col_types.get((right_ident.lower(), cond_right_col.lower()), "")
+        or col_types.get((cond_right_alias.lower(), cond_right_col.lower()), "")
+    )
 
     if not left_type or not right_type:
         return True, "type info unavailable, skipping validation"
@@ -4643,11 +5292,12 @@ def generate_proposals_from_strategy(
                 right_table = js_entry.get("right_table", "")
                 guidance = js_entry.get("join_guidance", "")
                 if left_table and right_table:
-                    join_spec = {
+                    sanitized_guidance = _sanitize_join_sql(guidance) if guidance else ""
+                    join_spec = ensure_join_spec_fields({
                         "left": {"identifier": left_table},
                         "right": {"identifier": right_table},
-                        "sql": [guidance] if guidance else [],
-                    }
+                        "sql": [sanitized_guidance] if sanitized_guidance else [],
+                    })
                     valid, reason = validate_join_spec_types(join_spec, metadata_snapshot)
                     if not valid:
                         logger.info("[%s] Join spec rejected (type mismatch): %s", ag_id, reason)
@@ -4686,6 +5336,8 @@ def generate_proposals_from_strategy(
                     join_spec = spec_result.get("join_spec")
                     if not isinstance(join_spec, dict):
                         continue
+                    join_spec = ensure_join_spec_fields(join_spec)
+                    spec_result["join_spec"] = join_spec
                     valid, reason = validate_join_spec_types(join_spec, metadata_snapshot)
                     if not valid:
                         logger.info("[%s] Discovery join rejected: %s", ag_id, reason)
@@ -5038,6 +5690,7 @@ def generate_metadata_proposals(
         extra_fields: dict = {}
 
         if lever == 4 and isinstance(llm_result.get("join_spec"), dict):
+            llm_result["join_spec"] = ensure_join_spec_fields(llm_result["join_spec"])
             valid, reason = validate_join_spec_types(
                 llm_result["join_spec"], metadata_snapshot
             )
@@ -5209,6 +5862,8 @@ def generate_metadata_proposals(
                 join_spec = spec_result.get("join_spec")
                 if not isinstance(join_spec, dict):
                     continue
+                join_spec = ensure_join_spec_fields(join_spec)
+                spec_result["join_spec"] = join_spec
 
                 valid, reason = validate_join_spec_types(join_spec, metadata_snapshot)
                 if not valid:
@@ -5395,10 +6050,21 @@ def detect_regressions(
     current_scores: dict[str, float],
     previous_scores: dict[str, float],
     threshold: float = REGRESSION_THRESHOLD,
+    skip_judges: set[str] | None = None,
 ) -> list[dict]:
-    """Detect if any metric dropped more than ``threshold`` percentage points."""
+    """Detect if any metric dropped more than ``threshold`` percentage points.
+
+    Parameters
+    ----------
+    skip_judges : set[str] | None
+        Judge names to exclude from regression checking.  Use this for
+        informational judges whose convergence threshold is 0.0 (e.g.
+        ``response_quality``) — they should not block progress.
+    """
     regressions: list[dict] = []
     for key in previous_scores:
+        if skip_judges and key in skip_judges:
+            continue
         prev_val = previous_scores.get(key, 0)
         curr_val = current_scores.get(key, 0)
         if curr_val < prev_val - threshold:

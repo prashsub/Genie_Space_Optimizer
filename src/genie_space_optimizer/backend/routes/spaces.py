@@ -589,6 +589,32 @@ def get_space_detail(
     except Exception:
         logger.debug("Benchmark questions not available for space %s", space_id)
 
+    if not benchmark_questions:
+        seen_bq: set[str] = set()
+        bench_section = ss.get("benchmarks", {}) if isinstance(ss, dict) else {}
+        bench_qs = bench_section.get("questions", []) if isinstance(bench_section, dict) else []
+        for bq in (bench_qs if isinstance(bench_qs, list) else []):
+            if not isinstance(bq, dict):
+                continue
+            q_raw = bq.get("question", [])
+            if isinstance(q_raw, list):
+                q_raw = q_raw[0] if q_raw else ""
+            q_text = str(q_raw).strip()
+            if q_text and q_text.lower() not in seen_bq:
+                seen_bq.add(q_text.lower())
+                benchmark_questions.append(q_text)
+
+        for eq in (example_qs if isinstance(example_qs, list) else []):
+            if not isinstance(eq, dict):
+                continue
+            q_raw = eq.get("question", "")
+            if isinstance(q_raw, list):
+                q_raw = q_raw[0] if q_raw else ""
+            q_text = str(q_raw).strip()
+            if q_text and q_text.lower() not in seen_bq:
+                seen_bq.add(q_text.lower())
+                benchmark_questions.append(q_text)
+
     sql_functions_raw = instr.get("sql_functions", []) if isinstance(instr, dict) else []
     functions: list[FunctionInfo] = []
     for fn in sql_functions_raw:

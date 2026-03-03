@@ -113,25 +113,36 @@ class TestRenderStructuredDescription:
     def test_table_rendering(self):
         sections = {"purpose": "Tracks bookings", "grain": "Per booking"}
         lines = render_structured_description(sections, "table")
-        assert any("**Purpose:** Tracks bookings" in l for l in lines)
-        assert any("**Grain:** Per booking" in l for l in lines)
+        text = "\n".join(lines)
+        assert "PURPOSE:" in text
+        assert "Tracks bookings" in text
+        assert "GRAIN:" in text
+        assert "Per booking" in text
+        assert "**" not in text
 
     def test_column_dim_rendering(self):
         sections = {"definition": "Destination city", "synonyms": "city, location"}
         lines = render_structured_description(sections, "column_dim")
-        assert any("**Definition:** Destination city" in l for l in lines)
-        assert any("**Synonyms:** city, location" in l for l in lines)
+        text = "\n".join(lines)
+        assert "DEFINITION:" in text
+        assert "Destination city" in text
+        assert "SYNONYMS:" in text
+        assert "city, location" in text
+        assert "**" not in text
 
     def test_preserves_preamble(self):
         sections = {"_preamble": "Legacy text", "definition": "The ID"}
         lines = render_structured_description(sections, "column_key")
         assert lines[0] == "Legacy text"
-        assert any("**Definition:** The ID" in l for l in lines)
+        text = "\n".join(lines)
+        assert "DEFINITION:" in text
+        assert "The ID" in text
+        assert "**" not in text
 
     def test_empty_sections_skipped(self):
         sections = {"definition": "The value", "values": ""}
         lines = render_structured_description(sections, "column_dim")
-        assert not any("Values" in l for l in lines)
+        assert not any("VALUES:" in l for l in lines)
 
     def test_empty_sections_returns_placeholder(self):
         lines = render_structured_description({}, "table")
@@ -144,10 +155,21 @@ class TestRenderStructuredDescription:
             "values": "S001, S002, S003",
         }
         lines = render_structured_description(sections, "column_dim")
-        def_idx = next(i for i, l in enumerate(lines) if "Definition" in l)
-        val_idx = next(i for i, l in enumerate(lines) if "Values" in l)
-        syn_idx = next(i for i, l in enumerate(lines) if "Synonyms" in l)
+        def_idx = next(i for i, l in enumerate(lines) if "DEFINITION:" in l)
+        val_idx = next(i for i, l in enumerate(lines) if "VALUES:" in l)
+        syn_idx = next(i for i, l in enumerate(lines) if "SYNONYMS:" in l)
         assert def_idx < val_idx < syn_idx
+
+    def test_blank_line_between_sections(self):
+        sections = {"purpose": "Booking table", "grain": "Per booking"}
+        lines = render_structured_description(sections, "table")
+        text = "\n".join(lines)
+        assert "Booking table\n\nGRAIN:" in text
+
+    def test_no_trailing_blank_line(self):
+        sections = {"definition": "The value"}
+        lines = render_structured_description(sections, "column_dim")
+        assert lines[-1] != ""
 
 
 # ── Updater ───────────────────────────────────────────────────────────
@@ -294,7 +316,7 @@ class TestSectionsForLever:
         assert "aggregation" in result
         assert "grain_note" in result
         assert "synonyms" in result
-        assert "definition" not in result
+        assert "definition" in result
 
     def test_lever_4_column_key(self):
         result = sections_for_lever(4, "column_key")
@@ -384,5 +406,58 @@ class TestLeverOwnership:
         )
         assert isinstance(new_desc, list)
         joined = "\n".join(new_desc)
-        assert "**Definition:**" in joined
-        assert "**Join:**" in joined
+        assert "DEFINITION:" in joined
+        assert "Unique order identifier" in joined
+        assert "JOIN:" in joined
+        assert "Joins to dim_customer.order_id" in joined
+
+
+# ── New-format parsing and backward compat ────────────────────────────
+
+
+class TestPlainTextParsing:
+    def test_parse_new_plaintext_format(self):
+        text = "PURPOSE:\nBooking fact table\n\nGRAIN:\nOne row per booking"
+        result = parse_structured_description(text)
+        assert result["purpose"] == "Booking fact table"
+        assert result["grain"] == "One row per booking"
+
+    def test_parse_new_plaintext_column(self):
+        text = "DEFINITION:\nUnique store identifier\n\nSYNONYMS:\nstore_no, loc_id"
+        result = parse_structured_description(text)
+        assert result["definition"] == "Unique store identifier"
+        assert result["synonyms"] == "store_no, loc_id"
+
+    def test_parse_legacy_markdown_still_works(self):
+        text = "**Purpose:** Legacy table\n**Grain:** Per row"
+        result = parse_structured_description(text)
+        assert result["purpose"] == "Legacy table"
+        assert result["grain"] == "Per row"
+
+    def test_round_trip_new_format_table(self):
+        original = {"purpose": "Fact table", "grain": "Per booking"}
+        rendered = render_structured_description(original, "table")
+        text = "\n".join(rendered)
+        reparsed = parse_structured_description(text)
+        assert reparsed.get("purpose") == original["purpose"]
+        assert reparsed.get("grain") == original["grain"]
+
+    def test_round_trip_new_format_column(self):
+        original = {"definition": "The city name", "synonyms": "city, town", "values": "NYC, LA"}
+        rendered = render_structured_description(original, "column_dim")
+        text = "\n".join(rendered)
+        reparsed = parse_structured_description(text)
+        assert reparsed.get("definition") == original["definition"]
+        assert reparsed.get("synonyms") == original["synonyms"]
+        assert reparsed.get("values") == original["values"]
+
+    def test_plaintext_with_preamble(self):
+        text = "Legacy free text\n\nDEFINITION:\nNew structured def"
+        result = parse_structured_description(text)
+        assert result.get("_preamble") == "Legacy free text"
+        assert result["definition"] == "New structured def"
+
+    def test_multiline_plaintext_value(self):
+        text = "PURPOSE:\nThis is a table\nthat tracks bookings\nacross destinations."
+        result = parse_structured_description(text)
+        assert "across destinations." in result["purpose"]

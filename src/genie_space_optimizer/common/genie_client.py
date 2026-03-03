@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, cast
 
@@ -251,14 +252,31 @@ def fetch_genie_result_df(w: WorkspaceClient, statement_id: str):
 # ── Asset Detection ────────────────────────────────────────────────────
 
 
-def detect_asset_type(sql: str) -> str:
-    """Detect asset type (MV, TVF, TABLE, NONE) from a SQL string."""
+def detect_asset_type(
+    sql: str,
+    mv_names: list[str] | None = None,
+) -> str:
+    """Detect asset type (MV, TVF, TABLE, NONE) from a SQL string.
+
+    Parameters
+    ----------
+    sql : str
+        SQL query text to inspect.
+    mv_names : list[str] | None
+        Optional metric-view table names.  When a known MV name appears
+        in the SQL, the query is classified as ``MV`` even without a
+        ``MEASURE()`` call.
+    """
     if not sql:
         return "NONE"
     sql_lower = sql.lower()
-    if "mv_" in sql_lower or "measure(" in sql_lower:
+    if "measure(" in sql_lower:
         return "MV"
-    elif "get_" in sql_lower:
+    if mv_names and any(name.lower() in sql_lower for name in mv_names):
+        return "MV"
+    if "mv_" in sql_lower:
+        return "MV"
+    if re.search(r"\bget_\w+\s*\(", sql_lower):
         return "TVF"
     return "TABLE"
 
@@ -488,6 +506,50 @@ def patch_space_config(
                 space_id,
                 exc,
                 _err_body,
+            )
+            if attempt <= max_retries:
+                time.sleep(retry_delay * attempt)
+
+    raise last_exc  # type: ignore[misc]
+
+
+def update_space_description(
+    w: WorkspaceClient,
+    space_id: str,
+    description: str,
+    *,
+    max_retries: int = 2,
+    retry_delay: float = 5.0,
+) -> dict:
+    """PATCH only the top-level ``description`` field of a Genie Space.
+
+    ``description`` is a top-level metadata field on the Space object, NOT
+    inside ``serialized_space``.  This sends a minimal PATCH with just
+    ``{"description": "..."}`` to avoid coupling with config updates.
+    """
+    payload = {"description": description}
+    logger.info(
+        "PATCHing Genie Space %s description (%d chars)", space_id, len(description),
+    )
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 2):
+        try:
+            raw_resp = w.api_client.do(
+                "PATCH", f"/api/2.0/genie/spaces/{space_id}", body=payload,
+            )
+            logger.info(
+                "Description PATCH succeeded for space %s on attempt %d",
+                space_id, attempt,
+            )
+            if isinstance(raw_resp, dict):
+                return raw_resp
+            return {}
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Description PATCH attempt %d/%d failed for space %s: %s",
+                attempt, max_retries + 1, space_id, exc,
             )
             if attempt <= max_retries:
                 time.sleep(retry_delay * attempt)

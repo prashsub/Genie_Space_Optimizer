@@ -27,6 +27,8 @@ from genie_space_optimizer.common.uc_metadata import (
     get_columns,
     get_columns_for_tables,
     get_columns_for_tables_rest,
+    get_foreign_keys_for_tables,
+    get_foreign_keys_for_tables_rest,
     get_routines,
     get_routines_for_schemas,
     get_routines_for_schemas_rest,
@@ -324,6 +326,22 @@ def run_preflight(
                 "routines (genie schemas)", "uc_routines",
             )
         )
+        _fk_pre = _usable_prefetch("uc_foreign_keys")
+        if _fk_pre is not None:
+            uc_fk_dicts = _fk_pre
+        else:
+            uc_fk_dicts = _rest_collect(
+                lambda: get_foreign_keys_for_tables_rest(w, genie_table_refs),
+                "foreign keys (genie tables)", "uc_foreign_keys",
+            )
+            if uc_fk_dicts is None:
+                try:
+                    uc_fk_dicts = get_foreign_keys_for_tables(spark, genie_table_refs)
+                    _actual_source["uc_foreign_keys"] = "spark"
+                except Exception as exc:
+                    logger.warning("Spark FK fallback failed: %s", exc)
+                    uc_fk_dicts = []
+        uc_fk_dicts = uc_fk_dicts if isinstance(uc_fk_dicts, list) else []
     else:
         uc_columns_dicts = (
             _usable_prefetch("uc_columns")
@@ -337,10 +355,12 @@ def run_preflight(
             _usable_prefetch("uc_routines")
             or _spark_collect(lambda: get_routines(spark, catalog, schema), "routines", "uc_routines")
         )
+        uc_fk_dicts = []
 
     uc_columns_dicts = uc_columns_dicts if isinstance(uc_columns_dicts, list) else []
     uc_tags_dicts = uc_tags_dicts if isinstance(uc_tags_dicts, list) else []
     uc_routines_dicts = uc_routines_dicts if isinstance(uc_routines_dicts, list) else []
+    uc_fk_dicts = uc_fk_dicts if isinstance(uc_fk_dicts, list) else []
 
     if not uc_tags_dicts:
         print(
@@ -351,8 +371,9 @@ def run_preflight(
         )
 
     logger.info(
-        "UC metadata: %d columns, %d tags, %d routines",
+        "UC metadata: %d columns, %d tags, %d routines, %d FK constraints",
         len(uc_columns_dicts), len(uc_tags_dicts), len(uc_routines_dicts),
+        len(uc_fk_dicts),
     )
 
     # ── Diagnostic Block 2: UC Metadata Collection Summary ──
@@ -367,7 +388,8 @@ def run_preflight(
         f"  UC Columns:   {len(uc_columns_dicts):>5}  (covering {len(_uc_table_names)} tables, source: {_actual_source.get('uc_columns', 'unknown')})\n"
         f"  Genie config: {_configured_cols:>5}  column_configs entries (descriptions/FA/VD)\n"
         f"  Tags:         {len(uc_tags_dicts):>5}  (source: {_actual_source.get('uc_tags', 'unknown')})\n"
-        f"  Routines:     {len(uc_routines_dicts):>5}  (source: {_actual_source.get('uc_routines', 'unknown')})"
+        f"  Routines:     {len(uc_routines_dicts):>5}  (source: {_actual_source.get('uc_routines', 'unknown')})\n"
+        f"  FK Constraints:{len(uc_fk_dicts):>4}  (source: {_actual_source.get('uc_foreign_keys', 'unknown')})"
     )
     if _collection_errors:
         print("  Collection errors:")
@@ -408,6 +430,7 @@ def run_preflight(
             routine_samples.append(routine_name)
 
     config["_uc_columns"] = uc_columns_dicts
+    config["_uc_foreign_keys"] = uc_fk_dicts
 
     referenced_schemas = sorted(
         {f"{c}.{s}" for c, s, _ in genie_table_refs if c and s}
@@ -421,6 +444,7 @@ def run_preflight(
         "columns_collected": len(uc_columns_dicts),
         "tags_collected": len(uc_tags_dicts),
         "routines_collected": len(uc_routines_dicts),
+        "fk_constraints_collected": len(uc_fk_dicts),
         "column_samples": [s for s in column_samples if s],
         "tag_samples": [s for s in tag_samples if s],
         "routine_samples": [s for s in routine_samples if s],

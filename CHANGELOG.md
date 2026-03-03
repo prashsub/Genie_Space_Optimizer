@@ -6,6 +6,30 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Proactive Join Discovery, Space Metadata Generation, Scorer Accuracy Fixes
+- **Stage 2.85: Proactive join discovery** (`harness.py`, `optimizer.py`): parses JOIN
+  clauses from successful baseline eval queries (arbiter `both_correct`/`genie_correct`),
+  corroborates with UC foreign key constraints and column type metadata, and codifies
+  execution-proven joins as Genie Space join specifications; only proposes Tier 1
+  (execution-proven) joins
+- **UC foreign key extraction** (`uc_metadata.py`): new `get_foreign_keys_for_tables_rest()`
+  fetches FK constraints via `w.tables.get()` for join corroboration; FK candidates
+  automatically converted to join spec proposals
+- **Proactive space metadata** (`optimizer.py`, `config.py`): `SPACE_DESCRIPTION_PROMPT`
+  generates structured descriptions for spaces with no description; `SAMPLE_QUESTIONS_PROMPT`
+  generates example questions for spaces with no sample questions
+- **Asset routing scorer overhaul** (`asset_routing.py`): uses `detect_asset_type()` for
+  robust MV/TVF/TABLE classification; result-match and empty-result-match now treated as
+  soft preferences instead of hard failures; supports expected_asset auto-detection from SQL
+- **FQN-based column lookup** (`optimizer.py`, `uc_metadata.py`): UC metadata now includes
+  `catalog_name`/`schema_name` for FQN-based column resolution; eliminates short-name
+  collisions in multi-catalog setups
+- **Genie schema join spec validation** (`genie_schema.py`): `ensure_join_spec_fields()`
+  for validating join specification structure
+- Expanded structured metadata tests (+99 lines)
+
+---
+
 ### Added — Strategist Architecture, Transparency UI, Description Enrichment
 - **Strategist architecture** (`optimizer.py`, `config.py`): new holistic optimization
   strategist that triages all failures into a unified strategy before lever execution;

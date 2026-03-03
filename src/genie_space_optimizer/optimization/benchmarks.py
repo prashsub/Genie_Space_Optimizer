@@ -12,6 +12,7 @@ import random
 from typing import Any
 
 from genie_space_optimizer.common.config import TEMPLATE_VARIABLES
+from genie_space_optimizer.common.genie_client import detect_asset_type
 
 logger = logging.getLogger(__name__)
 
@@ -447,6 +448,7 @@ def build_eval_records(benchmarks: list[dict]) -> list[dict]:
     Each record has ``inputs`` (question, expected_sql, expected_asset)
     and ``expectations`` (expected_sql, expected_facts, required_tables).
     """
+    _VALID_ASSET_TYPES = frozenset({"MV", "TVF", "TABLE"})
     records: list[dict] = []
     for b in benchmarks:
         question = b.get("question", "")
@@ -454,12 +456,20 @@ def build_eval_records(benchmarks: list[dict]) -> list[dict]:
             question.encode()
         ).hexdigest()[:8]
 
+        _raw_asset = b.get("expected_asset", "TABLE")
+        _esql = b.get("expected_sql", "")
+        _asset = (
+            _raw_asset.strip().upper()
+            if _raw_asset and _raw_asset.strip().upper() in _VALID_ASSET_TYPES
+            else detect_asset_type(_esql)
+        )
+
         records.append(
             {
                 "inputs": {
                     "question": question,
                     "question_id": qid,
-                    "expected_asset": b.get("expected_asset", "TABLE"),
+                    "expected_asset": _asset,
                 },
                 "expectations": {
                     "expected_sql": b.get("expected_sql", ""),

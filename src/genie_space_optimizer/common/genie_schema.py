@@ -52,6 +52,22 @@ def generate_genie_id() -> str:
     return f"{hi:016x}{lo:016x}"
 
 
+def ensure_join_spec_fields(spec: dict) -> dict:
+    """Ensure a join spec dict has all required fields (alias, id).
+
+    Mutates and returns the spec for convenience. Derives ``alias`` from
+    the last segment of ``identifier`` when missing, and generates a new
+    ``id`` when absent.
+    """
+    for side_key in ("left", "right"):
+        side = spec.get(side_key)
+        if isinstance(side, dict) and "identifier" in side and not side.get("alias"):
+            side["alias"] = side["identifier"].rsplit(".", 1)[-1]
+    if not spec.get("id"):
+        spec["id"] = generate_genie_id()
+    return spec
+
+
 # ── Leaf-level models ─────────────────────────────────────────────────
 
 

@@ -80,8 +80,13 @@ def get_columns_for_tables_rest(
     """Fetch column metadata via the Unity Catalog REST API.
 
     Calls ``w.tables.get()`` per table and extracts column info from the
-    ``TableInfo.columns`` list.  Returns dicts with keys matching the Spark
-    query output: ``table_name``, ``column_name``, ``data_type``, ``comment``.
+    ``TableInfo.columns`` list.  Returns dicts with keys:
+    ``catalog_name``, ``schema_name``, ``table_name``,
+    ``column_name``, ``data_type``, ``comment``.
+
+    The ``catalog_name`` and ``schema_name`` fields enable FQN-based
+    lookups downstream, avoiding short-name collisions in multi-catalog
+    setups.
     """
     rows: list[dict] = []
     failed: list[str] = []
@@ -98,6 +103,8 @@ def get_columns_for_tables_rest(
             continue
         for col in table_info.columns:
             rows.append({
+                "catalog_name": cat,
+                "schema_name": sch,
                 "table_name": tbl,
                 "column_name": getattr(col, "name", ""),
                 "data_type": getattr(col, "type_text", ""),
@@ -106,6 +113,110 @@ def get_columns_for_tables_rest(
     summary = (
         f"[UC_METADATA] REST get_columns_for_tables_rest: "
         f"{len(refs)} refs, {len(refs) - len(failed)} succeeded, {len(rows)} column rows"
+    )
+    print(summary, flush=True)
+    if failed:
+        for f in failed:
+            print(f"[UC_METADATA]   FAILED: {f}", flush=True)
+    return rows
+
+
+def get_foreign_keys_for_tables_rest(
+    w: "WorkspaceClient",
+    refs: list[tuple[str, str, str]],
+) -> list[dict]:
+    """Fetch foreign key constraints via the Unity Catalog REST API.
+
+    Calls ``w.tables.get()`` per table and extracts FK constraints from
+    ``TableInfo.table_constraints``.  Each returned dict describes one FK
+    relationship with fully-qualified table names:
+
+    ``child_table``, ``child_columns``, ``parent_table``, ``parent_columns``,
+    ``constraint_name``.
+    """
+    rows: list[dict] = []
+    failed: list[str] = []
+    for cat, sch, tbl in refs:
+        if not (cat and sch and tbl):
+            continue
+        full_name = f"{cat}.{sch}.{tbl}"
+        try:
+            table_info = w.tables.get(full_name=full_name)
+        except Exception as exc:
+            failed.append(f"{full_name}: {type(exc).__name__}: {exc}")
+            continue
+        if not table_info.table_constraints:
+            continue
+        for tc in table_info.table_constraints:
+            fk = getattr(tc, "foreign_key_constraint", None)
+            if not fk:
+                continue
+            parent_table = getattr(fk, "parent_table", "") or ""
+            child_cols = list(getattr(fk, "child_columns", []) or [])
+            parent_cols = list(getattr(fk, "parent_columns", []) or [])
+            if parent_table and child_cols and parent_cols:
+                rows.append({
+                    "child_table": full_name,
+                    "child_columns": child_cols,
+                    "parent_table": parent_table,
+                    "parent_columns": parent_cols,
+                    "constraint_name": getattr(fk, "name", "") or "",
+                })
+    summary = (
+        f"[UC_METADATA] REST get_foreign_keys_for_tables_rest: "
+        f"{len(refs)} refs, {len(refs) - len(failed)} succeeded, {len(rows)} FK rows"
+    )
+    print(summary, flush=True)
+    if failed:
+        for f in failed:
+            print(f"[UC_METADATA]   FAILED: {f}", flush=True)
+    return rows
+
+
+def get_foreign_keys_for_tables_rest(
+    w: "WorkspaceClient",
+    refs: list[tuple[str, str, str]],
+) -> list[dict]:
+    """Fetch FK constraint metadata via the Unity Catalog REST API.
+
+    Calls ``w.tables.get()`` per table and extracts ``ForeignKeyConstraint``
+    entries from ``TableInfo.table_constraints``.  Returns dicts with keys:
+    ``child_table`` (FQN), ``child_columns``, ``parent_table`` (FQN),
+    ``parent_columns``, ``constraint_name``.
+
+    Multi-column FKs are represented as a single dict with list-valued
+    ``child_columns`` / ``parent_columns``.
+    """
+    rows: list[dict] = []
+    failed: list[str] = []
+    for cat, sch, tbl in refs:
+        if not (cat and sch and tbl):
+            continue
+        full_name = f"{cat}.{sch}.{tbl}"
+        try:
+            table_info = w.tables.get(full_name=full_name)
+        except Exception as exc:
+            failed.append(f"{full_name}: {type(exc).__name__}: {exc}")
+            continue
+        constraints = getattr(table_info, "table_constraints", None) or []
+        for tc in constraints:
+            fk = getattr(tc, "foreign_key_constraint", None)
+            if not fk:
+                continue
+            parent_table = getattr(fk, "parent_table", "") or ""
+            child_cols = list(getattr(fk, "child_columns", []) or [])
+            parent_cols = list(getattr(fk, "parent_columns", []) or [])
+            if parent_table and child_cols and parent_cols:
+                rows.append({
+                    "child_table": full_name,
+                    "child_columns": child_cols,
+                    "parent_table": parent_table,
+                    "parent_columns": parent_cols,
+                    "constraint_name": getattr(fk, "name", "") or "",
+                })
+    summary = (
+        f"[UC_METADATA] REST get_foreign_keys_for_tables_rest: "
+        f"{len(refs)} refs, {len(refs) - len(failed)} succeeded, {len(rows)} FK rows"
     )
     print(summary, flush=True)
     if failed:
@@ -211,12 +322,17 @@ def get_columns_for_tables(
     for (cat, sch), tables in schema_groups.items():
         safe_tables = ", ".join(f"'{t.replace(chr(39), chr(39)+chr(39))}'" for t in tables)
         unions.append(
-            f"SELECT table_name, column_name, data_type, comment "
+            f"SELECT '{cat}' AS catalog_name, '{sch}' AS schema_name, "
+            f"table_name, column_name, data_type, comment "
             f"FROM {cat}.information_schema.columns "
             f"WHERE table_schema = '{sch}' AND table_name IN ({safe_tables})"
         )
     if not unions:
-        return spark.sql("SELECT CAST(NULL AS STRING) AS table_name, CAST(NULL AS STRING) AS column_name, CAST(NULL AS STRING) AS data_type, CAST(NULL AS STRING) AS comment WHERE 1=0")
+        return spark.sql(
+            "SELECT CAST(NULL AS STRING) AS catalog_name, CAST(NULL AS STRING) AS schema_name, "
+            "CAST(NULL AS STRING) AS table_name, CAST(NULL AS STRING) AS column_name, "
+            "CAST(NULL AS STRING) AS data_type, CAST(NULL AS STRING) AS comment WHERE 1=0"
+        )
     return spark.sql(" UNION ALL ".join(unions))
 
 
@@ -259,6 +375,82 @@ def get_routines_for_schemas(
     if not unions:
         return spark.sql("SELECT CAST(NULL AS STRING) AS routine_name WHERE 1=0")
     return spark.sql(" UNION ALL ".join(unions))
+
+
+def get_foreign_keys_for_tables(
+    spark: "SparkSession",
+    refs: list[tuple[str, str, str]],
+) -> list[dict]:
+    """Fetch FK constraints via Spark SQL against ``information_schema``.
+
+    Queries ``key_column_usage`` joined with ``constraint_column_usage`` per
+    unique (catalog, schema) pair derived from *refs*.  Multi-column FKs are
+    grouped into a single dict.
+
+    Returns the same schema as ``get_foreign_keys_for_tables_rest``.
+    """
+    schemas = get_unique_schemas(refs)
+    ref_set = {f"{c}.{s}.{t}".lower() for c, s, t in refs if c and s and t}
+
+    unions: list[str] = []
+    for cat, sch in schemas:
+        unions.append(
+            f"""
+            SELECT
+                k.constraint_name,
+                k.table_catalog AS child_catalog,
+                k.table_schema  AS child_schema,
+                k.table_name    AS child_table_name,
+                k.column_name   AS child_column,
+                k.ordinal_position,
+                c.table_catalog AS parent_catalog,
+                c.table_schema  AS parent_schema,
+                c.table_name    AS parent_table_name,
+                c.column_name   AS parent_column
+            FROM {cat}.information_schema.key_column_usage k
+            JOIN {cat}.information_schema.constraint_column_usage c
+              ON k.constraint_catalog = c.constraint_catalog
+             AND k.constraint_schema  = c.constraint_schema
+             AND k.constraint_name    = c.constraint_name
+             AND k.ordinal_position   = c.ordinal_position
+            WHERE k.table_schema = '{sch}'
+              AND k.position_in_unique_constraint IS NOT NULL
+            """
+        )
+    if not unions:
+        return []
+    try:
+        df = spark.sql(" UNION ALL ".join(unions))
+        raw_rows = df.collect()
+    except Exception as exc:
+        print(f"[UC_METADATA] Spark FK query failed: {exc}", flush=True)
+        return []
+
+    grouped: dict[str, dict] = {}
+    for r in raw_rows:
+        child_fqn = f"{r['child_catalog']}.{r['child_schema']}.{r['child_table_name']}"
+        parent_fqn = f"{r['parent_catalog']}.{r['parent_schema']}.{r['parent_table_name']}"
+        if child_fqn.lower() not in ref_set and parent_fqn.lower() not in ref_set:
+            continue
+        key = r["constraint_name"]
+        if key not in grouped:
+            grouped[key] = {
+                "child_table": child_fqn,
+                "child_columns": [],
+                "parent_table": parent_fqn,
+                "parent_columns": [],
+                "constraint_name": key,
+            }
+        grouped[key]["child_columns"].append(r["child_column"])
+        grouped[key]["parent_columns"].append(r["parent_column"])
+
+    result = list(grouped.values())
+    print(
+        f"[UC_METADATA] Spark get_foreign_keys_for_tables: "
+        f"{len(schemas)} schema(s), {len(raw_rows)} raw rows, {len(result)} FKs",
+        flush=True,
+    )
+    return result
 
 
 def get_columns(spark: SparkSession, catalog: str, schema: str) -> DataFrame:

@@ -35,9 +35,10 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 
 ### Optimization Levers
 
-Before the main lever loop, three preparatory stages run:
+Before the main lever loop, four preparatory stages run:
 - **Stage 2.5 (Prompt Matching)** -- Deterministic format assistance (`get_example_values`) and entity matching (`build_value_dictionary`) on prioritized columns. No LLM involved.
-- **Stage 2.75 (Description Enrichment)** -- LLM-generated structured descriptions for columns with no description in both Genie Space and Unity Catalog.
+- **Stage 2.75 (Description Enrichment)** -- LLM-generated structured descriptions for columns with no description in both Genie Space and Unity Catalog. Also generates space descriptions and sample questions for spaces that lack them.
+- **Stage 2.85 (Proactive Join Discovery)** -- Parses JOIN clauses from successful baseline queries, corroborates with UC foreign key constraints, and codifies execution-proven joins as Genie Space join specifications.
 - **Strategist** -- Holistic triage of all failures into a unified optimization strategy with per-lever action plans.
 
 The **5-lever loop** then iterates up to 5 times:
@@ -148,7 +149,7 @@ Genie_Space_Optimizer/
 │   │   ├── config.py                 # All constants (thresholds, prompts, taxonomy)
 │   │   ├── genie_client.py           # Genie Space API wrapper (list, fetch, patch, query, result DFs)
 │   │   ├── genie_schema.py           # Genie Space config schema validation (lenient + strict modes)
-│   │   ├── uc_metadata.py            # Unity Catalog introspection (REST API + Spark SQL fallback)
+│   │   ├── uc_metadata.py            # Unity Catalog introspection (REST API + Spark SQL fallback + FK extraction)
 │   │   └── delta_helpers.py          # Delta table read/write operations
 │   │
 │   ├── optimization/                 # Core optimization engine

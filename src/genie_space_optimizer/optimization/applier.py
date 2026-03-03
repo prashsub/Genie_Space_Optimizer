@@ -89,8 +89,8 @@ def _validate_join_spec_entry(entry: dict) -> bool:
     try:
         JoinSpec.model_validate(entry)
         return True
-    except Exception:
-        logger.warning("Invalid join spec rejected: %s", entry)
+    except Exception as exc:
+        logger.warning("Invalid join spec rejected: %s — validation error: %s", entry, exc)
         return False
 
 
@@ -1253,11 +1253,14 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
 
     # ── Join Specifications (Lever 4) ─────────────────────────────
     if section == "join_specs":
+        from genie_space_optimizer.common.genie_schema import ensure_join_spec_fields
+
         inst = config.setdefault("instructions", {})
         specs = inst.setdefault("join_specs", [])
         if op == "add":
             js = cmd.get("join_spec", {})
             if js:
+                js = ensure_join_spec_fields(js)
                 if not _validate_join_spec_entry(js):
                     return False
                 specs.append(js)
@@ -1272,8 +1275,10 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
         if op == "update":
             lt, rt = cmd.get("left_table", ""), cmd.get("right_table", "")
             new_spec = cmd.get("join_spec", {})
-            if new_spec and not _validate_join_spec_entry(new_spec):
-                return False
+            if new_spec:
+                new_spec = ensure_join_spec_fields(new_spec)
+                if not _validate_join_spec_entry(new_spec):
+                    return False
             for i, s in enumerate(specs):
                 if _join_spec_left_id(s) == lt and _join_spec_right_id(s) == rt:
                     specs[i] = new_spec

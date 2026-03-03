@@ -501,6 +501,15 @@ def normalize_result_df(df: pd.DataFrame | None) -> pd.DataFrame:
         converted = pd.to_numeric(df[col], errors="coerce")
         if converted.notna().any() and converted.notna().sum() >= df[col].notna().sum() * 0.5:
             df[col] = converted
+    _BOOL_CANONICAL = {"true": "true", "false": "false"}
+    for col in df.select_dtypes(include=["bool"]).columns:
+        df[col] = df[col].astype(str).str.lower()
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].apply(
+            lambda x: _BOOL_CANONICAL.get(x.lower(), x)
+            if isinstance(x, str) and x.lower() in _BOOL_CANONICAL
+            else x
+        )
     for col in df.select_dtypes(include=["number"]).columns:
         if df[col].dtype.kind == "i":
             df[col] = df[col].astype("float64")
@@ -773,6 +782,24 @@ def all_thresholds_met(
         if actual < threshold:
             return False
     return True
+
+
+# ── Asset Type Normalization ───────────────────────────────────────────
+
+_VALID_ASSET_TYPES = frozenset({"MV", "TVF", "TABLE"})
+
+
+def _normalize_expected_asset(raw: str, expected_sql: str) -> str:
+    """Normalize ``expected_asset`` to a valid type category.
+
+    Benchmarks may store table *names* (``BOOKING_ANALYTICS_METRICS``) instead
+    of type categories (``MV``/``TVF``/``TABLE``).  When the stored value is
+    not a recognized type, fall back to ``detect_asset_type(expected_sql)``.
+    """
+    upper = raw.strip().upper() if raw else ""
+    if upper in _VALID_ASSET_TYPES:
+        return upper
+    return detect_asset_type(expected_sql)
 
 
 # ── Arbiter-Adjusted Accuracy ──────────────────────────────────────────
@@ -1092,7 +1119,9 @@ def _precheck_benchmarks_for_eval(
                 reason_counts["bad_join_key_count"] += 1
             continue
 
-        expected_asset = str(benchmark.get("expected_asset", "")).upper()
+        expected_asset = _normalize_expected_asset(
+            str(benchmark.get("expected_asset", "")), resolved_sql,
+        )
         uses_measure = "MEASURE(" in resolved_sql.upper()
         refs_metric_view = any(
             mv in resolved_sql.lower() for mv in mv_names_lower
@@ -1519,7 +1548,7 @@ def make_predict_fn(
                                     gt_col_list = sorted(gt_df.columns.tolist())
                                     genie_col_list = sorted(genie_df.columns.tolist())
                                     comparison = {
-                                        "match": exact_match or hash_match or subset_match or approx_match or tied_subset,
+                                        "match": exact_match or hash_match or subset_match or approx_match or tied_subset or sig_match,
                                         "match_type": match_type,
                                         "gt_rows": len(gt_df),
                                         "genie_rows": len(genie_df),
@@ -2445,9 +2474,12 @@ def create_evaluation_dataset(
             )
         records = []
         for b in benchmarks:
+            _expected_sql = b.get("expected_sql", "")
             expectations = {
-                "expected_response": b.get("expected_sql", ""),
-                "expected_asset": b.get("expected_asset", "TABLE"),
+                "expected_response": _expected_sql,
+                "expected_asset": _normalize_expected_asset(
+                    b.get("expected_asset", "TABLE"), _expected_sql,
+                ),
                 "category": b.get("category", ""),
                 "source": b.get("source", ""),
                 "provenance": b.get("provenance", ""),
@@ -2832,9 +2864,12 @@ def run_evaluation(
         eval_records = []
         for b in filtered:
             qid = b.get("id", "")
+            _esql = b.get("expected_sql", "")
             expectations = {
-                "expected_response": b.get("expected_sql", ""),
-                "expected_asset": b.get("expected_asset", "TABLE"),
+                "expected_response": _esql,
+                "expected_asset": _normalize_expected_asset(
+                    b.get("expected_asset", "TABLE"), _esql,
+                ),
             }
             if has_reference_sqls:
                 expectations["previous_sql"] = (reference_sqls or {}).get(qid, "")
@@ -3187,6 +3222,25 @@ def run_evaluation(
         arbiter_adjusted_accuracy, arbiter_adjusted_correct, failure_ids, excluded_count = (
             _compute_arbiter_adjusted_accuracy(rows_for_output)
         )
+
+        # Arbiter-adjust result_correctness so detect_regressions sees true
+        # signal instead of raw hash-mismatch noise.
+        if rows_for_output:
+            _rc_total = _rc_correct = 0
+            for _rc_row in rows_for_output:
+                _rc_val = str(_rc_row.get("result_correctness/value", "")).lower()
+                if _rc_val == "excluded":
+                    continue
+                _rc_total += 1
+                if _rc_val in ("yes", "true", "1", "1.0"):
+                    _rc_correct += 1
+                elif str(_rc_row.get("arbiter/value", "")).lower() in _ARBITER_CORRECT_VERDICTS:
+                    _rc_correct += 1
+            if _rc_total > 0:
+                per_judge["result_correctness"] = _rc_correct / _rc_total
+                scores_100 = normalize_scores(per_judge)
+                thresholds_passed = all_thresholds_met(scores_100)
+
         row_unresolved_column_count = sum(
             1
             for artifact in question_failure_artifacts
@@ -3350,7 +3404,10 @@ def run_repeatability_evaluation(
                 },
                 "expectations": {
                     "expected_response": b.get("expected_sql", ""),
-                    "expected_asset": b.get("expected_asset", "TABLE"),
+                    "expected_asset": _normalize_expected_asset(
+                        b.get("expected_asset", "TABLE"),
+                        b.get("expected_sql", ""),
+                    ),
                     "previous_sql": prev_sql,
                 },
             }
@@ -4055,7 +4112,9 @@ def _fill_coverage_gaps(
         benchmark: dict[str, Any] = {
             "question": b.get("question", ""),
             "expected_sql": expected_sql,
-            "expected_asset": b.get("expected_asset", "TABLE"),
+            "expected_asset": _normalize_expected_asset(
+                b.get("expected_asset", "TABLE"), expected_sql,
+            ),
             "category": b.get("category", ""),
             "required_tables": [str(t) for t in required_tables],
             "required_columns": [str(c) for c in required_columns],
@@ -4336,7 +4395,9 @@ def generate_benchmarks(
         benchmark: dict[str, Any] = {
             "question": b.get("question", ""),
             "expected_sql": expected_sql,
-            "expected_asset": b.get("expected_asset", "TABLE"),
+            "expected_asset": _normalize_expected_asset(
+                b.get("expected_asset", "TABLE"), expected_sql,
+            ),
             "category": b.get("category", ""),
             "required_tables": [str(t) for t in required_tables],
             "required_columns": [str(c) for c in required_columns],
@@ -4538,7 +4599,9 @@ def generate_benchmarks(
                 "id": question_id,
                 "question": b.get("question", ""),
                 "expected_sql": expected_sql,
-                "expected_asset": b.get("expected_asset", "TABLE"),
+                "expected_asset": _normalize_expected_asset(
+                    b.get("expected_asset", "TABLE"), expected_sql,
+                ),
                 "category": b.get("category", "curated"),
                 "required_tables": b.get("required_tables", []),
                 "required_columns": b.get("required_columns", []),
@@ -4559,12 +4622,15 @@ def generate_benchmarks(
         question_id = f"{domain}_{offset + idx + 1:03d}"
         priority = "P0" if idx < 3 else "P1"
         split = "held_out" if (idx + 1) % 5 == 0 else "train"
+        _b_esql = b.get("expected_sql", "")
         all_benchmarks.append(
             {
                 "id": question_id,
                 "question": b.get("question", ""),
-                "expected_sql": b.get("expected_sql", ""),
-                "expected_asset": b.get("expected_asset", "TABLE"),
+                "expected_sql": _b_esql,
+                "expected_asset": _normalize_expected_asset(
+                    b.get("expected_asset", "TABLE"), _b_esql,
+                ),
                 "category": b.get("category", ""),
                 "required_tables": b.get("required_tables", []),
                 "required_columns": b.get("required_columns", []),
@@ -4603,12 +4669,15 @@ def generate_benchmarks(
     for idx, b in enumerate(gap_fill_benchmarks):
         question_id = f"{domain}_gf_{gap_fill_offset + idx + 1:03d}"
         split = "held_out" if (idx + 1) % 5 == 0 else "train"
+        _gf_esql = b.get("expected_sql", "")
         all_benchmarks.append(
             {
                 "id": question_id,
                 "question": b.get("question", ""),
-                "expected_sql": b.get("expected_sql", ""),
-                "expected_asset": b.get("expected_asset", "TABLE"),
+                "expected_sql": _gf_esql,
+                "expected_asset": _normalize_expected_asset(
+                    b.get("expected_asset", "TABLE"), _gf_esql,
+                ),
                 "category": b.get("category", ""),
                 "required_tables": b.get("required_tables", []),
                 "required_columns": b.get("required_columns", []),
@@ -4700,12 +4769,15 @@ def load_benchmarks_from_dataset(
             if not isinstance(expectations, dict):
                 expectations = {}
 
+            _cb_esql = inputs.get("expected_sql", expectations.get("expected_response", ""))
             benchmarks.append(
                 {
                     "id": inputs.get("question_id", ""),
                     "question": inputs.get("question", ""),
-                    "expected_sql": inputs.get("expected_sql", expectations.get("expected_response", "")),
-                    "expected_asset": expectations.get("expected_asset", "TABLE"),
+                    "expected_sql": _cb_esql,
+                    "expected_asset": _normalize_expected_asset(
+                        expectations.get("expected_asset", "TABLE"), _cb_esql,
+                    ),
                     "category": expectations.get("category", ""),
                     "required_tables": expectations.get("required_tables", []),
                     "required_columns": expectations.get("required_columns", []),
