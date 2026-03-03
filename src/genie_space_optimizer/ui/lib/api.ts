@@ -18,6 +18,8 @@ export interface ActionResponse {
     status: string;
 }
 export type ActivityItem = unknown;
+export type AsiResult = unknown;
+export type AsiSummary = unknown;
 export type ComparisonData = unknown;
 export interface ComplexValue {
     display?: string | null;
@@ -61,6 +63,7 @@ export interface FunctionInfo {
 export interface HTTPValidationError {
     detail?: ValidationError[];
 }
+export type IterationSummary = unknown;
 export interface JoinInfo {
     joinColumns?: string[];
     leftTable: string;
@@ -79,6 +82,8 @@ export interface PipelineLink {
 }
 export type PipelineRun = unknown;
 export type PipelineStep = unknown;
+export type ProvenanceRecord = unknown;
+export type ProvenanceSummary = unknown;
 export type RunStatusResponse = unknown;
 export type RunSummary = unknown;
 export interface SpaceConfiguration {
@@ -446,6 +451,69 @@ export function useApplyOptimization(options?: {
         ...options?.mutation
     });
 }
+export interface GetAsiResultsParams {
+    run_id: string;
+    iteration?: number | null;
+}
+export const getAsiResults = async (params: GetAsiResultsParams, options?: RequestInit): Promise<{
+    data: AsiSummary;
+}> =>{
+    const searchParams = new URLSearchParams();
+    if (params?.iteration != null) searchParams.set("iteration", String(params?.iteration));
+    const queryString = searchParams.toString();
+    const url = queryString ? `/api/genie/runs/${params.run_id}/asi-results?${queryString}` : `/api/genie/runs/${params.run_id}/asi-results`;
+    const res = await fetch(url, {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const getAsiResultsKey = (params?: GetAsiResultsParams)=>{
+    return [
+        "/api/genie/runs/{run_id}/asi-results",
+        params
+    ] as const;
+};
+export function useGetAsiResults<TData = {
+    data: AsiSummary;
+}>(options: {
+    params: GetAsiResultsParams;
+    query?: Omit<UseQueryOptions<{
+        data: AsiSummary;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: getAsiResultsKey(options.params),
+        queryFn: ()=>getAsiResults(options.params),
+        ...options?.query
+    });
+}
+export function useGetAsiResultsSuspense<TData = {
+    data: AsiSummary;
+}>(options: {
+    params: GetAsiResultsParams;
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: AsiSummary;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: getAsiResultsKey(options.params),
+        queryFn: ()=>getAsiResults(options.params),
+        ...options?.query
+    });
+}
 export interface GetComparisonParams {
     run_id: string;
     "X-Forwarded-Host"?: string | null;
@@ -592,6 +660,129 @@ export function useDiscardOptimization(options?: {
     return useMutation({
         mutationFn: (vars)=>discardOptimization(vars.params),
         ...options?.mutation
+    });
+}
+export interface GetIterationsParams {
+    run_id: string;
+}
+export const getIterations = async (params: GetIterationsParams, options?: RequestInit): Promise<{
+    data: IterationSummary[];
+}> =>{
+    const res = await fetch(`/api/genie/runs/${params.run_id}/iterations`, {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const getIterationsKey = (params?: GetIterationsParams)=>{
+    return [
+        "/api/genie/runs/{run_id}/iterations",
+        params
+    ] as const;
+};
+export function useGetIterations<TData = {
+    data: IterationSummary[];
+}>(options: {
+    params: GetIterationsParams;
+    query?: Omit<UseQueryOptions<{
+        data: IterationSummary[];
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: getIterationsKey(options.params),
+        queryFn: ()=>getIterations(options.params),
+        ...options?.query
+    });
+}
+export function useGetIterationsSuspense<TData = {
+    data: IterationSummary[];
+}>(options: {
+    params: GetIterationsParams;
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: IterationSummary[];
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: getIterationsKey(options.params),
+        queryFn: ()=>getIterations(options.params),
+        ...options?.query
+    });
+}
+export interface GetProvenanceParams {
+    run_id: string;
+    iteration?: number | null;
+    lever?: number | null;
+}
+export const getProvenance = async (params: GetProvenanceParams, options?: RequestInit): Promise<{
+    data: ProvenanceSummary[];
+}> =>{
+    const searchParams = new URLSearchParams();
+    if (params?.iteration != null) searchParams.set("iteration", String(params?.iteration));
+    if (params?.lever != null) searchParams.set("lever", String(params?.lever));
+    const queryString = searchParams.toString();
+    const url = queryString ? `/api/genie/runs/${params.run_id}/provenance?${queryString}` : `/api/genie/runs/${params.run_id}/provenance`;
+    const res = await fetch(url, {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const getProvenanceKey = (params?: GetProvenanceParams)=>{
+    return [
+        "/api/genie/runs/{run_id}/provenance",
+        params
+    ] as const;
+};
+export function useGetProvenance<TData = {
+    data: ProvenanceSummary[];
+}>(options: {
+    params: GetProvenanceParams;
+    query?: Omit<UseQueryOptions<{
+        data: ProvenanceSummary[];
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: getProvenanceKey(options.params),
+        queryFn: ()=>getProvenance(options.params),
+        ...options?.query
+    });
+}
+export function useGetProvenanceSuspense<TData = {
+    data: ProvenanceSummary[];
+}>(options: {
+    params: GetProvenanceParams;
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: ProvenanceSummary[];
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: getProvenanceKey(options.params),
+        queryFn: ()=>getProvenance(options.params),
+        ...options?.query
     });
 }
 export interface GetDataAccessParams {

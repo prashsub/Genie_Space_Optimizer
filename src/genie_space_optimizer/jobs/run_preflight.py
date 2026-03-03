@@ -1,8 +1,17 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Task 1: Preflight — Comprehensive Training Guide
+# MAGIC # Task 1: Preflight — Training Guide
 # MAGIC
-# MAGIC ## What Is Preflight?
+# MAGIC | Quick Reference | |
+# MAGIC |---|---|
+# MAGIC | **Task** | 1 of 5 — Preflight |
+# MAGIC | **Harness function** | `_run_preflight()` → `run_preflight()` in `optimization/preflight.py` |
+# MAGIC | **Reads from** | Job widgets (set by app backend) |
+# MAGIC | **Publishes to** | All downstream tasks (baseline, lever_loop, finalize, deploy) |
+# MAGIC | **Typical duration** | 2–10 min |
+# MAGIC | **Log label** | `[TASK-1 PREFLIGHT]` |
+# MAGIC
+# MAGIC ## 🎯 Purpose
 # MAGIC
 # MAGIC **Preflight** is the first stage of the Genie Space Optimizer's 5-task DAG. It runs *before* any optimization iterations and prepares everything downstream tasks need:
 # MAGIC
@@ -15,19 +24,31 @@
 # MAGIC | **Load or generate benchmarks** | Evaluation queries that drive accuracy scoring; LLM generates if none exist |
 # MAGIC | **Register judge prompts & create iteration 0 model** | MLflow experiment setup and initial LoggedModel for baseline comparison |
 # MAGIC
-# MAGIC ## What Happens If Preflight Fails?
+# MAGIC ## ⚠️ What Happens If Preflight Fails?
 # MAGIC
-# MAGIC - **The entire DAG stops.** Tasks 2–5 (baseline, lever_loop, finalize, deploy) never run.
+# MAGIC > **⚠️ Warning:** If preflight fails, **the entire DAG stops.** Tasks 2–5 (baseline, lever_loop, finalize, deploy) never run.
+# MAGIC
 # MAGIC - **Run status** is written as `FAILED` in `genie_opt_runs` (via `_safe_stage` in the harness).
 # MAGIC - **Error details** are logged and re-raised; the Databricks Job run fails.
-# MAGIC - **Debugging:** Check job run logs, `genie_opt_stages` for the last stage/status, and ensure Genie API access, UC permissions, and MLflow experiment paths are valid.
+# MAGIC
+# MAGIC > **💡 Tip:** Check job run logs, `genie_opt_stages` for the last stage/status, and ensure Genie API access, UC permissions, and MLflow experiment paths are valid.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Architecture: DAG Topology and Data Flow
+# MAGIC ## 🏗️ Architecture: DAG Position and Data Flow
 # MAGIC
-# MAGIC ### 5-Task DAG
+# MAGIC ### DAG Position
+# MAGIC
+# MAGIC | Step | Task | Status | Reads From | Publishes To |
+# MAGIC |:----:|------|:------:|------------|--------------|
+# MAGIC | 1 | **preflight** | **⬅️ THIS TASK** | widgets | all tasks |
+# MAGIC | 2 | baseline_eval | Next | preflight | lever_loop |
+# MAGIC | 3 | lever_loop | Pending | preflight + baseline | finalize |
+# MAGIC | 4 | finalize | Pending | lever_loop | deploy |
+# MAGIC | 5 | deploy | Pending | preflight + finalize | *(terminal)* |
+# MAGIC
+# MAGIC ### Task Value Flow
 # MAGIC
 # MAGIC ```
 # MAGIC   ┌─────────────┐
@@ -67,7 +88,7 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Imports and Helper Functions
+# MAGIC ## 📦 Imports and Helper Functions
 # MAGIC
 # MAGIC | Import | Purpose |
 # MAGIC |--------|---------|
@@ -111,7 +132,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Widget Parameters
+# MAGIC ## ⚙️ Widget Parameters
 # MAGIC
 # MAGIC Databricks Jobs pass parameters as **widgets**. Each widget has a default; the app backend overrides them when triggering a run.
 # MAGIC
@@ -129,7 +150,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # MAGIC | `deploy_target` | text | `""` | DABs target for post-optimization deploy (optional) |
 # MAGIC | `triggered_by` | text | `""` | Identity or context of who/what triggered the run (e.g. user email, app backend) |
 # MAGIC
-# MAGIC **Validation:** Empty `run_id`, `space_id`, `catalog`, or `schema` will cause downstream failures. The harness does not validate here; failures surface during `_run_preflight`.
+# MAGIC > **⚠️ Warning:** Empty `run_id`, `space_id`, `catalog`, or `schema` will cause downstream failures. The harness does not validate here; failures surface during `_run_preflight`.
 
 # COMMAND ----------
 
@@ -176,17 +197,17 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## WorkspaceClient and SparkSession Initialization
+# MAGIC ## 🔌 WorkspaceClient and SparkSession Initialization
 # MAGIC
 # MAGIC - **`WorkspaceClient()`** — Uses the job's execution identity (service principal or user). Needed for Genie API (`fetch_space_config`), MLflow, and workspace operations.
 # MAGIC - **`SparkSession.builder.getOrCreate()`** — Reuses the cluster's Spark context. Required for Delta DDL and SQL.
 # MAGIC
-# MAGIC **Common issues:** Missing `DATABRICKS_HOST` / `DATABRICKS_TOKEN` (or OAuth) causes `WorkspaceClient` to fail. Spark is typically already configured by the cluster.
+# MAGIC > **💡 Tip:** Missing `DATABRICKS_HOST` / `DATABRICKS_TOKEN` (or OAuth) causes `WorkspaceClient` to fail. Spark is typically already configured by the cluster.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Delta State Tables
+# MAGIC ## 💾 Delta State Tables
 # MAGIC
 # MAGIC `ensure_optimization_tables(spark, catalog, schema)` creates these tables with `CREATE TABLE IF NOT EXISTS`:
 # MAGIC
@@ -198,7 +219,7 @@ _log(
 # MAGIC | `genie_opt_patches` | Applied patches per iteration/lever; rollback tracking |
 # MAGIC | `genie_eval_asi_results` | ASI (Automated Semantic Inference) judge feedback |
 # MAGIC
-# MAGIC **Idempotent:** Safe to call on every run. Missing catalog/schema permissions will raise.
+# MAGIC > **📝 Note:** Idempotent — safe to call on every run. Missing catalog/schema permissions will raise.
 
 # COMMAND ----------
 
@@ -212,19 +233,23 @@ _log("State tables verified", catalog=catalog, schema=schema)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## What `_run_preflight` Does Internally
+# MAGIC ## 🔧 What `_run_preflight` Does Internally
 # MAGIC
-# MAGIC The harness calls `run_preflight` (in `optimization/preflight.py`) wrapped by `_safe_stage` for error handling. The sequence:
+# MAGIC The harness calls `run_preflight` (in `optimization/preflight.py`) wrapped by `_safe_stage` for error handling:
 # MAGIC
-# MAGIC 1. **Config fetch** — Load from `genie_opt_runs.config_snapshot` if present, else `fetch_space_config(w, space_id)` via Genie API.
-# MAGIC 2. **UC metadata** — `get_columns`, `get_tags`, `get_routines` for `catalog.schema`. Best-effort; continues if some fail (e.g. limited permissions).
-# MAGIC 3. **Experiment resolution** — Pick MLflow experiment path from `triggered_by` or `/Shared/genie-optimization/{domain}`.
-# MAGIC 4. **Benchmarks** — Load from UC evaluation dataset if ≥5 exist; otherwise LLM-generated via `generate_benchmarks`.
-# MAGIC 5. **Benchmark validation** — Initial SQL validation via `EXPLAIN`; invalid benchmarks are discarded. Note: the primary quarantine path (SQL/routine gating) now also runs inside `run_evaluation()` itself, shared across all eval scopes (baseline, slice, P0, full).
-# MAGIC 6. **Evaluation dataset** — `create_evaluation_dataset` syncs benchmarks to MLflow.
-# MAGIC 7. **Judge prompts** — `register_judge_prompts` registers prompts for ASI judges (idempotent).
-# MAGIC 8. **Model creation** — `create_genie_model_version` creates iteration 0 LoggedModel with config + UC metadata.
-# MAGIC 9. **State updates** — `write_stage(PREFLIGHT_STARTED, COMPLETE)`, `update_run_status(IN_PROGRESS)`.
+# MAGIC | Step | Action | Key Function | Output |
+# MAGIC |:----:|--------|-------------|--------|
+# MAGIC | 1 | Config fetch | `fetch_space_config(w, space_id)` or Delta snapshot | `config` dict |
+# MAGIC | 2 | UC metadata | `get_columns`, `get_tags`, `get_routines` | columns, tags, routines |
+# MAGIC | 3 | Experiment resolution | MLflow experiment lookup | `experiment_name`, `experiment_id` |
+# MAGIC | 4 | Benchmarks | Load from UC (≥5) or `generate_benchmarks()` | benchmark list |
+# MAGIC | 5 | Benchmark validation | SQL `EXPLAIN` gating | filtered benchmarks |
+# MAGIC | 6 | Evaluation dataset | `create_evaluation_dataset()` | MLflow dataset |
+# MAGIC | 7 | Judge prompts | `register_judge_prompts()` | ASI judge setup |
+# MAGIC | 8 | Model creation | `create_genie_model_version()` | iteration 0 `model_id` |
+# MAGIC | 9 | State updates | `write_stage()`, `update_run_status()` | Delta records |
+# MAGIC
+# MAGIC > **📝 Note:** Step 2 (UC metadata) is best-effort — continues if some calls fail (e.g. limited permissions). Step 5 (benchmark validation) discards invalid benchmarks; the primary quarantine path (SQL/routine gating) now also runs inside `run_evaluation()` itself, shared across all eval scopes.
 # MAGIC
 # MAGIC **Returns:** `{benchmarks, config, model_id, experiment_name, experiment_id}` — used for task values and downstream tasks.
 
@@ -273,7 +298,7 @@ except Exception as exc:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Task Value Publication Pattern
+# MAGIC ## 📤 Task Value Publication Pattern
 # MAGIC
 # MAGIC Downstream tasks read values via:
 # MAGIC
@@ -281,7 +306,7 @@ except Exception as exc:
 # MAGIC run_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="run_id")
 # MAGIC ```
 # MAGIC
-# MAGIC **Key rule:** Only strings and JSON-serializable values. `levers` is stored as `json.dumps(levers)`; consumers must `json.loads(...)`.
+# MAGIC > **📝 Note:** Only strings and JSON-serializable values. `levers` is stored as `json.dumps(levers)`; consumers must `json.loads(...)`.
 # MAGIC
 # MAGIC | Key | Consumed By |
 # MAGIC |-----|-------------|
@@ -326,7 +351,31 @@ dbutils.notebook.exit(json.dumps({
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Summary
+# MAGIC ## ✅ What Success Looks Like
+# MAGIC
+# MAGIC When this task completes successfully, you will see output similar to:
+# MAGIC
+# MAGIC ```
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-1 PREFLIGHT] Running _run_preflight
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 10:05:12 UTC] [TASK-1 PREFLIGHT] Starting preflight
+# MAGIC   {"space_id": "01ab...", "catalog": "my_catalog", "schema": "my_schema"}
+# MAGIC [2026-02-28 10:05:45 UTC] [TASK-1 PREFLIGHT] Preflight complete
+# MAGIC   {"benchmark_count": 42, "model_id": "mv-abc123", "experiment_name": "/Shared/genie-optimization/revenue"}
+# MAGIC [2026-02-28 10:05:46 UTC] [TASK-1 PREFLIGHT] Benchmark summary
+# MAGIC   {"total": 42, "with_sql": 38, "question_only": 4}
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-1 PREFLIGHT] Publishing Task Values
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 10:05:47 UTC] [TASK-1 PREFLIGHT] Task values published
+# MAGIC   {"run_id": "run-xyz", "benchmark_count": 42, "model_id": "mv-abc123"}
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-1 PREFLIGHT] Task 1 Completed
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC ```
+# MAGIC
+# MAGIC ## 📋 Summary
 # MAGIC
 # MAGIC - **Task 1 (Preflight)** validates inputs, ensures Delta tables, fetches config and UC metadata, loads or generates benchmarks, sets up the MLflow experiment and iteration 0 model, and publishes task values for Tasks 2–5.
 # MAGIC - **On success:** Run status is `IN_PROGRESS`; baseline task can proceed.

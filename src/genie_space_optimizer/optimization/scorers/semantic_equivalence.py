@@ -19,10 +19,10 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
-    build_temporal_note,
     format_asi_markdown,
     get_registered_prompt_name,
 )
+from genie_space_optimizer.optimization.scorers import build_scorer_context
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
@@ -42,69 +42,25 @@ def _make_semantic_equivalence_judge(w: WorkspaceClient, catalog: str, schema: s
         question_id = inputs.get("question_id", "")
         cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
-        cmp_summary = ""
-        if cmp:
-            cmp_summary = (
-                f"\nResult comparison (GT vs Genie): match={cmp.get('match')}, "
-                f"match_type={cmp.get('match_type', 'unknown')}, "
-                f"gt_rows={cmp.get('gt_rows', '?')}, genie_rows={cmp.get('genie_rows', '?')}\n"
-                "NOTE: If results match (match=True), the queries are functionally equivalent "
-                "even if SQL syntax differs. Weight this heavily in your assessment.\n"
-            )
-
-        column_note = ""
-        gt_cols = set(cmp.get("gt_columns") or [])
-        genie_cols = set(cmp.get("genie_columns") or [])
-        extra_gt_cols = gt_cols - genie_cols
-        if extra_gt_cols and genie_cols <= gt_cols:
-            column_note = (
-                f"\nCOLUMN NOTE: The Expected SQL returns {len(extra_gt_cols)} extra column(s) "
-                f"not in Generated SQL: {sorted(extra_gt_cols)}. "
-                "All Generated SQL columns exist in Expected SQL — this is a column SUBSET, "
-                "not a schema error. If those extra columns were NOT requested by the user, "
-                "the queries are still semantically equivalent.\n"
-            )
-
-        empty_data_note = ""
-        if cmp.get("gt_rows", -1) == 0 and cmp.get("genie_rows", -1) > 0:
-            empty_data_note = (
-                "\nCRITICAL: The Expected SQL returned 0 rows while the Generated SQL "
-                "returned data. This likely means the Expected SQL has overly restrictive "
-                "filters NOT present in the user's question. If the Generated SQL answers "
-                "the user's question correctly, it IS semantically valid — treat it as "
-                "equivalent or better. PASS.\n"
-            )
-        elif cmp.get("gt_rows", -1) == 0:
-            empty_data_note = (
-                "\nIMPORTANT: Both queries returned 0 rows — the underlying dataset "
-                "has no matching data. Minor SQL differences have no practical impact. "
-                "Lean toward PASS if structurally sound.\n"
-            )
+        context = build_scorer_context(
+            question=question, genie_sql=genie_sql, gt_sql=gt_sql, cmp=cmp,
+            include_column_note=True,
+        )
 
         prompt = (
             "You are a SQL semantics expert evaluating SQL for a Databricks Genie Space.\n"
             "Determine if the two SQL queries measure the SAME business metric and would "
             "answer the same question, even if written differently.\n\n"
             "IMPORTANT — Equivalence rules:\n"
-            "- If the Generated SQL answers the user's question correctly, it IS semantically\n"
-            "  equivalent even if the Expected SQL returns extra columns the user did not ask for.\n"
-            "  Extra columns in the Expected SQL do not change the business metric.\n"
-            "- ILIKE '%value%' vs = 'value' for proper nouns (cities, countries) are equivalent.\n"
-            "- Defensive IS NOT NULL guards do not change the business metric being measured.\n"
+            "- Extra columns in the Expected SQL do not change the business metric.\n"
+            "- ILIKE '%value%' vs = 'value' for proper nouns are equivalent.\n"
+            "- Defensive IS NOT NULL guards do not change the metric being measured.\n"
             "- GROUP BY ALL vs explicit GROUP BY is semantically identical.\n"
-            "- ORDER BY differences are cosmetic and do not change what is measured.\n"
-            "- MEASURE() on a metric view is semantically equivalent to SUM/AVG on the\n"
-            "  underlying fact table — both measure the same business metric.\n"
-            "- A metric view query and a TVF (table-valued function) call that cover the same\n"
-            "  domain are semantically equivalent if both answer the user's question. A TVF may\n"
-            "  return extra columns — that does NOT make the queries semantically different.\n"
-            "  Routing preference (which asset to use) is judged by asset_routing, not here.\n"
-            "- Focus on whether BOTH queries answer the SAME question, not whether they produce\n"
-            "  byte-identical output.\n\n"
-            f"User question: {question}\n"
-            f"Expected SQL: {gt_sql}\n"
-            f"Generated SQL: {genie_sql}\n"
-            f"{cmp_summary}{column_note}{empty_data_note}{build_temporal_note(cmp)}\n"
+            "- ORDER BY differences are cosmetic.\n"
+            "- MEASURE() on a metric view is equivalent to SUM/AVG on the fact table.\n"
+            "- A TVF and metric view covering the same domain are equivalent.\n"
+            "- Focus on whether BOTH queries answer the SAME question.\n\n"
+            f"{context}\n\n"
             'Respond with JSON only: {"equivalent": true/false, "failure_type": "<different_metric|different_grain|different_scope>", '
             '"blame_set": ["<metric_or_dimension>"], '
             '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '

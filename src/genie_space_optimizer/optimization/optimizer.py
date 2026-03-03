@@ -22,8 +22,10 @@ from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 from genie_space_optimizer.common.config import (
     APPLY_MODE,
     CONFLICT_RULES,
+    DESCRIPTION_ENRICHMENT_PROMPT,
     FAILURE_TAXONOMY,
     GENERIC_FIX_PREFIXES,
+    INSTRUCTION_SECTION_ORDER,
     LEVER_1_2_COLUMN_PROMPT,
     LEVER_4_JOIN_DISCOVERY_PROMPT,
     LEVER_4_JOIN_SPEC_PROMPT,
@@ -39,13 +41,58 @@ from genie_space_optimizer.common.config import (
     MAX_VALUE_DICTIONARY_COLUMNS,
     MEDIUM_RISK_PATCHES,
     PATCH_TYPES,
+    PROMPT_TOKEN_BUDGET,
     PROPOSAL_GENERATION_PROMPT,
     REGRESSION_THRESHOLD,
     REPEATABILITY_FIX_BY_ASSET,
+    STRATEGIST_DETAIL_PROMPT,
+    STRATEGIST_PROMPT,
+    STRATEGIST_TRIAGE_PROMPT,
     _LEVER_TO_PATCH_TYPE,
+    format_mlflow_template,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Conservative token estimate (~4 chars per token)."""
+    return len(text) // 4
+
+
+def _truncate_to_budget(
+    format_kwargs: dict[str, Any],
+    prompt_template: str,
+    priority_keys: list[str],
+) -> dict[str, Any]:
+    """Truncate low-priority context sections to fit within PROMPT_TOKEN_BUDGET.
+
+    ``priority_keys`` lists context keys from LOWEST to HIGHEST priority.
+    When the estimated prompt exceeds the budget, the lowest-priority keys
+    are truncated first (keeping a summary prefix).
+    """
+    est = _estimate_tokens(prompt_template) + sum(
+        _estimate_tokens(str(v)) for v in format_kwargs.values()
+    )
+    if est <= PROMPT_TOKEN_BUDGET:
+        return format_kwargs
+
+    overshoot = est - PROMPT_TOKEN_BUDGET
+    result = dict(format_kwargs)
+
+    for key in priority_keys:
+        if overshoot <= 0:
+            break
+        val = str(result.get(key, ""))
+        if not val:
+            continue
+        char_budget = max(200, len(val) - overshoot * 4)
+        if char_budget < len(val):
+            truncated = val[:char_budget]
+            result[key] = truncated + f"\n... ({len(val) - char_budget} chars truncated for token budget)"
+            overshoot -= _estimate_tokens(val) - _estimate_tokens(result[key])
+
+    return result
 
 
 def _row_qid(row: dict, *, fallback: str = "unknown") -> str:
@@ -796,7 +843,235 @@ def enrich_metadata_with_uc_types(
     logger.info("UC type enrichment: updated %d column_configs", enriched)
 
 
-_JOIN_KEY_SUFFIXES = ("_key", "_id", "_code", "_fk", "_ref", "_num", "_no")
+# ---------------------------------------------------------------------------
+# Proactive Description Enrichment
+# ---------------------------------------------------------------------------
+
+_ENRICHMENT_BATCH_THRESHOLD = 30
+
+
+def _is_description_blank(desc: Any) -> bool:
+    """Return True when a column_config description is effectively empty."""
+    if desc is None:
+        return True
+    if isinstance(desc, list):
+        return all(not str(d).strip() for d in desc)
+    return not str(desc).strip()
+
+
+def _collect_blank_columns(
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Scan metadata_snapshot for columns missing descriptions in both UC and Genie Space.
+
+    Returns a list of dicts with keys: table, column, data_type, entity_type,
+    table_description, sibling_columns.
+    """
+    from genie_space_optimizer.optimization.structured_metadata import (
+        entity_type_for_column,
+    )
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = metadata_snapshot.get("tables", []) or ds.get("tables", [])
+    mvs = metadata_snapshot.get("metric_views", []) or ds.get("metric_views", [])
+
+    blanks: list[dict] = []
+
+    for tbl in list(tables) + list(mvs):
+        if not isinstance(tbl, dict):
+            continue
+        identifier = tbl.get("identifier", "") or tbl.get("name", "")
+        tbl_desc = tbl.get("description", [])
+        if isinstance(tbl_desc, list):
+            tbl_desc = "\n".join(str(d) for d in tbl_desc)
+        else:
+            tbl_desc = str(tbl_desc or "")
+
+        is_mv = tbl in (mvs if isinstance(mvs, list) else [])
+        cols = tbl.get("column_configs", tbl.get("columns", []))
+        sibling_names = [
+            cc.get("column_name", cc.get("name", ""))
+            for cc in cols if isinstance(cc, dict)
+        ]
+
+        for cc in cols:
+            if not isinstance(cc, dict):
+                continue
+            if cc.get("hidden"):
+                continue
+            col_name = cc.get("column_name", cc.get("name", ""))
+            desc = cc.get("description")
+            uc_comment = cc.get("uc_comment", "")
+
+            if not _is_description_blank(desc):
+                continue
+            if uc_comment:
+                continue
+
+            data_type = cc.get("data_type", "")
+            etype = entity_type_for_column(
+                col_name, data_type,
+                is_in_metric_view=is_mv,
+                enable_entity_matching=bool(cc.get("enable_entity_matching")),
+            )
+            blanks.append({
+                "table": identifier,
+                "column": col_name,
+                "data_type": data_type,
+                "entity_type": etype,
+                "table_description": tbl_desc,
+                "sibling_columns": sibling_names,
+            })
+
+    return blanks
+
+
+def _format_enrichment_context(blanks: list[dict]) -> str:
+    """Format blank columns into a context string grouped by table."""
+    by_table: dict[str, list[dict]] = {}
+    for b in blanks:
+        by_table.setdefault(b["table"], []).append(b)
+
+    lines: list[str] = []
+    for tbl_id, cols in by_table.items():
+        tbl_desc = cols[0].get("table_description", "") or "(no table description)"
+        siblings = cols[0].get("sibling_columns", [])
+        target_names = {c["column"] for c in cols}
+        sibling_context = [s for s in siblings if s not in target_names]
+
+        lines.append(f"Table: {tbl_id} ({tbl_desc[:200]})")
+        lines.append("  Columns needing descriptions:")
+        for c in cols:
+            lines.append(
+                f"    - {c['column']} ({c['data_type'] or 'UNKNOWN'}) [{c['entity_type']}]"
+            )
+        if sibling_context:
+            lines.append(f"  Sibling columns (for context): {', '.join(sibling_context[:20])}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _enrich_blank_descriptions(
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> list[dict]:
+    """Generate structured descriptions for columns that have no description anywhere.
+
+    Returns a list of patch dicts compatible with the Lever 1/2 proposal format.
+    Only targets columns where BOTH the Genie Space description AND the UC
+    comment are empty and the column is not hidden.
+    """
+    from databricks.sdk import WorkspaceClient as _WC
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+
+    blanks = _collect_blank_columns(metadata_snapshot)
+    if not blanks:
+        logger.info("Description enrichment: 0 columns need enrichment — skipping")
+        return []
+
+    logger.info(
+        "Description enrichment: %d columns with blank descriptions across %d tables",
+        len(blanks),
+        len({b["table"] for b in blanks}),
+    )
+
+    allowlist = _build_identifier_allowlist(metadata_snapshot)
+    allowlist_str = _format_identifier_allowlist(allowlist)
+
+    if len(blanks) <= _ENRICHMENT_BATCH_THRESHOLD:
+        batches = [blanks]
+    else:
+        by_table: dict[str, list[dict]] = {}
+        for b in blanks:
+            by_table.setdefault(b["table"], []).append(b)
+        batches = list(by_table.values())
+
+    all_patches: list[dict] = []
+
+    for batch in batches:
+        context_str = _format_enrichment_context(batch)
+        format_kwargs: dict[str, Any] = {
+            "columns_context": context_str,
+            "identifier_allowlist": allowlist_str,
+        }
+        format_kwargs = _truncate_to_budget(
+            format_kwargs, DESCRIPTION_ENRICHMENT_PROMPT,
+            priority_keys=["columns_context"],
+        )
+        prompt = format_mlflow_template(DESCRIPTION_ENRICHMENT_PROMPT, **format_kwargs)
+
+        try:
+            if w is None:
+                w = _WC()
+            response = w.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[
+                    ChatMessage(
+                        role=ChatMessageRole.SYSTEM,
+                        content="You generate structured column descriptions for a Databricks Genie Space.",
+                    ),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
+                temperature=LLM_TEMPERATURE,
+                max_tokens=4096,
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                logger.warning("Description enrichment: empty LLM response for batch of %d columns", len(batch))
+                continue
+            message = choices[0].message if hasattr(choices[0], "message") else choices[0]
+            content = getattr(message, "content", None)
+            if not content:
+                logger.warning("Description enrichment: LLM content is empty")
+                continue
+            text = str(content).strip()
+            result = _extract_json(text)
+        except Exception:
+            logger.warning("Description enrichment: LLM call failed for batch", exc_info=True)
+            continue
+
+        batch_lookup = {(b["table"], b["column"]): b for b in batch}
+
+        for change in result.get("changes", []):
+            tbl = change.get("table", "")
+            col = change.get("column", "")
+            sections = change.get("sections", {})
+            etype = change.get("entity_type", "")
+
+            if not tbl or not col or not sections:
+                continue
+            if (tbl, col) not in batch_lookup:
+                logger.debug(
+                    "Description enrichment: skipping %s.%s — not in eligible set", tbl, col,
+                )
+                continue
+
+            if not etype:
+                etype = batch_lookup[(tbl, col)]["entity_type"]
+
+            all_patches.append({
+                "type": "update_column_description",
+                "table": tbl,
+                "column": col,
+                "structured_sections": sections,
+                "column_entity_type": etype,
+                "lever": 0,
+                "risk_level": "low",
+                "source": "proactive_enrichment",
+            })
+
+    logger.info(
+        "Description enrichment: generated %d patches for %d blank columns",
+        len(all_patches), len(blanks),
+    )
+    return all_patches
+
+
+_JOIN_KEY_SUFFIXES = ("_key", "_id", "_code", "_fk", "_ref", "_num", "_no", "_sk", "_pk")
+_DIM_FACT_PATTERNS = ("dim_", "fact_", "bridge_", "link_")
 
 _COMPATIBLE_TYPE_GROUPS: list[set[str]] = [
     {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "LONG", "SHORT"},
@@ -863,7 +1138,36 @@ def _types_compatible(type_a: str, type_b: str) -> bool:
     return False
 
 
-def discover_join_candidates(metadata_snapshot: dict) -> list[dict]:
+def _extract_table_pairs_from_clusters(clusters: list[dict]) -> set[tuple[str, str]]:
+    """Extract table pairs mentioned in soft signal cluster blame sets and fixes."""
+    pairs: set[tuple[str, str]] = set()
+    for cl in clusters:
+        blame = cl.get("asi_blame_set") or cl.get("blame_set") or []
+        if isinstance(blame, str):
+            blame = [blame]
+        fixes = cl.get("asi_counterfactual_fixes") or cl.get("counterfactual_fixes") or []
+        if isinstance(fixes, str):
+            fixes = [fixes]
+
+        tables_mentioned: list[str] = []
+        for item in list(blame) + list(fixes):
+            item_str = str(item).lower()
+            for tok in item_str.replace(",", " ").split():
+                if "." in tok and len(tok.split(".")) >= 2:
+                    tables_mentioned.append(tok.strip())
+
+        for i, t1 in enumerate(tables_mentioned):
+            for t2 in tables_mentioned[i + 1:]:
+                if t1 != t2:
+                    t_a, t_b = sorted((t1, t2))
+                    pairs.add((t_a, t_b))
+    return pairs
+
+
+def discover_join_candidates(
+    metadata_snapshot: dict,
+    soft_signal_clusters: list[dict] | None = None,
+) -> list[dict]:
     """Discover potential join relationships and return **hints** for the LLM.
 
     Scans all table pairs for columns that look like join keys using:
@@ -871,6 +1175,7 @@ def discover_join_candidates(metadata_snapshot: dict) -> list[dict]:
     * Exact name matching on key-suffix columns
     * Fuzzy name matching (substring / shared stem)
     * Data-type compatibility filtering (when types are enriched)
+    * Eval feedback from soft signal clusters (table pairs from blame sets)
 
     Existing join specs are excluded.  Returns a list of hint dicts
     (not final join specs) that feed into the LLM discovery prompt.
@@ -889,8 +1194,15 @@ def discover_join_candidates(metadata_snapshot: dict) -> list[dict]:
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
         ds = {}
+    _inst = metadata_snapshot.get("instructions", {})
+    if not isinstance(_inst, dict):
+        _inst = {}
     tables = metadata_snapshot.get("tables", []) or ds.get("tables", [])
-    join_specs = metadata_snapshot.get("join_specs", []) or ds.get("join_specs", [])
+    join_specs = (
+        metadata_snapshot.get("join_specs", [])
+        or _inst.get("join_specs", [])
+        or ds.get("join_specs", [])
+    )
 
     existing_pairs: set[tuple[str, str]] = set()
     for spec in join_specs:
@@ -995,6 +1307,54 @@ def discover_join_candidates(metadata_snapshot: dict) -> list[dict]:
                 "candidate_columns": candidate_columns,
                 "type_compatible": all_types_compatible,
             })
+
+    # 3) Eval-feedback enrichment: soft signal clusters may reference
+    # table pairs that heuristics missed (e.g., wrong join column, SCD filters).
+    if soft_signal_clusters:
+        feedback_pairs = _extract_table_pairs_from_clusters(soft_signal_clusters)
+        ident_lower = {ident.lower(): ident for ident in table_col_info}
+
+        for pair in feedback_pairs:
+            t1_lower, t2_lower = pair
+            t1_orig = ident_lower.get(t1_lower)
+            t2_orig = ident_lower.get(t2_lower)
+            if not t1_orig or not t2_orig:
+                for k, v in ident_lower.items():
+                    if t1_lower in k or k.endswith(t1_lower.rsplit(".", 1)[-1]):
+                        t1_orig = t1_orig or v
+                    if t2_lower in k or k.endswith(t2_lower.rsplit(".", 1)[-1]):
+                        t2_orig = t2_orig or v
+            if not t1_orig or not t2_orig:
+                continue
+            _a, _b = sorted((t1_orig, t2_orig))
+            if (_a, _b) in seen_pairs or (_a, _b) in existing_pairs:
+                continue
+
+            cols_a = table_col_info.get(t1_orig, [])
+            cols_b = table_col_info.get(t2_orig, [])
+            names_b_map = {c["name"]: c for c in cols_b}
+            cands: list[dict[str, str]] = []
+            for ca in cols_a:
+                cb = names_b_map.get(ca["name"])
+                if cb:
+                    cands.append({
+                        "left_col": ca["name"],
+                        "right_col": cb["name"],
+                        "reason": "eval feedback: shared column name",
+                    })
+            if cands:
+                seen_pairs.add((_a, _b))
+                hints.append({
+                    "left_table": t1_orig,
+                    "right_table": t2_orig,
+                    "candidate_columns": cands,
+                    "type_compatible": True,
+                    "source": "eval_feedback",
+                })
+        logger.info(
+            "Join discovery: %d feedback pairs from %d soft signal clusters",
+            len(feedback_pairs), len(soft_signal_clusters),
+        )
 
     logger.info(
         "Join discovery: found %d hint pairs (%d existing specs)",
@@ -1211,12 +1571,18 @@ def _extract_metadata_for_blame(
     return "\n".join(sections) if sections else "(blamed objects not found in metadata)"
 
 
-def _format_full_schema_context(metadata_snapshot: dict) -> str:
+def _format_full_schema_context(
+    metadata_snapshot: dict,
+    filter_tables: set[str] | None = None,
+) -> str:
     """Build a full schema summary of all tables, columns, descriptions, and synonyms.
 
     Gives the LLM complete visibility into the Genie Space structure so it can
     make informed decisions about which columns need descriptions vs. which
     should inherit from Unity Catalog, and which synonyms already exist.
+
+    If *filter_tables* is provided, only tables whose identifier (lowercased)
+    is in the set are included — useful for scoping join discovery prompts.
     """
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
@@ -1225,6 +1591,10 @@ def _format_full_schema_context(metadata_snapshot: dict) -> str:
 
     lines: list[str] = []
     for tbl in tables:
+        if filter_tables is not None:
+            tbl_id = (tbl.get("identifier", "") or "").lower()
+            if tbl_id not in filter_tables:
+                continue
         identifier = tbl.get("identifier", "")
         tbl_desc = tbl.get("description", [])
         if isinstance(tbl_desc, list):
@@ -1247,6 +1617,284 @@ def _format_full_schema_context(metadata_snapshot: dict) -> str:
             syn_part = f" | synonyms: {syns}" if syns else ""
             lines.append(f"  - `{col_name}`{type_part}{desc_part}{syn_part}")
     return "\n".join(lines) if lines else "(no schema available)"
+
+
+def _format_schema_index(metadata_snapshot: dict) -> str:
+    """Compact table-of-contents for the triage strategist.
+
+    Each table gets a single line with column names and types — no descriptions,
+    no synonyms. Keeps the prompt small while giving full schema awareness.
+    """
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+
+    lines: list[str] = []
+    for tbl in tables:
+        identifier = tbl.get("identifier", "")
+        cols = tbl.get("column_configs", [])
+        col_parts: list[str] = []
+        for cc in cols:
+            cname = cc.get("column_name", "")
+            dtype = cc.get("data_type", "")
+            col_parts.append(f"{cname}:{dtype}" if dtype else cname)
+        col_preview = ", ".join(col_parts[:12])
+        suffix = f", ... +{len(cols) - 12} more" if len(cols) > 12 else ""
+        lines.append(f"- {identifier} ({len(cols)} cols: {col_preview}{suffix})")
+    return "\n".join(lines) if lines else "(no schema available)"
+
+
+def _build_identifier_allowlist(
+    metadata_snapshot: dict,
+    uc_columns: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Extract an authoritative allowlist of all valid identifiers from metadata.
+
+    Merges Genie Config (tables, metric views, functions, column_configs)
+    with UC column metadata to produce a single source of truth that LLM
+    prompts and static validators can reference.
+    """
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables_list = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+    funcs_list = metadata_snapshot.get("functions", []) or []
+    mvs_list = metadata_snapshot.get("metric_views", []) or []
+
+    table_ids: list[str] = []
+    tables_short: set[str] = set()
+    columns_by_table: dict[str, list[tuple[str, str]]] = {}
+    columns_flat: set[str] = set()
+
+    uc_type_lookup: dict[tuple[str, str], str] = {}
+    if uc_columns:
+        for row in uc_columns:
+            if not isinstance(row, dict):
+                continue
+            tbl = str(row.get("table_name") or "").strip().lower()
+            col = str(row.get("column_name") or "").strip().lower()
+            dtype = str(row.get("data_type") or "").strip().upper()
+            if tbl and col:
+                uc_type_lookup[(tbl, col)] = dtype
+
+    for tbl in tables_list:
+        if not isinstance(tbl, dict):
+            continue
+        ident = tbl.get("identifier", "") or tbl.get("name", "")
+        if not ident:
+            continue
+        table_ids.append(ident)
+        short = ident.rsplit(".", 1)[-1].lower()
+        tables_short.add(short)
+
+        col_entries: list[tuple[str, str]] = []
+        for cc in tbl.get("column_configs", tbl.get("columns", [])):
+            if not isinstance(cc, dict):
+                continue
+            col_name = cc.get("column_name") or cc.get("name") or ""
+            dtype = cc.get("data_type") or ""
+            if not dtype:
+                dtype = uc_type_lookup.get((short, col_name.lower()), "")
+            col_entries.append((col_name, dtype.upper() if dtype else ""))
+            if col_name:
+                columns_flat.add(f"{short}.{col_name}".lower())
+                columns_flat.add(col_name.lower())
+        columns_by_table[short] = col_entries
+
+    func_ids: list[str] = []
+    funcs_short: set[str] = set()
+    for fn in funcs_list:
+        if isinstance(fn, dict):
+            name = fn.get("identifier", "") or fn.get("name", "")
+        else:
+            name = str(fn)
+        if name:
+            func_ids.append(name)
+            funcs_short.add(name.rsplit(".", 1)[-1].lower())
+
+    mv_ids: list[str] = []
+    for mv in mvs_list:
+        if isinstance(mv, dict):
+            name = mv.get("identifier", "") or mv.get("name", "")
+        else:
+            name = str(mv)
+        if name:
+            mv_ids.append(name)
+
+    return {
+        "tables": table_ids,
+        "tables_short": tables_short,
+        "columns": columns_by_table,
+        "columns_flat": columns_flat,
+        "functions": func_ids,
+        "functions_short": funcs_short,
+        "metric_views": mv_ids,
+    }
+
+
+def _format_identifier_allowlist(allowlist: dict[str, Any]) -> str:
+    """Render the identifier allowlist as a prompt-ready string."""
+    sections: list[str] = []
+
+    if allowlist.get("tables"):
+        lines = ["VALID TABLES (use ONLY these in FROM/JOIN):"]
+        for t in allowlist["tables"]:
+            lines.append(f"- {t}")
+        sections.append("\n".join(lines))
+
+    if allowlist.get("columns"):
+        lines = ["VALID COLUMNS BY TABLE (use ONLY these column names):"]
+        for tbl_short, cols in sorted(allowlist["columns"].items()):
+            if not cols:
+                continue
+            col_parts = []
+            for col_name, dtype in cols:
+                col_parts.append(f"{col_name} ({dtype})" if dtype else col_name)
+            lines.append(f"{tbl_short}: {', '.join(col_parts)}")
+        sections.append("\n".join(lines))
+
+    if allowlist.get("functions"):
+        lines = ["VALID FUNCTIONS (use ONLY these):"]
+        for fn in allowlist["functions"]:
+            lines.append(f"- {fn}")
+        sections.append("\n".join(lines))
+
+    if allowlist.get("metric_views"):
+        lines = ["VALID METRIC VIEWS:"]
+        for mv in allowlist["metric_views"]:
+            lines.append(f"- {mv}")
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections) if sections else "(no assets configured)"
+
+
+_SQL_TABLE_REF_RE = re.compile(
+    r"(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+"
+    r"(`[^`]+`(?:\.`[^`]+`)*"
+    r"|[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
+    r"(?:\s*\()?",
+    re.IGNORECASE,
+)
+
+
+def _validate_sql_identifiers(
+    sql: str,
+    allowlist: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """Deterministic cross-check of SQL table/column refs against the allowlist.
+
+    Returns ``(is_valid, violations)`` where *violations* is a list of
+    human-readable strings describing each unrecognized identifier.
+    This does NOT require a SparkSession — purely regex-based.
+    """
+    violations: list[str] = []
+    if not sql or not allowlist:
+        return True, violations
+
+    tables_full = {t.lower() for t in (allowlist.get("tables") or [])}
+    tables_short = {s.lower() for s in (allowlist.get("tables_short") or set())}
+    cols_flat = {c.lower() for c in (allowlist.get("columns_flat") or set())}
+
+    for m in _SQL_TABLE_REF_RE.finditer(sql):
+        ref = m.group(1).replace("`", "").strip()
+        ref_lower = ref.lower()
+        leaf = ref_lower.rsplit(".", 1)[-1]
+        if ref_lower not in tables_full and leaf not in tables_short:
+            violations.append(f"Unknown table: {ref}")
+
+    sql_upper = sql.upper()
+    for kw in ("SELECT", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "ON"):
+        idx = sql_upper.find(kw)
+        if idx < 0:
+            continue
+        end = len(sql)
+        for stop_kw in ("FROM", "JOIN", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION"):
+            si = sql_upper.find(stop_kw, idx + len(kw))
+            if 0 < si < end and stop_kw != kw:
+                end = si
+        clause = sql[idx + len(kw):end]
+        for col_match in re.finditer(
+            r"(?<![:\w])([A-Za-z_]\w*)\s*(?:\.([A-Za-z_]\w*))?",
+            clause,
+        ):
+            part1 = col_match.group(1).lower()
+            part2 = (col_match.group(2) or "").lower()
+            if part2:
+                candidate = f"{part1}.{part2}"
+                if candidate in cols_flat:
+                    continue
+                if part2 in cols_flat:
+                    continue
+            else:
+                if part1 in cols_flat or part1 in tables_short:
+                    continue
+                if part1 in _SQL_KEYWORDS:
+                    continue
+
+    return (len(violations) == 0, violations)
+
+
+_SQL_KEYWORDS = frozenset({
+    "select", "from", "where", "and", "or", "not", "in", "is", "null",
+    "as", "on", "join", "left", "right", "inner", "outer", "cross", "full",
+    "group", "by", "order", "asc", "desc", "having", "limit", "offset",
+    "union", "all", "distinct", "case", "when", "then", "else", "end",
+    "between", "like", "exists", "count", "sum", "avg", "min", "max",
+    "cast", "coalesce", "nullif", "true", "false", "insert", "update",
+    "delete", "into", "values", "set", "create", "alter", "drop", "table",
+    "view", "index", "with", "recursive", "over", "partition", "row_number",
+    "rank", "dense_rank", "lag", "lead", "first_value", "last_value",
+    "date", "timestamp", "string", "int", "integer", "bigint", "decimal",
+    "float", "double", "boolean", "array", "map", "struct", "measure",
+    "current_date", "current_timestamp", "extract", "year", "month", "day",
+    "hour", "minute", "second", "interval", "trim", "upper", "lower",
+    "substring", "concat", "length", "replace", "round", "floor", "ceil",
+    "abs", "if", "ifnull", "isnull", "nvl", "to_date", "date_format",
+    "datediff", "dateadd", "months_between", "trunc", "try_cast",
+})
+
+
+def _format_compact_cluster_summaries(clusters: list[dict]) -> str:
+    """One-liner per cluster for the triage strategist — no SQL diffs."""
+    if not clusters:
+        return "(No failure clusters.)"
+
+    lines: list[str] = []
+    for cluster in clusters:
+        cid = cluster.get("cluster_id", "?")
+        rc = cluster.get("root_cause", "unknown")
+        qids = cluster.get("question_ids", [])
+        blame = cluster.get("asi_blame_set")
+        if isinstance(blame, str) and blame:
+            blame_parts = [b.strip() for b in blame.split("|")][:5]
+        elif isinstance(blame, list):
+            blame_parts = [str(b) for b in blame[:5]]
+        else:
+            blame_parts = []
+        fixes = cluster.get("asi_counterfactual_fixes", [])
+        fix_str = "; ".join(str(f)[:120] for f in fixes[:2]) if fixes else ""
+
+        parts = [f"{cid}: {rc} ({len(qids)} questions)"]
+        if blame_parts:
+            parts.append(f"blamed=[{', '.join(blame_parts)}]")
+        if fix_str:
+            parts.append(f'fixes=["{fix_str}"]')
+
+        qtext_samples: list[str] = []
+        for qt in cluster.get("question_traces", [])[:2]:
+            qt_text = qt.get("question_text", "")[:100]
+            if qt_text:
+                qtext_samples.append(qt_text)
+        for sc in cluster.get("sql_contexts", [])[:2]:
+            qt_text = sc.get("question", "")[:100]
+            if qt_text and qt_text not in qtext_samples:
+                qtext_samples.append(qt_text)
+        if qtext_samples:
+            parts.append(f"sample_qs=[{'; '.join(qtext_samples[:2])}]")
+
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
 
 
 def _format_structured_column_context(
@@ -1368,6 +2016,129 @@ def _format_structured_column_context(
     return "\n".join(lines) if lines else "(no structured column metadata available)"
 
 
+def _format_structured_table_context(
+    metadata_snapshot: dict,
+    blame_set: Any,
+    lever: int,
+) -> str:
+    """Build structured table-level metadata with editability markers for the LLM.
+
+    Shows each relevant table's current structured sections (Purpose, Best For,
+    Grain, SCD, Relationships) with [EDITABLE]/[LOCKED] markers based on lever
+    ownership.
+    """
+    from genie_space_optimizer.optimization.structured_metadata import (
+        ENTITY_TYPE_TEMPLATES,
+        LEVER_SECTION_OWNERSHIP,
+        SECTION_LABELS,
+        parse_structured_description,
+    )
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+    mvs = ds.get("metric_views", []) or []
+    mv_identifiers = {
+        (m.get("identifier") or "").rsplit(".", 1)[-1].lower()
+        for m in mvs
+    }
+
+    blame_lower: set[str] = set()
+    if blame_set:
+        items = blame_set if isinstance(blame_set, list) else [str(blame_set)]
+        for b in items:
+            bl = b.lower().strip()
+            blame_lower.add(bl)
+            if "." in bl:
+                blame_lower.add(bl.rsplit(".", 1)[-1])
+
+    owned_sections = LEVER_SECTION_OWNERSHIP.get(lever, set())
+    lines: list[str] = []
+
+    for tbl in tables:
+        identifier = tbl.get("identifier", "")
+        short_name = identifier.rsplit(".", 1)[-1].lower() if identifier else ""
+        is_mv = short_name in mv_identifiers
+
+        if blame_lower:
+            tbl_match = short_name in blame_lower or identifier.lower() in blame_lower
+            col_match = any(
+                (cc.get("column_name") or "").lower() in blame_lower
+                for cc in tbl.get("column_configs", [])
+            )
+            if not tbl_match and not col_match:
+                continue
+
+        etype = "mv_table" if is_mv else "table"
+        template_sections = ENTITY_TYPE_TEMPLATES.get(etype, [])
+
+        desc = tbl.get("description", [])
+        desc_text = "\n".join(desc) if isinstance(desc, list) else str(desc or "")
+        sections = parse_structured_description(desc_text)
+
+        lines.append(f"### Table: {identifier} (entity_type: {etype})")
+        for sk in template_sections:
+            label = SECTION_LABELS[sk]
+            value = sections.get(sk, "").strip()
+            marker = "[EDITABLE]" if sk in owned_sections else "[LOCKED]"
+            lines.append(f"  {marker} **{label}:** {value if value else '(empty)'}")
+        preamble = sections.get("_preamble", "").strip()
+        if preamble:
+            lines.append(f"  [Legacy text]: {preamble}")
+        lines.append("")
+
+    return "\n".join(lines) if lines else "(no structured table metadata available)"
+
+
+def _format_structured_function_context(
+    metadata_snapshot: dict,
+    lever: int,
+) -> str:
+    """Build structured function metadata with editability markers for the LLM.
+
+    Shows each function's current metadata in structured sections (Purpose,
+    Best For, Use Instead Of, Parameters, Example).
+    """
+    from genie_space_optimizer.optimization.structured_metadata import (
+        ENTITY_TYPE_TEMPLATES,
+        LEVER_SECTION_OWNERSHIP,
+        SECTION_LABELS,
+        parse_structured_description,
+    )
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    funcs = metadata_snapshot.get("functions", []) or ds.get("functions", [])
+    if not funcs:
+        return "(no functions in this Genie Space)"
+
+    owned_sections = LEVER_SECTION_OWNERSHIP.get(lever, set())
+    template_sections = ENTITY_TYPE_TEMPLATES.get("function", [])
+    lines: list[str] = []
+
+    for fn in funcs:
+        name = fn.get("name") or fn.get("identifier", "")
+        comment = fn.get("comment") or fn.get("description") or ""
+        if isinstance(comment, list):
+            comment = "\n".join(comment)
+        sections = parse_structured_description(comment)
+
+        lines.append(f"### Function: {name}")
+        for sk in template_sections:
+            label = SECTION_LABELS[sk]
+            value = sections.get(sk, "").strip()
+            marker = "[EDITABLE]" if sk in owned_sections else "[LOCKED]"
+            lines.append(f"  {marker} **{label}:** {value if value else '(empty)'}")
+        preamble = sections.get("_preamble", "").strip()
+        if preamble:
+            lines.append(f"  [Legacy text]: {preamble}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _describe_patch_type(patch_type: str) -> str:
     """Human-readable description of a patch type."""
     pt_info = PATCH_TYPES.get(patch_type)
@@ -1379,16 +2150,26 @@ def _describe_patch_type(patch_type: str) -> str:
     return patch_type
 
 
-def _format_sql_diffs(cluster: dict) -> str:
-    """Build a human-readable summary of SQL diffs for the LLM prompt."""
+def _format_sql_diffs(cluster: dict, *, max_sql_chars: int = 0) -> str:
+    """Build a human-readable summary of SQL diffs for the LLM prompt.
+
+    When *max_sql_chars* > 0, individual SQL blocks are truncated to that
+    length to keep overall prompt size manageable.
+    """
     sql_contexts = cluster.get("sql_contexts", [])
     if not sql_contexts:
         return "(no SQL context available)"
+
+    def _trunc(sql: str) -> str:
+        if max_sql_chars > 0 and len(sql) > max_sql_chars:
+            return sql[:max_sql_chars] + " ... (truncated)"
+        return sql
+
     lines: list[str] = []
     for idx, ctx in enumerate(sql_contexts[:3], 1):
         q = ctx.get("question", "")
-        exp = ctx.get("expected_sql", "")
-        gen = ctx.get("generated_sql", "")
+        exp = _trunc(ctx.get("expected_sql", ""))
+        gen = _trunc(ctx.get("generated_sql", ""))
         comp = ctx.get("comparison", {})
         lines.append(f"### Question {idx}: {q}")
         lines.append(f"**Expected SQL:**\n```sql\n{exp}\n```")
@@ -1506,12 +2287,18 @@ def _format_lever_summary(lever_changes: list[dict] | None) -> str:
     return "\n".join(lines) if lines else "(No changes applied.)"
 
 
-def _format_cluster_briefs(clusters: list[dict], top_n: int = 5) -> str:
+def _format_cluster_briefs(
+    clusters: list[dict],
+    top_n: int = 5,
+    max_sql_chars: int = 0,
+) -> str:
     """Format cluster data for the holistic prompt.
 
-    Hard-failure clusters (top N) get full SQL diffs; remaining get one-line
-    summaries.  Soft-signal clusters (correct-but-suboptimal) are rendered
-    under a separate header so the LLM can weight them appropriately.
+    Hard-failure clusters (top N) get SQL diffs; remaining get one-line
+    summaries.  Soft-signal clusters are rendered under a separate header.
+
+    When *max_sql_chars* > 0 each SQL block in the diff is truncated to that
+    length — useful for keeping the strategist prompt within budget.
     """
     if not clusters:
         return "(No failure clusters.)"
@@ -1530,7 +2317,7 @@ def _format_cluster_briefs(clusters: list[dict], top_n: int = 5) -> str:
         lines.append(f"### Cluster {idx}: {rc} ({len(q_ids)} questions, judge: {judge})")
         if blame:
             lines.append(f"Blamed objects: {', '.join(str(b) for b in blame[:5])}")
-        lines.append(_format_sql_diffs(cluster))
+        lines.append(_format_sql_diffs(cluster, max_sql_chars=max_sql_chars))
         lines.append("")
 
     remaining_hard = sorted_hard[top_n:]
@@ -1561,7 +2348,7 @@ def _format_cluster_briefs(clusters: list[dict], top_n: int = 5) -> str:
             lines.append(f"#### Soft {idx}: {rc} ({len(q_ids)} questions, judge: {judge})")
             if blame:
                 lines.append(f"Blamed objects: {', '.join(str(b) for b in blame[:5])}")
-            lines.append(_format_sql_diffs(cluster))
+            lines.append(_format_sql_diffs(cluster, max_sql_chars=max_sql_chars))
             lines.append("")
         remaining_soft = sorted_soft[top_n:]
         if remaining_soft:
@@ -1644,8 +2431,9 @@ def _resolve_lever5_llm_result(
             "for routing issues. Keeping text_instruction but marking as downgraded."
         )
 
+    raw_text = llm_result.get("instruction_text", "")
     return "add_instruction", {
-        "new_text": llm_result.get("instruction_text", ""),
+        "new_text": _sanitize_plaintext_instructions(raw_text) if raw_text else "",
         "downgraded_from_example_sql": original_patch_type == "add_example_sql",
     }
 
@@ -1687,10 +2475,19 @@ def _call_llm_for_proposal(
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
         ds = {}
+    _inst_lookup = metadata_snapshot.get("instructions", {})
+    if not isinstance(_inst_lookup, dict):
+        _inst_lookup = {}
     _tables = metadata_snapshot.get("tables", []) or ds.get("tables", [])
     _mvs = metadata_snapshot.get("metric_views", []) or ds.get("metric_views", [])
     _funcs = metadata_snapshot.get("functions", []) or ds.get("functions", [])
-    _join_specs = metadata_snapshot.get("join_specs", []) or ds.get("join_specs", [])
+    _join_specs = (
+        metadata_snapshot.get("join_specs", [])
+        or _inst_lookup.get("join_specs", [])
+        or ds.get("join_specs", [])
+    )
+
+    _allowlist = _build_identifier_allowlist(metadata_snapshot)
 
     format_kwargs: dict[str, Any] = {
         "failure_type": cluster.get("asi_failure_type", cluster.get("root_cause", "")),
@@ -1713,6 +2510,7 @@ def _call_llm_for_proposal(
             metadata_snapshot.get("column_configs", {}), default=str
         ),
         "full_schema_context": _format_full_schema_context(metadata_snapshot),
+        "identifier_allowlist": _format_identifier_allowlist(_allowlist),
         "string_column_count": metadata_snapshot.get("string_column_count", 0),
         "max_value_dictionary_cols": MAX_VALUE_DICTIONARY_COLUMNS,
         "current_dictionary_count": current_dict_count,
@@ -1740,13 +2538,22 @@ def _call_llm_for_proposal(
         format_kwargs["structured_column_context"] = _format_structured_column_context(
             metadata_snapshot, blame, lever,
         )
+        format_kwargs["structured_table_context"] = _format_structured_table_context(
+            metadata_snapshot, blame, lever,
+        )
+        format_kwargs["full_schema_context"] = "(See structured table/column metadata above for relevant schema.)"
+        format_kwargs.pop("current_column_configs", None)
 
-    try:
-        prompt = prompt_template.format(**format_kwargs)
-    except KeyError:
-        prompt = prompt_template.format_map(defaultdict(str, format_kwargs))
+    format_kwargs = _truncate_to_budget(
+        format_kwargs, prompt_template,
+        priority_keys=["full_schema_context", "current_column_configs", "table_relationships", "failures_context", "sql_diffs"],
+    )
 
+    prompt = format_mlflow_template(prompt_template, **format_kwargs)
+
+    from genie_space_optimizer.optimization.evaluation import _link_prompt_to_trace
     _tmpl_name = {1: "LEVER_1_2_COLUMN", 2: "LEVER_1_2_COLUMN", 4: "LEVER_4_JOIN_SPEC", 5: "LEVER_5_INSTRUCTION"}.get(lever, "PROPOSAL_GENERATION")
+    _link_prompt_to_trace(_tmpl_name.lower())
     _W = 78
     _hdr = f"┌─── LLM Call [{_tmpl_name}] " + "─" * max(0, _W - 18 - len(_tmpl_name))
     _ftr = "└" + "─" * (_W - 1)
@@ -1907,17 +2714,45 @@ def _call_llm_for_join_discovery(
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
         ds = {}
-    _join_specs = metadata_snapshot.get("join_specs", []) or ds.get("join_specs", [])
+    _inst_js = metadata_snapshot.get("instructions", {})
+    if not isinstance(_inst_js, dict):
+        _inst_js = {}
+    _join_specs = (
+        metadata_snapshot.get("join_specs", [])
+        or _inst_js.get("join_specs", [])
+        or ds.get("join_specs", [])
+    )
 
-    format_kwargs = {
-        "full_schema_context": _format_full_schema_context(metadata_snapshot),
+    hint_tables: set[str] = set()
+    for h in hints:
+        for k in ("left_table", "right_table", "table", "source_table", "target_table"):
+            v = h.get(k)
+            if v and isinstance(v, str):
+                hint_tables.add(v.lower())
+
+    if hint_tables:
+        scoped_schema = _format_full_schema_context(metadata_snapshot, filter_tables=hint_tables)
+    else:
+        scoped_schema = _format_full_schema_context(metadata_snapshot)
+
+    _allowlist = _build_identifier_allowlist(metadata_snapshot)
+
+    format_kwargs: dict[str, Any] = {
+        "full_schema_context": scoped_schema,
+        "identifier_allowlist": _format_identifier_allowlist(_allowlist),
         "current_join_specs": json.dumps(_join_specs, default=str),
         "discovery_hints": _format_discovery_hints(hints),
     }
-    try:
-        prompt = LEVER_4_JOIN_DISCOVERY_PROMPT.format(**format_kwargs)
-    except KeyError:
-        prompt = LEVER_4_JOIN_DISCOVERY_PROMPT.format_map(defaultdict(str, format_kwargs))
+
+    format_kwargs = _truncate_to_budget(
+        format_kwargs, LEVER_4_JOIN_DISCOVERY_PROMPT,
+        priority_keys=["full_schema_context", "current_join_specs"],
+    )
+
+    prompt = format_mlflow_template(LEVER_4_JOIN_DISCOVERY_PROMPT, **format_kwargs)
+
+    from genie_space_optimizer.optimization.evaluation import _link_prompt_to_trace
+    _link_prompt_to_trace("lever_4_join_discovery")
 
     logger.info(
         "\n"
@@ -2001,40 +2836,193 @@ def _call_llm_for_join_discovery(
     return []
 
 
+def _sanitize_plaintext_instructions(text: str) -> str:
+    """Strip residual Markdown from instruction text for plain-text display."""
+    text = re.sub(r'^```[a-z]*\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^---+\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\*\*\*+\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^___+\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(
+        r'^#{1,6}\s+(.+)$',
+        lambda m: m.group(1).upper().rstrip() + ':',
+        text,
+        flags=re.MULTILINE,
+    )
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+_SECTION_HEADER_RE = re.compile(
+    r'^([A-Z][A-Z /]+):[ \t]*$', re.MULTILINE,
+)
+_KNOWN_SECTIONS = set(INSTRUCTION_SECTION_ORDER)
+
+
+def _parse_sections(text: str) -> tuple[dict[str, list[str]], list[str]]:
+    """Parse structured plain-text into {SECTION_HEADER: [lines]} and preamble lines."""
+    lines = text.splitlines()
+    sections: dict[str, list[str]] = {}
+    preamble: list[str] = []
+    current: str | None = None
+
+    for line in lines:
+        m = _SECTION_HEADER_RE.match(line)
+        if m and m.group(1) in _KNOWN_SECTIONS:
+            current = m.group(1)
+            if current not in sections:
+                sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+        else:
+            preamble.append(line)
+
+    for key in sections:
+        while sections[key] and not sections[key][-1].strip():
+            sections[key].pop()
+
+    return sections, preamble
+
+
+def _merge_structured_instructions(
+    existing: str,
+    contributions: list[str],
+    global_guidance: str = "",
+) -> str:
+    """Merge instruction fragments into a single structured document.
+
+    Parses ``existing`` and each contribution by ALL-CAPS section header,
+    deduplicates bullets within each section, then reassembles in
+    ``INSTRUCTION_SECTION_ORDER``.  Unrecognized content goes into CONSTRAINTS.
+    """
+    merged: dict[str, list[str]] = {s: [] for s in INSTRUCTION_SECTION_ORDER}
+
+    existing_sections, existing_preamble = _parse_sections(
+        _sanitize_plaintext_instructions(existing) if existing else ""
+    )
+    for section, lines in existing_sections.items():
+        if section in merged:
+            merged[section].extend(lines)
+
+    if existing_preamble:
+        non_blank = [l for l in existing_preamble if l.strip()]
+        if non_blank:
+            if not merged["PURPOSE"]:
+                merged["PURPOSE"].extend(non_blank)
+            else:
+                merged["CONSTRAINTS"].extend(non_blank)
+
+    for fragment in contributions:
+        sanitized = _sanitize_plaintext_instructions(fragment) if fragment else ""
+        frag_sections, frag_preamble = _parse_sections(sanitized)
+        for section, lines in frag_sections.items():
+            if section in merged:
+                merged[section].extend(lines)
+            else:
+                merged["CONSTRAINTS"].extend(lines)
+        if frag_preamble:
+            non_blank = [l for l in frag_preamble if l.strip()]
+            if non_blank:
+                merged["CONSTRAINTS"].extend(non_blank)
+
+    if global_guidance:
+        sanitized_g = _sanitize_plaintext_instructions(global_guidance)
+        g_sections, g_preamble = _parse_sections(sanitized_g)
+        for section, lines in g_sections.items():
+            if section in merged:
+                merged[section].extend(lines)
+        if g_preamble:
+            non_blank = [l for l in g_preamble if l.strip()]
+            if non_blank:
+                merged["CONSTRAINTS"].extend(non_blank)
+
+    for section in merged:
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for line in merged[section]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped not in seen:
+                seen.add(stripped)
+                deduped.append(line)
+        merged[section] = deduped
+
+    parts: list[str] = []
+    for section in INSTRUCTION_SECTION_ORDER:
+        if merged[section]:
+            parts.append(f"{section}:")
+            for line in merged[section]:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not stripped.startswith("- "):
+                    stripped = f"- {stripped}"
+                parts.append(stripped)
+            parts.append("")
+
+    result = "\n".join(parts).strip()
+    return _sanitize_plaintext_instructions(result)
+
+
 def _repair_truncated_holistic_json(text: str) -> dict:
-    """Extract instruction_text from a truncated JSON response.
+    """Extract instruction_text and example_sql_proposals from a truncated JSON.
 
     When the LLM output exceeds max_tokens, the JSON is cut off mid-string.
-    This attempts to salvage the instruction_text field.
+    Attempts to salvage both ``instruction_text`` and ``example_sql_proposals``.
     """
+    instruction_text = ""
+    example_sql_proposals: list[dict] = []
+
     m = re.search(r'"instruction_text"\s*:\s*"', text)
-    if not m:
-        raise json.JSONDecodeError("No instruction_text field found", text, 0)
-    start = m.end()
-    depth = 0
-    i = start
-    while i < len(text):
-        ch = text[i]
-        if ch == "\\" and i + 1 < len(text):
-            i += 2
-            continue
-        if ch == '"' and depth == 0:
-            break
-        i += 1
-    else:
-        i = len(text)
-    instruction_text = text[start:i]
-    try:
-        instruction_text = json.loads(f'"{instruction_text}"')
-    except (json.JSONDecodeError, ValueError):
-        instruction_text = instruction_text.replace('\\"', '"').replace("\\n", "\n")
+    if m:
+        start = m.end()
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if ch == "\\" and i + 1 < len(text):
+                i += 2
+                continue
+            if ch == '"':
+                break
+            i += 1
+        else:
+            i = len(text)
+        raw = text[start:i]
+        try:
+            instruction_text = json.loads(f'"{raw}"')
+        except (json.JSONDecodeError, ValueError):
+            instruction_text = raw.replace('\\"', '"').replace("\\n", "\n")
+
+    m_ex = re.search(r'"example_sql_proposals"\s*:\s*\[', text)
+    if m_ex:
+        bracket_start = m_ex.end() - 1
+        depth = 0
+        for j in range(bracket_start, len(text)):
+            if text[j] == "[":
+                depth += 1
+            elif text[j] == "]":
+                depth -= 1
+            if depth == 0:
+                try:
+                    example_sql_proposals = json.loads(text[bracket_start : j + 1])
+                except json.JSONDecodeError:
+                    pass
+                break
+
+    if not instruction_text and not example_sql_proposals:
+        raise json.JSONDecodeError("No instruction_text or example_sql_proposals found", text, 0)
+
     logger.warning(
-        "Repaired truncated holistic JSON — extracted %d chars of instruction_text",
-        len(instruction_text),
+        "Repaired truncated holistic JSON — %d chars instruction, %d example SQL proposals",
+        len(instruction_text), len(example_sql_proposals),
     )
     return {
         "instruction_text": instruction_text,
-        "example_sql_proposals": [],
+        "example_sql_proposals": example_sql_proposals,
         "rationale": "Recovered from truncated JSON response",
     }
 
@@ -2066,23 +3054,43 @@ def _call_llm_for_holistic_instructions(
     current_instructions = metadata_snapshot.get("general_instructions", "")
     existing_example_sqls = _format_existing_example_sqls(metadata_snapshot)
 
+    resolved_ids: set[str] = set()
+    for lc in (lever_changes or []):
+        for cid in (lc.get("cluster_ids", []) or []):
+            if lc.get("status") in ("applied", "success"):
+                resolved_ids.add(str(cid))
+
+    unresolved = [
+        c for c in all_clusters
+        if str(c.get("cluster_id", "")) not in resolved_ids
+    ]
+    focus_clusters = unresolved if unresolved else all_clusters
+
+    _allowlist = _build_identifier_allowlist(metadata_snapshot)
+
     format_kwargs: dict[str, Any] = {
         "space_description": space_desc,
-        "eval_summary": _format_eval_summary(all_clusters),
-        "cluster_briefs": _format_cluster_briefs(all_clusters, top_n=5),
+        "eval_summary": _format_eval_summary(focus_clusters),
+        "cluster_briefs": _format_cluster_briefs(focus_clusters, top_n=5),
         "lever_summary": _format_lever_summary(lever_changes),
         "current_instructions": current_instructions or "(No current instructions.)",
         "existing_example_sqls": existing_example_sqls,
         "instruction_char_budget": max(0, 24500 - 500),
+        "identifier_allowlist": _format_identifier_allowlist(_allowlist),
         "table_names": [t.get("name") or t.get("identifier", "") for t in _tables],
         "mv_names": [m.get("name") or m.get("identifier", "") for m in _mvs],
         "tvf_names": [f.get("name") or f.get("identifier", "") for f in _funcs],
     }
 
-    try:
-        prompt = LEVER_5_HOLISTIC_PROMPT.format(**format_kwargs)
-    except KeyError:
-        prompt = LEVER_5_HOLISTIC_PROMPT.format_map(defaultdict(str, format_kwargs))
+    format_kwargs = _truncate_to_budget(
+        format_kwargs, LEVER_5_HOLISTIC_PROMPT,
+        priority_keys=["existing_example_sqls", "lever_summary", "cluster_briefs", "eval_summary"],
+    )
+
+    prompt = format_mlflow_template(LEVER_5_HOLISTIC_PROMPT, **format_kwargs)
+
+    from genie_space_optimizer.optimization.evaluation import _link_prompt_to_trace
+    _link_prompt_to_trace("lever_5_holistic")
 
     _W = 78
     _hdr = "┌─── LLM Call [LEVER_5_HOLISTIC] " + "─" * max(0, _W - 32)
@@ -2090,7 +3098,7 @@ def _call_llm_for_holistic_instructions(
 
     logger.info(
         "\n%s\n│ Clusters: %d\n│ Lever changes: %d\n│ Prompt length: %d chars\n%s",
-        _hdr, len(all_clusters), len(lever_changes or []), len(prompt), _ftr,
+        _hdr, len(focus_clusters), len(lever_changes or []), len(prompt), _ftr,
     )
 
     import time
@@ -2133,6 +3141,8 @@ def _call_llm_for_holistic_instructions(
                 result = _repair_truncated_holistic_json(text)
 
             instruction_text = result.get("instruction_text", "")
+            if instruction_text:
+                instruction_text = _sanitize_plaintext_instructions(instruction_text)
             example_proposals = result.get("example_sql_proposals", [])
             rationale = result.get("rationale", "")
 
@@ -2162,6 +3172,11 @@ def _call_llm_for_holistic_instructions(
                 attempt + 1, text,
             )
             if attempt >= LLM_MAX_RETRIES - 1:
+                m_regex = re.search(r'"instruction_text"\s*:\s*"(.{50,}?)"', text, re.DOTALL)
+                if m_regex:
+                    recovered = m_regex.group(1).replace('\\"', '"').replace("\\n", "\n")
+                    logger.info("Last-ditch regex recovered %d chars of instruction_text", len(recovered))
+                    return {"instruction_text": recovered, "example_sql_proposals": [], "rationale": "Regex recovery"}
                 return {"instruction_text": "", "example_sql_proposals": [], "rationale": "JSON parse failed"}
         except Exception:
             if attempt < LLM_MAX_RETRIES - 1:
@@ -2173,6 +3188,769 @@ def _call_llm_for_holistic_instructions(
                 )
                 return {"instruction_text": "", "example_sql_proposals": [], "rationale": "LLM call failed"}
     return {"instruction_text": "", "example_sql_proposals": [], "rationale": "All retries exhausted"}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1 — Holistic Strategist
+# ═══════════════════════════════════════════════════════════════════════
+
+_EMPTY_STRATEGY: dict[str, Any] = {
+    "action_groups": [],
+    "global_instruction_rewrite": "",
+    "rationale": "",
+}
+
+
+def _format_soft_signal_summary(soft_clusters: list[dict]) -> str:
+    """Compact summary of soft-signal clusters for the strategist prompt."""
+    if not soft_clusters:
+        return "(No soft signals.)"
+    lines: list[str] = []
+    for sc in soft_clusters[:10]:
+        cid = sc.get("cluster_id", "?")
+        rc = sc.get("root_cause", "unknown")
+        qids = sc.get("question_ids", [])
+        lines.append(f"- {cid}: root_cause={rc}, questions={len(qids)}")
+        for qt in sc.get("question_traces", [])[:2]:
+            qtext = qt.get("question_text", "")[:120]
+            lines.append(f"    Q: {qtext}")
+            for fj in qt.get("failed_judges", []):
+                lines.append(
+                    f"    Judge {fj.get('judge','?')}: {fj.get('resolved_root_cause','?')} "
+                    f"— {fj.get('rationale_snippet','')[:150]}"
+                )
+    return "\n".join(lines) if lines else "(No soft signals.)"
+
+
+def _format_join_specs_context(metadata_snapshot: dict) -> str:
+    """Format current join specs for the strategist prompt."""
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    inst = metadata_snapshot.get("instructions", {})
+    if not isinstance(inst, dict):
+        inst = {}
+    specs = (
+        metadata_snapshot.get("join_specs", [])
+        or inst.get("join_specs", [])
+        or ds.get("join_specs", [])
+    )
+    if not specs:
+        return "(No join specifications configured.)"
+    lines: list[str] = []
+    for js in specs:
+        left = js.get("left", {})
+        right = js.get("right", {})
+        sql = js.get("sql", "")
+        lines.append(f"- {left.get('identifier','?')} <-> {right.get('identifier','?')}: {sql[:200]}")
+    return "\n".join(lines)
+
+
+def _repair_truncated_strategy_json(text: str) -> dict:
+    """Extract action_groups from a truncated strategy JSON response.
+
+    Attempts bracket-matching on the ``action_groups`` array first, then
+    falls back to extracting ``global_instruction_rewrite`` if present.
+    """
+    result: dict[str, Any] = {**_EMPTY_STRATEGY, "rationale": "Recovered from truncated JSON"}
+
+    m_ag = re.search(r'"action_groups"\s*:\s*\[', text)
+    if m_ag:
+        bracket_start = m_ag.end() - 1
+        depth = 0
+        for i in range(bracket_start, len(text)):
+            if text[i] == "[":
+                depth += 1
+            elif text[i] == "]":
+                depth -= 1
+            if depth == 0:
+                try:
+                    result["action_groups"] = json.loads(text[bracket_start : i + 1])
+                except json.JSONDecodeError:
+                    pass
+                break
+
+    m_gi = re.search(r'"global_instruction_rewrite"\s*:\s*"', text)
+    if m_gi:
+        start = m_gi.end()
+        j = start
+        while j < len(text):
+            ch = text[j]
+            if ch == "\\" and j + 1 < len(text):
+                j += 2
+                continue
+            if ch == '"':
+                break
+            j += 1
+        else:
+            j = len(text)
+        raw = text[start:j]
+        try:
+            result["global_instruction_rewrite"] = json.loads(f'"{raw}"')
+        except (json.JSONDecodeError, ValueError):
+            result["global_instruction_rewrite"] = raw.replace('\\"', '"').replace("\\n", "\n")
+
+    if not result["action_groups"] and not result["global_instruction_rewrite"]:
+        raise json.JSONDecodeError("Could not extract strategy fields", text, 0)
+
+    logger.warning(
+        "Repaired truncated strategy JSON — %d action groups, %d chars instruction",
+        len(result["action_groups"]),
+        len(result.get("global_instruction_rewrite", "")),
+    )
+    return result
+
+
+def _call_llm_for_strategy(
+    clusters: list[dict],
+    soft_signal_clusters: list[dict],
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> dict:
+    """Monolithic strategist fallback — used only when triage returns 0 AGs.
+
+    Sends the full STRATEGIST_PROMPT with compressed context (top-5 clusters,
+    SQL truncated to 300 chars) to stay within timeout bounds.
+    """
+    from genie_space_optimizer.optimization.evaluation import (
+        _extract_json,
+        _link_prompt_to_trace,
+    )
+
+    blame_set: Any = None
+    for c in clusters:
+        if c.get("asi_blame_set"):
+            blame_set = c["asi_blame_set"]
+            break
+
+    format_kwargs: dict[str, Any] = {
+        "full_schema_context": _format_full_schema_context(metadata_snapshot),
+        "cluster_briefs": _format_cluster_briefs(clusters, top_n=5, max_sql_chars=300),
+        "soft_signal_summary": _format_soft_signal_summary(soft_signal_clusters),
+        "structured_table_context": _format_structured_table_context(
+            metadata_snapshot, blame_set, lever=1,
+        ),
+        "structured_column_context": _format_structured_column_context(
+            metadata_snapshot, blame_set, lever=1,
+        ),
+        "structured_function_context": _format_structured_function_context(
+            metadata_snapshot, lever=3,
+        ),
+        "current_join_specs": _format_join_specs_context(metadata_snapshot),
+        "current_instructions": (
+            metadata_snapshot.get("general_instructions", "") or "(No current instructions.)"
+        ),
+        "existing_example_sqls": _format_existing_example_sqls(metadata_snapshot),
+        "instruction_char_budget": max(0, 24500 - 500),
+    }
+
+    format_kwargs = _truncate_to_budget(
+        format_kwargs, STRATEGIST_PROMPT,
+        priority_keys=["full_schema_context", "existing_example_sqls", "soft_signal_summary",
+                        "structured_function_context", "structured_column_context", "cluster_briefs"],
+    )
+
+    prompt = format_mlflow_template(STRATEGIST_PROMPT, **format_kwargs)
+
+    _W = 78
+    _hdr = "┌─── LLM Call [STRATEGIST] " + "─" * max(0, _W - 27)
+    _ftr = "└" + "─" * (_W - 1)
+    logger.info(
+        "\n%s\n│ Hard clusters: %d\n│ Soft clusters: %d\n│ Prompt length: %d chars\n%s",
+        _hdr, len(clusters), len(soft_signal_clusters), len(prompt), _ftr,
+    )
+    print(
+        f"\n{'=' * _W}\n"
+        f"  PHASE 1: HOLISTIC STRATEGIST\n"
+        f"  Hard clusters: {len(clusters)} | Soft clusters: {len(soft_signal_clusters)}\n"
+        f"  Prompt: {len(prompt):,} chars\n"
+        f"{'=' * _W}"
+    )
+
+    _link_prompt_to_trace("strategist")
+
+    import time
+
+    from databricks.sdk import WorkspaceClient as _WC
+
+    system_msg = (
+        "You are a JSON API. You MUST respond with ONLY a valid JSON object. "
+        "Do NOT include any explanation, analysis, or markdown outside the JSON. "
+        "Your entire response must be parseable by json.loads(). "
+        "The JSON must contain an 'action_groups' array."
+    )
+
+    from databricks.sdk import client as _sdk_client
+
+    _STRATEGIST_TIMEOUT_SECONDS = 600
+
+    text = ""
+    for attempt in range(LLM_MAX_RETRIES):
+        try:
+            if w:
+                wc = w
+            else:
+                wc = _WC(config=_sdk_client.Config(
+                    http_timeout_seconds=_STRATEGIST_TIMEOUT_SECONDS,
+                ))
+            response = wc.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[
+                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
+                temperature=LLM_TEMPERATURE,
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise ValueError("LLM response had no choices")
+            first_choice = choices[0]
+            message = getattr(first_choice, "message", None)
+            content = getattr(message, "content", None)
+            if not content:
+                raise ValueError("LLM response content is empty")
+            text = str(content).strip()
+            try:
+                result = _extract_json(text)
+            except json.JSONDecodeError:
+                result = _repair_truncated_strategy_json(text)
+
+            action_groups = result.get("action_groups", [])
+            if not isinstance(action_groups, list):
+                action_groups = []
+            global_rewrite = result.get("global_instruction_rewrite", "")
+            if isinstance(global_rewrite, str) and global_rewrite:
+                global_rewrite = _sanitize_plaintext_instructions(global_rewrite)
+            if isinstance(global_rewrite, str) and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+                logger.warning(
+                    "Strategist instruction rewrite exceeds %d chars (%d), truncating",
+                    MAX_HOLISTIC_INSTRUCTION_CHARS, len(global_rewrite),
+                )
+                global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+            rationale = result.get("rationale", "")
+
+            logger.info(
+                "\n┌─── LLM Response [STRATEGIST] ────────────────────────────────────────\n"
+                "│ Action groups: %d\n"
+                "│ Global instruction rewrite: %d chars\n"
+                "│ Rationale: %s\n"
+                "└─────────────────────────────────────────────────────────────────────────",
+                len(action_groups), len(global_rewrite), str(rationale)[:300],
+            )
+            print(
+                f"\n  Strategy produced {len(action_groups)} action group(s), "
+                f"{len(global_rewrite)} chars instruction rewrite"
+            )
+            for i, ag in enumerate(action_groups):
+                levers = sorted(ag.get("lever_directives", {}).keys())
+                qs = ag.get("affected_questions", [])
+                print(
+                    f"    AG{i + 1}: {ag.get('root_cause_summary', '?')[:80]}"
+                    f" | levers={levers} | questions={len(qs)}"
+                )
+
+            return {
+                "action_groups": action_groups,
+                "global_instruction_rewrite": global_rewrite,
+                "rationale": rationale,
+            }
+        except json.JSONDecodeError:
+            logger.warning(
+                "Strategist LLM response was not valid JSON (attempt %d): %.500s",
+                attempt + 1, text,
+            )
+            m = re.search(r'"action_groups"\s*:\s*\[', text)
+            if m and attempt >= LLM_MAX_RETRIES - 1:
+                logger.info("Last-ditch: attempting bracket extraction for action_groups")
+                try:
+                    repaired = _repair_truncated_strategy_json(text)
+                    return repaired
+                except json.JSONDecodeError:
+                    pass
+            if attempt >= LLM_MAX_RETRIES - 1:
+                return {**_EMPTY_STRATEGY, "rationale": "JSON parse failed"}
+        except Exception:
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(2**attempt)
+            else:
+                logger.exception(
+                    "Strategist LLM call failed after %d retries (prompt len: %d)",
+                    LLM_MAX_RETRIES, len(prompt),
+                )
+                return {**_EMPTY_STRATEGY, "rationale": "LLM call failed"}
+    return {**_EMPTY_STRATEGY, "rationale": "All retries exhausted"}
+
+
+# ── Phase 1a: Triage ────────────────────────────────────────────────────
+
+_EMPTY_TRIAGE: dict[str, Any] = {
+    "action_groups": [],
+    "global_instruction_guidance": "",
+    "rationale": "",
+}
+
+
+def _call_llm_for_triage(
+    clusters: list[dict],
+    soft_signal_clusters: list[dict],
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> dict:
+    """Phase 1a: lightweight triage call that sees ALL clusters compactly.
+
+    Returns action group *skeletons* with ``levers_needed``, ``focus_tables``,
+    and ``focus_columns`` — no actual lever directives yet.
+    """
+    from genie_space_optimizer.optimization.evaluation import (
+        _extract_json,
+        _link_prompt_to_trace,
+    )
+
+    schema_index = _format_schema_index(metadata_snapshot)
+    cluster_summaries = _format_compact_cluster_summaries(clusters)
+    soft_summary = _format_soft_signal_summary(soft_signal_clusters)
+    join_summary = _format_join_specs_context(metadata_snapshot)
+    current_instr = metadata_snapshot.get("general_instructions", "") or "(No current instructions.)"
+    instruction_summary = current_instr[:1500]
+    if len(current_instr) > 1500:
+        instruction_summary += f" ... ({len(current_instr) - 1500} chars omitted)"
+
+    format_kwargs: dict[str, Any] = {
+        "schema_index": schema_index,
+        "cluster_summaries": cluster_summaries,
+        "soft_signal_summary": soft_summary,
+        "current_join_summary": join_summary,
+        "instruction_summary": instruction_summary,
+    }
+
+    format_kwargs = _truncate_to_budget(
+        format_kwargs, STRATEGIST_TRIAGE_PROMPT,
+        priority_keys=["soft_signal_summary", "instruction_summary", "schema_index", "cluster_summaries"],
+    )
+
+    prompt = format_mlflow_template(STRATEGIST_TRIAGE_PROMPT, **format_kwargs)
+
+    _W = 78
+    logger.info(
+        "\n┌─── LLM Call [TRIAGE] %s\n│ Clusters: %d hard, %d soft\n│ Prompt: %d chars\n└%s",
+        "─" * max(0, _W - 23), len(clusters), len(soft_signal_clusters), len(prompt), "─" * (_W - 1),
+    )
+    print(
+        f"\n{'=' * _W}\n"
+        f"  PHASE 1a: TRIAGE STRATEGIST\n"
+        f"  Clusters: {len(clusters)} hard, {len(soft_signal_clusters)} soft\n"
+        f"  Prompt: {len(prompt):,} chars\n"
+        f"{'=' * _W}"
+    )
+
+    _link_prompt_to_trace("strategist_triage")
+
+    import time
+    from databricks.sdk import WorkspaceClient as _WC
+    from databricks.sdk import client as _sdk_client
+
+    _TRIAGE_TIMEOUT = 600
+
+    system_msg = (
+        "You are a JSON API. Respond with ONLY a valid JSON object. "
+        "No explanation or markdown outside the JSON. "
+        "The JSON must contain an 'action_groups' array."
+    )
+
+    text = ""
+    for attempt in range(LLM_MAX_RETRIES):
+        try:
+            if w:
+                wc = w
+            else:
+                wc = _WC(config=_sdk_client.Config(http_timeout_seconds=_TRIAGE_TIMEOUT))
+            response = wc.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[
+                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
+                temperature=LLM_TEMPERATURE,
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise ValueError("LLM response had no choices")
+            content = getattr(choices[0].message, "content", None)
+            if not content:
+                raise ValueError("LLM response content is empty")
+            text = str(content).strip()
+
+            try:
+                result = _extract_json(text)
+            except json.JSONDecodeError:
+                result = _repair_truncated_strategy_json(text)
+
+            ags = result.get("action_groups", [])
+            if not isinstance(ags, list):
+                ags = []
+
+            logger.info("Triage produced %d action group skeleton(s)", len(ags))
+            print(f"\n  Triage produced {len(ags)} action group skeleton(s)")
+            for i, ag in enumerate(ags):
+                levers = ag.get("levers_needed", [])
+                ft = ag.get("focus_tables", [])
+                fc = ag.get("focus_columns", [])
+                print(
+                    f"    AG{i + 1}: {ag.get('root_cause_summary', '?')[:80]}"
+                    f" | levers={levers} | tables={len(ft)} | cols={len(fc)}"
+                )
+
+            return {
+                "action_groups": ags,
+                "global_instruction_guidance": result.get("global_instruction_guidance", ""),
+                "rationale": result.get("rationale", ""),
+            }
+        except json.JSONDecodeError:
+            logger.warning("Triage LLM response was not valid JSON (attempt %d): %.500s", attempt + 1, text)
+            if attempt >= LLM_MAX_RETRIES - 1:
+                return {**_EMPTY_TRIAGE, "rationale": "JSON parse failed"}
+        except Exception:
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(2**attempt)
+            else:
+                logger.exception("Triage LLM call failed after %d retries (prompt len: %d)", LLM_MAX_RETRIES, len(prompt))
+                return {**_EMPTY_TRIAGE, "rationale": "LLM call failed"}
+    return {**_EMPTY_TRIAGE, "rationale": "All retries exhausted"}
+
+
+# ── Phase 1b: AG Detail ─────────────────────────────────────────────────
+
+def _call_llm_for_ag_detail(
+    ag_skeleton: dict,
+    clusters: list[dict],
+    metadata_snapshot: dict,
+    instruction_char_budget: int = 4000,
+    w: WorkspaceClient | None = None,
+) -> dict:
+    """Phase 1b: produce full lever_directives for one action group skeleton.
+
+    Receives the skeleton from triage plus *only* the relevant clusters and
+    metadata scoped to ``focus_tables``/``focus_columns``.
+    """
+    from genie_space_optimizer.optimization.evaluation import (
+        _extract_json,
+        _link_prompt_to_trace,
+    )
+
+    ag_id = ag_skeleton.get("id", "AG?")
+    source_cids = set(ag_skeleton.get("source_cluster_ids", []))
+    relevant_clusters = [c for c in clusters if c.get("cluster_id") in source_cids]
+    if not relevant_clusters:
+        relevant_clusters = clusters[:3]
+
+    sql_diffs_parts: list[str] = []
+    for cluster in relevant_clusters:
+        cid = cluster.get("cluster_id", "?")
+        rc = cluster.get("root_cause", "unknown")
+        sql_diffs_parts.append(f"### Cluster {cid}: {rc}")
+        sql_diffs_parts.append(_format_sql_diffs(cluster))
+        sql_diffs_parts.append("")
+    sql_diffs_text = "\n".join(sql_diffs_parts) if sql_diffs_parts else "(no SQL context)"
+
+    focus_tables = ag_skeleton.get("focus_tables", [])
+    focus_columns = ag_skeleton.get("focus_columns", [])
+    blame_set = list(focus_tables) + [c.split(".")[-1] for c in focus_columns if "." in c]
+    if not blame_set:
+        for c in relevant_clusters:
+            b = c.get("asi_blame_set")
+            if isinstance(b, str) and b:
+                blame_set.extend(b.split("|"))
+            elif isinstance(b, list):
+                blame_set.extend(str(x) for x in b)
+
+    levers_needed = ag_skeleton.get("levers_needed", [1, 5])
+
+    structured_table_ctx = _format_structured_table_context(
+        metadata_snapshot, blame_set or None, lever=1,
+    )
+    structured_col_ctx = _format_structured_column_context(
+        metadata_snapshot, blame_set or None, lever=1,
+    )
+    structured_fn_ctx = ""
+    if 3 in levers_needed:
+        structured_fn_ctx = _format_structured_function_context(metadata_snapshot, lever=3)
+
+    join_specs = _format_join_specs_context(metadata_snapshot)
+    current_instr = metadata_snapshot.get("general_instructions", "") or "(No current instructions.)"
+    example_sqls = _format_existing_example_sqls(metadata_snapshot)
+
+    skeleton_json = json.dumps(ag_skeleton, indent=2, default=str)
+    _allowlist = _build_identifier_allowlist(metadata_snapshot)
+
+    format_kwargs: dict[str, Any] = {
+        "action_group_skeleton": skeleton_json,
+        "sql_diffs": sql_diffs_text,
+        "identifier_allowlist": _format_identifier_allowlist(_allowlist),
+        "structured_table_context": structured_table_ctx,
+        "structured_column_context": structured_col_ctx,
+        "structured_function_context": structured_fn_ctx,
+        "current_join_specs": join_specs,
+        "current_instructions": current_instr,
+        "existing_example_sqls": example_sqls,
+        "instruction_char_budget": instruction_char_budget,
+    }
+
+    format_kwargs = _truncate_to_budget(
+        format_kwargs, STRATEGIST_DETAIL_PROMPT,
+        priority_keys=["existing_example_sqls", "structured_function_context", "current_instructions", "sql_diffs"],
+    )
+
+    prompt = format_mlflow_template(STRATEGIST_DETAIL_PROMPT, **format_kwargs)
+
+    logger.info(
+        "\n┌─── LLM Call [AG DETAIL: %s] ────────────────────────────────────\n"
+        "│ Clusters: %d | Levers: %s | Prompt: %d chars\n"
+        "└─────────────────────────────────────────────────────────────────────",
+        ag_id, len(relevant_clusters), levers_needed, len(prompt),
+    )
+    print(
+        f"\n  Phase 1b: Detailing {ag_id} "
+        f"({len(relevant_clusters)} clusters, levers={levers_needed}, "
+        f"prompt={len(prompt):,} chars)"
+    )
+
+    _link_prompt_to_trace("strategist_detail")
+
+    import time
+    from databricks.sdk import WorkspaceClient as _WC
+    from databricks.sdk import client as _sdk_client
+
+    _DETAIL_TIMEOUT = 600
+
+    system_msg = (
+        "You are a JSON API. Respond with ONLY a valid JSON object. "
+        "No explanation or markdown outside the JSON. "
+        "The JSON must contain a 'lever_directives' object."
+    )
+
+    text = ""
+    for attempt in range(LLM_MAX_RETRIES):
+        try:
+            if w:
+                wc = w
+            else:
+                wc = _WC(config=_sdk_client.Config(http_timeout_seconds=_DETAIL_TIMEOUT))
+            response = wc.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[
+                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
+                temperature=LLM_TEMPERATURE,
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise ValueError("LLM response had no choices")
+            content = getattr(choices[0].message, "content", None)
+            if not content:
+                raise ValueError("LLM response content is empty")
+            text = str(content).strip()
+
+            try:
+                result = _extract_json(text)
+            except json.JSONDecodeError:
+                result = _repair_truncated_strategy_json(text)
+
+            lever_dirs = result.get("lever_directives", {})
+            if not isinstance(lever_dirs, dict):
+                lever_dirs = {}
+            coord = result.get("coordination_notes", "")
+            instr_contrib = result.get("instruction_contribution", "")
+
+            logger.info(
+                "AG %s detail: %d lever directives, coordination=%d chars, instruction=%d chars",
+                ag_id, len(lever_dirs), len(coord), len(instr_contrib),
+            )
+            print(
+                f"    {ag_id} detail: levers={sorted(lever_dirs.keys())}, "
+                f"coordination={len(coord)} chars, instruction={len(instr_contrib)} chars"
+            )
+
+            return {
+                "lever_directives": lever_dirs,
+                "coordination_notes": coord,
+                "instruction_contribution": instr_contrib,
+            }
+        except json.JSONDecodeError:
+            logger.warning("AG detail LLM response not valid JSON (attempt %d): %.500s", attempt + 1, text)
+            if attempt >= LLM_MAX_RETRIES - 1:
+                return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": ""}
+        except Exception:
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(2**attempt)
+            else:
+                logger.exception("AG detail LLM call failed after %d retries for %s", LLM_MAX_RETRIES, ag_id)
+                return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": ""}
+    return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": ""}
+
+
+def _generate_holistic_strategy(
+    clusters: list[dict],
+    soft_signal_clusters: list[dict],
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> dict:
+    """Two-phase progressive strategist.
+
+    Phase 1a — Triage: compact summaries of ALL clusters, produces action
+    group skeletons with ``levers_needed`` and ``focus_objects``.
+
+    Phase 1b — Detail: for each skeleton, full SQL diffs and structured
+    metadata (scoped to focus objects) produce concrete ``lever_directives``.
+
+    Falls back to the monolithic ``_call_llm_for_strategy`` if triage
+    returns 0 action groups (LLM failure safety net).
+
+    Returns a strategy dict with ``action_groups``, ``global_instruction_rewrite``,
+    and ``rationale`` — identical shape to what harness.py expects.
+    """
+    import mlflow
+
+    hard = [c for c in clusters if c.get("cluster_id")]
+    soft = [c for c in soft_signal_clusters if c.get("cluster_id")]
+
+    if not hard and not soft:
+        logger.info("No clusters to strategize on — returning empty strategy")
+        return {**_EMPTY_STRATEGY, "rationale": "No clusters available"}
+
+    with mlflow.start_span(name="generate_holistic_strategy") as span:
+        span.set_inputs({
+            "hard_clusters": len(hard),
+            "soft_clusters": len(soft),
+        })
+
+        # ── Phase 1a: Triage ────────────────────────────────────────
+        with mlflow.start_span(name="phase_1a_triage") as triage_span:
+            triage_result = _call_llm_for_triage(
+                clusters=hard,
+                soft_signal_clusters=soft,
+                metadata_snapshot=metadata_snapshot,
+                w=w,
+            )
+            triage_ags = triage_result.get("action_groups", [])
+            triage_span.set_outputs({
+                "action_groups": len(triage_ags),
+                "rationale": str(triage_result.get("rationale", ""))[:300],
+            })
+
+        if not triage_ags:
+            logger.warning(
+                "Triage returned 0 action groups — falling back to monolithic strategist"
+            )
+            print("\n  Triage returned 0 AGs — falling back to monolithic call")
+            fallback = _call_llm_for_strategy(
+                clusters=hard,
+                soft_signal_clusters=soft,
+                metadata_snapshot=metadata_snapshot,
+                w=w,
+            )
+            ags = fallback.get("action_groups", [])
+            for i, ag in enumerate(ags):
+                if "id" not in ag:
+                    ag["id"] = f"AG{i + 1}"
+                if "priority" not in ag:
+                    ag["priority"] = i + 1
+            span.set_outputs({
+                "action_groups_count": len(ags),
+                "mode": "monolithic_fallback",
+                "global_instruction_rewrite_len": len(fallback.get("global_instruction_rewrite", "")),
+            })
+            return fallback
+
+        # ── Phase 1b: Detail per AG ─────────────────────────────────
+        per_ag_budget = max(2000, 24000 // max(len(triage_ags), 1))
+        final_ags: list[dict] = []
+        instruction_contributions: list[str] = []
+
+        for i, skeleton in enumerate(triage_ags):
+            if "id" not in skeleton:
+                skeleton["id"] = f"AG{i + 1}"
+            if "priority" not in skeleton:
+                skeleton["priority"] = i + 1
+
+            with mlflow.start_span(name=f"phase_1b_detail_{skeleton['id']}") as detail_span:
+                detail_span.set_inputs({
+                    "ag_id": skeleton["id"],
+                    "levers_needed": skeleton.get("levers_needed", []),
+                    "focus_tables": skeleton.get("focus_tables", []),
+                    "focus_columns": skeleton.get("focus_columns", []),
+                })
+
+                detail = _call_llm_for_ag_detail(
+                    ag_skeleton=skeleton,
+                    clusters=hard,
+                    metadata_snapshot=metadata_snapshot,
+                    instruction_char_budget=per_ag_budget,
+                    w=w,
+                )
+
+                lever_dirs = detail.get("lever_directives", {})
+                coord_notes = detail.get("coordination_notes", "")
+                instr_contrib = detail.get("instruction_contribution", "")
+
+                assembled_ag: dict[str, Any] = {
+                    "id": skeleton["id"],
+                    "root_cause_summary": skeleton.get("root_cause_summary", ""),
+                    "source_cluster_ids": skeleton.get("source_cluster_ids", []),
+                    "affected_questions": skeleton.get("affected_questions", []),
+                    "priority": skeleton.get("priority", i + 1),
+                    "lever_directives": lever_dirs,
+                    "coordination_notes": coord_notes,
+                }
+                final_ags.append(assembled_ag)
+
+                if instr_contrib:
+                    instruction_contributions.append(instr_contrib)
+
+                detail_span.set_outputs({
+                    "lever_count": len(lever_dirs),
+                    "coordination_len": len(coord_notes),
+                    "instruction_contribution_len": len(instr_contrib),
+                })
+
+        # ── Merge instruction contributions (structure-aware) ────────
+        global_guidance = triage_result.get("global_instruction_guidance", "")
+        existing_instr = metadata_snapshot.get("general_instructions", "") or ""
+
+        if instruction_contributions or global_guidance:
+            global_rewrite = _merge_structured_instructions(
+                existing=existing_instr,
+                contributions=instruction_contributions,
+                global_guidance=global_guidance,
+            )
+            if len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+                global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+                logger.warning(
+                    "Merged instruction rewrite truncated to %d chars",
+                    MAX_HOLISTIC_INSTRUCTION_CHARS,
+                )
+        else:
+            global_rewrite = ""
+
+        strategy: dict[str, Any] = {
+            "action_groups": final_ags,
+            "global_instruction_rewrite": global_rewrite,
+            "rationale": triage_result.get("rationale", ""),
+        }
+
+        span.set_outputs({
+            "action_groups_count": len(final_ags),
+            "mode": "two_phase_progressive",
+            "global_instruction_rewrite_len": len(global_rewrite),
+            "rationale": str(strategy.get("rationale", ""))[:300],
+        })
+
+        print(
+            f"\n  Strategy complete: {len(final_ags)} action group(s), "
+            f"{len(global_rewrite)} chars instruction rewrite"
+        )
+
+    return strategy
 
 
 def validate_join_spec_types(
@@ -2367,9 +4145,14 @@ def _detect_instruction_content_in_description(
 
 
 def _validate_lever5_proposals(
-    proposals: list[dict], metadata_snapshot: dict
+    proposals: list[dict],
+    metadata_snapshot: dict,
+    *,
+    spark: Any = None,
+    catalog: str = "",
+    gold_schema: str = "",
 ) -> list[dict]:
-    """Filter out empty, generic, or over-length Lever 5 proposals."""
+    """Filter out empty, generic, over-length, or hallucinated Lever 5 proposals."""
     from genie_space_optimizer.common.config import MAX_INSTRUCTION_TEXT_CHARS
 
     _tables = metadata_snapshot.get("tables") or []
@@ -2390,6 +4173,8 @@ def _validate_lever5_proposals(
         known_assets.add(name.rsplit(".", 1)[-1])
     known_assets.discard("")
 
+    id_allowlist = _build_identifier_allowlist(metadata_snapshot)
+
     valid: list[dict] = []
     for p in proposals:
         ptype = p.get("patch_type", "")
@@ -2408,13 +4193,23 @@ def _validate_lever5_proposals(
                     MAX_HOLISTIC_INSTRUCTION_CHARS, len(text),
                 )
                 continue
-            text_lower = text.lower()
-            if known_assets and not any(a in text_lower for a in known_assets):
+            _MIN_INSTRUCTION_LEN = 50
+            if len(text) < _MIN_INSTRUCTION_LEN:
                 logger.warning(
-                    "Rejecting generic rewrite_instruction (no known asset referenced): %.100s...",
-                    text,
+                    "Rejecting rewrite_instruction below minimum length (%d < %d chars)",
+                    len(text), _MIN_INSTRUCTION_LEN,
                 )
                 continue
+            found_sections = [
+                s for s in INSTRUCTION_SECTION_ORDER
+                if re.search(rf'^{re.escape(s)}:', text, re.MULTILINE)
+            ]
+            if not found_sections:
+                logger.warning(
+                    "rewrite_instruction has no recognized structured sections "
+                    "(expected ALL-CAPS headers like PURPOSE:, ASSET ROUTING:, etc.). "
+                    "Content will still be accepted but may lack structure."
+                )
             valid.append(p)
             continue
 
@@ -2444,6 +4239,29 @@ def _validate_lever5_proposals(
             if not eq or not es:
                 logger.info("Rejecting empty add_example_sql proposal")
                 continue
+
+            sql_ok, violations = _validate_sql_identifiers(es, id_allowlist)
+            if not sql_ok:
+                logger.warning(
+                    "Rejecting add_example_sql with hallucinated identifiers: %s — %.120s",
+                    violations, es,
+                )
+                continue
+
+            if spark is not None:
+                try:
+                    from genie_space_optimizer.optimization.benchmarks import validate_ground_truth_sql
+                    is_valid, err = validate_ground_truth_sql(
+                        es, spark, catalog=catalog, gold_schema=gold_schema,
+                    )
+                    if not is_valid:
+                        logger.warning(
+                            "Rejecting add_example_sql that failed EXPLAIN: %s — %.120s",
+                            err, es,
+                        )
+                        continue
+                except Exception:
+                    logger.debug("EXPLAIN validation skipped (error)", exc_info=True)
 
         valid.append(p)
 
@@ -2659,6 +4477,371 @@ def _build_provenance(cluster: dict, lever: int, patch_type: str) -> dict:
     }
 
 
+def generate_proposals_from_strategy(
+    strategy: dict,
+    action_group: dict,
+    metadata_snapshot: dict,
+    target_lever: int,
+    apply_mode: str = APPLY_MODE,
+    w: WorkspaceClient | None = None,
+    *,
+    spark: Any = None,
+    catalog: str = "",
+    gold_schema: str = "",
+) -> list[dict]:
+    """Generate proposals for a single lever guided by the holistic strategy.
+
+    Each lever acts as an *executor*: it receives the strategist's directives
+    for its action group and generates the concrete patch proposals accordingly.
+    """
+    import mlflow
+
+    proposals: list[dict] = []
+    ag_id = action_group.get("id", "AG?")
+    directives = action_group.get("lever_directives", {})
+    lever_key = str(target_lever)
+    lever_dir = directives.get(lever_key, {})
+
+    if not lever_dir and target_lever != 5:
+        return proposals
+
+    scope = _resolve_scope(target_lever, apply_mode)
+    coordination_notes = action_group.get("coordination_notes", "")
+    root_cause = action_group.get("root_cause_summary", "")
+    affected_qs = action_group.get("affected_questions", [])
+    q_fixed = len(affected_qs)
+    source_clusters = action_group.get("source_cluster_ids", [])
+
+    provenance_base = {
+        "cluster_id": ag_id,
+        "root_cause": root_cause,
+        "originating_questions": [],
+        "lever": target_lever,
+        "lever_name": _LEVER_NAMES.get(target_lever, f"Lever {target_lever}"),
+        "patch_type": "",
+    }
+
+    with mlflow.start_span(name=f"generate_proposals_lever_{target_lever}_ag_{ag_id}") as span:
+        span.set_inputs({
+            "action_group_id": ag_id,
+            "target_lever": target_lever,
+            "directives_keys": list(lever_dir.keys()) if isinstance(lever_dir, dict) else [],
+        })
+
+        # ── Lever 1 / 2: table + column metadata ────────────────────────
+        if target_lever in (1, 2):
+            for tbl_entry in lever_dir.get("tables", []):
+                if not isinstance(tbl_entry, dict):
+                    continue
+                tbl = tbl_entry.get("table", "")
+                tbl_sections = tbl_entry.get("sections", {})
+                tbl_etype = tbl_entry.get("entity_type", "table")
+                if tbl and isinstance(tbl_sections, dict) and tbl_sections:
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": ag_id,
+                        "lever": target_lever,
+                        "scope": scope,
+                        "patch_type": "update_description",
+                        "change_description": f"[{ag_id}] Update table {tbl} sections={list(tbl_sections.keys())}",
+                        "proposed_value": "",
+                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(target_lever, DUAL_PERSIST_PATHS[5]),
+                        "confidence": 0.85,
+                        "questions_fixed": q_fixed,
+                        "questions_at_risk": 0,
+                        "net_impact": max(q_fixed * 0.85, 1.0),
+                        "asi": {
+                            "failure_type": root_cause,
+                            "blame_set": source_clusters,
+                            "severity": "major",
+                            "counterfactual_fixes": [],
+                            "ambiguity_detected": False,
+                        },
+                        "provenance": {**provenance_base, "patch_type": "update_description"},
+                        "table": tbl,
+                        "table_sections": tbl_sections,
+                        "table_entity_type": tbl_etype,
+                    })
+
+            for col_entry in lever_dir.get("columns", []):
+                if not isinstance(col_entry, dict):
+                    continue
+                tbl = col_entry.get("table", "")
+                col = col_entry.get("column", "")
+                col_sections = col_entry.get("sections", {})
+                col_etype = col_entry.get("entity_type", "")
+                if tbl and col and isinstance(col_sections, dict) and col_sections:
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": ag_id,
+                        "lever": target_lever,
+                        "scope": scope,
+                        "patch_type": "update_column_description",
+                        "change_description": f"[{ag_id}] Update {tbl}.{col} sections={list(col_sections.keys())}",
+                        "proposed_value": "",
+                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(target_lever, DUAL_PERSIST_PATHS[5]),
+                        "confidence": 0.85,
+                        "questions_fixed": q_fixed,
+                        "questions_at_risk": 0,
+                        "net_impact": max(q_fixed * 0.85, 1.0),
+                        "asi": {
+                            "failure_type": root_cause,
+                            "blame_set": source_clusters,
+                            "severity": "major",
+                            "counterfactual_fixes": [],
+                            "ambiguity_detected": False,
+                        },
+                        "provenance": {**provenance_base, "patch_type": "update_column_description"},
+                        "table": tbl,
+                        "column": col,
+                        "column_sections": col_sections,
+                        "column_entity_type": col_etype,
+                    })
+
+        # ── Lever 3: functions ───────────────────────────────────────────
+        elif target_lever == 3:
+            for fn_entry in lever_dir.get("functions", []):
+                if not isinstance(fn_entry, dict):
+                    continue
+                fn_name = fn_entry.get("function", "")
+                fn_sections = fn_entry.get("sections", {})
+                if fn_name and isinstance(fn_sections, dict) and fn_sections:
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": ag_id,
+                        "lever": 3,
+                        "scope": scope,
+                        "patch_type": "update_function_description",
+                        "change_description": f"[{ag_id}] Update function {fn_name} sections={list(fn_sections.keys())}",
+                        "proposed_value": "",
+                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(3, DUAL_PERSIST_PATHS[5]),
+                        "confidence": 0.85,
+                        "questions_fixed": q_fixed,
+                        "questions_at_risk": 0,
+                        "net_impact": max(q_fixed * 0.85, 1.0),
+                        "asi": {
+                            "failure_type": root_cause,
+                            "blame_set": source_clusters,
+                            "severity": "major",
+                            "counterfactual_fixes": [],
+                            "ambiguity_detected": False,
+                        },
+                        "provenance": {**provenance_base, "patch_type": "update_function_description"},
+                        "function": fn_name,
+                        "function_sections": fn_sections,
+                    })
+
+        # ── Lever 4: join specs ──────────────────────────────────────────
+        elif target_lever == 4:
+            for js_entry in lever_dir.get("join_specs", []):
+                if not isinstance(js_entry, dict):
+                    continue
+                left_table = js_entry.get("left_table", "")
+                right_table = js_entry.get("right_table", "")
+                guidance = js_entry.get("join_guidance", "")
+                if left_table and right_table:
+                    join_spec = {
+                        "left": {"identifier": left_table},
+                        "right": {"identifier": right_table},
+                        "sql": [guidance] if guidance else [],
+                    }
+                    valid, reason = validate_join_spec_types(join_spec, metadata_snapshot)
+                    if not valid:
+                        logger.info("[%s] Join spec rejected (type mismatch): %s", ag_id, reason)
+                        continue
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": ag_id,
+                        "lever": 4,
+                        "scope": "genie_config",
+                        "patch_type": "add_join_spec",
+                        "change_description": f"[{ag_id}] Join: {left_table} ↔ {right_table}",
+                        "proposed_value": "",
+                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "join_spec": join_spec,
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(4, DUAL_PERSIST_PATHS[5]),
+                        "confidence": 0.8,
+                        "questions_fixed": q_fixed,
+                        "questions_at_risk": 0,
+                        "net_impact": max(q_fixed * 0.8, 1.0),
+                        "asi": {
+                            "failure_type": root_cause,
+                            "blame_set": source_clusters,
+                            "severity": "major",
+                            "counterfactual_fixes": [],
+                            "ambiguity_detected": False,
+                        },
+                        "provenance": {**provenance_base, "patch_type": "add_join_spec"},
+                    })
+
+            discovery_hints = discover_join_candidates(metadata_snapshot)
+            if discovery_hints:
+                discovery_specs = _call_llm_for_join_discovery(
+                    metadata_snapshot, discovery_hints, w=w,
+                )
+                for spec_result in discovery_specs:
+                    join_spec = spec_result.get("join_spec")
+                    if not isinstance(join_spec, dict):
+                        continue
+                    valid, reason = validate_join_spec_types(join_spec, metadata_snapshot)
+                    if not valid:
+                        logger.info("[%s] Discovery join rejected: %s", ag_id, reason)
+                        continue
+                    left_obj = join_spec.get("left", {})
+                    right_obj = join_spec.get("right", {})
+                    left_id = left_obj.get("identifier", "") if isinstance(left_obj, dict) else ""
+                    right_id = right_obj.get("identifier", "") if isinstance(right_obj, dict) else ""
+                    sql_parts = join_spec.get("sql", [])
+                    condition = sql_parts[0] if sql_parts else ""
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": f"{ag_id}_DISC_{len(proposals) + 1:03d}",
+                        "lever": 4,
+                        "scope": "genie_config",
+                        "patch_type": "add_join_spec",
+                        "change_description": f"[{ag_id}] Discover join: {condition}" if condition else f"[{ag_id}] Join: {left_id} ↔ {right_id}",
+                        "proposed_value": "",
+                        "rationale": spec_result.get("rationale", "LLM-assisted join discovery"),
+                        "join_spec": join_spec,
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(4, DUAL_PERSIST_PATHS[5]),
+                        "confidence": 0.7,
+                        "questions_fixed": 0,
+                        "questions_at_risk": 0,
+                        "net_impact": 0.35,
+                        "asi": {
+                            "failure_type": "missing_join_spec",
+                            "blame_set": [],
+                            "severity": "minor",
+                            "counterfactual_fixes": [],
+                            "ambiguity_detected": False,
+                        },
+                    })
+
+        # ── Lever 5: instructions + example SQL ──────────────────────────
+        elif target_lever == 5:
+            global_rewrite = strategy.get("global_instruction_rewrite", "")
+            l5_dir = lever_dir or {}
+            instruction_guidance = l5_dir.get("instruction_guidance", "")
+            example_sql_dir = l5_dir.get("example_sql")
+
+            if global_rewrite:
+                from genie_space_optimizer.optimization.applier import _get_general_instructions
+
+                current_instructions = _get_general_instructions(
+                    metadata_snapshot.get("config") or metadata_snapshot
+                )
+                proposals.append({
+                    "proposal_id": f"P{len(proposals) + 1:03d}",
+                    "cluster_id": ag_id,
+                    "lever": 5,
+                    "scope": "genie_config",
+                    "patch_type": "rewrite_instruction",
+                    "change_description": f"[{ag_id}] Holistic instruction rewrite ({len(global_rewrite)} chars)",
+                    "proposed_value": global_rewrite,
+                    "old_value": current_instructions,
+                    "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                    "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                    "confidence": 0.85,
+                    "questions_fixed": q_fixed,
+                    "questions_at_risk": 0,
+                    "net_impact": max(q_fixed * 0.85, 1.0),
+                    "asi": {
+                        "failure_type": "missing_instruction",
+                        "blame_set": source_clusters,
+                        "severity": "major",
+                        "counterfactual_fixes": [],
+                        "ambiguity_detected": False,
+                    },
+                    "provenance": {**provenance_base, "patch_type": "rewrite_instruction"},
+                })
+
+            if isinstance(example_sql_dir, dict):
+                eq = (example_sql_dir.get("question") or "").strip()
+                es = (example_sql_dir.get("sql_sketch") or "").strip()
+                if eq and es:
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": f"{ag_id}_EX",
+                        "lever": 5,
+                        "scope": "genie_config",
+                        "patch_type": "add_example_sql",
+                        "change_description": f"[{ag_id}] Example SQL: {eq[:80]}",
+                        "proposed_value": eq,
+                        "example_question": eq,
+                        "example_sql": es,
+                        "parameters": example_sql_dir.get("parameters", []),
+                        "usage_guidance": example_sql_dir.get("usage_guidance", ""),
+                        "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                        "confidence": 0.8,
+                        "questions_fixed": 1,
+                        "questions_at_risk": 0,
+                        "net_impact": 0.8,
+                        "asi": {
+                            "failure_type": "asset_routing_error",
+                            "blame_set": source_clusters,
+                            "severity": "major",
+                            "counterfactual_fixes": [],
+                            "ambiguity_detected": False,
+                        },
+                        "provenance": {**provenance_base, "patch_type": "add_example_sql"},
+                    })
+
+        # ── Example SQL from any lever ────────────────────────────────────
+        if target_lever != 5 and isinstance(lever_dir, dict):
+            ex_sql = lever_dir.get("example_sql")
+            if isinstance(ex_sql, dict):
+                eq = (ex_sql.get("question") or "").strip()
+                es = (ex_sql.get("sql_sketch") or "").strip()
+                if eq and es:
+                    proposals.append({
+                        "proposal_id": f"P{len(proposals) + 1:03d}",
+                        "cluster_id": f"{ag_id}_L{target_lever}_EX",
+                        "lever": 5,
+                        "scope": "genie_config",
+                        "patch_type": "add_example_sql",
+                        "change_description": f"[{ag_id}] Lever {target_lever} example SQL: {eq[:80]}",
+                        "proposed_value": eq,
+                        "example_question": eq,
+                        "example_sql": es,
+                        "parameters": ex_sql.get("parameters", []),
+                        "usage_guidance": ex_sql.get("usage_guidance", ""),
+                        "rationale": f"Example SQL from lever {target_lever}: {root_cause}",
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                        "confidence": 0.75,
+                        "questions_fixed": 1,
+                        "questions_at_risk": 0,
+                        "net_impact": 0.75,
+                        "asi": {
+                            "failure_type": "asset_routing_error",
+                            "blame_set": source_clusters,
+                            "severity": "major",
+                            "counterfactual_fixes": [],
+                            "ambiguity_detected": False,
+                        },
+                        "provenance": {**provenance_base, "patch_type": "add_example_sql"},
+                    })
+
+        proposals = _validate_lever5_proposals(
+            proposals, metadata_snapshot,
+            spark=spark, catalog=catalog, gold_schema=gold_schema,
+        )
+        proposals = _deduplicate_proposals(proposals)
+        proposals = _filter_no_op_proposals(proposals, metadata_snapshot)
+        proposals.sort(key=lambda p: p.get("net_impact", 0), reverse=True)
+
+        span.set_outputs({"proposal_count": len(proposals)})
+        logger.info(
+            "[%s] Lever %d generated %d proposal(s) from strategy directives",
+            ag_id, target_lever, len(proposals),
+        )
+
+    return proposals
+
+
 def generate_metadata_proposals(
     clusters: list[dict],
     metadata_snapshot: dict,
@@ -2667,6 +4850,10 @@ def generate_metadata_proposals(
     w: WorkspaceClient | None = None,
     failed_levers: set[int] | None = None,
     lever_changes: list[dict] | None = None,
+    *,
+    spark: Any = None,
+    catalog: str = "",
+    gold_schema: str = "",
 ) -> list[dict]:
     """Generate metadata change proposals from failure clusters.
 
@@ -2717,6 +4904,8 @@ def generate_metadata_proposals(
         )
 
         instruction_text = holistic_result.get("instruction_text", "")
+        if instruction_text:
+            instruction_text = _sanitize_plaintext_instructions(instruction_text)
         example_proposals = holistic_result.get("example_sql_proposals", [])
         rationale = holistic_result.get("rationale", "")
 
@@ -2797,7 +4986,10 @@ def generate_metadata_proposals(
                 },
             })
 
-        proposals = _validate_lever5_proposals(proposals, metadata_snapshot)
+        proposals = _validate_lever5_proposals(
+            proposals, metadata_snapshot,
+            spark=spark, catalog=catalog, gold_schema=gold_schema,
+        )
         _pre_dedup_p = len(proposals)
         proposals = _deduplicate_proposals(proposals)
         if len(proposals) < _pre_dedup_p:
@@ -2939,6 +5131,39 @@ def generate_metadata_proposals(
                         "column_synonyms": syns,
                         **extra_fields,
                     })
+
+            for tbl_change in llm_result.get("table_changes") or []:
+                if not isinstance(tbl_change, dict):
+                    continue
+                tbl = tbl_change.get("table", "")
+                if not tbl:
+                    continue
+                tbl_sections = tbl_change.get("sections")
+                if not isinstance(tbl_sections, dict) or not tbl_sections:
+                    continue
+                tbl_etype = tbl_change.get("entity_type", "table")
+                change_desc = f"Update table {tbl} sections={list(tbl_sections.keys())}"
+                proposals.append({
+                    "proposal_id": f"P{len(proposals) + 1:03d}",
+                    "cluster_id": cluster["cluster_id"],
+                    "lever": lever,
+                    "scope": scope,
+                    "patch_type": "update_description",
+                    "change_description": change_desc,
+                    "proposed_value": "",
+                    "rationale": rationale,
+                    "dual_persistence": DUAL_PERSIST_PATHS.get(lever, DUAL_PERSIST_PATHS[5]),
+                    "confidence": confidence,
+                    "questions_fixed": q_fixed,
+                    "questions_at_risk": 0,
+                    "net_impact": net_impact,
+                    "asi": asi_block,
+                    "provenance": _build_provenance(cluster, lever, "update_description"),
+                    "table": tbl,
+                    "table_sections": tbl_sections,
+                    "table_entity_type": tbl_etype,
+                    **extra_fields,
+                })
         else:
             proposed_value = (
                 llm_result.get("proposed_value")
@@ -2968,7 +5193,14 @@ def generate_metadata_proposals(
             proposals.append(proposal)
 
     if target_lever == 4:
-        discovery_hints = discover_join_candidates(metadata_snapshot)
+        soft_clusters_for_joins = [
+            c for c in clusters
+            if c.get("source") == "soft_signal" or c.get("is_soft_signal")
+        ]
+        discovery_hints = discover_join_candidates(
+            metadata_snapshot,
+            soft_signal_clusters=soft_clusters_for_joins or None,
+        )
         if discovery_hints:
             discovery_specs = _call_llm_for_join_discovery(
                 metadata_snapshot, discovery_hints, w=w,
@@ -3014,7 +5246,10 @@ def generate_metadata_proposals(
                     },
                 })
 
-    proposals = _validate_lever5_proposals(proposals, metadata_snapshot)
+    proposals = _validate_lever5_proposals(
+        proposals, metadata_snapshot,
+        spark=spark, catalog=catalog, gold_schema=gold_schema,
+    )
     _pre_dedup_p = len(proposals)
     proposals = _deduplicate_proposals(proposals)
     if len(proposals) < _pre_dedup_p:

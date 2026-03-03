@@ -70,10 +70,13 @@ from genie_space_optimizer.optimization.models import (
     promote_best_model,
 )
 from genie_space_optimizer.optimization.optimizer import (
+    _enrich_blank_descriptions,
+    _generate_holistic_strategy,
     cluster_failures,
     detect_regressions,
     enrich_metadata_with_uc_types,
     generate_metadata_proposals,
+    generate_proposals_from_strategy,
 )
 from genie_space_optimizer.optimization.preflight import run_preflight
 from genie_space_optimizer.optimization.repeatability import run_repeatability_test
@@ -445,6 +448,175 @@ def _run_prompt_matching_setup(
             catalog=catalog, schema=schema,
         )
         return {"format_assistance_count": 0, "entity_matching_count": 0, "total_changes": 0}
+
+
+# ── Stage 2.75: PROACTIVE DESCRIPTION ENRICHMENT ───────────────────
+
+
+def _run_description_enrichment(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    config: dict,
+    metadata_snapshot: dict,
+    catalog: str,
+    schema: str,
+) -> dict:
+    """Stage 2.75: Generate structured descriptions for blank columns.
+
+    Runs after UC type enrichment and before the strategist.  Targets only
+    columns that have NO description in both the Genie Space and Unity Catalog.
+    Applies patches via update_sections with lever=0 (pre-optimization).
+
+    Returns summary dict with ``total_eligible``, ``total_enriched``, and
+    ``total_skipped``.
+    """
+    from genie_space_optimizer.common.genie_client import (
+        fetch_space_config,
+        patch_space_config,
+    )
+    from genie_space_optimizer.optimization.structured_metadata import (
+        entity_type_for_column,
+        update_sections,
+    )
+
+    write_stage(
+        spark, run_id, "DESCRIPTION_ENRICHMENT", "STARTED",
+        task_key="description_enrichment", catalog=catalog, schema=schema,
+    )
+
+    result = {"total_eligible": 0, "total_enriched": 0, "total_skipped": 0}
+
+    try:
+        patches = _enrich_blank_descriptions(metadata_snapshot, w)
+        result["total_eligible"] = len(patches)
+
+        if not patches:
+            print(
+                f"\n-- DESCRIPTION ENRICHMENT " + "-" * 27 + "\n"
+                f"  Eligible columns: 0\n"
+                f"  No columns need proactive descriptions.\n"
+                + "-" * 52
+            )
+            write_stage(
+                spark, run_id, "DESCRIPTION_ENRICHMENT", "COMPLETE",
+                task_key="description_enrichment",
+                detail=result, catalog=catalog, schema=schema,
+            )
+            return result
+
+        ds = metadata_snapshot.get("data_sources", {})
+        if not isinstance(ds, dict):
+            ds = {}
+        tables = metadata_snapshot.get("tables", []) or ds.get("tables", [])
+        mvs = metadata_snapshot.get("metric_views", []) or ds.get("metric_views", [])
+        all_objects = list(tables) + list(mvs)
+        tbl_lookup: dict[str, dict] = {}
+        for tbl in all_objects:
+            if isinstance(tbl, dict):
+                ident = tbl.get("identifier", "") or tbl.get("name", "")
+                tbl_lookup[ident] = tbl
+
+        enriched = 0
+        skipped = 0
+
+        for patch in patches:
+            tbl_id = patch["table"]
+            col_name = patch["column"]
+            sections = patch.get("structured_sections", {})
+            etype = patch.get("column_entity_type", "")
+
+            tbl = tbl_lookup.get(tbl_id)
+            if not tbl:
+                logger.warning("Description enrichment: table %s not found — skipping", tbl_id)
+                skipped += 1
+                continue
+
+            cols = tbl.get("column_configs", tbl.get("columns", []))
+            cc = None
+            for c in cols:
+                if isinstance(c, dict) and (c.get("column_name", c.get("name", "")) == col_name):
+                    cc = c
+                    break
+
+            if cc is None:
+                logger.warning(
+                    "Description enrichment: column %s.%s not found — skipping", tbl_id, col_name,
+                )
+                skipped += 1
+                continue
+
+            if not etype:
+                data_type = cc.get("data_type", "")
+                etype = entity_type_for_column(col_name, data_type)
+
+            try:
+                new_desc = update_sections(
+                    cc.get("description"),
+                    sections,
+                    lever=0,
+                    entity_type=etype,
+                )
+                cc["description"] = new_desc
+                enriched += 1
+            except Exception:
+                logger.warning(
+                    "Description enrichment: failed to apply sections for %s.%s",
+                    tbl_id, col_name, exc_info=True,
+                )
+                skipped += 1
+
+        result["total_enriched"] = enriched
+        result["total_skipped"] = skipped
+
+        if enriched > 0:
+            parsed = config.get("_parsed_space", config)
+            patch_space_config(w, space_id, parsed)
+
+            for idx, patch in enumerate(patches[:enriched]):
+                write_patch(
+                    spark, run_id, 0, 0, idx,
+                    {
+                        "patch_type": "proactive_description_enrichment",
+                        "scope": "genie_config",
+                        "risk_level": "low",
+                        "target_object": f"{patch['table']}.{patch['column']}",
+                        "patch": patch,
+                        "command": None,
+                        "rollback": None,
+                        "proposal_id": "description_enrichment",
+                    },
+                    catalog, schema,
+                )
+
+        print(
+            f"\n-- DESCRIPTION ENRICHMENT " + "-" * 27 + "\n"
+            f"  Eligible columns: {len(patches)}\n"
+            f"  Enriched: {enriched}\n"
+            f"  Skipped: {skipped}\n"
+            f"  Genie Space API PATCH sent: {'YES' if enriched > 0 else 'NO'}\n"
+            + "-" * 52
+        )
+
+        write_stage(
+            spark, run_id, "DESCRIPTION_ENRICHMENT", "COMPLETE",
+            task_key="description_enrichment",
+            detail=result, catalog=catalog, schema=schema,
+        )
+
+        return result
+
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("DESCRIPTION_ENRICHMENT FAILED for run %s", run_id)
+        write_stage(
+            spark, run_id, "DESCRIPTION_ENRICHMENT", "FAILED",
+            task_key="description_enrichment",
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        return result
 
 
 # ── Stage 2.5b: PREPARE LEVER LOOP ──────────────────────────────────
@@ -907,6 +1079,291 @@ def _analyze_and_distribute(
     }
 
 
+def _run_gate_checks(
+    *,
+    spark: Any,
+    w: WorkspaceClient,
+    run_id: str,
+    space_id: str,
+    exp_name: str,
+    domain: str,
+    iteration_counter: int,
+    ag_id: str,
+    benchmarks: list[dict],
+    proposals: list[dict],
+    patches: list[dict],
+    apply_log: dict,
+    clusters: list[dict],
+    metadata_snapshot: dict,
+    predict_fn: Any,
+    scorers: list,
+    prev_model_id: str,
+    best_scores: dict[str, float],
+    best_accuracy: float,
+    catalog: str,
+    schema: str,
+    reference_sqls: dict[str, str],
+    noise_floor: float,
+) -> dict:
+    """Run slice → P0 → full eval gate sequence for an action group.
+
+    Returns a dict with:
+      - ``passed``: bool
+      - ``full_scores``: dict (only if full eval ran)
+      - ``full_accuracy``: float (only if full eval ran)
+      - ``new_model_id``: str (only if full eval ran)
+      - ``full_result``: dict (only if full eval ran)
+      - ``rollback_reason``: str (only if failed)
+    """
+    import mlflow
+
+    uc_schema = f"{catalog}.{schema}"
+
+    has_dict_changes = any(
+        (entry.get("patch", {}) or {}).get("enable_entity_matching")
+        or (entry.get("action", {}) or {}).get("type") in (
+            "enable_value_dictionary", "enable_entity_matching",
+        )
+        for entry in apply_log.get("applied", [])
+    )
+    wait_time = (
+        PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS if has_dict_changes
+        else PROPAGATION_WAIT_SECONDS
+    )
+    _wait_note = " (extended for value dictionary rebuild)" if has_dict_changes else ""
+    patched_objects = apply_log.get("patched_objects", [])
+    print(
+        _section("Propagation Wait", "-") + "\n"
+        + _kv("AG", f"{ag_id}: {len(apply_log.get('applied', []))} patches applied") + "\n"
+        + _kv("Patched objects", ", ".join(str(o) for o in patched_objects) if patched_objects else "(none)") + "\n"
+        + _kv("Wait time", f"{wait_time}s{_wait_note}") + "\n"
+        + _bar("-")
+    )
+    time.sleep(wait_time)
+
+    # ── Slice gate ────────────────────────────────────────────────────
+    try:
+        mlflow.end_run()
+    except Exception:
+        pass
+    affected_qids: set[str] = set()
+    for p in proposals:
+        cid = p.get("cluster_id", "")
+        for c in clusters:
+            if c.get("cluster_id") == cid:
+                affected_qids.update(c.get("question_ids", []))
+    slice_benchmarks = filter_benchmarks_by_scope(
+        benchmarks, "slice", patched_objects,
+        affected_question_ids=affected_qids,
+    )
+    if slice_benchmarks:
+        _ensure_sql_context(spark, catalog, schema)
+        write_stage(
+            spark, run_id, f"AG_{ag_id}_SLICE_EVAL", "STARTED",
+            task_key="lever_loop", iteration=iteration_counter,
+            catalog=catalog, schema=schema,
+        )
+        slice_result = run_evaluation(
+            space_id, exp_name, iteration_counter, slice_benchmarks,
+            domain, prev_model_id, "slice",
+            predict_fn, scorers,
+            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+            patched_objects=patched_objects,
+            reference_sqls=reference_sqls if reference_sqls else None,
+        )
+        slice_scores = slice_result.get("scores", {})
+        effective_slice_tol = max(SLICE_GATE_TOLERANCE, noise_floor + 2.0)
+        slice_drops = detect_regressions(
+            slice_scores, best_scores, threshold=effective_slice_tol,
+        )
+
+        if slice_drops:
+            _score_changes = ", ".join(
+                f"{d['judge']} {best_scores.get(d['judge'], 0):.1f}->{slice_scores.get(d['judge'], 0):.1f} ({d['drop']:+.1f})"
+                for d in slice_drops
+            )
+            print(
+                _section(f"SLICE GATE [{ag_id}]: FAIL", "-") + "\n"
+                + _kv("Regressions", _score_changes) + "\n"
+                + _kv("Action", "ROLLBACK") + "\n"
+                + _bar("-")
+            )
+            try:
+                update_provenance_gate(
+                    spark, run_id, iteration_counter, 0,
+                    "slice", "rollback",
+                    {"regressions": [{"judge": d["judge"], "drop": d["drop"]} for d in slice_drops]},
+                    catalog, schema,
+                )
+            except Exception:
+                logger.debug("Failed to update provenance gate", exc_info=True)
+            try:
+                log_gate_feedback_on_traces(
+                    slice_result, "slice", "rollback",
+                    regressions=slice_drops, lever=0, iteration=iteration_counter,
+                )
+            except Exception:
+                logger.debug("Failed to log gate feedback", exc_info=True)
+            return {"passed": False, "rollback_reason": f"slice_gate: {slice_drops[0]['judge']}"}
+        else:
+            _sc = ", ".join(
+                f"{j} {best_scores.get(j, 0):.1f}->{slice_scores.get(j, 0):.1f}"
+                for j in sorted(slice_scores)
+            )
+            print(
+                _section(f"SLICE GATE [{ag_id}]: PASS", "-") + "\n"
+                + _kv("Score changes", _sc) + "\n"
+                + _bar("-")
+            )
+
+    # ── P0 gate ───────────────────────────────────────────────────────
+    try:
+        mlflow.end_run()
+    except Exception:
+        pass
+    p0_benchmarks = filter_benchmarks_by_scope(benchmarks, "p0")
+    if p0_benchmarks:
+        _ensure_sql_context(spark, catalog, schema)
+        p0_result = run_evaluation(
+            space_id, exp_name, iteration_counter, p0_benchmarks,
+            domain, prev_model_id, "p0",
+            predict_fn, scorers,
+            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+            reference_sqls=reference_sqls if reference_sqls else None,
+        )
+        p0_failures = p0_result.get("failures", [])
+        if p0_failures:
+            print(
+                _section(f"P0 GATE [{ag_id}]: FAIL", "-") + "\n"
+                + _kv("P0 questions failing", len(p0_failures)) + "\n"
+                + _kv("Action", "ROLLBACK") + "\n"
+                + _bar("-")
+            )
+            return {"passed": False, "rollback_reason": f"p0_gate: {len(p0_failures)} failures"}
+        else:
+            print(
+                _section(f"P0 GATE [{ag_id}]: PASS", "-") + "\n"
+                + _kv("P0 benchmarks", len(p0_benchmarks)) + "\n"
+                + _bar("-")
+            )
+
+    # ── Full evaluation ───────────────────────────────────────────────
+    try:
+        mlflow.end_run()
+    except Exception:
+        pass
+    write_stage(
+        spark, run_id, f"AG_{ag_id}_FULL_EVAL", "STARTED",
+        task_key="lever_loop", iteration=iteration_counter,
+        catalog=catalog, schema=schema,
+    )
+
+    new_model_id = create_genie_model_version(
+        w, space_id, metadata_snapshot, iteration_counter, domain,
+        experiment_name=exp_name,
+        uc_schema=uc_schema,
+        patch_set=patches,
+        parent_model_id=prev_model_id,
+    )
+
+    _ensure_sql_context(spark, catalog, schema)
+    full_result = run_evaluation(
+        space_id, exp_name, iteration_counter, benchmarks,
+        domain, new_model_id, "full",
+        predict_fn, scorers,
+        spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+        reference_sqls=reference_sqls if reference_sqls else None,
+    )
+
+    full_scores = full_result.get("scores", {})
+    full_accuracy = full_result.get("overall_accuracy", 0.0)
+
+    write_iteration(
+        spark, run_id, iteration_counter, full_result,
+        catalog=catalog, schema=schema,
+        lever=0, eval_scope="full", model_id=new_model_id,
+    )
+
+    effective_regression_tol = max(REGRESSION_THRESHOLD, noise_floor)
+    regressions = detect_regressions(
+        full_scores, best_scores, threshold=effective_regression_tol,
+    )
+
+    accuracy_drop = best_accuracy - full_accuracy
+    accuracy_threshold = max(effective_regression_tol / 2, noise_floor)
+    if accuracy_drop > accuracy_threshold:
+        regressions.append({
+            "judge": "overall_accuracy",
+            "previous": best_accuracy,
+            "current": full_accuracy,
+            "drop": accuracy_drop,
+        })
+
+    if regressions:
+        _reg_details = ", ".join(
+            f"{r['judge']} {best_scores.get(r['judge'], 0):.1f}->{full_scores.get(r['judge'], 0):.1f} ({r['drop']:+.1f})"
+            for r in regressions
+        )
+        print(
+            _section(f"FULL EVAL [{ag_id}]: FAIL (REGRESSION)", "-") + "\n"
+            + _kv("Accuracy", f"{best_accuracy:.1f}% -> {full_accuracy:.1f}%") + "\n"
+            + _kv("Regressions", _reg_details) + "\n"
+            + _kv("Action", "ROLLBACK") + "\n"
+            + _bar("-")
+        )
+        try:
+            update_provenance_gate(
+                spark, run_id, iteration_counter, 0,
+                "full", "rollback",
+                {"regressions": [{"judge": r["judge"], "drop": r["drop"]} for r in regressions]},
+                catalog, schema,
+            )
+        except Exception:
+            logger.debug("Failed to update provenance gate (full rollback)", exc_info=True)
+        try:
+            log_gate_feedback_on_traces(
+                full_result, "full", "rollback",
+                regressions=regressions, lever=0, iteration=iteration_counter,
+            )
+        except Exception:
+            logger.debug("Failed to log full eval gate feedback", exc_info=True)
+        return {"passed": False, "rollback_reason": f"full_eval: {regressions[0]['judge']}"}
+
+    # ── PASSED ────────────────────────────────────────────────────────
+    _score_delta = ", ".join(
+        f"{j} {best_scores.get(j, 0):.1f}->{full_scores.get(j, 0):.1f}"
+        for j in sorted(full_scores)
+    )
+    print(
+        _section(f"FULL EVAL [{ag_id}]: PASS -- ACCEPTED", "=") + "\n"
+        + _kv("Accuracy", f"{best_accuracy:.1f}% -> {full_accuracy:.1f}% ({full_accuracy - best_accuracy:+.1f}%)") + "\n"
+        + _kv("Score changes", _score_delta) + "\n"
+        + _bar("=")
+    )
+    try:
+        update_provenance_gate(
+            spark, run_id, iteration_counter, 0,
+            "full", "pass", None, catalog, schema,
+        )
+    except Exception:
+        logger.debug("Failed to update provenance gate (full pass)", exc_info=True)
+    try:
+        log_gate_feedback_on_traces(
+            full_result, "full", "pass",
+            lever=0, iteration=iteration_counter,
+        )
+    except Exception:
+        logger.debug("Failed to log full eval gate feedback", exc_info=True)
+
+    return {
+        "passed": True,
+        "full_scores": full_scores,
+        "full_accuracy": full_accuracy,
+        "new_model_id": new_model_id,
+        "full_result": full_result,
+    }
+
+
 def _run_lever_loop(
     w: WorkspaceClient,
     spark: SparkSession,
@@ -981,6 +1438,18 @@ def _run_lever_loop(
     if uc_columns:
         enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
+    # Stage 2.75: Proactive description enrichment for blank columns
+    enrichment_result = _run_description_enrichment(
+        w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+    )
+    if enrichment_result.get("total_enriched", 0) > 0:
+        from genie_space_optimizer.common.genie_client import fetch_space_config
+        config = fetch_space_config(w, space_id)
+        config["_uc_columns"] = uc_columns
+        metadata_snapshot = config.get("_parsed_space", config)
+        if uc_columns:
+            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
     baseline_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
     reference_sqls: dict[str, str] = {}
     if baseline_iter:
@@ -1054,86 +1523,108 @@ def _run_lever_loop(
     except Exception:
         logger.debug("Failed to write provenance rows", exc_info=True)
 
-    for lever in levers:
-        if lever <= start_lever:
-            continue
+    # ═══════════════════════════════════════════════════════════════════
+    # PHASE 1: Holistic Strategist
+    # ═══════════════════════════════════════════════════════════════════
+    print(_section("PHASE 1: HOLISTIC STRATEGIST", "="))
+    strategy = _generate_holistic_strategy(
+        clusters=clusters,
+        soft_signal_clusters=soft_signal_clusters,
+        metadata_snapshot=metadata_snapshot,
+        w=w,
+    )
+    action_groups = strategy.get("action_groups", [])
+    action_groups.sort(key=lambda a: a.get("priority", 999))
+
+    if not action_groups:
+        print(
+            _section("Strategy produced 0 action groups — nothing to do", "-") + "\n"
+            + _bar("-")
+        )
+        logger.info("Strategist returned 0 action groups — lever loop ending early")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PHASE 2 + 3: Execute Action Groups with Gating
+    # ═══════════════════════════════════════════════════════════════════
+    ags_attempted: list[str] = []
+    ags_accepted: list[str] = []
+    ags_rolled_back: list[str] = []
+    noise_floor = 100.0 / max(len(benchmarks), 1)
+    global_rewrite_applied = False
+
+    for ag in action_groups:
+        ag_id = ag.get("id", f"AG{len(ags_attempted) + 1}")
 
         if all_thresholds_met(best_scores, thresholds):
-            logger.info("Convergence: all thresholds met at lever %d", lever)
+            logger.info("Convergence: all thresholds met before AG %s", ag_id)
             break
-
         if iteration_counter >= max_iterations:
-            logger.info("Max iterations (%d) reached", max_iterations)
+            logger.info("Max iterations (%d) reached before AG %s", max_iterations, ag_id)
             break
 
         iteration_counter += 1
-        levers_attempted.append(lever)
-        lever_name = LEVER_NAMES.get(lever, f"Lever {lever}")
+        ags_attempted.append(ag_id)
+        lever_keys = sorted(ag.get("lever_directives", {}).keys())
 
         print(
-            _section(f"LEVER {lever}: {lever_name} -- Iteration {iteration_counter}") + "\n"
+            _section(f"ACTION GROUP {ag_id} — Iteration {iteration_counter}") + "\n"
+            + _kv("Root cause", ag.get("root_cause_summary", "?")[:120]) + "\n"
+            + _kv("Levers", ", ".join(lever_keys)) + "\n"
+            + _kv("Affected questions", len(ag.get("affected_questions", []))) + "\n"
             + _kv("Best accuracy", f"{best_accuracy:.1f}%") + "\n"
-            + _kv("Thresholds met", all_thresholds_met(best_scores, thresholds)) + "\n"
             + _scorecard(best_scores) + "\n"
             + _bar("=")
         )
 
         write_stage(
-            spark, run_id, f"LEVER_{lever}_STARTED", "STARTED",
-            task_key="lever_loop", lever=lever, iteration=iteration_counter,
+            spark, run_id, f"AG_{ag_id}_STARTED", "STARTED",
+            task_key="lever_loop", iteration=iteration_counter,
             catalog=catalog, schema=schema,
         )
 
-        # ── Use pre-computed lever assignments ─────────────────────
-        assigned = list(lever_assignments.get(lever, []))
-        _failed_lever_set = set(levers_rolled_back)
-        if lever == 5:
-            for fl in _failed_lever_set:
-                assigned.extend(lever_assignments.get(fl, []))
-
-        matching_count = len(assigned)
-        if matching_count == 0 and lever not in (4, 5):
-            print(_section(f"No clusters match lever {lever} -- SKIPPING", "-"))
-            logger.info("No clusters match lever %d — skipping", lever)
-            write_stage(
-                spark, run_id, f"LEVER_{lever}_STARTED", "SKIPPED",
-                task_key="lever_loop", lever=lever, iteration=iteration_counter,
-                detail={"reason": "no_matching_clusters"},
-                catalog=catalog, schema=schema,
+        # ── Generate proposals for ALL levers in this action group ──
+        all_proposals: list[dict] = []
+        for lever_key in lever_keys:
+            lever_int = int(lever_key)
+            levers_attempted.append(lever_int)
+            lever_proposals = generate_proposals_from_strategy(
+                strategy=strategy,
+                action_group=ag,
+                metadata_snapshot=metadata_snapshot,
+                target_lever=lever_int,
+                apply_mode=apply_mode,
+                w=w,
+                spark=spark,
+                catalog=catalog,
+                gold_schema=schema,
             )
-            continue
-        if matching_count == 0 and lever == 4:
-            print(_section("Lever 4: no failure clusters, running proactive join discovery", "-"))
-            logger.info("Lever 4: no failure clusters — proceeding with proactive join discovery")
-        if matching_count == 0 and lever == 5:
-            print(_section("Lever 5: running holistic instruction synthesis", "-"))
-            logger.info("Lever 5: no direct clusters — proceeding with holistic instruction synthesis")
+            all_proposals.extend(lever_proposals)
 
-        effective_clusters = assigned if assigned else clusters
-        if lever in (4, 5) and soft_signal_clusters:
-            effective_clusters = effective_clusters + soft_signal_clusters
-            print(
-                _kv(
-                    f"Lever {lever}: enriched with soft signals",
-                    f"{len(effective_clusters) - len(soft_signal_clusters)} hard + {len(soft_signal_clusters)} soft = {len(effective_clusters)} total clusters",
+        # Lever 5: apply global instruction rewrite only once (on first AG with L5)
+        if "5" in lever_keys and not global_rewrite_applied:
+            global_rewrite_applied = True
+        elif "5" not in lever_keys and not global_rewrite_applied:
+            gi = strategy.get("global_instruction_rewrite", "")
+            if gi and ag == action_groups[-1]:
+                l5_proposals = generate_proposals_from_strategy(
+                    strategy=strategy,
+                    action_group={**ag, "lever_directives": {**ag.get("lever_directives", {}), "5": {}}},
+                    metadata_snapshot=metadata_snapshot,
+                    target_lever=5,
+                    apply_mode=apply_mode,
+                    w=w,
+                    spark=spark,
+                    catalog=catalog,
+                    gold_schema=schema,
                 )
-            )
-            logger.info(
-                "Lever %d: enriched with %d soft-signal clusters (%d assigned + %d soft)",
-                lever, len(soft_signal_clusters), len(assigned), len(soft_signal_clusters),
-            )
+                all_proposals.extend(l5_proposals)
+                global_rewrite_applied = True
 
-        proposals = generate_metadata_proposals(
-            effective_clusters, metadata_snapshot,
-            target_lever=lever, apply_mode=apply_mode, w=w,
-            failed_levers=_failed_lever_set,
-            lever_changes=lever_changes if lever == 5 else None,
-        )
-
+        # ── Log proposals ────────────────────────────────────────────
         _n_valid = 0
         _n_failed = 0
-        proposal_lines = [_section(f"Proposals ({len(proposals)} total)", "-"), "|"]
-        for pi, p in enumerate(proposals, 1):
+        proposal_lines = [_section(f"[{ag_id}] Proposals ({len(all_proposals)} total)", "-"), "|"]
+        for pi, p in enumerate(all_proposals, 1):
             cluster_id = p.get("cluster_id", "?")
             ptype = p.get("type", p.get("patch_type", "?"))
             target = p.get("target", p.get("target_object", "")) or "(none)"
@@ -1148,31 +1639,43 @@ def _run_lever_loop(
             else:
                 _n_valid += 1
 
-            proposal_lines.append(f"|  Proposal {pi} / {len(proposals)}  [from cluster {cluster_id}]")
+            proposal_lines.append(f"|  Proposal {pi} / {len(all_proposals)}  [{cluster_id}]")
             proposal_lines.append(f"|    {'Type:':<24s} {ptype}")
-            proposal_lines.append(f"|    {'Target:':<24s} {target}")
+            proposal_lines.append(f"|    {'Lever:':<24s} {p.get('lever', '?')}")
             if table:
                 proposal_lines.append(f"|    {'Table:':<24s} {table}")
             if column:
                 proposal_lines.append(f"|    {'Column:':<24s} {column}")
             proposal_lines.append(f"|    {'Rationale:':<24s} {rationale[:200]}")
-            if proposed_value:
+            _p_col_sect = p.get("column_sections")
+            _p_tbl_sect = p.get("table_sections")
+            if isinstance(_p_col_sect, dict) and _p_col_sect:
+                proposal_lines.append(f"|    Sections proposed:")
+                for _sk, _sv in _p_col_sect.items():
+                    _sv_str = str(_sv).replace("\n", " ")
+                    proposal_lines.append(f"|      {_sk}: \"{_sv_str[:100]}\"")
+            elif isinstance(_p_tbl_sect, dict) and _p_tbl_sect:
+                proposal_lines.append(f"|    Table sections proposed:")
+                for _sk, _sv in _p_tbl_sect.items():
+                    _sv_str = str(_sv).replace("\n", " ")
+                    proposal_lines.append(f"|      {_sk}: \"{_sv_str[:100]}\"")
+            elif proposed_value:
                 _val_preview = proposed_value.replace("\n", "\\n")
                 proposal_lines.append(f"|    {'Value (preview):':<24s} {_val_preview[:300]}")
             proposal_lines.append(f"|    {'Status:':<24s} {status}")
             proposal_lines.append("|")
 
         proposal_lines.append("|  --- Summary ---")
-        proposal_lines.append(f"|    {'Valid proposals:':<24s} {_n_valid} of {len(proposals)}")
+        proposal_lines.append(f"|    {'Valid proposals:':<24s} {_n_valid} of {len(all_proposals)}")
         if _n_failed:
             proposal_lines.append(f"|    {'Failed (non-JSON):':<24s} {_n_failed}")
         proposal_lines.append(f"|    Proceeding with {_n_valid} patch(es)")
         proposal_lines.append(_bar("-"))
         print("\n".join(proposal_lines))
 
-        # ── 8e. Patch Provenance log ─────────────────────────────────
+        # ── Provenance log ───────────────────────────────────────────
         _prov_patch_lines = ["\n-- Patch Provenance " + "-" * 58]
-        for pi, p in enumerate(proposals, 1):
+        for pi, p in enumerate(all_proposals, 1):
             prov = p.get("provenance", {})
             if not prov:
                 continue
@@ -1181,358 +1684,148 @@ def _run_lever_loop(
             lv = prov.get("lever", "?")
             ln = prov.get("lever_name", "?")
             pt = prov.get("patch_type", "?")
-            _prov_patch_lines.append(f"|  Patch P{pi:03d} [cluster {cid}]  lever={lv} ({ln})  type={pt}  root_cause={rc}")
-            for qt in prov.get("originating_questions", [])[:5]:
-                qid = qt.get("question_id", "?")
-                for jt in qt.get("failed_judges", [])[:3]:
-                    snip = (jt.get("rationale_snippet") or "")[:80].replace("\n", " ")
-                    _prov_patch_lines.append(f"|    {qid}: {jt.get('judge', '?')}={jt.get('verdict', '?')} (\"{snip}\")")
+            _prov_patch_lines.append(f"|  P{pi:03d} [{cid}] lever={lv} ({ln}) type={pt} root_cause={rc}")
         _prov_patch_lines.append("-" * 78)
         print("\n".join(_prov_patch_lines))
 
-        # ── Write provenance proposal mappings to Delta ──────────────
         _prop_mappings = [
             {"cluster_id": p.get("cluster_id"), "proposal_id": p.get("proposal_id"), "patch_type": p.get("patch_type")}
-            for p in proposals if p.get("cluster_id")
+            for p in all_proposals if p.get("cluster_id")
         ]
         try:
             update_provenance_proposals(spark, run_id, iteration_counter, _prop_mappings, catalog, schema)
         except Exception:
             logger.debug("Failed to update provenance proposals", exc_info=True)
 
-        if not proposals:
-            print(_section(f"No proposals for {lever_name} -- SKIPPING lever", "-"))
-            logger.info("No proposals for %s — skipping", lever_name)
+        if not all_proposals:
+            print(_section(f"[{ag_id}] No proposals — SKIPPING action group", "-"))
             write_stage(
-                spark, run_id, f"LEVER_{lever}_STARTED", "SKIPPED",
-                task_key="lever_loop", lever=lever, iteration=iteration_counter,
+                spark, run_id, f"AG_{ag_id}_STARTED", "SKIPPED",
+                task_key="lever_loop", iteration=iteration_counter,
                 detail={"reason": "no_proposals"},
                 catalog=catalog, schema=schema,
             )
             continue
 
-        patches = proposals_to_patches(proposals)
+        # ── Apply coordinated patch set ──────────────────────────────
+        patches = proposals_to_patches(all_proposals)
         apply_log = apply_patch_set(
             w, space_id, patches, metadata_snapshot, apply_mode=apply_mode,
         )
 
         for idx, entry in enumerate(apply_log.get("applied", [])):
             write_patch(
-                spark, run_id, iteration_counter, lever, idx,
-                _build_patch_record(entry, lever, apply_mode),
+                spark, run_id, iteration_counter, 0, idx,
+                _build_patch_record(entry, 0, apply_mode),
                 catalog, schema,
             )
 
-        patched_objects = apply_log.get("patched_objects", [])
-
-        # ── Check if the PATCH was actually deployed to the Genie Space ──
         if not apply_log.get("patch_deployed", False) and apply_log.get("applied"):
             _pe = apply_log.get("patch_error", "unknown")
-            _ve = apply_log.get("validation_errors", [])
-            _fail_lines = [
-                _section("PATCH DEPLOY FAILED", "!"),
-                _kv("Lever", lever),
-                _kv("Patches prepared", len(apply_log.get("applied", []))),
-                _kv("Error", _pe[:300] if _pe else "see logs"),
-            ]
-            if _ve:
-                _fail_lines.append(_kv("Validation errors", "; ".join(str(e) for e in _ve[:5])))
-            _fail_lines.append("")
-            _fail_lines.append("|  Patches were NOT applied to the remote Genie Space.")
-            _fail_lines.append("|  Skipping slice gate and continuing to next lever.")
-            _fail_lines.append(_bar("!"))
-            print("\n".join(_fail_lines))
+            print(
+                _section(f"[{ag_id}] PATCH DEPLOY FAILED", "!") + "\n"
+                + _kv("Error", str(_pe)[:300]) + "\n"
+                + _bar("!")
+            )
             write_stage(
-                spark, run_id, f"LEVER_{lever}_PATCH_FAILED", "ERROR",
-                task_key="lever_loop", lever=lever, iteration=iteration_counter,
-                error_message=_pe[:500] if _pe else "PATCH deploy failed",
+                spark, run_id, f"AG_{ag_id}_PATCH_FAILED", "ERROR",
+                task_key="lever_loop", iteration=iteration_counter,
+                error_message=str(_pe)[:500],
                 catalog=catalog, schema=schema,
             )
             continue
 
-        # ── Applied Patches Detail ────────────────────────────────
+        # ── Applied Patches Detail ───────────────────────────────────
         _applied = apply_log.get("applied", [])
         if _applied:
-            _ap_lines = [_section(f"Applied Patches Detail ({len(_applied)} patches)", "-")]
+            _ap_lines = [_section(f"[{ag_id}] Applied Patches ({len(_applied)})", "-")]
             for ai, aentry in enumerate(_applied, 1):
                 _ap = aentry.get("patch", {})
                 _aa = aentry.get("action", {})
                 _ap_type = _ap.get("type", _aa.get("action_type", "?"))
-                _ap_target = _aa.get("target", _ap.get("target", ""))
                 _ap_table = _ap.get("table", "")
                 _ap_column = _ap.get("column", "")
                 _ap_new_text = _ap.get("new_text", "")
                 _ap_join_spec = _ap.get("join_spec")
                 _ap_example_q = _ap.get("example_question", "")
                 _ap_example_sql = _ap.get("example_sql", "")
-                _ap_lines.append(f"|")
-                _ap_lines.append(f"|  Patch {ai} / {len(_applied)}")
-                _ap_lines.append(f"|    {'Type:':<22s} {_ap_type}")
-                if _ap_target:
-                    _ap_lines.append(f"|    {'Target:':<22s} {_ap_target}")
+                _ap_lines.append(f"|  Patch {ai}: {_ap_type}")
                 if _ap_table:
-                    _ap_lines.append(f"|    {'Table:':<22s} {_ap_table}")
+                    _ap_lines.append(f"|    Table: {_ap_table}")
                 if _ap_column:
-                    _ap_lines.append(f"|    {'Column:':<22s} {_ap_column}")
-                _ap_lines.append(f"|    {'Risk:':<22s} {_ap.get('risk_level', _aa.get('risk_level', '?'))}")
-                if _ap_new_text:
-                    _val = _ap_new_text.replace("\n", "\\n")
-                    for chunk_start in range(0, len(_val), 120):
-                        chunk = _val[chunk_start:chunk_start + 120]
-                        if chunk_start == 0:
-                            _ap_lines.append(f"|    {'Value:':<22s} {chunk}")
-                        else:
-                            _ap_lines.append(f"|    {'':22s} {chunk}")
+                    _ap_lines.append(f"|    Column: {_ap_column}")
+                _ap_struct = _ap.get("structured_sections") or {}
+                if _ap_struct and isinstance(_ap_struct, dict):
+                    for _sk, _sv in _ap_struct.items():
+                        _ap_lines.append(f"|    **{_sk}:** {str(_sv).replace(chr(10), ' ')[:120]}")
+                elif _ap_new_text:
+                    _ap_lines.append(f"|    Value: {_ap_new_text.replace(chr(10), ' ')[:200]}")
+                _tbl_struct = _ap.get("table_sections") if not _ap_struct else None
+                if _tbl_struct and isinstance(_tbl_struct, dict):
+                    for _sk, _sv in _tbl_struct.items():
+                        _ap_lines.append(f"|    **{_sk}:** {str(_sv).replace(chr(10), ' ')[:120]}")
                 if _ap_example_q:
-                    _ap_lines.append(f"|    {'Example Q:':<22s} {_ap_example_q[:120]}")
+                    _ap_lines.append(f"|    Example Q: {_ap_example_q[:120]}")
                 if _ap_example_sql:
-                    _ap_lines.append(f"|    {'Example SQL:':<22s} {_ap_example_sql[:120]}")
+                    _ap_lines.append(f"|    Example SQL: {_ap_example_sql[:120]}")
                 if _ap_join_spec:
-                    _ap_lines.append(f"|    {'Join Spec:':<22s} {json.dumps(_ap_join_spec)[:200]}")
-            _ap_lines.append("|")
+                    _ap_lines.append(f"|    Join: {json.dumps(_ap_join_spec)[:200]}")
             _ap_lines.append(_bar("-"))
             print("\n".join(_ap_lines))
 
-        noise_floor = 100.0 / max(len(benchmarks), 1)
+        # ── Gate checks (slice → P0 → full eval) ────────────────────
+        gate_result = _run_gate_checks(
+            spark=spark,
+            w=w,
+            run_id=run_id,
+            space_id=space_id,
+            exp_name=exp_name,
+            domain=domain,
+            iteration_counter=iteration_counter,
+            ag_id=ag_id,
+            benchmarks=benchmarks,
+            proposals=all_proposals,
+            patches=patches,
+            apply_log=apply_log,
+            clusters=clusters,
+            metadata_snapshot=metadata_snapshot,
+            predict_fn=predict_fn,
+            scorers=scorers,
+            prev_model_id=prev_model_id,
+            best_scores=best_scores,
+            best_accuracy=best_accuracy,
+            catalog=catalog,
+            schema=schema,
+            reference_sqls=reference_sqls,
+            noise_floor=noise_floor,
+        )
 
-        has_dict_changes = any(
-            (entry.get("patch", {}) or {}).get("enable_entity_matching")
-            or (entry.get("action", {}) or {}).get("type") in (
-                "enable_value_dictionary", "enable_entity_matching",
+        if not gate_result.get("passed"):
+            reason = gate_result.get("rollback_reason", "unknown")
+            rollback(apply_log, w, space_id, metadata_snapshot)
+            mark_patches_rolled_back(
+                spark, run_id, iteration_counter, reason, catalog, schema,
             )
-            for entry in apply_log.get("applied", [])
-        )
-        wait_time = (
-            PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS if has_dict_changes
-            else PROPAGATION_WAIT_SECONDS
-        )
-        _wait_note = " (extended for value dictionary rebuild)" if has_dict_changes else ""
-        print(
-            _section("Propagation Wait", "-") + "\n"
-            + _kv("Lever", f"{lever}: {len(apply_log.get('applied', []))} patches applied") + "\n"
-            + _kv("Patched objects", ", ".join(str(o) for o in patched_objects) if patched_objects else "(none)") + "\n"
-            + _kv("Value dict changes", "YES" if has_dict_changes else "NO") + "\n"
-            + _kv("Wait time", f"{wait_time}s{_wait_note}") + "\n"
-            + _bar("-")
-        )
-        time.sleep(wait_time)
-
-        # ── Slice gate ────────────────────────────────────────────
-        import mlflow
-        try:
-            mlflow.end_run()
-        except Exception:
-            pass
-        affected_qids: set[str] = set()
-        for p in proposals:
-            cid = p.get("cluster_id", "")
-            for c in clusters:
-                if c.get("cluster_id") == cid:
-                    affected_qids.update(c.get("question_ids", []))
-        slice_benchmarks = filter_benchmarks_by_scope(
-            benchmarks, "slice", patched_objects,
-            affected_question_ids=affected_qids,
-        )
-        if slice_benchmarks:
-            _ensure_sql_context(spark, catalog, schema)
+            ags_rolled_back.append(ag_id)
+            for lk in lever_keys:
+                levers_rolled_back.append(int(lk))
             write_stage(
-                spark, run_id, f"LEVER_{lever}_SLICE_EVAL", "STARTED",
-                task_key="lever_loop", lever=lever, iteration=iteration_counter,
+                spark, run_id, f"AG_{ag_id}_STARTED", "ROLLED_BACK",
+                task_key="lever_loop", iteration=iteration_counter,
+                detail={"reason": reason},
                 catalog=catalog, schema=schema,
             )
-            slice_result = run_evaluation(
-                space_id, exp_name, iteration_counter, slice_benchmarks,
-                domain, prev_model_id, "slice",
-                predict_fn, scorers,
-                spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
-                patched_objects=patched_objects,
-                reference_sqls=reference_sqls if reference_sqls else None,
-            )
-            slice_scores = slice_result.get("scores", {})
-            effective_slice_tol = max(SLICE_GATE_TOLERANCE, noise_floor + 2.0)
-            slice_drops = detect_regressions(
-                slice_scores, best_scores, threshold=effective_slice_tol,
-            )
+            continue
 
-            if slice_drops:
-                _score_changes = ", ".join(
-                    f"{d['judge']} {best_scores.get(d['judge'], 0):.1f}->{slice_scores.get(d['judge'], 0):.1f} ({d['drop']:+.1f})"
-                    for d in slice_drops
-                )
-                _gate_lines = [
-                    _section("SLICE GATE: FAIL", "-"),
-                    _kv("Benchmarks evaluated", len(slice_benchmarks)),
-                    _kv("Regressions", _score_changes),
-                    "",
-                    "|  Patches applied in this iteration:",
-                ]
-                for p in proposals:
-                    prov = p.get("provenance", {})
-                    pid = p.get("proposal_id", "?")
-                    pt = p.get("patch_type", "?")
-                    lv = p.get("lever", "?")
-                    rc = prov.get("root_cause", "?")
-                    _gate_lines.append(f"|    {pid} ({pt}, lever {lv}): root_cause={rc}")
-                    for qt in prov.get("originating_questions", [])[:3]:
-                        judges_str = " + ".join(
-                            f"{qt.get('question_id', '?')}/{jt.get('judge', '?')}"
-                            for jt in qt.get("failed_judges", [])[:3]
-                        )
-                        if judges_str:
-                            _gate_lines.append(f"|      Originated from: {judges_str}")
-                _gate_lines.append("|")
-                _gate_lines.append(_kv("Action", "ROLLBACK"))
-                _gate_lines.append(_bar("-"))
-                print("\n".join(_gate_lines))
+        # ── Accept action group ──────────────────────────────────────
+        ags_accepted.append(ag_id)
+        for lk in lever_keys:
+            levers_accepted.append(int(lk))
 
-                try:
-                    update_provenance_gate(
-                        spark, run_id, iteration_counter, lever,
-                        "slice", "rollback",
-                        {"regressions": [{"judge": d["judge"], "drop": d["drop"]} for d in slice_drops]},
-                        catalog, schema,
-                    )
-                except Exception:
-                    logger.debug("Failed to update provenance gate", exc_info=True)
-
-                try:
-                    log_gate_feedback_on_traces(
-                        slice_result, "slice", "rollback",
-                        regressions=slice_drops, lever=lever, iteration=iteration_counter,
-                    )
-                except Exception:
-                    logger.debug("Failed to log gate feedback on traces", exc_info=True)
-
-                rollback(apply_log, w, space_id, metadata_snapshot)
-                mark_patches_rolled_back(
-                    spark, run_id, iteration_counter,
-                    f"slice_gate_regression: {slice_drops[0]['judge']}",
-                    catalog, schema,
-                )
-                levers_rolled_back.append(lever)
-                write_stage(
-                    spark, run_id, f"LEVER_{lever}_STARTED", "ROLLED_BACK",
-                    task_key="lever_loop", lever=lever, iteration=iteration_counter,
-                    detail={"reason": "slice_gate", "regressions": slice_drops},
-                    catalog=catalog, schema=schema,
-                )
-                continue
-            else:
-                _score_changes = ", ".join(
-                    f"{j} {best_scores.get(j, 0):.1f}->{slice_scores.get(j, 0):.1f}"
-                    for j in sorted(slice_scores)
-                )
-                print(
-                    _section("SLICE GATE: PASS", "-") + "\n"
-                    + _kv("Benchmarks evaluated", len(slice_benchmarks)) + "\n"
-                    + _kv("Score changes", _score_changes) + "\n"
-                    + _bar("-")
-                )
-                try:
-                    update_provenance_gate(
-                        spark, run_id, iteration_counter, lever,
-                        "slice", "pass", None, catalog, schema,
-                    )
-                except Exception:
-                    logger.debug("Failed to update provenance gate (pass)", exc_info=True)
-                try:
-                    log_gate_feedback_on_traces(
-                        slice_result, "slice", "pass",
-                        lever=lever, iteration=iteration_counter,
-                    )
-                except Exception:
-                    logger.debug("Failed to log gate feedback on traces", exc_info=True)
-
-        # ── P0 gate ───────────────────────────────────────────────
-        try:
-            mlflow.end_run()
-        except Exception:
-            pass
-        p0_benchmarks = filter_benchmarks_by_scope(benchmarks, "p0")
-        if p0_benchmarks:
-            _ensure_sql_context(spark, catalog, schema)
-            p0_result = run_evaluation(
-                space_id, exp_name, iteration_counter, p0_benchmarks,
-                domain, prev_model_id, "p0",
-                predict_fn, scorers,
-                spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
-                reference_sqls=reference_sqls if reference_sqls else None,
-            )
-            p0_failures = p0_result.get("failures", [])
-            if p0_failures:
-                print(
-                    _section("P0 GATE: FAIL", "-") + "\n"
-                    + _kv("P0 questions failing", len(p0_failures)) + "\n"
-                    + _kv("Failed IDs", ", ".join(str(f) for f in p0_failures)) + "\n"
-                    + _kv("Action", "ROLLBACK") + "\n"
-                    + _bar("-")
-                )
-                try:
-                    log_gate_feedback_on_traces(
-                        p0_result, "p0", "fail",
-                        lever=lever, iteration=iteration_counter,
-                    )
-                except Exception:
-                    logger.debug("Failed to log p0 gate feedback", exc_info=True)
-                rollback(apply_log, w, space_id, metadata_snapshot)
-                mark_patches_rolled_back(
-                    spark, run_id, iteration_counter,
-                    f"p0_gate_failure: {len(p0_failures)} P0s failing",
-                    catalog, schema,
-                )
-                levers_rolled_back.append(lever)
-                write_stage(
-                    spark, run_id, f"LEVER_{lever}_STARTED", "ROLLED_BACK",
-                    task_key="lever_loop", lever=lever, iteration=iteration_counter,
-                    detail={"reason": "p0_gate", "p0_failures": p0_failures},
-                    catalog=catalog, schema=schema,
-                )
-                continue
-            else:
-                print(
-                    _section("P0 GATE: PASS", "-") + "\n"
-                    + _kv("P0 benchmarks evaluated", len(p0_benchmarks)) + "\n"
-                    + _kv("P0 failures", 0) + "\n"
-                    + _bar("-")
-                )
-                try:
-                    log_gate_feedback_on_traces(
-                        p0_result, "p0", "pass",
-                        lever=lever, iteration=iteration_counter,
-                    )
-                except Exception:
-                    logger.debug("Failed to log p0 gate feedback", exc_info=True)
-
-        # ── Full evaluation ───────────────────────────────────────
-        try:
-            mlflow.end_run()
-        except Exception:
-            pass
-        write_stage(
-            spark, run_id, f"LEVER_{lever}_EVAL", "STARTED",
-            task_key="lever_loop", lever=lever, iteration=iteration_counter,
-            catalog=catalog, schema=schema,
-        )
-
-        new_model_id = create_genie_model_version(
-            w, space_id, config, iteration_counter, domain,
-            experiment_name=exp_name,
-            uc_schema=uc_schema,
-            patch_set=patches,
-            parent_model_id=prev_model_id,
-        )
-
-        _ensure_sql_context(spark, catalog, schema)
-        full_result = run_evaluation(
-            space_id, exp_name, iteration_counter, benchmarks,
-            domain, new_model_id, "full",
-            predict_fn, scorers,
-            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
-            reference_sqls=reference_sqls if reference_sqls else None,
-        )
-
-        full_scores = full_result.get("scores", {})
-        full_accuracy = full_result.get("overall_accuracy", 0.0)
+        full_scores = gate_result["full_scores"]
+        full_accuracy = gate_result["full_accuracy"]
+        new_model_id = gate_result["new_model_id"]
+        full_result = gate_result["full_result"]
 
         _full_trace_map = full_result.get("trace_map", {})
         _full_failures = set(full_result.get("failure_question_ids", []))
@@ -1540,106 +1833,12 @@ def _run_lever_loop(
             if qid in _full_failures:
                 all_failure_trace_ids.append(tid)
 
-        write_iteration(
-            spark, run_id, iteration_counter, full_result,
-            catalog=catalog, schema=schema,
-            lever=lever, eval_scope="full", model_id=new_model_id,
-        )
-
-        effective_regression_tol = max(REGRESSION_THRESHOLD, noise_floor)
-        regressions = detect_regressions(
-            full_scores, best_scores, threshold=effective_regression_tol,
-        )
-
-        accuracy_drop = best_accuracy - full_accuracy
-        accuracy_threshold = max(effective_regression_tol / 2, noise_floor)
-        if accuracy_drop > accuracy_threshold:
-            regressions.append({
-                "judge": "overall_accuracy",
-                "previous": best_accuracy,
-                "current": full_accuracy,
-                "drop": accuracy_drop,
-            })
-
-        if regressions:
-            for tid in _full_trace_map.values():
-                all_regression_trace_ids.append(tid)
-            _reg_details = ", ".join(
-                f"{r['judge']} {best_scores.get(r['judge'], 0):.1f}->{full_scores.get(r['judge'], 0):.1f} ({r['drop']:+.1f})"
-                for r in regressions
-            )
-            print(
-                _section("FULL EVAL: FAIL (REGRESSION)", "-") + "\n"
-                + _kv("Accuracy", f"{best_accuracy:.1f}% -> {full_accuracy:.1f}%") + "\n"
-                + _kv("Regressions", _reg_details) + "\n"
-                + _kv("Action", "ROLLBACK") + "\n"
-                + _bar("-")
-            )
-            try:
-                update_provenance_gate(
-                    spark, run_id, iteration_counter, lever,
-                    "full", "rollback",
-                    {"regressions": [{"judge": r["judge"], "drop": r["drop"]} for r in regressions]},
-                    catalog, schema,
-                )
-            except Exception:
-                logger.debug("Failed to update provenance gate (full rollback)", exc_info=True)
-            try:
-                log_gate_feedback_on_traces(
-                    full_result, "full", "rollback",
-                    regressions=regressions, lever=lever, iteration=iteration_counter,
-                )
-            except Exception:
-                logger.debug("Failed to log full eval gate feedback", exc_info=True)
-            rollback(apply_log, w, space_id, metadata_snapshot)
-            mark_patches_rolled_back(
-                spark, run_id, iteration_counter,
-                f"full_eval_regression: {regressions[0]['judge']} dropped {regressions[0]['drop']:.1f}",
-                catalog, schema,
-            )
-            levers_rolled_back.append(lever)
-            write_stage(
-                spark, run_id, f"LEVER_{lever}_STARTED", "ROLLED_BACK",
-                task_key="lever_loop", lever=lever, iteration=iteration_counter,
-                detail={"reason": "regression", "regressions": regressions},
-                catalog=catalog, schema=schema,
-            )
-            continue
-
-        # ── Accept lever ──────────────────────────────────────────
-        _score_delta = ", ".join(
-            f"{j} {best_scores.get(j, 0):.1f}->{full_scores.get(j, 0):.1f}"
-            for j in sorted(full_scores)
-        )
-        print(
-            _section("FULL EVAL: PASS -- ACCEPTED", "=") + "\n"
-            + _kv("Accuracy", f"{best_accuracy:.1f}% -> {full_accuracy:.1f}% ({full_accuracy - best_accuracy:+.1f}%)") + "\n"
-            + _kv("Score changes", _score_delta) + "\n"
-            + _kv("Result", f"LEVER {lever} ACCEPTED") + "\n"
-            + _bar("=")
-        )
-        try:
-            update_provenance_gate(
-                spark, run_id, iteration_counter, lever,
-                "full", "pass", None, catalog, schema,
-            )
-        except Exception:
-            logger.debug("Failed to update provenance gate (full pass)", exc_info=True)
-        try:
-            log_gate_feedback_on_traces(
-                full_result, "full", "pass",
-                lever=lever, iteration=iteration_counter,
-            )
-        except Exception:
-            logger.debug("Failed to log full eval gate feedback", exc_info=True)
-
-        levers_accepted.append(lever)
         lever_changes.append({
-            "lever": lever,
-            "lever_name": LEVER_NAMES.get(lever, f"Lever {lever}"),
+            "lever": ag_id,
+            "lever_name": f"AG {ag_id}: {ag.get('root_cause_summary', '')[:60]}",
             "patches": [
                 {"change": p.get("change_description", ""), "patch_type": p.get("patch_type", "")}
-                for p in proposals
+                for p in all_proposals
             ],
             "accuracy_delta": full_accuracy - best_accuracy,
         })
@@ -1667,51 +1866,29 @@ def _run_lever_loop(
         )
         if post_instructions:
             register_instruction_version(
-                uc_schema=uc_schema,
+                uc_schema=f"{catalog}.{schema}",
                 space_id=space_id,
                 instruction_text=post_instructions,
                 run_id=run_id,
-                lever=lever,
+                lever=0,
                 iteration=iteration_counter,
                 accuracy=best_accuracy,
                 domain=domain,
             )
 
         write_stage(
-            spark, run_id, f"LEVER_{lever}_STARTED", "COMPLETE",
-            task_key="lever_loop", lever=lever, iteration=iteration_counter,
+            spark, run_id, f"AG_{ag_id}_STARTED", "COMPLETE",
+            task_key="lever_loop", iteration=iteration_counter,
             detail={
                 "accuracy": full_accuracy,
                 "accepted": True,
                 "patches_applied": len(apply_log.get("applied", [])),
+                "levers": lever_keys,
             },
             catalog=catalog, schema=schema,
         )
 
-        write_stage(
-            spark, run_id, f"LEVER_{lever}_EVAL", "COMPLETE",
-            task_key="lever_loop", lever=lever, iteration=iteration_counter,
-            catalog=catalog, schema=schema,
-        )
-
-        # Re-analyze failures after accepted patches change the landscape
         metadata_snapshot = apply_log.get("post_snapshot", metadata_snapshot)
-        print(_section("Re-analyzing failures after accepted patches", "-"))
-        _analysis = _analyze_and_distribute(
-            spark, run_id, catalog, schema, metadata_snapshot,
-            iteration_counter, lever_label=lever,
-        )
-        lever_assignments = _analysis["lever_assignments"]
-        clusters = _analysis["all_clusters"]
-        soft_signal_clusters = _analysis["soft_signal_clusters"]
-        try:
-            write_asi_results(spark, run_id, iteration_counter, _analysis["asi_rows"], catalog, schema, mlflow_run_id="")
-        except Exception:
-            logger.debug("Failed to write ASI results (re-analysis)", exc_info=True)
-        try:
-            write_provenance(spark, run_id, iteration_counter, lever, _analysis["prov_rows"], catalog, schema)
-        except Exception:
-            logger.debug("Failed to write provenance rows (re-analysis)", exc_info=True)
 
     write_stage(
         spark, run_id, "LEVER_LOOP_STARTED", "COMPLETE",

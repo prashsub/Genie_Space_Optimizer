@@ -914,3 +914,44 @@ def load_recent_activity(
         spark,
         f"SELECT * FROM {fqn} {where} ORDER BY started_at DESC LIMIT {limit}",
     )
+
+
+def load_asi_results(
+    spark: SparkSession,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    *,
+    iteration: int | None = None,
+) -> pd.DataFrame:
+    """All ASI judge results for a run, optionally filtered by iteration."""
+    fqn = _fqn(catalog, schema, TABLE_ASI)
+    where = f"WHERE run_id = '{run_id}'"
+    if iteration is not None:
+        where += f" AND iteration = {iteration}"
+    return run_query(
+        spark,
+        f"SELECT * FROM {fqn} {where} ORDER BY question_id, judge",
+    )
+
+
+def load_provenance(
+    spark: SparkSession,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    *,
+    iteration: int | None = None,
+    lever: int | None = None,
+) -> pd.DataFrame:
+    """All provenance records for a run, optionally filtered by iteration/lever."""
+    fqn = _fqn(catalog, schema, TABLE_PROVENANCE)
+    where = f"WHERE run_id = '{run_id}'"
+    if iteration is not None:
+        where += f" AND iteration = {iteration}"
+    if lever is not None:
+        where += f" AND lever = {lever}"
+    return run_query(
+        spark,
+        f"SELECT * FROM {fqn} {where} ORDER BY iteration, lever, question_id",
+    )

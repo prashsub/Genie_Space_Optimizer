@@ -58,6 +58,7 @@ from genie_space_optimizer.common.config import (
     RUN_NAME_TEMPLATE,
     TARGET_BENCHMARK_COUNT,
     TEMPLATE_VARIABLES,
+    format_mlflow_template,
 )
 from genie_space_optimizer.common.genie_client import (
     detect_asset_type,
@@ -76,7 +77,7 @@ logger = logging.getLogger(__name__)
 CODE_SOURCE = AssessmentSource(source_type="CODE", source_id=CODE_SOURCE_ID)
 LLM_SOURCE = AssessmentSource(
     source_type="LLM_JUDGE",
-    source_id=LLM_SOURCE_ID_TEMPLATE.format(endpoint=LLM_ENDPOINT),
+    source_id=format_mlflow_template(LLM_SOURCE_ID_TEMPLATE, endpoint=LLM_ENDPOINT),
 )
 
 _SCORER_FEEDBACK_CACHE: dict[tuple[str, str], dict] = {}
@@ -1036,19 +1037,41 @@ def _precheck_benchmarks_for_eval(
         if _mv_measures:
             resolved_sql = _rewrite_measure_refs(resolved_sql, _mv_measures)
 
-        if _extract_sql_params(resolved_sql):
-            logger.info(
-                "Benchmark %s has parameterized SQL — skipping EXPLAIN quarantine",
-                qid,
+        _found_params = _extract_sql_params(resolved_sql)
+        if _found_params:
+            from genie_space_optimizer.optimization.benchmarks import _resolve_params_with_defaults
+            _bench_params = benchmark.get("parameters", [])
+            _resolved_default, _all_resolved = _resolve_params_with_defaults(
+                resolved_sql, _bench_params,
             )
-            valid.append(benchmark)
-            continue
+            if _all_resolved:
+                logger.info(
+                    "Benchmark %s: substituted defaults for %d params — running EXPLAIN",
+                    qid, len(_found_params),
+                )
+                resolved_sql = _resolved_default
+            else:
+                logger.info(
+                    "Benchmark %s has parameterized SQL (some without defaults) — "
+                    "skipping EXPLAIN quarantine",
+                    qid,
+                )
+                valid.append(benchmark)
+                continue
 
         try:
             _set_sql_context(spark, catalog, gold_schema)
             spark.sql(f"EXPLAIN {resolved_sql}")
         except Exception as exc:
             msg = str(exc)
+            if "UNBOUND_SQL_PARAMETER" in msg:
+                logger.info(
+                    "Benchmark %s hit UNBOUND_SQL_PARAMETER in EXPLAIN — "
+                    "treating as valid (parameterized SQL)",
+                    qid,
+                )
+                valid.append(benchmark)
+                continue
             reason = _classify_sql_validation_error(msg)
             quarantined.append(
                 {
@@ -1212,6 +1235,22 @@ def make_predict_fn(
                     )
             statement_id = result.get("statement_id")
 
+            if genie_sql and not comparison.get("error"):
+                try:
+                    _set_sql_context(spark, catalog, schema)
+                    spark.sql(f"EXPLAIN {genie_sql}")
+                except Exception as _genie_explain_exc:
+                    _genie_msg = str(_genie_explain_exc)
+                    if "UNBOUND_SQL_PARAMETER" not in _genie_msg:
+                        comparison["error"] = (
+                            f"Genie SQL failed EXPLAIN: {_genie_msg[:400]}"
+                        )
+                        comparison["error_type"] = "genie_sql_invalid"
+                        logger.warning(
+                            "Genie SQL for '%s' failed EXPLAIN pre-check: %.200s",
+                            question[:60], _genie_msg,
+                        )
+
             if genie_sql and gt_sql:
                 _genie_sql_norm = genie_sql.strip().lower()
                 _gt_sql_norm = gt_sql.strip().lower()
@@ -1232,17 +1271,29 @@ def make_predict_fn(
                 else:
                     _unbound_params = _extract_sql_params(gt_sql)
                     if _unbound_params:
-                        logger.warning(
-                            "GT SQL contains unbound parameters %s — "
-                            "skipping result comparison for '%s'",
-                            _unbound_params, question[:80],
+                        from genie_space_optimizer.optimization.benchmarks import _resolve_params_with_defaults
+                        _bench_params = kwargs.get("parameters", [])
+                        _gt_resolved, _gt_all = _resolve_params_with_defaults(
+                            gt_sql, _bench_params,
                         )
-                        comparison["error"] = (
-                            f"GT SQL contains parameterized placeholders "
-                            f"({', '.join(':' + p for p in _unbound_params)}) "
-                            f"that cannot be executed directly"
-                        )
-                        comparison["error_type"] = "parameterized_sql"
+                        if _gt_all:
+                            logger.info(
+                                "Substituted defaults for %d params in GT SQL for '%s'",
+                                len(_unbound_params), question[:60],
+                            )
+                            gt_sql = _gt_resolved
+                        else:
+                            logger.warning(
+                                "GT SQL contains unbound parameters %s — "
+                                "skipping result comparison for '%s'",
+                                _unbound_params, question[:80],
+                            )
+                            comparison["error"] = (
+                                f"GT SQL contains parameterized placeholders "
+                                f"({', '.join(':' + p for p in _unbound_params)}) "
+                                f"that cannot be executed directly"
+                            )
+                            comparison["error_type"] = "parameterized_sql"
 
                     if not comparison.get("error"):
                         try:
@@ -1261,8 +1312,15 @@ def make_predict_fn(
                                     spark.sql(f"EXPLAIN {gt_sql}")
                                 except Exception as explain_exc:
                                     explain_msg = str(explain_exc)
-                                    comparison["error"] = f"ground_truth SQL compilation failed: {explain_msg[:400]}"
-                                    comparison["error_type"] = "infrastructure"
+                                    if "UNBOUND_SQL_PARAMETER" in explain_msg:
+                                        comparison["error"] = (
+                                            f"GT SQL contains parameterized placeholders "
+                                            f"that cannot be executed directly: {explain_msg[:300]}"
+                                        )
+                                        comparison["error_type"] = "parameterized_sql"
+                                    else:
+                                        comparison["error"] = f"ground_truth SQL compilation failed: {explain_msg[:400]}"
+                                        comparison["error_type"] = "infrastructure"
                                     comparison["sqlstate"] = _extract_sqlstate(explain_msg)
 
                                 if not comparison["error"]:
@@ -1475,14 +1533,16 @@ def make_predict_fn(
                                         "genie_sample": _truncated_sample(genie_df),
                                         "error": None,
                                     }
-                    except Exception as exc:
-                        err_msg = str(exc)
-                        comparison["error"] = err_msg[:500]
-                        if _is_infrastructure_sql_error(err_msg):
-                            comparison["error_type"] = "infrastructure"
-                        else:
-                            comparison["error_type"] = "query_execution"
-                        comparison["sqlstate"] = _extract_sqlstate(err_msg)
+                        except Exception as exc:
+                            err_msg = str(exc)
+                            comparison["error"] = err_msg[:500]
+                            if "UNBOUND_SQL_PARAMETER" in err_msg:
+                                comparison["error_type"] = "parameterized_sql"
+                            elif _is_infrastructure_sql_error(err_msg):
+                                comparison["error_type"] = "infrastructure"
+                            else:
+                                comparison["error_type"] = "query_execution"
+                            comparison["sqlstate"] = _extract_sqlstate(err_msg)
             else:
                 if not genie_sql:
                     comparison["error"] = "Genie did not return SQL"
@@ -1493,9 +1553,12 @@ def make_predict_fn(
         except Exception as exc:
             err_msg = str(exc)
             comparison["error"] = err_msg[:500]
-            comparison["error_type"] = (
-                "infrastructure" if _is_infrastructure_sql_error(err_msg) else "predict_fn_error"
-            )
+            if "UNBOUND_SQL_PARAMETER" in err_msg:
+                comparison["error_type"] = "parameterized_sql"
+            elif _is_infrastructure_sql_error(err_msg):
+                comparison["error_type"] = "infrastructure"
+            else:
+                comparison["error_type"] = "predict_fn_error"
             comparison["sqlstate"] = _extract_sqlstate(err_msg)
 
         if temporal_rewrite_meta:
@@ -1632,8 +1695,8 @@ def register_instruction_version(
         return None
 
     safe_space_id = re.sub(r"[^a-zA-Z0-9_]+", "_", space_id or "unknown").strip("_")
-    prompt_name = INSTRUCTION_PROMPT_NAME_TEMPLATE.format(
-        uc_schema=uc_schema, space_id=safe_space_id,
+    prompt_name = format_mlflow_template(
+        INSTRUCTION_PROMPT_NAME_TEMPLATE, uc_schema=uc_schema, space_id=safe_space_id,
     ) if uc_schema else f"genie_instructions_{safe_space_id}"
 
     commit_msg = (
@@ -1938,7 +2001,7 @@ def _log_judge_prompt_artifacts(
         "judges": [],
     }
     for name, template in JUDGE_PROMPTS.items():
-        prompt_name = PROMPT_NAME_TEMPLATE.format(uc_schema=uc_schema, judge_name=name) if uc_schema else name
+        prompt_name = format_mlflow_template(PROMPT_NAME_TEMPLATE, uc_schema=uc_schema, judge_name=name) if uc_schema else name
         template_hash = hashlib.sha256(template.encode("utf-8")).hexdigest()
         prompt_meta = registered.get(name, {})
         judges_manifest["judges"].append(
@@ -1975,7 +2038,7 @@ def _prompt_name_candidates(uc_schema: str, domain: str, judge_name: str) -> lis
     safe_domain = re.sub(r"[^a-zA-Z0-9_]+", "_", domain or "default").strip("_").lower() or "default"
     candidates: list[str] = []
     if uc_schema:
-        candidates.append(PROMPT_NAME_TEMPLATE.format(uc_schema=uc_schema, judge_name=judge_name))
+        candidates.append(format_mlflow_template(PROMPT_NAME_TEMPLATE, uc_schema=uc_schema, judge_name=judge_name))
         candidates.append(f"{uc_schema}.genie_opt_{safe_domain}_{judge_name}")
     candidates.append(f"genie_opt_{safe_domain}_{judge_name}")
     return list(dict.fromkeys(candidates))
@@ -2709,7 +2772,7 @@ def run_evaluation(
         scope_filtered = benchmarks
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = RUN_NAME_TEMPLATE.format(iteration=iteration, timestamp=ts)
+    run_name = format_mlflow_template(RUN_NAME_TEMPLATE, iteration=iteration, timestamp=ts)
 
     with mlflow.start_run(run_name=run_name) as run:
         _version_tags: dict[str, str] = {
@@ -3632,6 +3695,21 @@ def _build_schema_contexts(
         for q in sample_questions
     ) if sample_questions else "(none)"
 
+    columns_by_table: dict[str, list[str]] = {}
+    for c in uc_columns:
+        if not isinstance(c, dict):
+            continue
+        tbl = str(c.get("table_name") or "").strip()
+        col = str(c.get("column_name") or "").strip()
+        dtype = str(c.get("data_type") or "").strip().upper()
+        if tbl and col:
+            entry = f"{col} ({dtype})" if dtype else col
+            columns_by_table.setdefault(tbl, []).append(entry)
+    column_allowlist_lines: list[str] = []
+    for tbl_name in sorted(columns_by_table):
+        column_allowlist_lines.append(f"{tbl_name}: {', '.join(columns_by_table[tbl_name])}")
+    column_allowlist = "\n".join(column_allowlist_lines) if column_allowlist_lines else "(no columns)"
+
     return {
         "tables_context": tables_context,
         "metric_views_context": metric_views_context,
@@ -3639,6 +3717,7 @@ def _build_schema_contexts(
         "instructions_context": instructions_context,
         "sample_questions_context": sample_questions_context,
         "valid_assets_context": _build_valid_assets_context(config),
+        "column_allowlist": column_allowlist,
     }
 
 
@@ -3693,9 +3772,11 @@ def _attempt_benchmark_correction(
         indent=2,
     )
 
-    prompt = BENCHMARK_CORRECTION_PROMPT.format(
+    prompt = format_mlflow_template(
+        BENCHMARK_CORRECTION_PROMPT,
         valid_assets_context=ctx["valid_assets_context"],
         tables_context=ctx["tables_context"],
+        column_allowlist=ctx.get("column_allowlist", "(no columns)"),
         metric_views_context=ctx.get("metric_views_context", "None"),
         tvfs_context=ctx.get("tvfs_context", "None"),
         benchmarks_to_fix=benchmarks_to_fix,
@@ -3934,7 +4015,8 @@ def _fill_coverage_gaps(
     existing_q_lines = "\n".join(f"- {q}" for q in sorted(existing_questions)) or "(none)"
     uncovered_lines = "\n".join(f"- {a}" for a in targeted)
 
-    prompt = BENCHMARK_COVERAGE_GAP_PROMPT.format(
+    prompt = format_mlflow_template(
+        BENCHMARK_COVERAGE_GAP_PROMPT,
         domain=domain,
         categories=json.dumps(BENCHMARK_CATEGORIES),
         uncovered_assets=uncovered_lines,
@@ -4206,7 +4288,8 @@ def generate_benchmarks(
             + "\n".join(f"- {b.get('question', '')}" for b in all_existing)
         )
 
-    prompt = BENCHMARK_GENERATION_PROMPT.format(
+    prompt = format_mlflow_template(
+        BENCHMARK_GENERATION_PROMPT,
         domain=domain,
         target_count=synthetic_target,
         categories=json.dumps(BENCHMARK_CATEGORIES),

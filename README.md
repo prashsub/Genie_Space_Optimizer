@@ -30,12 +30,15 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 1. **Configuration Analysis** -- Scans the Genie Space config, counts tables/instructions/sample questions, and validates structure.
 2. **Metadata Collection** -- Queries Unity Catalog via REST API (with Spark SQL fallback) for columns, data types, tags, routines, and table descriptions.
 3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges. All evaluation traces are tagged with `genie.optimization_run_id`, `genie.iteration`, and `genie.lever` for end-to-end traceability. The arbiter judge identifies `genie_correct` verdicts for benchmark correction and tiered soft signals for best-practice guidance.
-4. **Configuration Generation (Lever Loop)** -- Stage 2.5 applies deterministic prompt matching (format assistance + entity matching). Arbiter benchmark corrections rewrite stale gold SQL. Then iterates through 5 optimization levers (up to 5 iterations), applying targeted patches with tiered failure analysis (hard failures + soft signals). Each patch is evaluated via a 3-gate system (slice, P0, full); regressions trigger automatic rollback.
+4. **Configuration Generation (Lever Loop)** -- Stage 2.5 applies deterministic prompt matching (format assistance + entity matching). Stage 2.75 proactively enriches blank column descriptions using UC metadata. Arbiter benchmark corrections rewrite stale gold SQL. A holistic strategist then triages all failures and generates a unified optimization strategy. Iterates through 5 optimization levers (up to 5 iterations), applying targeted patches with tiered failure analysis (hard failures + soft signals). Each patch is evaluated via a 3-gate system (slice, P0, full); regressions trigger automatic rollback.
 5. **Optimized Evaluation & Repeatability** -- Final evaluation of the optimized config, including repeatability testing to ensure consistent results.
 
 ### Optimization Levers
 
-Before the main lever loop, **Stage 2.5 (Prompt Matching Auto-Config)** runs deterministically -- applying format assistance (`get_example_values`) and entity matching (`build_value_dictionary`) on prioritized columns. No LLM is involved.
+Before the main lever loop, three preparatory stages run:
+- **Stage 2.5 (Prompt Matching)** -- Deterministic format assistance (`get_example_values`) and entity matching (`build_value_dictionary`) on prioritized columns. No LLM involved.
+- **Stage 2.75 (Description Enrichment)** -- LLM-generated structured descriptions for columns with no description in both Genie Space and Unity Catalog.
+- **Strategist** -- Holistic triage of all failures into a unified optimization strategy with per-lever action plans.
 
 The **5-lever loop** then iterates up to 5 times:
 
@@ -109,7 +112,7 @@ Genie_Space_Optimizer/
 │   │   │   └── sql.py                # SQL Warehouse statement execution
 │   │   └── routes/
 │   │       ├── spaces.py             # GET /spaces, GET /spaces/{id}, POST /spaces/{id}/optimize
-│   │       ├── runs.py               # GET /runs/{id}, GET /runs/{id}/comparison, POST apply/discard
+│   │       ├── runs.py               # GET /runs/{id}, comparison, iterations, ASI, provenance, apply/discard
 │   │       ├── activity.py           # GET /activity (recent runs feed)
 │   │       ├── settings.py           # GET/POST/DELETE /settings/data-access (UC permissions)
 │   │       └── trigger.py            # POST /trigger, GET /trigger/status (programmatic API)
@@ -130,9 +133,15 @@ Genie_Space_Optimizer/
 │   │   │   ├── LeverProgress.tsx     # Lever progress bar
 │   │   │   ├── ConfigDiff.tsx        # Configuration comparison viewer
 │   │   │   ├── ResourceLinks.tsx     # Workspace resource links
-│   │   │   └── ui/                   # shadcn/ui components
+│   │   │   ├── IterationChart.tsx    # Score-over-iterations line chart
+│   │   │   ├── AsiResultsPanel.tsx   # ASI failure analysis breakdown
+│   │   │   ├── ProvenancePanel.tsx   # Judge → cluster → patch provenance viewer
+│   │   │   ├── StageTimeline.tsx     # Pipeline stage timeline visualization
+│   │   │   ├── CrossRunChart.tsx     # Cross-run score comparison chart
+│   │   │   └── ui/                   # shadcn/ui components (incl. chart)
 │   │   └── lib/
 │   │       ├── api.ts                # Auto-generated OpenAPI client (DO NOT edit)
+│   │       ├── transparency-api.ts   # Transparency API hooks (iterations, ASI, provenance)
 │   │       └── selector.ts           # Query selector helper
 │   │
 │   ├── common/                       # Shared utilities
@@ -143,7 +152,7 @@ Genie_Space_Optimizer/
 │   │   └── delta_helpers.py          # Delta table read/write operations
 │   │
 │   ├── optimization/                 # Core optimization engine
-│   │   ├── optimizer.py              # Failure analysis → proposal generation → patch application
+│   │   ├── optimizer.py              # Strategist, failure analysis, proposal generation, description enrichment
 │   │   ├── evaluation.py             # Benchmark generation, temporal date resolution, 9-judge scoring, MLflow tracking
 │   │   ├── applier.py                # Patch application & rollback
 │   │   ├── harness.py                # Full pipeline orchestration
@@ -197,6 +206,9 @@ All endpoints are prefixed with `/api/genie`.
 | `DELETE` | `/settings/data-access/{grant_id}` | `revokeDataAccess` | Revoke a UC data-access grant |
 | `POST` | `/trigger` | `triggerOptimization` | Trigger optimization programmatically (headless API) |
 | `GET` | `/trigger/status/{run_id}` | `getTriggerStatus` | Poll status of a triggered optimization run |
+| `GET` | `/runs/{run_id}/iterations` | `getIterations` | Per-iteration scores for iteration chart |
+| `GET` | `/runs/{run_id}/asi` | `getAsiResults` | ASI failure analysis breakdown |
+| `GET` | `/runs/{run_id}/provenance` | `getProvenance` | End-to-end provenance (judge → cluster → patch → gate) |
 | `GET` | `/version` | `getVersion` | App version |
 | `GET` | `/current-user` | `getCurrentUser` | Authenticated user info |
 

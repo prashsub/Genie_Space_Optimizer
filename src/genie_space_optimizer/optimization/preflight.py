@@ -18,6 +18,7 @@ import mlflow
 from genie_space_optimizer.common.config import (
     EXPERIMENT_PATH_TEMPLATE,
     TARGET_BENCHMARK_COUNT,
+    format_mlflow_template,
 )
 from genie_space_optimizer.common.genie_client import fetch_space_config
 from genie_space_optimizer.common.genie_schema import validate_serialized_space
@@ -97,7 +98,7 @@ def _resolve_experiment_path(
     """
     triggered_by = str(run_data.get("triggered_by") or "").strip()
     if "@" in triggered_by:
-        return EXPERIMENT_PATH_TEMPLATE.format(user_email=triggered_by, domain=domain)
+        return format_mlflow_template(EXPERIMENT_PATH_TEMPLATE, user_email=triggered_by, domain=domain)
 
     try:
         current_user = str(ws.current_user.me().user_name or "").strip()
@@ -105,7 +106,7 @@ def _resolve_experiment_path(
         current_user = ""
 
     if "@" in current_user:
-        return EXPERIMENT_PATH_TEMPLATE.format(user_email=current_user, domain=domain)
+        return format_mlflow_template(EXPERIMENT_PATH_TEMPLATE, user_email=current_user, domain=domain)
 
     return f"/Shared/genie-optimization/{domain}"
 

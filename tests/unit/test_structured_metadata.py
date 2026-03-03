@@ -364,3 +364,25 @@ class TestLeverOwnership:
             all_sections.update(secs)
         for section in all_sections:
             assert section in SECTION_LABELS, f"Section '{section}' missing from SECTION_LABELS"
+
+    def test_lever_0_owns_all_entity_sections(self):
+        all_entity_sections = set()
+        for secs in ENTITY_TYPE_TEMPLATES.values():
+            all_entity_sections.update(secs)
+        lever_0 = LEVER_SECTION_OWNERSHIP[0]
+        for section in all_entity_sections:
+            assert section in lever_0, (
+                f"Lever 0 must own all entity sections but is missing '{section}'"
+            )
+
+    def test_lever_0_update_sections_on_blank_column(self):
+        new_desc = update_sections(
+            None,
+            {"definition": "Unique order identifier", "join": "Joins to dim_customer.order_id"},
+            lever=0,
+            entity_type="column_key",
+        )
+        assert isinstance(new_desc, list)
+        joined = "\n".join(new_desc)
+        assert "**Definition:**" in joined
+        assert "**Join:**" in joined

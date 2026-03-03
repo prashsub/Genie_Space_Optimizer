@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
 import { toast } from "sonner";
+import { CrossRunChart } from "@/components/CrossRunChart";
 
 export const Route = createFileRoute("/spaces/$spaceId")({
   component: () => (
@@ -221,6 +222,7 @@ function SpaceDetail() {
           <TabsTrigger value="referenced-tables">Referenced Tables</TabsTrigger>
           <TabsTrigger value="referenced-joins">Referenced Joins</TabsTrigger>
           <TabsTrigger value="referenced-functions">Referenced Functions</TabsTrigger>
+          <TabsTrigger value="analytics">Analytics</TabsTrigger>
           <TabsTrigger value="optimization-history">Optimization History</TabsTrigger>
         </TabsList>
 
@@ -400,6 +402,12 @@ function SpaceDetail() {
               )}
             </CardContent>
           </Card>
+        </TabsContent>
+
+        <TabsContent value="analytics">
+          <div className="space-y-4">
+            <CrossRunChart runs={optimizationHistory} />
+          </div>
         </TabsContent>
 
         <TabsContent value="optimization-history">

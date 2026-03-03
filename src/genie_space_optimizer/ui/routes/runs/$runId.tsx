@@ -9,6 +9,9 @@ import { Badge } from "@/components/ui/badge";
 import { PipelineStepCard } from "@/components/PipelineStepCard";
 import { LeverProgress } from "@/components/LeverProgress";
 import { ResourceLinks } from "@/components/ResourceLinks";
+import { IterationChart } from "@/components/IterationChart";
+import { AsiResultsPanel } from "@/components/AsiResultsPanel";
+import { StageTimeline, type StageEvent } from "@/components/StageTimeline";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
@@ -278,6 +281,34 @@ function PipelineView() {
   const elapsed = useElapsedTime(run?.startedAt, isActive);
   const workflowLink = run?.links?.find((link) => link.category === "job")?.url;
 
+  const allStageEvents: StageEvent[] = useMemo(() => {
+    if (!run) return [];
+    const events: StageEvent[] = [];
+    for (const step of run.steps) {
+      const stepEvents = (step.outputs as Record<string, unknown> | null)
+        ?.stageEvents as StageEvent[] | undefined;
+      if (stepEvents) events.push(...stepEvents);
+    }
+    for (const lever of run.levers) {
+      for (const iter of lever.iterations ?? []) {
+        const iterEvents = iter.stageEvents as StageEvent[] | undefined;
+        if (iterEvents) events.push(...iterEvents);
+      }
+    }
+    return events;
+  }, [run]);
+
+  const availableIterations: number[] = useMemo(() => {
+    if (!run) return [0];
+    const iters = new Set<number>([0]);
+    for (const lever of run.levers) {
+      for (const iter of lever.iterations ?? []) {
+        iters.add(iter.iteration);
+      }
+    }
+    return Array.from(iters).sort((a, b) => a - b);
+  }, [run]);
+
   if (!run) return null;
 
   const completedSteps = run.steps.filter(
@@ -439,6 +470,22 @@ function PipelineView() {
           </div>
         )}
 
+      {/* Score Progression & Timeline (shown when completed) */}
+      {isCompleted && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <IterationChart runId={run.runId} />
+          <StageTimeline stageEvents={allStageEvents} />
+        </div>
+      )}
+
+      {/* ASI Judge Feedback (shown when completed) */}
+      {isCompleted && (
+        <AsiResultsPanel
+          runId={run.runId}
+          availableIterations={availableIterations}
+        />
+      )}
+
       {/* Pipeline Steps */}
       <div className="relative space-y-3">
         {/* Vertical connector line */}
@@ -457,7 +504,7 @@ function PipelineView() {
             <StepInsights step={step} links={run.links ?? []} />
             {step.stepNumber === 4 &&
               run.levers.length > 0 && (
-                <LeverProgress levers={run.levers} links={run.links ?? []} />
+                <LeverProgress levers={run.levers} links={run.links ?? []} runId={run.runId} />
               )}
           </PipelineStepCard>
         ))}

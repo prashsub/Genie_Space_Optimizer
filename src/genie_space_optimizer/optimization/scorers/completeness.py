@@ -19,10 +19,10 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
-    build_temporal_note,
     format_asi_markdown,
     get_registered_prompt_name,
 )
+from genie_space_optimizer.optimization.scorers import build_scorer_context
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
@@ -42,44 +42,10 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
         question_id = inputs.get("question_id", "")
         cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
-        cmp_summary = ""
-        if cmp:
-            cmp_summary = (
-                f"\nResult comparison (GT vs Genie): match={cmp.get('match')}, "
-                f"match_type={cmp.get('match_type', 'unknown')}, "
-                f"gt_rows={cmp.get('gt_rows', '?')}, genie_rows={cmp.get('genie_rows', '?')}\n"
-                "NOTE: If results match (match=True), the queries are functionally equivalent "
-                "even if SQL syntax differs. Weight this heavily in your assessment.\n"
-            )
-
-        column_note = ""
-        gt_cols = set(cmp.get("gt_columns") or [])
-        genie_cols = set(cmp.get("genie_columns") or [])
-        extra_gt_cols = gt_cols - genie_cols
-        if extra_gt_cols and genie_cols <= gt_cols:
-            column_note = (
-                f"\nCOLUMN NOTE: The Expected SQL returns {len(extra_gt_cols)} extra column(s) "
-                f"not in Generated SQL: {sorted(extra_gt_cols)}. "
-                "All Generated SQL columns exist in Expected SQL — this is a column SUBSET. "
-                "Evaluate completeness against the USER'S QUESTION only. If the user did NOT "
-                "explicitly ask for those extra columns, the Generated SQL is still complete.\n"
-            )
-
-        empty_data_note = ""
-        if cmp.get("gt_rows", -1) == 0 and cmp.get("genie_rows", -1) > 0:
-            empty_data_note = (
-                "\nCRITICAL: The Expected SQL returned 0 rows while the Generated SQL "
-                "returned data. This likely means the Expected SQL has overly restrictive "
-                "filters NOT present in the user's question. Evaluate completeness "
-                "against the user's question ONLY. If the Generated SQL includes "
-                "everything the user asked for, it is complete. PASS.\n"
-            )
-        elif cmp.get("gt_rows", -1) == 0:
-            empty_data_note = (
-                "\nIMPORTANT: Both queries returned 0 rows — the underlying dataset "
-                "has no matching data. Minor SQL differences have no practical impact. "
-                "Lean toward PASS if structurally sound.\n"
-            )
+        context = build_scorer_context(
+            question=question, genie_sql=genie_sql, gt_sql=gt_sql, cmp=cmp,
+            include_column_note=True,
+        )
 
         prompt = (
             "You are a SQL completeness expert evaluating SQL for a Databricks Genie Space.\n"
@@ -87,20 +53,12 @@ def _make_completeness_judge(w: WorkspaceClient, catalog: str, schema: str):
             "missing dimensions, measures, or filters.\n\n"
             "IMPORTANT RULES:\n"
             "1. Evaluate completeness against the USER'S QUESTION, not the Expected SQL.\n"
-            "   The Expected SQL is a reference that may return extra columns, dimensions, or measures\n"
-            "   that the user never requested. If the Generated SQL includes everything the user\n"
-            "   explicitly asked for, it IS complete — do NOT penalize it for omitting extras\n"
-            "   that only appear in the Expected SQL. The user's question is the source of truth.\n"
+            "   The user's question is the source of truth.\n"
             "2. MEASURE() on a metric view is a complete alternative to SUM/AVG on a fact table.\n"
-            "   Similarly, a metric view query and a TVF call are both complete if they return\n"
-            "   everything the user asked for. A TVF may return extra columns beyond what the\n"
-            "   user requested — that does NOT make the Generated SQL incomplete.\n"
+            "   A TVF call returning everything the user asked for is also complete.\n"
             "3. Defensive IS NOT NULL or ORDER BY clauses are NOT completeness issues.\n"
             "4. GROUP BY ALL is semantically identical to explicit GROUP BY.\n\n"
-            f"User question: {question}\n"
-            f"Expected SQL: {gt_sql}\n"
-            f"Generated SQL: {genie_sql}\n"
-            f"{cmp_summary}{column_note}{empty_data_note}{build_temporal_note(cmp)}\n"
+            f"{context}\n\n"
             'Respond with JSON only: {"complete": true/false, "failure_type": "<missing_column|missing_filter|missing_temporal_filter|missing_aggregation|partial_answer>", '
             '"blame_set": ["<missing_element>"], '
             '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '

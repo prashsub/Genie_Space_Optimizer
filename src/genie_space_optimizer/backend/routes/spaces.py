@@ -863,9 +863,9 @@ def do_start_optimization(
     # (running as SP) doesn't need to create it under the user's path.
     experiment_name = prev_experiment
     if not experiment_name:
-        from genie_space_optimizer.common.config import EXPERIMENT_PATH_TEMPLATE
-        experiment_name = EXPERIMENT_PATH_TEMPLATE.format(
-            user_email=current_user, domain=domain,
+        from genie_space_optimizer.common.config import EXPERIMENT_PATH_TEMPLATE, format_mlflow_template
+        experiment_name = format_mlflow_template(
+            EXPERIMENT_PATH_TEMPLATE, user_email=current_user, domain=domain,
         )
     try:
         import mlflow
@@ -882,7 +882,7 @@ def do_start_optimization(
         mlflow.set_experiment(experiment_name)
         logger.info("Pre-created MLflow experiment %s via OBO", experiment_name)
 
-        exp = mlflow.get_experiment_by_name(experiment_name)
+        exp = mlflow.get_experiment_by_name(experiment_name)  # type: ignore[possibly-missing-attribute]
         if exp:
             sp_id = get_sp_principal(sp_ws)
             try:

@@ -6,6 +6,40 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Strategist Architecture, Transparency UI, Description Enrichment
+- **Strategist architecture** (`optimizer.py`, `config.py`): new holistic optimization
+  strategist that triages all failures into a unified strategy before lever execution;
+  `STRATEGIST_PROMPT`, `STRATEGIST_TRIAGE_PROMPT`, `STRATEGIST_DETAIL_PROMPT` generate
+  per-lever action plans; `generate_proposals_from_strategy()` converts strategy to
+  targeted proposals; `_truncate_to_budget()` manages prompt token limits
+- **Stage 2.75: Proactive description enrichment** (`harness.py`, `optimizer.py`):
+  new pipeline stage that LLM-generates structured descriptions for columns with no
+  description in both Genie Space and Unity Catalog; `DESCRIPTION_ENRICHMENT_PROMPT`
+  in config; runs after UC type enrichment and before the strategist
+- **Transparency API endpoints** (`runs.py`, `models.py`): `GET /runs/{id}/iterations`
+  (per-iteration scores), `GET /runs/{id}/asi` (ASI failure analysis), `GET
+  /runs/{id}/provenance` (end-to-end provenance); new Pydantic models `IterationSummary`,
+  `AsiResult`, `AsiSummary`, `ProvenanceRecord`, `ProvenanceSummary`
+- **Transparency UI components**: `IterationChart` (score-over-iterations line chart),
+  `AsiResultsPanel` (failure analysis breakdown), `ProvenancePanel` (judge → cluster →
+  patch provenance viewer), `StageTimeline` (pipeline stage visualization),
+  `CrossRunChart` (cross-run score comparison); `transparency-api.ts` with React Query
+  hooks; integrated into run detail page
+- **Extract-over-generate validation** (`config.py`, `benchmarks.py`): column allowlists
+  in all LLM prompts; `format_mlflow_template()` for MLflow `{{ variable }}` syntax;
+  `PROMPT_TOKEN_BUDGET` for automatic context truncation
+- **Shared scorer context** (`scorers/__init__.py`): `build_scorer_context()` builds
+  common context block (comparison summary, empty-data notes, column subset notes,
+  temporal notes) shared by all SQL-comparison judges; reduces duplication across scorers
+- **Plain-text instruction formatting** (`config.py`): Lever 5 holistic prompt and
+  instruction section ordering via `INSTRUCTION_SECTION_ORDER`
+- **Job notebook training docs**: all 5 task notebooks expanded with DAG placement,
+  failure handling, input/output specifications
+- Expanded unit tests for optimizer (+191 lines) and structured metadata (+22 lines)
+- Added `recharts` dependency for chart components
+
+---
+
 ### Added — Dynamic Counterfactual Fixes in Judge Prompts
 - **Structured judge responses** (`config.py`): all LLM judge prompts
   (`schema_accuracy`, `logical_accuracy`, `completeness`, `semantic_equivalence`,

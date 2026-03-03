@@ -16,12 +16,17 @@ from ..utils import ensure_utc_iso, safe_finite, safe_float, safe_int, safe_json
 from .spaces import _genie_client
 from ..models import (
     ActionResponse,
+    AsiResult,
+    AsiSummary,
     ComparisonData,
     DimensionScore,
+    IterationSummary,
     LeverStatus,
     PipelineLink,
     PipelineRun,
     PipelineStep,
+    ProvenanceRecord,
+    ProvenanceSummary,
     SpaceConfiguration,
     TableDescription,
 )
@@ -1405,6 +1410,260 @@ def discard_optimization(
         runId=run_id,
         message="Optimization discarded and patches rolled back.",
     )
+
+
+# ── Transparency Endpoints ──────────────────────────────────────────────
+
+
+@router.get(
+    "/runs/{run_id}/iterations",
+    response_model=list[IterationSummary],
+    operation_id="getIterations",
+)
+def get_iterations(run_id: str, config: Dependencies.Config):
+    """All evaluation iterations for a run (baseline + lever evals)."""
+    from genie_space_optimizer.optimization.state import load_iterations, load_run
+
+    spark = get_spark()
+    run_data = load_run(spark, run_id, config.catalog, config.schema_name)
+    if not run_data:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    iters_df = load_iterations(spark, run_id, config.catalog, config.schema_name)
+    if iters_df.empty:
+        return []
+
+    results: list[IterationSummary] = []
+    for row in iters_df.to_dict("records"):
+        scores = row.get("scores_json", {})
+        if isinstance(scores, str):
+            try:
+                scores = json.loads(scores)
+            except (json.JSONDecodeError, TypeError):
+                scores = {}
+        if not isinstance(scores, dict):
+            scores = {}
+
+        results.append(
+            IterationSummary(
+                iteration=int(row.get("iteration", 0)),
+                lever=_safe_int(row.get("lever")),
+                evalScope=str(row.get("eval_scope", "full")),
+                overallAccuracy=_finite(row.get("overall_accuracy", 0)),
+                totalQuestions=int(row.get("total_questions", 0)),
+                correctCount=int(row.get("correct_count", 0)),
+                repeatabilityPct=_safe_float(row.get("repeatability_pct")),
+                thresholdsMet=bool(row.get("thresholds_met", False)),
+                judgeScores={str(k): _safe_float(v) for k, v in scores.items()},
+            )
+        )
+    return results
+
+
+@router.get(
+    "/runs/{run_id}/asi-results",
+    response_model=AsiSummary,
+    operation_id="getAsiResults",
+)
+def get_asi_results(
+    run_id: str,
+    config: Dependencies.Config,
+    iteration: int | None = None,
+):
+    """ASI judge feedback for a run, with summary statistics."""
+    from genie_space_optimizer.optimization.state import load_asi_results, load_run
+
+    spark = get_spark()
+    run_data = load_run(spark, run_id, config.catalog, config.schema_name)
+    if not run_data:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    resolved_iteration = iteration if iteration is not None else 0
+    df = load_asi_results(
+        spark, run_id, config.catalog, config.schema_name, iteration=resolved_iteration,
+    )
+    if df.empty:
+        return AsiSummary(
+            runId=run_id, iteration=resolved_iteration,
+            totalResults=0, passCount=0, failCount=0,
+        )
+
+    records = df.to_dict("records")
+    results: list[AsiResult] = []
+    pass_count = 0
+    fail_count = 0
+    failure_types: dict[str, int] = {}
+    blame_counts: dict[str, int] = {}
+    judge_totals: dict[str, int] = {}
+    judge_passes: dict[str, int] = {}
+
+    _PASS_VALUES = {"yes", "genie_correct", "pass", "true"}
+
+    for row in records:
+        value = str(row.get("value", "")).lower().strip()
+        is_pass = value in _PASS_VALUES
+        if is_pass:
+            pass_count += 1
+        else:
+            fail_count += 1
+
+        judge = str(row.get("judge", ""))
+        judge_totals[judge] = judge_totals.get(judge, 0) + 1
+        if is_pass:
+            judge_passes[judge] = judge_passes.get(judge, 0) + 1
+
+        ft = row.get("failure_type")
+        if ft and not is_pass:
+            ft_str = str(ft)
+            failure_types[ft_str] = failure_types.get(ft_str, 0) + 1
+
+        blame_raw = row.get("blame_set")
+        blame_list: list[str] = []
+        if blame_raw:
+            if isinstance(blame_raw, str):
+                try:
+                    blame_list = json.loads(blame_raw)
+                except (json.JSONDecodeError, TypeError):
+                    blame_list = []
+            elif isinstance(blame_raw, list):
+                blame_list = [str(x) for x in blame_raw]
+
+        results.append(
+            AsiResult(
+                questionId=str(row.get("question_id", "")),
+                judge=judge,
+                value=str(row.get("value", "")),
+                failureType=row.get("failure_type"),
+                severity=row.get("severity"),
+                confidence=_safe_float(row.get("confidence")),
+                blameSet=blame_list,
+                counterfactualFix=row.get("counterfactual_fix"),
+                wrongClause=row.get("wrong_clause"),
+                expectedValue=row.get("expected_value"),
+                actualValue=row.get("actual_value"),
+            )
+        )
+
+    judge_pass_rates = {
+        j: round((judge_passes.get(j, 0) / judge_totals[j]) * 100, 1)
+        for j in sorted(judge_totals)
+        if judge_totals[j] > 0
+    }
+
+    return AsiSummary(
+        runId=run_id,
+        iteration=resolved_iteration,
+        totalResults=len(records),
+        passCount=pass_count,
+        failCount=fail_count,
+        failureTypeDistribution=failure_types,
+        blameDistribution=blame_counts,
+        judgePassRates=judge_pass_rates,
+        results=results,
+    )
+
+
+@router.get(
+    "/runs/{run_id}/provenance",
+    response_model=list[ProvenanceSummary],
+    operation_id="getProvenance",
+)
+def get_provenance(
+    run_id: str,
+    config: Dependencies.Config,
+    iteration: int | None = None,
+    lever: int | None = None,
+):
+    """Provenance lineage for a run, grouped by iteration+lever."""
+    from genie_space_optimizer.optimization.state import load_provenance, load_run
+
+    spark = get_spark()
+    run_data = load_run(spark, run_id, config.catalog, config.schema_name)
+    if not run_data:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    df = load_provenance(
+        spark, run_id, config.catalog, config.schema_name,
+        iteration=iteration, lever=lever,
+    )
+    if df.empty:
+        return []
+
+    groups: dict[tuple[int, int], list[dict]] = {}
+    for row in df.to_dict("records"):
+        key = (int(row.get("iteration", 0)), int(row.get("lever", 0)))
+        groups.setdefault(key, []).append(row)
+
+    summaries: list[ProvenanceSummary] = []
+    for (iter_num, lever_num), rows in sorted(groups.items()):
+        prov_records: list[ProvenanceRecord] = []
+        root_causes: dict[str, int] = {}
+        gate_results: dict[str, int] = {}
+        clusters: set[str] = set()
+        proposals: set[str] = set()
+
+        for row in rows:
+            rc = str(row.get("resolved_root_cause", ""))
+            if rc:
+                root_causes[rc] = root_causes.get(rc, 0) + 1
+
+            gr = row.get("gate_result")
+            if gr:
+                gr_str = str(gr)
+                gate_results[gr_str] = gate_results.get(gr_str, 0) + 1
+
+            cid = str(row.get("cluster_id", ""))
+            if cid:
+                clusters.add(cid)
+
+            pid = row.get("proposal_id")
+            if pid:
+                proposals.add(str(pid))
+
+            blame_raw = row.get("blame_set")
+            blame_list: list[str] = []
+            if blame_raw:
+                if isinstance(blame_raw, str):
+                    try:
+                        blame_list = json.loads(blame_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        blame_list = []
+                elif isinstance(blame_raw, list):
+                    blame_list = [str(x) for x in blame_raw]
+
+            prov_records.append(
+                ProvenanceRecord(
+                    questionId=str(row.get("question_id", "")),
+                    signalType=str(row.get("signal_type", "")),
+                    judge=str(row.get("judge", "")),
+                    judgeVerdict=str(row.get("judge_verdict", "")),
+                    resolvedRootCause=rc,
+                    resolutionMethod=str(row.get("resolution_method", "")),
+                    blameSet=blame_list,
+                    counterfactualFix=row.get("counterfactual_fix"),
+                    clusterId=cid,
+                    proposalId=row.get("proposal_id"),
+                    patchType=row.get("patch_type"),
+                    gateType=row.get("gate_type"),
+                    gateResult=row.get("gate_result"),
+                )
+            )
+
+        summaries.append(
+            ProvenanceSummary(
+                runId=run_id,
+                iteration=iter_num,
+                lever=lever_num,
+                totalRecords=len(prov_records),
+                clusterCount=len(clusters),
+                proposalCount=len(proposals),
+                rootCauseDistribution=root_causes,
+                gateResults=gate_results,
+                records=prov_records,
+            )
+        )
+
+    return summaries
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────

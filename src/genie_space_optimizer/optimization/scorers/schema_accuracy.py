@@ -19,10 +19,10 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
-    build_temporal_note,
     format_asi_markdown,
     get_registered_prompt_name,
 )
+from genie_space_optimizer.optimization.scorers import build_scorer_context
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
@@ -42,34 +42,9 @@ def _make_schema_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
         question_id = inputs.get("question_id", "")
         cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
-        cmp_summary = ""
-        if cmp:
-            cmp_summary = (
-                f"\nResult comparison (GT vs Genie): match={cmp.get('match')}, "
-                f"match_type={cmp.get('match_type', 'unknown')}, "
-                f"gt_rows={cmp.get('gt_rows', '?')}, genie_rows={cmp.get('genie_rows', '?')}\n"
-                "NOTE: If results match (match=True), the queries are functionally equivalent "
-                "even if SQL syntax differs. Weight this heavily in your assessment.\n"
-            )
-
-        empty_data_note = ""
-        if cmp.get("gt_rows", -1) == 0 and cmp.get("genie_rows", -1) > 0:
-            empty_data_note = (
-                "\nCRITICAL: The Expected SQL returned 0 rows while the Generated SQL "
-                "returned data. This likely means the Expected SQL has overly restrictive "
-                "filters NOT present in the user's question (e.g. date ranges, status "
-                "filters the user never asked for). When the Expected SQL is wrong, "
-                "evaluate the Generated SQL SOLELY against the user's question. If the "
-                "Generated SQL correctly answers what the user asked, it should PASS "
-                "regardless of differences from the Expected SQL.\n"
-            )
-        elif cmp.get("gt_rows", -1) == 0:
-            empty_data_note = (
-                "\nIMPORTANT: Both queries returned 0 rows — the underlying dataset "
-                "has no matching data. Minor SQL differences have no practical impact. "
-                "Focus on whether the SQL structure and intent are correct. Lean toward "
-                "PASS if structurally sound.\n"
-            )
+        context = build_scorer_context(
+            question=question, genie_sql=genie_sql, gt_sql=gt_sql, cmp=cmp,
+        )
 
         prompt = (
             "You are a SQL schema expert evaluating SQL for a Databricks Genie Space.\n"
@@ -81,18 +56,14 @@ def _make_schema_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
             "2. ASSET EQUIVALENCE: A metric view (using MEASURE()), a TVF (table-valued function),\n"
             "   and the underlying fact table are ALL valid schema choices when they answer the\n"
             "   same question. Do NOT flag wrong_table when Generated SQL uses one asset type\n"
-            "   while Expected uses another (e.g. metric view vs TVF, TVF vs fact table) if\n"
-            "   both answer the user's question. The asset_routing judge handles routing\n"
-            "   preference separately — schema_accuracy only cares about correctness.\n"
+            "   while Expected uses another. The asset_routing judge handles routing preference\n"
+            "   separately — schema_accuracy only cares about correctness.\n"
             "3. COSMETIC DIFFERENCES are NOT schema errors:\n"
             "   - GROUP BY ALL vs explicit GROUP BY (identical semantics)\n"
             "   - Defensive WHERE col IS NOT NULL filters\n"
             "   - ORDER BY differences\n"
             "   - Column aliasing differences\n\n"
-            f"User question: {question}\n"
-            f"Expected SQL: {gt_sql}\n"
-            f"Generated SQL: {genie_sql}\n"
-            f"{cmp_summary}{empty_data_note}{build_temporal_note(cmp)}\n"
+            f"{context}\n\n"
             'Respond with JSON only: {"correct": true/false, "failure_type": "<wrong_table|wrong_column|wrong_join|missing_column>", '
             '"wrong_clause": "<the problematic SQL clause>", "blame_set": ["<table_or_column>"], '
             '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '

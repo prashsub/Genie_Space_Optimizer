@@ -1,12 +1,23 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Standalone Evaluation — Training Document
+# MAGIC # Standalone Evaluation — Training Guide
 # MAGIC
-# MAGIC ## Purpose
+# MAGIC | Quick Reference | |
+# MAGIC |---|---|
+# MAGIC | **Task** | Standalone — **Not part of the 5-task DAG** |
+# MAGIC | **Entry point** | `run_evaluation_via_job()` in `optimization/harness.py`, or manual run |
+# MAGIC | **Shares code with** | Task 2 (baseline_eval) — same `run_evaluation()`, `make_predict_fn()`, `make_all_scorers()` |
+# MAGIC | **Results via** | `dbutils.notebook.exit(accuracy)` + MLflow experiment runs |
+# MAGIC | **Typical duration** | 5–30 min |
+# MAGIC | **Log label** | `[EVALUATION]` |
+# MAGIC
+# MAGIC ## 🎯 Purpose
 # MAGIC
 # MAGIC This notebook runs evaluation **independently** — it is **not** part of the 5-task optimization DAG (preflight → baseline_eval → lever_loop → finalize → deploy). It is a self-contained evaluation runner used when evaluation needs to run in isolation.
 # MAGIC
-# MAGIC ## Relationship to the DAG
+# MAGIC ## 🏗️ Relationship to the DAG
+# MAGIC
+# MAGIC > **⚠️ Warning:** This notebook is **NOT** a DAG task. It runs as a separate Databricks Job.
 # MAGIC
 # MAGIC ```
 # MAGIC ┌─────────────────────────────────────────────────────────────┐
@@ -31,15 +42,13 @@
 # MAGIC | `run_evaluation_via_job()` | Submits this notebook as a `w.jobs.submit()` run with widget parameters | When evaluation is executed as a separate task (e.g., for Serverless compute or multi-task architecture) |
 # MAGIC | **Manual runs** | Operators run directly in Databricks with widget parameters | Ad-hoc evaluation, debugging, or re-evaluation of a specific space |
 # MAGIC
-# MAGIC The `run_evaluation_via_job()` function lives in `optimization/harness.py`. It passes `space_id`, `experiment_name`, `iteration`, `domain`, `model_id`, and `eval_scope` as widget parameters.
-# MAGIC
 # MAGIC ## How Results Flow Back
 # MAGIC
 # MAGIC - The notebook calls `dbutils.notebook.exit(accuracy)` with the overall accuracy as a string.
 # MAGIC - The caller (`run_evaluation_via_job`) polls the job status via `w.jobs.get_run()` and reads the exit value from the completed run.
 # MAGIC - Evaluation results are also persisted in MLflow (experiment runs, metrics, artifacts) and are accessible independently of the notebook exit value.
 # MAGIC
-# MAGIC ## Widget Parameters
+# MAGIC ## ⚙️ Widget Parameters
 # MAGIC
 # MAGIC | Parameter | Type | Default | Description |
 # MAGIC |-----------|------|---------|-------------|
@@ -54,12 +63,12 @@
 # MAGIC
 # MAGIC ## SQL Context Setup
 # MAGIC
-# MAGIC Before creating the predict function and running evaluation, the notebook sets the Spark SQL context (`USE CATALOG` / `USE SCHEMA`) via `_ensure_sql_context()`. This is required for SQL Connect stability when querying Unity Catalog tables and running Genie predictions.
+# MAGIC > **📝 Note:** Before creating the predict function and running evaluation, the notebook sets the Spark SQL context (`USE CATALOG` / `USE SCHEMA`) via `_ensure_sql_context()`. This is required for SQL Connect stability when querying Unity Catalog tables and running Genie predictions.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Imports and Helper Functions
+# MAGIC ## 📦 Imports and Helper Functions
 # MAGIC
 # MAGIC | Import | Purpose |
 # MAGIC |--------|---------|
@@ -111,7 +120,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Widget Parameter Resolution
+# MAGIC ## ⚙️ Widget Parameter Resolution
 # MAGIC
 # MAGIC Widgets are read from `dbutils.widgets.get(...)`. When submitted via `run_evaluation_via_job()`, these are passed as `base_parameters` in the notebook task. When run manually, operators fill them in the Databricks notebook UI.
 
@@ -151,9 +160,11 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Load Benchmarks
+# MAGIC ## 🔄 Load Benchmarks
 # MAGIC
-# MAGIC Benchmarks are loaded from the UC table `{catalog}.{schema}.genie_benchmarks_{domain}`. If no benchmarks are found, the notebook raises immediately. The same benchmark dataset is used by the DAG's baseline and lever_loop tasks.
+# MAGIC Benchmarks are loaded from the UC table `{catalog}.{schema}.genie_benchmarks_{domain}`. The same benchmark dataset is used by the DAG's baseline and lever_loop tasks.
+# MAGIC
+# MAGIC > **⚠️ Warning:** If no benchmarks are found, the notebook raises immediately.
 
 # COMMAND ----------
 
@@ -171,7 +182,7 @@ _log("Benchmark dataset", uc_schema=uc_schema, domain=domain, benchmark_count=le
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Set SQL Context and Create Predict/Scorers
+# MAGIC ## 🔌 Set SQL Context and Create Predict/Scorers
 # MAGIC
 # MAGIC - **`_ensure_sql_context()`** — Runs `USE CATALOG` and `USE SCHEMA` so Spark SQL resolves table references correctly.
 # MAGIC - **`make_predict_fn()`** — Creates a closure that rate-limits, calls Genie API, executes both expected and generated SQLs, normalizes results, and compares hashes.
@@ -186,14 +197,17 @@ scorers = make_all_scorers(w, spark, catalog, schema)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Run Evaluation
+# MAGIC ## 🔄 Run Evaluation
 # MAGIC
 # MAGIC `run_evaluation()` wraps `mlflow.genai.evaluate()` with:
-# MAGIC - Retry logic (`_run_evaluate_with_retries()`) — up to 4 attempts with exponential backoff
-# MAGIC - Single-worker fallback on retries to reduce concurrency-related races
-# MAGIC - Benchmark quarantine (SQL/routine gating) integrated in the evaluation path
-# MAGIC - Threshold checking against `MLFLOW_THRESHOLDS`
-# MAGIC - Infrastructure SQL error detection and fail-fast behavior (controlled by `FAIL_ON_INFRA_EVAL_ERRORS`)
+# MAGIC
+# MAGIC | Feature | Detail |
+# MAGIC |---------|--------|
+# MAGIC | Retry logic | `_run_evaluate_with_retries()` — up to 4 attempts with exponential backoff |
+# MAGIC | Worker fallback | Single-worker mode on retries to reduce concurrency-related races |
+# MAGIC | Benchmark quarantine | SQL/routine gating integrated in the evaluation path |
+# MAGIC | Threshold checking | Against `MLFLOW_THRESHOLDS` |
+# MAGIC | Infra error detection | Fail-fast controlled by `FAIL_ON_INFRA_EVAL_ERRORS` |
 # MAGIC
 # MAGIC **Returns:** `{overall_accuracy, thresholds_met, scores, ...}`
 
@@ -235,11 +249,11 @@ dbutils.notebook.exit(str(result.get("overall_accuracy", 0.0)))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Known Failure Modes
+# MAGIC ## ⚠️ Known Failure Modes
 # MAGIC
 # MAGIC This notebook uses the same evaluation engine as Task 2 (baseline_eval). The same failure modes apply:
 # MAGIC
-# MAGIC ### 1. `AttributeError: 'NoneType' object has no attribute 'info'`
+# MAGIC ### 🔴 CRITICAL: `AttributeError: 'NoneType' object has no attribute 'info'`
 # MAGIC
 # MAGIC **Cause:** Transient bug inside `mlflow.genai.evaluation.harness`.
 # MAGIC
@@ -247,7 +261,7 @@ dbutils.notebook.exit(str(result.get("overall_accuracy", 0.0)))
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 2. Infrastructure SQL Errors
+# MAGIC ### 🔴 CRITICAL: Infrastructure SQL Errors
 # MAGIC
 # MAGIC **Cause:** Spark SQL context not set correctly, or missing permissions.
 # MAGIC
@@ -255,7 +269,7 @@ dbutils.notebook.exit(str(result.get("overall_accuracy", 0.0)))
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 3. No Benchmarks Found
+# MAGIC ### 🟡 WARNING: No Benchmarks Found
 # MAGIC
 # MAGIC **Cause:** The benchmark table `{catalog}.{schema}.genie_benchmarks_{domain}` is empty or missing.
 # MAGIC
@@ -276,7 +290,24 @@ dbutils.notebook.exit(str(result.get("overall_accuracy", 0.0)))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Summary
+# MAGIC ## ✅ What Success Looks Like
+# MAGIC
+# MAGIC When this notebook completes successfully, you will see output similar to:
+# MAGIC
+# MAGIC ```
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [EVALUATION] Running Evaluation
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 14:05:00 UTC] [EVALUATION] Evaluation complete
+# MAGIC   {"overall_accuracy": 82.5, "thresholds_met": true}
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [EVALUATION] Evaluation Completed
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 14:05:01 UTC] [EVALUATION] Final result
+# MAGIC   {"overall_accuracy": 82.5, "thresholds_met": true}
+# MAGIC ```
+# MAGIC
+# MAGIC ## 📋 Summary
 # MAGIC
 # MAGIC - **Standalone Evaluation** runs the same 8-judge evaluation suite as the DAG's baseline task, but as an independent Databricks Job.
 # MAGIC - **Not part of the DAG** — called by `run_evaluation_via_job()` in the harness or run manually by operators.

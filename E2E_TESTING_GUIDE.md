@@ -1116,6 +1116,12 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] "View Results" button appears on terminal status
 - [ ] Failed run shows convergence reason
 - [ ] Polling stops on terminal status
+- [ ] Iteration chart renders score progression across iterations
+- [ ] ASI panel shows failure breakdown by judge and type
+- [ ] Provenance panel shows judge → cluster → patch → gate chain
+- [ ] `GET /runs/{id}/iterations` returns per-iteration score data
+- [ ] `GET /runs/{id}/asi` returns ASI failure analysis
+- [ ] `GET /runs/{id}/provenance` returns provenance records
 
 ### Job Execution (check each task)
 
@@ -1124,6 +1130,8 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Baseline eval completes: scores recorded in `genie_opt_iterations` with iteration=0
 - [ ] Baseline traces tagged with `genie.optimization_run_id`, `genie.iteration`, `genie.eval_scope`
 - [ ] Lever loop Stage 2.5: prompt matching auto-config applied (format assistance + entity matching)
+- [ ] Lever loop Stage 2.75: proactive description enrichment for blank columns (if any eligible)
+- [ ] Lever loop strategist: holistic strategy generated triaging all failures to levers
 - [ ] Lever loop arbiter corrections: applied if ≥3 `genie_correct` verdicts in baseline
 - [ ] Lever loop arbiter filter: `both_correct` AND `genie_correct` excluded from hard failure rows
 - [ ] Lever loop tiered arbiter: soft signal rows extracted (individual judge failures on correct verdicts)

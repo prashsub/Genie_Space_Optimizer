@@ -1,50 +1,50 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Task 4: Finalize — Training Document
+# MAGIC # Task 4: Finalize — Training Guide
 # MAGIC
-# MAGIC ## Purpose
+# MAGIC | Quick Reference | |
+# MAGIC |---|---|
+# MAGIC | **Task** | 4 of 5 — Finalize (Repeatability + Promotion + Report) |
+# MAGIC | **Harness function** | `_run_finalize()` in `optimization/harness.py` |
+# MAGIC | **Reads from** | `preflight` (run context) + `lever_loop` or `baseline_eval` (scores, model_id) |
+# MAGIC | **Publishes to** | `deploy` (status, convergence_reason, repeatability_pct, report_path) |
+# MAGIC | **Typical duration** | 10–120 min (depends on repeatability test size) |
+# MAGIC | **Log label** | `[TASK-4 FINALIZE]` |
+# MAGIC
+# MAGIC ## 🎯 Purpose
 # MAGIC
 # MAGIC Task 4 (Finalize) is the penultimate stage of the Genie Space optimization pipeline. It performs **repeatability testing**, **model promotion**, and **final report generation** before the optional deploy step. This task ensures that the optimized configuration is validated for consistency and that all downstream consumers receive a complete, auditable summary of the run.
 # MAGIC
-# MAGIC ## What Finalize Does
+# MAGIC ## 🏗️ DAG Position
 # MAGIC
-# MAGIC 1. **Reads upstream values** from preflight and lever_loop (or baseline_eval if lever_loop was skipped)
-# MAGIC 2. **Loads benchmarks** from the UC table for repeatability testing
-# MAGIC 3. **Runs repeatability testing** — re-queries Genie multiple times and compares SQL hashes to detect non-determinism
-# MAGIC 4. **Promotes the best model** to the production registry
-# MAGIC 5. **Generates a final report** summarizing the run, scores, convergence reason, and optimization history
-# MAGIC 6. **Determines terminal status** (CONVERGED, MAX_ITERATIONS, STALLED, or FAILED)
-# MAGIC 7. **Publishes task values** for the deploy task
-# MAGIC
-# MAGIC ## Place in the 5-Task DAG
-# MAGIC
-# MAGIC ```
-# MAGIC preflight → baseline_eval → lever_loop → finalize (this task) → deploy
-# MAGIC ```
-# MAGIC
-# MAGIC - **Depends on:** lever_loop (must complete or skip first)
-# MAGIC - **Feeds:** deploy (uses `status`, `convergence_reason`, `terminal_reason`, `repeatability_pct`, `report_path`)
+# MAGIC | Step | Task | Status | Reads From | Publishes To |
+# MAGIC |:----:|------|:------:|------------|--------------|
+# MAGIC | 1 | preflight | Done | widgets | all tasks |
+# MAGIC | 2 | baseline_eval | Done | preflight | lever_loop |
+# MAGIC | 3 | lever_loop | Done | preflight + baseline | finalize |
+# MAGIC | 4 | **finalize** | **⬅️ THIS TASK** | lever_loop | deploy |
+# MAGIC | 5 | deploy | Next | preflight + finalize | *(terminal)* |
 # MAGIC
 # MAGIC ## Input Sources: lever_loop vs baseline_eval
 # MAGIC
-# MAGIC This task reads scores and model metadata from **either** `lever_loop` **or** `baseline_eval`, depending on whether the lever loop was skipped:
+# MAGIC > **📝 Note:** This task reads scores and model metadata from **either** `lever_loop` **or** `baseline_eval`, depending on whether the lever loop was skipped. The `skipped` task value from `lever_loop` determines which source to use.
 # MAGIC
 # MAGIC - **If lever loop was skipped** (baseline already met all thresholds): reads from `baseline_eval` — scores, model_id, and iteration_counter=0.
 # MAGIC - **If lever loop ran**: reads from `lever_loop` — scores, model_id, and iteration_counter from the last iteration.
 # MAGIC
-# MAGIC The `skipped` task value from `lever_loop` determines which source to use.
+# MAGIC ## ⚠️ What Happens If This Task Fails
 # MAGIC
-# MAGIC ## What Happens If This Task Fails
+# MAGIC > **⚠️ Warning:** Deploy task may still run (depends on job configuration) but will lack finalize metadata.
 # MAGIC
-# MAGIC - Deploy task may still run (depends on job configuration) but will lack finalize metadata
 # MAGIC - Delta state is updated with `FINALIZE` = FAILED
 # MAGIC - Run status is set to FAILED with `convergence_reason=error_in_FINALIZE` or `finalize_timeout`
-# MAGIC - **Debugging:** Check job run logs for `[TASK-4 FINALIZE] Failure details`, inspect `genie_opt_stages` for the FINALIZE stage record
+# MAGIC
+# MAGIC > **💡 Tip:** Check job run logs for `[TASK-4 FINALIZE] Failure details`, inspect `genie_opt_stages` for the FINALIZE stage record.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Timeout and Heartbeat Mechanism
+# MAGIC ## ⏱️ Timeout and Heartbeat Mechanism
 # MAGIC
 # MAGIC Finalize can be long-running (repeatability tests re-query Genie many times). To keep the task observable and avoid silent hangs:
 # MAGIC
@@ -78,7 +78,7 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Imports and Helper Functions
+# MAGIC ## 📦 Imports and Helper Functions
 # MAGIC
 # MAGIC | Import | Purpose |
 # MAGIC |--------|---------|
@@ -122,7 +122,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Reading Upstream Task Values
+# MAGIC ## ⚙️ Reading Upstream Task Values
 # MAGIC
 # MAGIC Task 4 reads from two upstream tasks depending on whether lever_loop ran or was skipped:
 # MAGIC
@@ -144,7 +144,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # MAGIC | `model_id` | `baseline_eval` | `lever_loop` | Best model version ID |
 # MAGIC | `iteration_counter` | `0` (hardcoded) | `lever_loop` | Number of lever iterations completed |
 # MAGIC
-# MAGIC The `skipped` key from `lever_loop` determines which source to use. When `True`, baseline values are used directly since no optimization was needed.
+# MAGIC > **📝 Note:** The `skipped` key from `lever_loop` determines which source to use. When `True`, baseline values are used directly since no optimization was needed.
 
 # COMMAND ----------
 
@@ -191,7 +191,7 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Loading Benchmarks for Repeatability
+# MAGIC ## 🔄 Loading Benchmarks for Repeatability
 # MAGIC
 # MAGIC Benchmarks are loaded from the UC table `{catalog}.{schema}.genie_benchmarks_{domain}` for use in repeatability testing. The same benchmark set used during baseline and lever_loop evaluation is re-used here to ensure consistency.
 
@@ -210,17 +210,19 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## What `_run_finalize` Does Internally
+# MAGIC ## 🔧 What `_run_finalize` Does Internally
 # MAGIC
 # MAGIC The harness function `_run_finalize()` (in `optimization/harness.py`) performs:
 # MAGIC
-# MAGIC 1. **Stage write** — Records `FINALIZE_STARTED` in Delta `genie_opt_stages`.
-# MAGIC 2. **Repeatability testing** — Runs 2 evaluation passes over all benchmarks, comparing SQL hashes across invocations. Computes per-question match rates and averages them into a final `repeatability_pct`.
-# MAGIC 3. **Terminal status resolution** — Determines whether the run converged, hit max iterations, stalled, or failed. This drives the `convergence_reason` and `terminal_reason` fields.
-# MAGIC 4. **Model promotion** — Promotes the best-performing model (by accuracy and repeatability) to the production registry via MLflow.
-# MAGIC 5. **Report generation** — Produces a comprehensive report artifact summarizing scores, convergence reason, iteration history, and repeatability results.
-# MAGIC 6. **State updates** — Writes `FINALIZE_COMPLETE` stage, updates `genie_opt_runs` with terminal status and report path.
-# MAGIC 7. **Heartbeat loop** — During long-running repeatability tests, periodically writes `FINALIZE_HEARTBEAT` stage records and updates `run.updated_at` to prevent stale-state detection.
+# MAGIC | Step | Action | Key Detail | Output |
+# MAGIC |:----:|--------|-----------|--------|
+# MAGIC | 1 | Stage write | Records `FINALIZE_STARTED` in Delta | stage record |
+# MAGIC | 2 | Repeatability testing | 2 eval passes, compare SQL hashes per question | `repeatability_pct` |
+# MAGIC | 3 | Terminal status resolution | Converged / max_iterations / stalled / failed | `convergence_reason` |
+# MAGIC | 4 | Model promotion | Best model → production registry via MLflow | promoted model |
+# MAGIC | 5 | Report generation | Scores, convergence, iteration history, repeatability | `report_path` |
+# MAGIC | 6 | State updates | `FINALIZE_COMPLETE`, update `genie_opt_runs` | Delta records |
+# MAGIC | 7 | Heartbeat loop | Periodic `FINALIZE_HEARTBEAT` during long runs | prevents stale-state detection |
 # MAGIC
 # MAGIC **Returns:** `{status, convergence_reason, terminal_reason, repeatability_pct, report_path, elapsed_seconds, heartbeat_count}`
 
@@ -258,7 +260,7 @@ except Exception as exc:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Publishing Task Values
+# MAGIC ## 📤 Publishing Task Values
 # MAGIC
 # MAGIC The deploy task reads these keys via `dbutils.jobs.taskValues.get(taskKey="finalize", key="...")`.
 # MAGIC
@@ -299,9 +301,9 @@ dbutils.notebook.exit(json.dumps({
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Known Failure Modes
+# MAGIC ## ⚠️ Known Failure Modes
 # MAGIC
-# MAGIC ### 1. Finalize Timeout
+# MAGIC ### 🔴 CRITICAL: Finalize Timeout
 # MAGIC
 # MAGIC **Cause:** Repeatability testing exceeds `FINALIZE_TIMEOUT_SECONDS` (default 6600s / ~110 min). This can happen with large benchmark sets or slow Genie API responses.
 # MAGIC
@@ -314,7 +316,7 @@ dbutils.notebook.exit(json.dumps({
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 2. MLflow Model Promotion Errors
+# MAGIC ### 🔴 CRITICAL: MLflow Model Promotion Errors
 # MAGIC
 # MAGIC **Cause:** Insufficient permissions to promote the model, or the model version no longer exists.
 # MAGIC
@@ -324,9 +326,9 @@ dbutils.notebook.exit(json.dumps({
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 3. Repeatability Regressions
+# MAGIC ### 🔵 INFO: Repeatability Regressions
 # MAGIC
-# MAGIC **Note:** Low repeatability does **not** cause task failure — it is recorded as a metric. However, a very low repeatability percentage (<50%) may indicate instability in the Genie Space configuration or API.
+# MAGIC > **📝 Note:** Low repeatability does **not** cause task failure — it is recorded as a metric. However, a very low repeatability percentage (<50%) may indicate instability in the Genie Space configuration or API.
 # MAGIC
 # MAGIC ---
 # MAGIC
@@ -348,7 +350,31 @@ dbutils.notebook.exit(json.dumps({
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Summary
+# MAGIC ## ✅ What Success Looks Like
+# MAGIC
+# MAGIC When this task completes successfully, you will see output similar to:
+# MAGIC
+# MAGIC ```
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-4 FINALIZE] Running _run_finalize
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 11:30:00 UTC] [TASK-4 FINALIZE] Repeatability pass 1/2 complete (87.5%)
+# MAGIC [2026-02-28 11:45:00 UTC] [TASK-4 FINALIZE] Repeatability pass 2/2 complete (90.0%)
+# MAGIC [2026-02-28 11:45:01 UTC] [TASK-4 FINALIZE] Finalize finished
+# MAGIC   {
+# MAGIC     "status": "CONVERGED",
+# MAGIC     "convergence_reason": "threshold_met",
+# MAGIC     "repeatability_pct": 88.75,
+# MAGIC     "elapsed_seconds": 912,
+# MAGIC     "heartbeat_count": 30,
+# MAGIC     "report_path": "/Workspace/reports/run-xyz-report.html"
+# MAGIC   }
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-4 FINALIZE] Task 4 Completed
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC ```
+# MAGIC
+# MAGIC ## 📋 Summary
 # MAGIC
 # MAGIC - **Task 4 (Finalize)** runs repeatability testing, promotes the best model, generates the final report, and determines terminal status.
 # MAGIC - **Input branching:** Reads from `lever_loop` if it ran, or `baseline_eval` if it was skipped. The `skipped` task value controls the source.

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import mlflow
 
-from genie_space_optimizer.common.config import MODEL_NAME_TEMPLATE
+from genie_space_optimizer.common.config import MODEL_NAME_TEMPLATE, format_mlflow_template
 from genie_space_optimizer.optimization.state import (
     load_iterations,
     load_run,
@@ -51,7 +51,7 @@ def create_genie_model_version(
     Captures the full Genie config and UC metadata state as model params
     and artifacts. Returns the ``model_id`` string.
     """
-    model_name = MODEL_NAME_TEMPLATE.format(space_id=space_id)
+    model_name = format_mlflow_template(MODEL_NAME_TEMPLATE, space_id=space_id)
 
     try:
         if experiment_name:
@@ -165,7 +165,7 @@ def promote_best_model(
         return None
 
     space_id = run_row.get("space_id", "")
-    model_name = MODEL_NAME_TEMPLATE.format(space_id=space_id)
+    model_name = format_mlflow_template(MODEL_NAME_TEMPLATE, space_id=space_id)
 
     try:
         alias_fn = getattr(mlflow, "set_logged_model_alias", None)

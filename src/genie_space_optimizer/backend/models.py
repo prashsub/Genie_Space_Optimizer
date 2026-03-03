@@ -255,3 +255,78 @@ class MissingGrantDetail(BaseModel):
     catalog: str
     schema_name: str
     grantCommand: str
+
+
+# ── ASI (Judge Feedback) Models ───────────────────────────────────────
+
+
+class AsiResult(SafeModel):
+    questionId: str
+    judge: str
+    value: str
+    failureType: str | None = None
+    severity: str | None = None
+    confidence: float | None = None
+    blameSet: list[str] = []
+    counterfactualFix: str | None = None
+    wrongClause: str | None = None
+    expectedValue: str | None = None
+    actualValue: str | None = None
+
+
+class AsiSummary(SafeModel):
+    runId: str
+    iteration: int
+    totalResults: int
+    passCount: int
+    failCount: int
+    failureTypeDistribution: dict[str, int] = {}
+    blameDistribution: dict[str, int] = {}
+    judgePassRates: dict[str, float] = {}
+    results: list[AsiResult] = []
+
+
+# ── Provenance Models ─────────────────────────────────────────────────
+
+
+class ProvenanceRecord(SafeModel):
+    questionId: str
+    signalType: str
+    judge: str
+    judgeVerdict: str
+    resolvedRootCause: str
+    resolutionMethod: str
+    blameSet: list[str] = []
+    counterfactualFix: str | None = None
+    clusterId: str
+    proposalId: str | None = None
+    patchType: str | None = None
+    gateType: str | None = None
+    gateResult: str | None = None
+
+
+class ProvenanceSummary(SafeModel):
+    runId: str
+    iteration: int
+    lever: int
+    totalRecords: int
+    clusterCount: int
+    proposalCount: int
+    rootCauseDistribution: dict[str, int] = {}
+    gateResults: dict[str, int] = {}
+    records: list[ProvenanceRecord] = []
+
+
+# ── Iteration Models ──────────────────────────────────────────────────
+
+
+class IterationSummary(SafeModel):
+    iteration: int
+    lever: int | None = None
+    evalScope: str
+    overallAccuracy: float
+    totalQuestions: int
+    correctCount: int
+    repeatabilityPct: float | None = None
+    thresholdsMet: bool
+    judgeScores: dict[str, float | None] = {}

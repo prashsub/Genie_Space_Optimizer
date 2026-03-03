@@ -1,28 +1,33 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Task 5: Deploy — Training Document
+# MAGIC # Task 5: Deploy — Training Guide
 # MAGIC
-# MAGIC ## Purpose
+# MAGIC | Quick Reference | |
+# MAGIC |---|---|
+# MAGIC | **Task** | 5 of 5 — Deploy (Conditional) |
+# MAGIC | **Harness function** | `_run_deploy()` in `optimization/harness.py` |
+# MAGIC | **Reads from** | `preflight` (deploy_target, run context) + `lever_loop` or `baseline_eval` (model_id) |
+# MAGIC | **Publishes to** | *(terminal — no downstream)* |
+# MAGIC | **Typical duration** | 1–5 min |
+# MAGIC | **Log label** | `[TASK-5 DEPLOY]` |
+# MAGIC
+# MAGIC ## 🎯 Purpose
 # MAGIC
 # MAGIC Task 5 (Deploy) is the **final and conditional** step in the 5-task optimization DAG. It applies the optimized Genie Space configuration to a target environment (e.g., via DABs) after optimization has completed successfully.
 # MAGIC
-# MAGIC ## Place in the 5-Task DAG
+# MAGIC ## 🏗️ DAG Position
 # MAGIC
-# MAGIC ```
-# MAGIC preflight → baseline_eval → lever_loop → finalize → deploy (this task)
-# MAGIC ```
-# MAGIC
-# MAGIC - **Depends on:** finalize (must complete first)
-# MAGIC - **Upstream data:** preflight (run context), lever_loop or baseline_eval (model_id, iteration_counter)
-# MAGIC - **Terminal task:** No downstream consumers
+# MAGIC | Step | Task | Status | Reads From | Publishes To |
+# MAGIC |:----:|------|:------:|------------|--------------|
+# MAGIC | 1 | preflight | Done | widgets | all tasks |
+# MAGIC | 2 | baseline_eval | Done | preflight | lever_loop |
+# MAGIC | 3 | lever_loop | Done | preflight + baseline | finalize |
+# MAGIC | 4 | finalize | Done | lever_loop | deploy |
+# MAGIC | 5 | **deploy** | **⬅️ THIS TASK** | preflight + finalize | *(terminal)* |
 # MAGIC
 # MAGIC ## When Does Deploy Run?
 # MAGIC
-# MAGIC Deploy is **conditional** — it executes only when `deploy_target` is set:
-# MAGIC
-# MAGIC - **`deploy_target`** is provided by the **preflight** task (from job parameters or widget input).
-# MAGIC - A **condition task** (`deploy_check`) gates the deploy step: it runs only when `deploy_target` is non-empty.
-# MAGIC - If `deploy_target` is empty or unset, the deploy task is skipped and the pipeline completes after finalize.
+# MAGIC > **📝 Note:** Deploy is **conditional** — it executes only when `deploy_target` is set. A **condition task** (`deploy_check`) gates the deploy step: it runs only when `deploy_target` is non-empty. If `deploy_target` is empty or unset, the deploy task is skipped and the pipeline completes after finalize.
 # MAGIC
 # MAGIC ## What Deploy Does
 # MAGIC
@@ -38,16 +43,20 @@
 # MAGIC 1. **Writes** `DEPLOY_SKIPPED` stage record to Delta
 # MAGIC 2. **Returns** `{"status": "SKIPPED", "reason": "no_deploy_target"}`
 # MAGIC
-# MAGIC ## What Happens If This Task Fails
+# MAGIC > **📝 Note:** DABs integration is pending full implementation. The harness currently writes stage records and returns status.
 # MAGIC
-# MAGIC - The optimization results are **not lost** — scores, model, and report from finalize are already persisted in Delta and MLflow
+# MAGIC ## ⚠️ What Happens If This Task Fails
+# MAGIC
+# MAGIC > **📝 Note:** Optimization results are **not lost** — scores, model, and report from finalize are already persisted in Delta and MLflow.
+# MAGIC
 # MAGIC - Delta state is updated with `DEPLOY` = FAILED
-# MAGIC - **Debugging:** Check job run logs for `[TASK-5 DEPLOY] Failure details`, inspect `genie_opt_stages` for the DEPLOY stage record
+# MAGIC
+# MAGIC > **💡 Tip:** Check job run logs for `[TASK-5 DEPLOY] Failure details`, inspect `genie_opt_stages` for the DEPLOY stage record.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Imports and Helper Functions
+# MAGIC ## 📦 Imports and Helper Functions
 # MAGIC
 # MAGIC | Import | Purpose |
 # MAGIC |--------|---------|
@@ -89,7 +98,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Reading Upstream Task Values
+# MAGIC ## ⚙️ Reading Upstream Task Values
 # MAGIC
 # MAGIC Task 5 reads from two upstream tasks depending on whether lever_loop ran or was skipped:
 # MAGIC
@@ -111,7 +120,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # MAGIC | `model_id` | `baseline_eval` | `lever_loop` | Best model version ID to deploy |
 # MAGIC | `iteration_counter` | `0` (hardcoded) | `lever_loop` | Number of lever iterations completed |
 # MAGIC
-# MAGIC The `skipped` key from `lever_loop` determines which source to use. This mirrors the branching logic in Task 4 (finalize).
+# MAGIC > **📝 Note:** The `skipped` key from `lever_loop` determines which source to use. This mirrors the branching logic in Task 4 (finalize).
 
 # COMMAND ----------
 
@@ -155,7 +164,7 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## What `_run_deploy` Does Internally
+# MAGIC ## 🔧 What `_run_deploy` Does Internally
 # MAGIC
 # MAGIC The harness function `_run_deploy()` (in `optimization/harness.py`) performs:
 # MAGIC
@@ -192,15 +201,15 @@ dbutils.notebook.exit(json.dumps(deploy_out, default=str))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Known Failure Modes
+# MAGIC ## ⚠️ Known Failure Modes
 # MAGIC
-# MAGIC ### 1. Empty `deploy_target`
+# MAGIC ### 🔵 INFO: Empty `deploy_target`
 # MAGIC
-# MAGIC **Behavior:** Not a failure — the harness writes `DEPLOY_SKIPPED` to Delta and returns `{"status": "SKIPPED"}`. The condition task in the job definition should prevent this notebook from running at all when `deploy_target` is empty, but the harness handles it gracefully as a safety net.
+# MAGIC > **📝 Note:** Not a failure — the harness writes `DEPLOY_SKIPPED` to Delta and returns `{"status": "SKIPPED"}`. The condition task in the job definition should prevent this notebook from running at all when `deploy_target` is empty, but the harness handles it gracefully as a safety net.
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 2. Permission Errors
+# MAGIC ### 🔴 CRITICAL: Permission Errors
 # MAGIC
 # MAGIC **Cause:** The service principal lacks permissions to modify the target Genie Space or write to the deploy location.
 # MAGIC
@@ -210,7 +219,7 @@ dbutils.notebook.exit(json.dumps(deploy_out, default=str))
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 3. Stale Model ID
+# MAGIC ### 🟡 WARNING: Stale Model ID
 # MAGIC
 # MAGIC **Cause:** The `model_id` from lever_loop/baseline may reference a model version that was deleted or moved between tasks.
 # MAGIC
@@ -238,7 +247,35 @@ dbutils.notebook.exit(json.dumps(deploy_out, default=str))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Summary
+# MAGIC ## ✅ What Success Looks Like
+# MAGIC
+# MAGIC **When deployed:**
+# MAGIC
+# MAGIC ```
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-5 DEPLOY] Running _run_deploy
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 11:50:00 UTC] [TASK-5 DEPLOY] Deploy result
+# MAGIC   {"status": "DEPLOYED", "deploy_target": "dabs://my-workspace/genie-spaces/revenue"}
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-5 DEPLOY] Task 5 Completed
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC ```
+# MAGIC
+# MAGIC **When skipped (no deploy target):**
+# MAGIC
+# MAGIC ```
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-5 DEPLOY] Running _run_deploy
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 11:50:00 UTC] [TASK-5 DEPLOY] Deploy result
+# MAGIC   {"status": "SKIPPED", "reason": "no_deploy_target"}
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-5 DEPLOY] Task 5 Completed
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC ```
+# MAGIC
+# MAGIC ## 📋 Summary
 # MAGIC
 # MAGIC - **Task 5 (Deploy)** is a conditional step that applies the optimized Genie Space configuration to a target environment.
 # MAGIC - **Input branching:** Reads `model_id` and `iteration_counter` from `lever_loop` if it ran, or `baseline_eval` if it was skipped. This mirrors the same branching logic as Task 4 (finalize).

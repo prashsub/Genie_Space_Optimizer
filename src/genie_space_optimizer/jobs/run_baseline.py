@@ -1,18 +1,29 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Task 2: Baseline Evaluation
+# MAGIC # Task 2: Baseline Evaluation — Training Guide
 # MAGIC
-# MAGIC ## Purpose
+# MAGIC | Quick Reference | |
+# MAGIC |---|---|
+# MAGIC | **Task** | 2 of 5 — Baseline Evaluation |
+# MAGIC | **Harness function** | `_run_baseline()` in `optimization/harness.py` |
+# MAGIC | **Reads from** | `preflight` (task values) |
+# MAGIC | **Publishes to** | `lever_loop` (scores, accuracy, thresholds_met, model_id) |
+# MAGIC | **Typical duration** | 5–20 min |
+# MAGIC | **Log label** | `[TASK-2 BASELINE]` |
+# MAGIC
+# MAGIC ## 🎯 Purpose
 # MAGIC
 # MAGIC This task establishes the **quality baseline** for the Genie Space before any optimization. It runs the full 8-judge evaluation suite against the benchmark dataset and records scores that the downstream **lever_loop** task will use to measure improvement.
 # MAGIC
-# MAGIC ## What Baseline Evaluation Does
+# MAGIC ## 🏗️ DAG Position
 # MAGIC
-# MAGIC 1. **Reads upstream values** from the preflight task (`run_id`, `space_id`, `domain`, `catalog`, `schema`, `experiment_name`, `model_id`)
-# MAGIC 2. **Loads benchmarks** from the UC table `{catalog}.{schema}.genie_benchmarks_{domain}`
-# MAGIC 3. **Runs the 8-judge evaluation** via `mlflow.genai.evaluate()` with retry for transient harness failures — benchmark quarantine (SQL/routine gating) is now integrated inside `run_evaluation()` and shared across all eval scopes (baseline, slice, P0, full)
-# MAGIC 4. **Checks thresholds** (syntax_validity, schema_accuracy, logical_accuracy, etc.)
-# MAGIC 5. **Publishes task values** (`scores`, `overall_accuracy`, `thresholds_met`, `model_id`) for lever_loop
+# MAGIC | Step | Task | Status | Reads From | Publishes To |
+# MAGIC |:----:|------|:------:|------------|--------------|
+# MAGIC | 1 | preflight | Done | widgets | all tasks |
+# MAGIC | 2 | **baseline_eval** | **⬅️ THIS TASK** | preflight | lever_loop |
+# MAGIC | 3 | lever_loop | Next | preflight + baseline | finalize |
+# MAGIC | 4 | finalize | Pending | lever_loop | deploy |
+# MAGIC | 5 | deploy | Pending | preflight + finalize | *(terminal)* |
 # MAGIC
 # MAGIC ## 8-Judge Scoring System
 # MAGIC
@@ -29,18 +40,10 @@
 # MAGIC | asset_routing | Correct asset type (TABLE/MV/TVF) selected |
 # MAGIC | arbiter | Tie-breaker when results disagree (LLM-based) |
 # MAGIC
-# MAGIC ## Place in the 5-Task DAG
+# MAGIC ## ⚠️ What Happens If This Task Fails
 # MAGIC
-# MAGIC ```
-# MAGIC preflight → baseline_eval (this task) → lever_loop → finalize → deploy
-# MAGIC ```
+# MAGIC > **⚠️ Warning:** If baseline fails, the job stops — lever_loop never runs.
 # MAGIC
-# MAGIC - **Depends on:** preflight (must complete first)
-# MAGIC - **Feeds:** lever_loop (uses `scores`, `overall_accuracy`, `thresholds_met`, `model_id`)
-# MAGIC
-# MAGIC ## What Happens If This Task Fails
-# MAGIC
-# MAGIC - The job stops; lever_loop never runs
 # MAGIC - Delta state is updated with `BASELINE_EVAL` = FAILED
 # MAGIC - Run status is set to FAILED with `convergence_reason=error_in_BASELINE_EVAL`
 # MAGIC - This task is expected to **fail loudly** when infrastructure-level evaluation issues are detected (see Known Failure Modes below)
@@ -48,32 +51,30 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Architecture: How Baseline Works
+# MAGIC ## 🔧 What `_run_baseline` Does Internally
 # MAGIC
-# MAGIC ### Data Flow
+# MAGIC | Step | Action | Key Function | Output |
+# MAGIC |:----:|--------|-------------|--------|
+# MAGIC | 1 | Create predict function | `make_predict_fn(w, space_id, spark, catalog, schema)` | closure (rate-limits, calls Genie, executes SQL, normalizes, compares hashes) |
+# MAGIC | 2 | Assemble 8 scorers | `make_all_scorers(w, spark, catalog, schema)` | scorer list for `mlflow.genai.evaluate()` |
+# MAGIC | 3 | Run evaluation with retry | `run_evaluation()` → `_run_evaluate_with_retries()` | scores, accuracy (up to 4 attempts, exponential backoff, single-worker fallback) |
+# MAGIC | 4 | Check thresholds | `all_thresholds_met(scores, MLFLOW_THRESHOLDS)` | `thresholds_met` boolean |
+# MAGIC | 5 | Write state | Delta iteration 0, link scores to model, update run status | Delta records |
 # MAGIC
-# MAGIC 1. **Inputs from preflight** — `dbutils.jobs.taskValues.get(taskKey="preflight", key="...")` provides:
-# MAGIC    - `run_id`, `space_id`, `domain`, `catalog`, `schema`, `experiment_name`, `model_id`
+# MAGIC > **📝 Note:** Benchmark quarantine (SQL/routine gating) is now integrated inside `run_evaluation()` — invalid benchmarks are quarantined within the shared evaluation path rather than as a separate pre-step.
 # MAGIC
-# MAGIC 2. **`_run_baseline()`** (in `optimization.harness`) performs:
-# MAGIC    - **Predict function creation** — `make_predict_fn(w, space_id, spark, catalog, schema)` returns a closure that: rate-limits, calls Genie, executes both SQLs, normalizes results, compares hashes
-# MAGIC    - **Scorer assembly** — `make_all_scorers(w, spark, catalog, schema)` returns the 8-judge list for `mlflow.genai.evaluate(scorers=...)`
-# MAGIC    - **Evaluation with retry** — `run_evaluation()` wraps `mlflow.genai.evaluate()` with `_run_evaluate_with_retries()`: up to 4 attempts, exponential backoff, single-worker fallback on retries for transient harness bugs. Benchmark quarantine (SQL/routine gating) is now integrated inside `run_evaluation()` — invalid benchmarks are quarantined within the shared evaluation path rather than as a separate pre-step.
-# MAGIC    - **Threshold checking** — Compares per-judge means against `MLFLOW_THRESHOLDS`; sets `thresholds_met` boolean
-# MAGIC    - **State writes** — Writes iteration 0 to Delta, links scores to model, updates run status
-# MAGIC
-# MAGIC 3. **Results flow to lever_loop** — Task values `scores`, `overall_accuracy`, `thresholds_met`, `model_id` are consumed by lever_loop to decide whether to proceed and to compare against post-lever scores
+# MAGIC Results flow to lever_loop via task values: `scores`, `overall_accuracy`, `thresholds_met`, `model_id` are consumed to decide whether to proceed and to compare against post-lever scores.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Known Failure Modes (Read This If Baseline Fails Often)
+# MAGIC ## ⚠️ Known Failure Modes (Read This If Baseline Fails Often)
 # MAGIC
 # MAGIC This task fails more often than others because it touches MLflow GenAI harness, Spark SQL, and Genie APIs. Below are the main failure modes and how to handle them.
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 1. `AttributeError: 'NoneType' object has no attribute 'info'`
+# MAGIC ### 🔴 CRITICAL: `AttributeError: 'NoneType' object has no attribute 'info'`
 # MAGIC
 # MAGIC **Cause:** Transient bug inside `mlflow.genai.evaluation.harness`. The harness sometimes receives `eval_item.trace` or `eval_item.trace.info` as `None` and accesses `.info` or `.assessments` on it.
 # MAGIC
@@ -89,7 +90,7 @@
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 2. Infrastructure SQL Errors (Catalog/Schema Context)
+# MAGIC ### 🔴 CRITICAL: Infrastructure SQL Errors (Catalog/Schema Context)
 # MAGIC
 # MAGIC **Cause:** Spark SQL context not set correctly. Errors like:
 # MAGIC - `"TABLE_OR_VIEW_NOT_FOUND"` / `"not in the current catalog"`
@@ -106,7 +107,7 @@
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 3. `FAIL_ON_INFRA_EVAL_ERRORS` Behavior
+# MAGIC ### 🟡 WARNING: `FAIL_ON_INFRA_EVAL_ERRORS` Behavior
 # MAGIC
 # MAGIC **Env var:** `GENIE_SPACE_OPTIMIZER_FAIL_ON_INFRA_EVAL_ERRORS` (default: `true`)
 # MAGIC
@@ -122,7 +123,7 @@
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### 4. gRPC / Spark Connect Timeouts
+# MAGIC ### 🟡 WARNING: gRPC / Spark Connect Timeouts
 # MAGIC
 # MAGIC **Cause:** Transient network or Spark Connect issues during scorer execution.
 # MAGIC
@@ -150,7 +151,7 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Imports and Helpers
+# MAGIC ## 📦 Imports and Helpers
 # MAGIC
 # MAGIC - `_ts()` — UTC timestamp for log lines
 # MAGIC - `_banner()` — Section separator with task label
@@ -180,9 +181,11 @@ _log = partial(_log_base, _TASK_LABEL)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Read Upstream Task Values from Preflight
+# MAGIC ## ⚙️ Read Upstream Task Values from Preflight
 # MAGIC
-# MAGIC All values required for baseline evaluation are published by the preflight task. If any key is missing, `dbutils.jobs.taskValues.get()` returns `None` and downstream logic will fail with a clear error.
+# MAGIC All values required for baseline evaluation are published by the preflight task.
+# MAGIC
+# MAGIC > **⚠️ Warning:** If any key is missing, `dbutils.jobs.taskValues.get()` returns `None` and downstream logic will fail with a clear error.
 
 # COMMAND ----------
 
@@ -213,9 +216,11 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Load Benchmarks
+# MAGIC ## 🔄 Load Benchmarks
 # MAGIC
-# MAGIC Benchmarks are loaded from the UC table `{catalog}.{schema}.genie_benchmarks_{domain}`. Each row is a benchmark question with `question`, `expected_sql`, `expected_asset`, and metadata. If no benchmarks are found, the task raises immediately.
+# MAGIC Benchmarks are loaded from the UC table `{catalog}.{schema}.genie_benchmarks_{domain}`. Each row is a benchmark question with `question`, `expected_sql`, `expected_asset`, and metadata.
+# MAGIC
+# MAGIC > **⚠️ Warning:** If no benchmarks are found, the task raises immediately.
 
 # COMMAND ----------
 
@@ -229,7 +234,7 @@ if not benchmarks:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Run Baseline Evaluation
+# MAGIC ## 🔄 Run Baseline Evaluation
 # MAGIC
 # MAGIC `_run_baseline()` creates the predict function and scorers, runs `mlflow.genai.evaluate()` with retry (benchmark quarantine is integrated inside the evaluation path), checks thresholds, and writes Delta state. On success it returns `scores`, `overall_accuracy`, `thresholds_met`, and `model_id`. On failure it re-raises after logging full details.
 
@@ -261,7 +266,7 @@ except Exception as exc:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Publish Task Values for Downstream
+# MAGIC ## 📤 Publish Task Values for Downstream
 # MAGIC
 # MAGIC The lever_loop task reads these keys via `dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="...")`. All values must be published for the DAG to proceed correctly.
 
@@ -288,7 +293,27 @@ dbutils.notebook.exit(json.dumps({
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Summary
+# MAGIC ## ✅ What Success Looks Like
+# MAGIC
+# MAGIC When this task completes successfully, you will see output similar to:
+# MAGIC
+# MAGIC ```
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-2 BASELINE] Running _run_baseline
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 10:15:12 UTC] [TASK-2 BASELINE] Baseline finished
+# MAGIC   {"overall_accuracy": 72.5, "thresholds_met": false, "model_id": "mv-abc123", "judge_count": 8}
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-2 BASELINE] Publishing Task Values
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [2026-02-28 10:15:23 UTC] [TASK-2 BASELINE] Task values published
+# MAGIC   {"overall_accuracy": 72.5, "thresholds_met": false, "model_id": "mv-abc123"}
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC [TASK-2 BASELINE] Task 2 Completed
+# MAGIC ════════════════════════════════════════════════════════════════
+# MAGIC ```
+# MAGIC
+# MAGIC ## 📋 Summary
 # MAGIC
 # MAGIC Task 2 (Baseline Evaluation) has completed successfully. The lever_loop task will use the published scores and thresholds to:
 # MAGIC - Decide whether baseline already meets thresholds (early exit possible)

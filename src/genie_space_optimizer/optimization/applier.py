@@ -138,17 +138,14 @@ def _enforce_instruction_limit(config: dict) -> None:
     content = ti[0].get("content", [])
     if not isinstance(content, list):
         content = [str(content)]
-    total = sum(len(line) for line in content)
-    if total <= _MAX_INSTRUCTION_CHARS:
+    full_text = "\n".join(content)
+    if len(full_text) <= _MAX_INSTRUCTION_CHARS:
         return
     logger.warning(
         "Instruction text %d chars exceeds limit %d — trimming from end",
-        total, _MAX_INSTRUCTION_CHARS,
+        len(full_text), _MAX_INSTRUCTION_CHARS,
     )
-    while content and total > _MAX_INSTRUCTION_CHARS:
-        removed = content.pop()
-        total -= len(removed)
-    ti[0]["content"] = content
+    ti[0]["content"] = [full_text[:_MAX_INSTRUCTION_CHARS].rsplit("\n", 1)[0]]
 
 
 def _get_general_instructions(config: dict) -> str:
@@ -169,7 +166,12 @@ _HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 def _set_general_instructions(
     config: dict, text: str, instruction_id: str | None = None
 ) -> None:
-    """Set general instructions into text_instructions."""
+    """Set general instructions into text_instructions.
+
+    Stores the full text as a single content list item so that the Genie UI
+    renders newlines correctly.  The ``content`` field is ``list[str]``; using
+    multiple items causes the UI to concatenate them without line breaks.
+    """
     from genie_space_optimizer.common.genie_schema import generate_genie_id
 
     inst = config.setdefault("instructions", {})
@@ -177,11 +179,13 @@ def _set_general_instructions(
     effective_id = instruction_id or (ti[0].get("id") if ti else None) or generate_genie_id()
     if not _HEX_32.match(effective_id or ""):
         effective_id = generate_genie_id()
-    lines = [ln for ln in text.split("\n")] if text else [""]
+
+    content = [text.strip()] if text and text.strip() else [""]
+
     if ti:
-        ti[0] = {"id": effective_id, "content": lines}
+        ti[0] = {"id": effective_id, "content": content}
     else:
-        ti.append({"id": effective_id, "content": lines})
+        ti.append({"id": effective_id, "content": content})
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -503,11 +507,29 @@ def proposals_to_patches(proposals: list[dict]) -> list[dict]:
             fixes = [fixes]
         new_text = p.get("proposed_value") or (fixes[0] if fixes else p.get("change_description", ""))
 
+        table_sections = p.get("table_sections")
         col_sections = p.get("column_sections")
         col_desc = p.get("column_description")
         col_syns = p.get("column_synonyms")
         tbl_id = p.get("table", "")
         col_name = p.get("column", "")
+
+        if isinstance(table_sections, dict) and table_sections and tbl_id and not col_name:
+            patches.append({
+                "type": "update_description",
+                "target": tbl_id,
+                "new_text": "",
+                "old_text": "",
+                "structured_sections": table_sections,
+                "table_entity_type": p.get("table_entity_type", "table"),
+                "lever": lever,
+                "risk_level": classify_risk("update_description"),
+                "predicted_affected_questions": p.get("questions_fixed", 0),
+                "grounded_in": p.get("grounded_in", []),
+                "source_proposal_id": p.get("proposal_id", ""),
+                "table": tbl_id,
+            })
+            continue
 
         if isinstance(col_sections, dict) and col_sections and tbl_id and col_name:
             base = {
@@ -574,6 +596,73 @@ def proposals_to_patches(proposals: list[dict]) -> list[dict]:
                     "synonyms": col_syns,
                 })
             continue
+
+        # ── Auto-convert freeform description patches to structured ──
+        if (
+            patch_type in ("update_column_description", "update_description")
+            and new_text
+            and not col_sections
+            and not table_sections
+        ):
+            parsed = parse_structured_description(new_text)
+            if parsed and any(k != "_preamble" for k in parsed):
+                structured = {k: v for k, v in parsed.items() if k != "_preamble" and v}
+                if structured:
+                    logger.info(
+                        "Auto-converting freeform %s to structured sections: %s",
+                        patch_type, list(structured.keys()),
+                    )
+                    base_freeform = {
+                        "lever": lever,
+                        "risk_level": classify_risk(patch_type),
+                        "predicted_affected_questions": p.get("questions_fixed", 0),
+                        "grounded_in": p.get("grounded_in", []),
+                        "source_proposal_id": p.get("proposal_id", ""),
+                    }
+                    if tbl_id:
+                        base_freeform["table"] = tbl_id
+                    if col_name:
+                        base_freeform["column"] = col_name
+                    patches.append({
+                        **base_freeform,
+                        "type": patch_type,
+                        "target": tbl_id or target,
+                        "new_text": "",
+                        "old_text": "",
+                        "structured_sections": structured,
+                        "column_entity_type": p.get("column_entity_type", ""),
+                        "table_entity_type": p.get("table_entity_type", "table"),
+                    })
+                    continue
+            elif not parsed or (len(parsed) == 1 and "_preamble" in parsed):
+                preamble = (parsed.get("_preamble") or new_text).strip()
+                if preamble:
+                    logger.info(
+                        "Wrapping freeform %s text in 'definition' section",
+                        patch_type,
+                    )
+                    base_freeform = {
+                        "lever": lever,
+                        "risk_level": classify_risk(patch_type),
+                        "predicted_affected_questions": p.get("questions_fixed", 0),
+                        "grounded_in": p.get("grounded_in", []),
+                        "source_proposal_id": p.get("proposal_id", ""),
+                    }
+                    if tbl_id:
+                        base_freeform["table"] = tbl_id
+                    if col_name:
+                        base_freeform["column"] = col_name
+                    patches.append({
+                        **base_freeform,
+                        "type": patch_type,
+                        "target": tbl_id or target,
+                        "new_text": "",
+                        "old_text": "",
+                        "structured_sections": {"definition": preamble},
+                        "column_entity_type": p.get("column_entity_type", ""),
+                        "table_entity_type": p.get("table_entity_type", "table"),
+                    })
+                    continue
 
         patch_dict: dict = {
             "type": patch_type,
@@ -697,6 +786,20 @@ def render_patch(patch: dict, space_id: str, space_config: dict) -> dict:
             json.dumps({"op": "remove", "section": "descriptions", "target": target, "value": new_text}),
         )
     if patch_type == "update_description":
+        structured_sections = patch.get("structured_sections")
+        if isinstance(structured_sections, dict) and structured_sections:
+            cmd_fwd_desc: dict = {
+                "op": "update", "section": "descriptions",
+                "target": target,
+                "structured_sections": structured_sections,
+                "lever": patch.get("lever", 0),
+                "table_entity_type": patch.get("table_entity_type", "table"),
+            }
+            cmd_rev_desc: dict = {
+                "op": "update", "section": "descriptions",
+                "target": target, "old_text": new_text, "new_text": old_text,
+            }
+            return action(json.dumps(cmd_fwd_desc), json.dumps(cmd_rev_desc))
         return action(
             json.dumps({"op": "update", "section": "descriptions", "target": target, "old_text": old_text, "new_text": new_text}),
             json.dumps({"op": "update", "section": "descriptions", "target": target, "old_text": new_text, "new_text": old_text}),
@@ -1001,6 +1104,14 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
                 q_str = eq[0] if isinstance(eq, list) and eq else str(eq)
                 if q_str == question_text:
                     new_sql = cmd.get("new_sql", "")
+                    updated_entry = dict(entry)
+                    updated_entry["sql"] = [new_sql]
+                    if not _validate_example_sql_entry(updated_entry, config=config):
+                        logger.warning(
+                            "update_example_sql rejected by validation: %.120s",
+                            new_sql,
+                        )
+                        return False
                     entry["sql"] = [new_sql]
                     return True
             return False
@@ -1098,6 +1209,25 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
         tbl = _find_table_in_config(config, target)
         if not tbl:
             return False
+        if op == "update" and "structured_sections" in cmd:
+            sections_update = cmd["structured_sections"]
+            lever_num = cmd.get("lever", 0)
+            entity_type = cmd.get("table_entity_type", "table")
+            try:
+                new_desc = update_sections(
+                    tbl.get("description"),
+                    sections_update,
+                    lever_num,
+                    entity_type,
+                )
+                tbl["description"] = new_desc
+                return True
+            except LeverOwnershipError:
+                logger.warning(
+                    "Lever %d tried to update locked sections on table %s — skipped",
+                    lever_num, target,
+                )
+                return False
         if op == "add":
             desc = tbl.get("description", [])
             if isinstance(desc, list):
@@ -1123,8 +1253,8 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
 
     # ── Join Specifications (Lever 4) ─────────────────────────────
     if section == "join_specs":
-        ds = config.setdefault("data_sources", {})
-        specs = ds.setdefault("join_specs", [])
+        inst = config.setdefault("instructions", {})
+        specs = inst.setdefault("join_specs", [])
         if op == "add":
             js = cmd.get("join_spec", {})
             if js:

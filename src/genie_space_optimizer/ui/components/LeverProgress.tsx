@@ -1,4 +1,5 @@
 import { Badge } from "@/components/ui/badge";
+import { ProvenancePanel } from "@/components/ProvenancePanel";
 import {
   CheckCircle2,
   Loader2,
@@ -66,6 +67,7 @@ interface LeverItem {
 interface LeverProgressProps {
   levers: LeverItem[];
   links?: { label: string; url: string; category: string }[];
+  runId?: string;
 }
 
 const leverStatusConfig: Record<
@@ -120,7 +122,7 @@ function formatDelta(delta: number | null | undefined): React.ReactNode {
   );
 }
 
-export function LeverProgress({ levers, links = [] }: LeverProgressProps) {
+export function LeverProgress({ levers, links = [], runId }: LeverProgressProps) {
   if (!levers.length) return null;
 
   const accepted = levers.filter((l) => l.status === "accepted").length;
@@ -343,6 +345,10 @@ export function LeverProgress({ levers, links = [] }: LeverProgressProps) {
                     );
                   })}
                 </div>
+              )}
+
+              {runId && (lever.status === "accepted" || lever.status === "rolled_back") && (
+                <ProvenancePanel runId={runId} lever={lever.lever} />
               )}
             </div>
           );

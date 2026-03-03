@@ -346,6 +346,13 @@ def strip_non_exportable_fields(config: dict) -> dict:
                     for bad_key in _NON_API_COLUMN_CONFIG_KEYS:
                         cc.pop(bad_key, None)
 
+        # join_specs belongs under instructions, not data_sources
+        misplaced_js = ds.pop("join_specs", None)
+        if misplaced_js:
+            inst_block = cleaned.setdefault("instructions", {})
+            existing = inst_block.get("join_specs", [])
+            inst_block["join_specs"] = existing + misplaced_js
+
     inst = cleaned.get("instructions")
     if isinstance(inst, dict):
         ti_list = inst.get("text_instructions")

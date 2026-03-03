@@ -8,8 +8,11 @@ lever updates metadata that another lever depends on.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Section Templates per Entity Type
@@ -73,6 +76,11 @@ _LABEL_TO_KEY: dict[str, str] = {v.lower(): k for k, v in SECTION_LABELS.items()
 # ---------------------------------------------------------------------------
 
 LEVER_SECTION_OWNERSHIP: dict[int, set[str]] = {
+    0: {
+        "purpose", "best_for", "grain", "scd", "relationships",
+        "definition", "values", "synonyms", "aggregation", "grain_note",
+        "join", "important_filters", "use_instead_of", "parameters", "example",
+    },
     1: {"purpose", "best_for", "grain", "scd", "definition", "values", "synonyms"},
     2: {"definition", "values", "aggregation", "grain_note", "important_filters", "synonyms"},
     3: {"purpose", "best_for", "use_instead_of", "parameters", "example"},
@@ -244,18 +252,44 @@ def update_sections(
 ) -> list[str]:
     """Update multiple sections at once, validating lever ownership for each.
 
-    *updates* maps section keys to their new values.
+    *updates* maps section keys to their new values.  Sections that the lever
+    does not own are silently skipped (with a warning) rather than rejecting
+    the entire patch.  Only raises ``LeverOwnershipError`` when *every*
+    requested section is locked.
     """
     allowed = LEVER_SECTION_OWNERSHIP.get(lever, set())
-    for section in updates:
-        if section not in allowed:
-            raise LeverOwnershipError(
-                f"Lever {lever} cannot modify section '{section}' "
-                f"(allowed: {sorted(allowed)})"
-            )
+    applicable = {k: v for k, v in updates.items() if k in allowed}
+    skipped = sorted(k for k in updates if k not in allowed)
+    if skipped:
+        logger.warning(
+            "Lever %d: skipping locked sections %s (allowed: %s)",
+            lever, skipped, sorted(allowed),
+        )
+    if not applicable:
+        raise LeverOwnershipError(
+            f"Lever {lever} cannot modify any of the requested sections "
+            f"{sorted(updates)} (allowed: {sorted(allowed)})"
+        )
 
     sections = parse_structured_description(current_description)
-    sections.update(updates)
+
+    _INFO_LOSS_THRESHOLD = 0.7
+    _MIN_EXISTING_LEN = 20
+    for key, new_val in applicable.items():
+        old_val = sections.get(key, "")
+        if (
+            old_val
+            and new_val
+            and len(old_val.strip()) > _MIN_EXISTING_LEN
+            and len(new_val.strip()) < len(old_val.strip()) * _INFO_LOSS_THRESHOLD
+        ):
+            logger.warning(
+                "Section '%s' would lose content (%d -> %d chars) — merging instead of replacing",
+                key, len(old_val.strip()), len(new_val.strip()),
+            )
+            applicable[key] = f"{old_val.rstrip('. ')}. {new_val.lstrip()}"
+
+    sections.update(applicable)
     return render_structured_description(sections, entity_type)
 
 
@@ -308,11 +342,12 @@ def entity_type_for_column(
         is_in_metric_view=is_in_metric_view,
         enable_entity_matching=enable_entity_matching,
     )
-    return {
+    _map: dict[str, EntityType] = {
         "dimension": "column_dim",
         "measure": "column_measure",
         "key": "column_key",
-    }[kind]
+    }
+    return _map[kind]
 
 
 # ---------------------------------------------------------------------------

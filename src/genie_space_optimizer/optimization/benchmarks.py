@@ -157,6 +157,47 @@ def _quote_identifier_fqn(fqn: str) -> str:
     return ".".join(_quote_identifier(p) for p in parts)
 
 
+def _resolve_params_with_defaults(
+    sql: str,
+    parameters: list[dict] | None = None,
+) -> tuple[str, bool]:
+    """Replace ``:param_name`` placeholders with their default values.
+
+    Returns ``(resolved_sql, all_resolved)`` where *all_resolved* is True
+    only if every parameter had a usable default value.
+    """
+    if not parameters:
+        return sql, False
+
+    from genie_space_optimizer.optimization.evaluation import _extract_sql_params
+
+    params_in_sql = _extract_sql_params(sql)
+    if not params_in_sql:
+        return sql, True
+
+    defaults: dict[str, str] = {}
+    for p in parameters:
+        if not isinstance(p, dict):
+            continue
+        name = p.get("name", "")
+        dv = p.get("default_value", "")
+        if isinstance(dv, dict):
+            vals = dv.get("values", [])
+            dv = vals[0] if vals else ""
+        if name and dv:
+            defaults[name] = str(dv)
+
+    resolved = sql
+    all_resolved = True
+    for param in params_in_sql:
+        if param in defaults:
+            resolved = resolved.replace(f":{param}", f"'{defaults[param]}'")
+        else:
+            all_resolved = False
+
+    return resolved, all_resolved
+
+
 def validate_ground_truth_sql(
     sql: str,
     spark: Any,
@@ -164,6 +205,7 @@ def validate_ground_truth_sql(
     gold_schema: str = "",
     *,
     execute: bool = False,
+    parameters: list[dict] | None = None,
 ) -> tuple[bool, str]:
     """Validate a single expected SQL via EXPLAIN + table existence checks.
 
@@ -175,6 +217,9 @@ def validate_ground_truth_sql(
          ``LIMIT 1`` to verify it produces at least one row and doesn't fail
          at runtime on data type mismatches.
 
+    When *parameters* are provided, attempts to substitute default values
+    before running EXPLAIN rather than short-circuiting on parameterized SQL.
+
     Returns ``(is_valid, error_message)``.
     """
     resolved = resolve_sql(sql, catalog=catalog, gold_schema=gold_schema)
@@ -185,17 +230,33 @@ def validate_ground_truth_sql(
 
     _params = _extract_sql_params(resolved)
     if _params:
-        logger.warning(
-            "GT SQL contains parameterized placeholders %s — skipping EXPLAIN validation",
-            _params,
+        resolved_with_defaults, all_resolved = _resolve_params_with_defaults(
+            resolved, parameters,
         )
-        return True, ""
+        if all_resolved:
+            logger.info(
+                "Substituted defaults for %d params — running EXPLAIN on resolved SQL",
+                len(_params),
+            )
+            resolved = resolved_with_defaults
+        else:
+            logger.warning(
+                "GT SQL contains parameterized placeholders %s (some without defaults) — "
+                "skipping EXPLAIN validation",
+                _params,
+            )
+            return True, ""
 
     try:
         _set_sql_context(spark, catalog, gold_schema)
         spark.sql(f"EXPLAIN {resolved}")
     except Exception as e:
         err_msg = str(e)
+        if "UNBOUND_SQL_PARAMETER" in err_msg:
+            logger.warning(
+                "EXPLAIN hit UNBOUND_SQL_PARAMETER — treating as valid parameterized SQL"
+            )
+            return True, ""
         if "UNRESOLVED_COLUMN" in err_msg:
             import re as _re
             col_match = _re.search(r"name `([^`]+)`", err_msg)
@@ -280,6 +341,7 @@ def validate_question_sql_alignment(
     from genie_space_optimizer.common.config import (
         BENCHMARK_ALIGNMENT_CHECK_PROMPT,
         LLM_ENDPOINT,
+        format_mlflow_template,
     )
 
     results: list[dict] = []
@@ -301,7 +363,8 @@ def validate_question_sql_alignment(
             {"question": b.get("question", ""), "expected_sql": b.get("expected_sql", "")}
             for _, b in batch
         ]
-        prompt = BENCHMARK_ALIGNMENT_CHECK_PROMPT.format(
+        prompt = format_mlflow_template(
+            BENCHMARK_ALIGNMENT_CHECK_PROMPT,
             benchmarks_json=json.dumps(batch_payload, indent=2),
         )
 

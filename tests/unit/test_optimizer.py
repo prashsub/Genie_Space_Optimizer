@@ -7,7 +7,10 @@ import copy
 import pytest
 
 from genie_space_optimizer.optimization.optimizer import (
+    _collect_blank_columns,
     _detect_instruction_content_in_description,
+    _format_enrichment_context,
+    _is_description_blank,
     _is_fuzzy_match,
     _map_to_lever,
     _resolve_lever5_llm_result,
@@ -746,3 +749,191 @@ class TestDetectInstructionContentInDescription:
     def test_missing_config_returns_empty(self):
         snap = {}
         assert _detect_instruction_content_in_description(snap) == []
+
+
+# ---------------------------------------------------------------------------
+# Proactive Description Enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestIsDescriptionBlank:
+    def test_none_is_blank(self):
+        assert _is_description_blank(None) is True
+
+    def test_empty_string_is_blank(self):
+        assert _is_description_blank("") is True
+
+    def test_empty_list_is_blank(self):
+        assert _is_description_blank([]) is True
+
+    def test_list_with_empty_string_is_blank(self):
+        assert _is_description_blank([""]) is True
+
+    def test_list_with_whitespace_is_blank(self):
+        assert _is_description_blank(["  ", ""]) is True
+
+    def test_nonempty_string_is_not_blank(self):
+        assert _is_description_blank("Primary key") is False
+
+    def test_nonempty_list_is_not_blank(self):
+        assert _is_description_blank(["Primary key"]) is False
+
+    def test_whitespace_only_string_is_blank(self):
+        assert _is_description_blank("   ") is True
+
+
+class TestCollectBlankColumns:
+    def _make_snapshot(self, tables):
+        return {"data_sources": {"tables": tables}}
+
+    def test_no_blanks_when_all_described(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.orders",
+                "description": ["Order data"],
+                "column_configs": [
+                    {"column_name": "order_id", "description": ["Primary key"], "data_type": "BIGINT"},
+                    {"column_name": "amount", "description": ["Order amount"], "data_type": "DOUBLE"},
+                ],
+            }
+        ])
+        assert _collect_blank_columns(snap) == []
+
+    def test_blank_description_no_uc_comment(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.orders",
+                "description": ["Order data"],
+                "column_configs": [
+                    {"column_name": "order_id", "description": None, "data_type": "BIGINT"},
+                    {"column_name": "amount", "description": ["Order amount"], "data_type": "DOUBLE"},
+                ],
+            }
+        ])
+        result = _collect_blank_columns(snap)
+        assert len(result) == 1
+        assert result[0]["column"] == "order_id"
+        assert result[0]["table"] == "cat.sch.orders"
+        assert result[0]["entity_type"] == "column_key"
+
+    def test_blank_description_with_uc_comment_excluded(self):
+        """Columns with a UC comment but no Genie description are NOT eligible."""
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.orders",
+                "description": [],
+                "column_configs": [
+                    {
+                        "column_name": "order_id",
+                        "description": None,
+                        "data_type": "BIGINT",
+                        "uc_comment": "Primary key for orders",
+                    },
+                ],
+            }
+        ])
+        assert _collect_blank_columns(snap) == []
+
+    def test_hidden_columns_excluded(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.orders",
+                "description": [],
+                "column_configs": [
+                    {"column_name": "internal_id", "description": None, "data_type": "BIGINT", "hidden": True},
+                ],
+            }
+        ])
+        assert _collect_blank_columns(snap) == []
+
+    def test_sibling_columns_populated(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.orders",
+                "description": ["Order data"],
+                "column_configs": [
+                    {"column_name": "order_id", "description": None, "data_type": "BIGINT"},
+                    {"column_name": "amount", "description": ["Order amount"], "data_type": "DOUBLE"},
+                    {"column_name": "status", "description": ["Status"], "data_type": "STRING"},
+                ],
+            }
+        ])
+        result = _collect_blank_columns(snap)
+        assert len(result) == 1
+        assert "amount" in result[0]["sibling_columns"]
+        assert "status" in result[0]["sibling_columns"]
+
+    def test_empty_list_description_is_blank(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t",
+                "description": [],
+                "column_configs": [
+                    {"column_name": "col_a", "description": [], "data_type": "STRING"},
+                ],
+            }
+        ])
+        result = _collect_blank_columns(snap)
+        assert len(result) == 1
+        assert result[0]["column"] == "col_a"
+
+    def test_multiple_tables_multiple_blanks(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t1",
+                "description": [],
+                "column_configs": [
+                    {"column_name": "a", "description": None, "data_type": "INT"},
+                    {"column_name": "b", "description": ["desc"], "data_type": "INT"},
+                ],
+            },
+            {
+                "identifier": "cat.sch.t2",
+                "description": [],
+                "column_configs": [
+                    {"column_name": "x", "description": [""], "data_type": "STRING"},
+                ],
+            },
+        ])
+        result = _collect_blank_columns(snap)
+        assert len(result) == 2
+        tables = {r["table"] for r in result}
+        assert tables == {"cat.sch.t1", "cat.sch.t2"}
+
+
+class TestFormatEnrichmentContext:
+    def test_basic_formatting(self):
+        blanks = [
+            {
+                "table": "cat.sch.orders",
+                "column": "amount",
+                "data_type": "DOUBLE",
+                "entity_type": "column_measure",
+                "table_description": "Order data",
+                "sibling_columns": ["order_id", "amount", "status"],
+            },
+        ]
+        ctx = _format_enrichment_context(blanks)
+        assert "cat.sch.orders" in ctx
+        assert "amount (DOUBLE) [column_measure]" in ctx
+        assert "Sibling columns" in ctx
+        assert "order_id" in ctx
+        assert "status" in ctx
+
+    def test_target_column_excluded_from_siblings(self):
+        blanks = [
+            {
+                "table": "cat.sch.t",
+                "column": "col_a",
+                "data_type": "STRING",
+                "entity_type": "column_dim",
+                "table_description": "",
+                "sibling_columns": ["col_a", "col_b"],
+            },
+        ]
+        ctx = _format_enrichment_context(blanks)
+        lines = ctx.split("\n")
+        sibling_line = [l for l in lines if "Sibling columns" in l]
+        assert len(sibling_line) == 1
+        assert "col_b" in sibling_line[0]
+        assert "col_a" not in sibling_line[0].split("Sibling columns")[1]

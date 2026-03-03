@@ -19,10 +19,10 @@ from genie_space_optimizer.optimization.evaluation import (
     _call_llm_for_scoring,
     _extract_response_text,
     build_asi_metadata,
-    build_temporal_note,
     format_asi_markdown,
     get_registered_prompt_name,
 )
+from genie_space_optimizer.optimization.scorers import build_scorer_context
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
@@ -42,55 +42,23 @@ def _make_logical_accuracy_judge(w: WorkspaceClient, catalog: str, schema: str):
         question_id = inputs.get("question_id", "")
         cmp = outputs.get("comparison", {}) if isinstance(outputs, dict) else {}
 
-        cmp_summary = ""
-        if cmp:
-            cmp_summary = (
-                f"\nResult comparison (GT vs Genie): match={cmp.get('match')}, "
-                f"match_type={cmp.get('match_type', 'unknown')}, "
-                f"gt_rows={cmp.get('gt_rows', '?')}, genie_rows={cmp.get('genie_rows', '?')}\n"
-                "NOTE: If results match (match=True), the queries are functionally equivalent "
-                "even if SQL syntax differs. Weight this heavily in your assessment.\n"
-            )
-
-        empty_data_note = ""
-        if cmp.get("gt_rows", -1) == 0 and cmp.get("genie_rows", -1) > 0:
-            empty_data_note = (
-                "\nCRITICAL: The Expected SQL returned 0 rows while the Generated SQL "
-                "returned data. This likely means the Expected SQL has overly restrictive "
-                "filters NOT present in the user's question. Evaluate the Generated SQL "
-                "SOLELY against the user's question. If it correctly answers what the "
-                "user asked, it should PASS.\n"
-            )
-        elif cmp.get("gt_rows", -1) == 0:
-            empty_data_note = (
-                "\nIMPORTANT: Both queries returned 0 rows — the underlying dataset "
-                "has no matching data. Minor SQL differences have no practical impact. "
-                "Lean toward PASS if structurally sound.\n"
-            )
+        context = build_scorer_context(
+            question=question, genie_sql=genie_sql, gt_sql=gt_sql, cmp=cmp,
+        )
 
         prompt = (
             "You are a SQL logic expert evaluating SQL for a Databricks Genie Space.\n"
             "Determine if the GENERATED SQL applies correct aggregations, filters, "
             "GROUP BY, ORDER BY, and WHERE clauses for the business question.\n\n"
             "IMPORTANT — Evaluation rules:\n"
-            "- ILIKE '%value%' and = 'value' are functionally equivalent for proper nouns\n"
-            "  (city names, country names, etc.). Do NOT penalize defensive/fuzzy matching.\n"
+            "- ILIKE '%value%' and = 'value' are functionally equivalent for proper nouns.\n"
             "- Extra IS NOT NULL guards are defensive programming, not logical errors.\n"
-            "  They should not cause a FAIL unless they provably exclude data the user\n"
-            "  intended to see.\n"
-            "- A missing or extra ORDER BY is a cosmetic difference, not a logic error — do NOT\n"
-            "  flag it as wrong_orderby unless ordering is semantically required by the question\n"
+            "- A missing or extra ORDER BY is cosmetic unless ordering is semantically required\n"
             "  (e.g. 'top 10', 'rank by', 'highest').\n"
-            "- GROUP BY ALL vs explicit GROUP BY columns are semantically identical — NOT an error.\n"
+            "- GROUP BY ALL vs explicit GROUP BY are semantically identical.\n"
             "- MEASURE() on a metric view is logically equivalent to SUM/AVG on the underlying\n"
-            "  fact table. Do NOT flag metric view vs fact table as wrong_aggregation.\n"
-            "- A metric view query and a TVF (table-valued function) call can both produce\n"
-            "  logically correct answers. Do NOT flag wrong_aggregation or wrong_filter solely\n"
-            "  because one uses a TVF and the other uses a metric view or fact table.\n\n"
-            f"User question: {question}\n"
-            f"Expected SQL: {gt_sql}\n"
-            f"Generated SQL: {genie_sql}\n"
-            f"{cmp_summary}{empty_data_note}{build_temporal_note(cmp)}\n"
+            "  fact table. A TVF call can also produce logically correct answers.\n\n"
+            f"{context}\n\n"
             'Respond with JSON only: {"correct": true/false, "failure_type": "<wrong_aggregation|wrong_filter|wrong_groupby|wrong_orderby>", '
             '"wrong_clause": "<the problematic SQL clause>", "blame_set": ["<column_or_function>"], '
             '"counterfactual_fix": "<specific Genie Space metadata change that would fix this, referencing exact table/column names>", '
