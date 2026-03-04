@@ -1161,6 +1161,12 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Provenance rows written to `genie_opt_provenance` linking judges → clusters → proposals → gates
 - [ ] ASI Feedback logged on MLflow traces (`asi_{judge}` entries)
 - [ ] Gate Feedback logged on MLflow traces (`gate_{type}` entries with pass/fail + regression details)
+- [ ] Expected SQL logged as `Expectation` assessments on evaluation traces (baseline + each accepted iteration)
+- [ ] Instruction slot budget enforced: proposals capped at remaining budget, post-apply trim, strict validation
+- [ ] Labeling session created with eval-run-based trace population (not experiment-wide search)
+- [ ] Labeling session URL persisted to `genie_opt_runs.labeling_session_url`
+- [ ] Labeling session URL surfaced as "Human Review" link in run detail UI
+- [ ] Baseline labeling session also captures and persists session URL
 - [ ] Finalize: repeatability eval prints per-judge scores to console; falls back to benchmark `expected_sql` if no reference SQLs
 - [ ] Finalize heartbeats visible in `genie_opt_stages` (FINALIZE_HEARTBEAT events)
 - [ ] Deploy skipped (deploy_target empty): deploy_check condition evaluates to false

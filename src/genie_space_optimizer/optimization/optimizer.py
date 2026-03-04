@@ -5485,6 +5485,7 @@ def _validate_lever5_proposals(
 ) -> list[dict]:
     """Filter out empty, generic, over-length, or hallucinated Lever 5 proposals."""
     from genie_space_optimizer.common.config import MAX_INSTRUCTION_TEXT_CHARS
+    from genie_space_optimizer.common.genie_schema import count_instruction_slots, MAX_INSTRUCTION_SLOTS
 
     _tables = metadata_snapshot.get("tables") or []
     _funcs = metadata_snapshot.get("functions") or []
@@ -5522,6 +5523,10 @@ def _validate_lever5_proposals(
                 existing_questions.add(q)
 
     seen_new_questions: set[str] = set()
+
+    current_slots = count_instruction_slots(metadata_snapshot)
+    remaining_budget = MAX_INSTRUCTION_SLOTS - current_slots
+    added_slots = 0
 
     valid: list[dict] = []
     for p in proposals:
@@ -5588,6 +5593,13 @@ def _validate_lever5_proposals(
                 logger.info("Rejecting empty add_example_sql proposal")
                 continue
 
+            if added_slots >= remaining_budget:
+                logger.warning(
+                    "Dropping add_example_sql — slot budget exhausted (%d/%d)",
+                    current_slots + added_slots, MAX_INSTRUCTION_SLOTS,
+                )
+                continue
+
             eq_norm = eq.lower().strip()
             if eq_norm in existing_questions:
                 logger.info("Rejecting add_example_sql duplicate of existing config: %.80s", eq)
@@ -5621,6 +5633,8 @@ def _validate_lever5_proposals(
                         continue
                 except Exception:
                     logger.debug("Example SQL execution validation skipped (error)", exc_info=True)
+
+            added_slots += 1
 
         valid.append(p)
 

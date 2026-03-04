@@ -1760,6 +1760,21 @@ def _build_links(
             category="mlflow",
         ))
 
+    labeling_url = run_data.get("labeling_session_url")
+    labeling_name = run_data.get("labeling_session_name")
+    if labeling_url:
+        links.append(PipelineLink(
+            label=f"Human Review: {labeling_name}" if labeling_name else "Human Review Session",
+            url=labeling_url,
+            category="review",
+        ))
+    elif labeling_name and experiment_id:
+        links.append(PipelineLink(
+            label=f"Human Review: {labeling_name}",
+            url=f"{host}/ml/experiments/{experiment_id}",
+            category="review",
+        ))
+
     catalog = config.catalog
     schema = config.schema_name
     if catalog and schema:

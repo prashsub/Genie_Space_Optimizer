@@ -3278,6 +3278,7 @@ def run_evaluation(
         )
 
         trace_map: dict[str, str] = {}
+        _rows_without_tid = 0
         for _row in rows_for_output:
             _qid = (
                 _row.get("question_id")
@@ -3287,6 +3288,20 @@ def run_evaluation(
             _tid = _row.get("trace_id")
             if _qid and _tid:
                 trace_map[_qid] = str(_tid)
+            elif _qid:
+                _rows_without_tid += 1
+
+        if not trace_map:
+            logger.warning(
+                "Evaluation %s produced 0 trace IDs from %d rows "
+                "(trace context may have been lost during Genie API calls)",
+                run_name, len(rows_for_output),
+            )
+        elif _rows_without_tid:
+            logger.info(
+                "Evaluation %s: %d/%d rows have trace IDs (%d missing)",
+                run_name, len(trace_map), len(rows_for_output), _rows_without_tid,
+            )
 
         output: dict[str, Any] = {
             "run_id": run.info.run_id,
@@ -4908,4 +4923,62 @@ def log_asi_feedback_on_traces(
             logger.debug("Failed to log ASI feedback for trace %s judge %s", tid, judge, exc_info=True)
     if logged:
         logger.info("Logged ASI feedback on %d traces", logged)
+    return logged
+
+
+def log_expectations_on_traces(eval_result: dict) -> int:
+    """Attach expected SQL as Expectation assessments on evaluation traces.
+
+    Makes traces self-contained for reviewers in labeling sessions — they
+    can see the expected SQL alongside Genie's generated SQL without
+    needing external context.
+
+    Returns the number of expectations successfully logged.
+    """
+    trace_map = eval_result.get("trace_map", {})
+    if not trace_map:
+        return 0
+
+    rows = eval_result.get("rows", [])
+    logged = 0
+    for row in rows:
+        qid = (
+            row.get("question_id")
+            or row.get("inputs/question_id")
+            or (row.get("inputs") or {}).get("question_id", "")
+        )
+        tid = trace_map.get(qid)
+        if not tid:
+            continue
+
+        expected_sql = (
+            row.get("inputs/expected_sql")
+            or (row.get("inputs") or {}).get("expected_sql", "")
+        )
+        question = (
+            row.get("inputs/question")
+            or (row.get("inputs") or {}).get("question", "")
+        )
+        if not expected_sql:
+            continue
+
+        try:
+            mlflow.log_expectation(
+                trace_id=tid,
+                name="expected_sql",
+                value=expected_sql,
+                source=AssessmentSource(
+                    source_type="CODE",
+                    source_id="genie_space_optimizer/benchmark",
+                ),
+                metadata={
+                    "question_id": qid,
+                    "question": question[:200] if question else "",
+                },
+            )
+            logged += 1
+        except Exception:
+            logger.debug("Failed to log expectation for trace %s", tid, exc_info=True)
+    if logged:
+        logger.info("Logged expected_sql expectations on %d/%d traces", logged, len(trace_map))
     return logged

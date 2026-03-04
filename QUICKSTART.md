@@ -166,7 +166,7 @@ Click **Optimize** to kick off the pipeline. This submits a multi-task Databrick
 
 **Total time: 20-60 minutes** depending on space complexity and number of tables.
 
-The lever loop now uses **tiered failure analysis**: hard failures (arbiter says `ground_truth_correct` or `neither_correct`) drive targeted fixes, while soft signals (individual judge failures on otherwise-correct questions) inform best-practice guidance in Lever 5 instructions. Lever 4 (Join Specifications) always runs its discovery path to document implicit joins. Lever 5 generates a holistic instruction rewrite considering all evaluation learnings.
+The lever loop now uses an **adaptive iteration cycle**: each iteration re-clusters failures, priority-scores them by impact, calls the adaptive strategist for a single targeted action group, applies patches, evaluates through 3 gates, and reflects on the outcome. A **100-instruction slot budget** is enforced (each example SQL = 1 slot, SQL function = 1, text instructions = 1) to stay within the Genie API limit. At the end of the loop, an MLflow labeling session is created for human review with a clickable URL link in the run detail page.
 
 ### Step 4: Monitor Progress
 

@@ -4,6 +4,7 @@ import {
   BriefcaseBusiness,
   Database,
   Sparkles,
+  UserCheck,
 } from "lucide-react";
 
 interface LinkItem {
@@ -41,6 +42,13 @@ const categoryConfig: Record<
     bgColor: "bg-emerald-50",
     borderColor: "border-emerald-200",
   },
+  review: {
+    icon: <UserCheck className="h-4 w-4" />,
+    title: "Human Review",
+    color: "text-teal-700",
+    bgColor: "bg-teal-50",
+    borderColor: "border-teal-200",
+  },
   data: {
     icon: <Database className="h-4 w-4" />,
     title: "Data",
@@ -60,7 +68,7 @@ export function ResourceLinks({ links }: ResourceLinksProps) {
     return acc;
   }, {});
 
-  const categoryOrder = ["genie", "job", "mlflow", "data"];
+  const categoryOrder = ["genie", "job", "mlflow", "review", "data"];
   const sortedCategories = Object.keys(grouped).sort(
     (a, b) => (categoryOrder.indexOf(a) === -1 ? 99 : categoryOrder.indexOf(a))
          - (categoryOrder.indexOf(b) === -1 ? 99 : categoryOrder.indexOf(b)),

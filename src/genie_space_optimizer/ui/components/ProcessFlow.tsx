@@ -39,6 +39,7 @@ import {
   Award,
   MessageCircle,
   UserCheck,
+  RotateCw,
   type LucideIcon,
 } from "lucide-react";
 
@@ -133,36 +134,49 @@ function JudgesDetail() {
 }
 
 function StrategistDetail() {
+  const loopSteps = [
+    { label: "Re-cluster", desc: "Re-cluster failures from the latest evaluation results, removing already-tried clusters", icon: Filter, color: "amber" as const },
+    { label: "Rank", desc: "Score clusters by question_count × causal_weight × severity × fixability; pick highest-impact", icon: Target, color: "orange" as const },
+    { label: "Strategist", desc: "Single LLM call produces exactly one action group with concrete lever directives", icon: Brain, color: "blue" as const },
+    { label: "Apply", desc: "Execute lever patches and run the 3-gate evaluation system", icon: Sparkles, color: "green" as const },
+    { label: "Reflect", desc: "Record outcome (accepted/rolled back, score delta) into the reflection buffer for the next iteration", icon: Layers, color: "violet" as const },
+  ];
+
+  const colorMap = {
+    amber: { border: "border-amber-200", bg: "bg-amber-50/50", circle: "bg-amber-100", iconColor: "text-amber-700", title: "text-amber-900", text: "text-amber-800" },
+    orange: { border: "border-orange-200", bg: "bg-orange-50/50", circle: "bg-orange-100", iconColor: "text-orange-700", title: "text-orange-900", text: "text-orange-800" },
+    blue: { border: "border-blue-200", bg: "bg-blue-50/50", circle: "bg-blue-100", iconColor: "text-blue-700", title: "text-blue-900", text: "text-blue-800" },
+    green: { border: "border-green-200", bg: "bg-green-50/50", circle: "bg-green-100", iconColor: "text-green-700", title: "text-green-900", text: "text-green-800" },
+    violet: { border: "border-violet-200", bg: "bg-violet-50/50", circle: "bg-violet-100", iconColor: "text-violet-700", title: "text-violet-900", text: "text-violet-800" },
+  };
+
   return (
-    <div className="flex flex-col items-center gap-3 sm:flex-row sm:items-stretch sm:gap-4">
-      <div className="flex-1 rounded-xl border-2 border-amber-200 bg-amber-50/50 p-4 text-center">
-        <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-amber-100">
-          <Brain className="h-5 w-5 text-amber-700" />
-        </div>
-        <p className="text-sm font-semibold text-amber-900">Phase 1: Triage</p>
-        <p className="mt-1 text-xs text-amber-800 leading-snug">Clusters failures by root cause, outputs action group skeletons with needed levers.</p>
+    <div className="space-y-3">
+      <div className="flex flex-col items-center gap-3 sm:flex-row sm:items-stretch sm:gap-4">
+        {loopSteps.map((step, idx) => {
+          const c = colorMap[step.color];
+          return (
+            <React.Fragment key={step.label}>
+              <div className={`flex-1 rounded-xl border-2 ${c.border} ${c.bg} p-4 text-center`}>
+                <div className={`mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full ${c.circle}`}>
+                  <step.icon className={`h-5 w-5 ${c.iconColor}`} />
+                </div>
+                <p className={`text-sm font-semibold ${c.title}`}>{step.label}</p>
+                <p className={`mt-1 text-xs leading-snug ${c.text}`}>{step.desc}</p>
+              </div>
+              {idx < loopSteps.length - 1 && (
+                <div className="flex items-center justify-center">
+                  <ArrowRight className="hidden h-5 w-5 text-muted-foreground/40 sm:block" />
+                  <ArrowDown className="block h-5 w-5 text-muted-foreground/40 sm:hidden" />
+                </div>
+              )}
+            </React.Fragment>
+          );
+        })}
       </div>
-      <div className="flex items-center justify-center">
-        <ArrowRight className="hidden h-5 w-5 text-muted-foreground/40 sm:block" />
-        <ArrowDown className="block h-5 w-5 text-muted-foreground/40 sm:hidden" />
-      </div>
-      <div className="flex-1 rounded-xl border-2 border-blue-200 bg-blue-50/50 p-4 text-center">
-        <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-blue-100">
-          <Layers className="h-5 w-5 text-blue-700" />
-        </div>
-        <p className="text-sm font-semibold text-blue-900">Phase 2: Detail</p>
-        <p className="mt-1 text-xs text-blue-800 leading-snug">Produces concrete lever directives with specific tables, columns, and patches.</p>
-      </div>
-      <div className="flex items-center justify-center">
-        <ArrowRight className="hidden h-5 w-5 text-muted-foreground/40 sm:block" />
-        <ArrowDown className="block h-5 w-5 text-muted-foreground/40 sm:hidden" />
-      </div>
-      <div className="flex-1 rounded-xl border-2 border-green-200 bg-green-50/50 p-4 text-center">
-        <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-green-100">
-          <Sparkles className="h-5 w-5 text-green-700" />
-        </div>
-        <p className="text-sm font-semibold text-green-900">Action Groups</p>
-        <p className="mt-1 text-xs text-green-800 leading-snug">Coordinated lever changes for one root cause, applied in priority order.</p>
+      <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
+        <RotateCw className="h-3.5 w-3.5" />
+        <span>Repeats each iteration until convergence criteria are met</span>
       </div>
     </div>
   );
@@ -209,11 +223,13 @@ function ThreeGateDetail() {
     { name: "Slice Eval", desc: "Quick check on affected questions only", icon: Filter, color: "amber" as const },
     { name: "P0 Eval", desc: "Evaluate high-priority questions for critical accuracy", icon: ShieldCheck, color: "orange" as const },
     { name: "Full Eval", desc: "Complete benchmark re-evaluation against all judges", icon: CheckCircle2, color: "green" as const },
+    { name: "Confirmation Eval", desc: "Full eval runs a second time; the two scores are averaged to smooth Genie non-determinism", icon: Repeat, color: "blue" as const },
   ];
   const colorMap = {
     amber: { border: "border-amber-200", bg: "bg-amber-50/50", circle: "bg-amber-100", iconColor: "text-amber-700", title: "text-amber-900", text: "text-amber-800" },
     orange: { border: "border-orange-200", bg: "bg-orange-50/50", circle: "bg-orange-100", iconColor: "text-orange-700", title: "text-orange-900", text: "text-orange-800" },
     green: { border: "border-green-200", bg: "bg-green-50/50", circle: "bg-green-100", iconColor: "text-green-700", title: "text-green-900", text: "text-green-800" },
+    blue: { border: "border-blue-200", bg: "bg-blue-50/50", circle: "bg-blue-100", iconColor: "text-blue-700", title: "text-blue-900", text: "text-blue-800" },
   };
 
   return (
@@ -242,7 +258,7 @@ function ThreeGateDetail() {
       </div>
       <div className="rounded-lg border border-green-200 bg-green-50/50 p-3">
         <p className="text-xs text-green-800">
-          <span className="font-semibold">Rollback protection:</span> Regressions on any gate cause automatic rollback of that action group.
+          <span className="font-semibold">Rollback protection:</span> Regressions on any gate cause automatic rollback. The confirmation eval (Gate 4) averages two Full Eval runs to reduce variance from Genie non-determinism.
         </p>
       </div>
     </div>
@@ -290,6 +306,7 @@ const STEPS: StepDef[] = [
       { id: "s2-prompt", title: "Prompt Matching", description: "Enable format assistance on visible columns and entity matching on STRING columns so Genie shows example values. Deterministic, no LLM. Capped at 120 columns.", icon: Sparkles, variant: "proactive" },
       { id: "s2-enrich", title: "Description Enrichment", description: "Find columns where both Genie description and UC comment are blank, generate structured descriptions (definition, values, join hints) via Databricks LLM.", icon: Sparkles, variant: "proactive" },
       { id: "s2-joindisco", title: "Join Discovery", description: "Parse JOINs from baseline SQL results, merge with UC FK constraints, validate type compatibility, and patch new join specifications into the Genie Space.", icon: Sparkles, variant: "proactive" },
+      { id: "s2-instrseed", title: "Instruction Seeding", description: "For spaces with empty or minimal instructions, generates conservative routing instructions via LLM and patches them before the lever loop.", icon: Sparkles, variant: "proactive" },
     ],
     mlflow: [
       { label: "Instruction Versioning", api: "mlflow.genai.register_prompt()", icon: BookMarked },
@@ -315,12 +332,15 @@ const STEPS: StepDef[] = [
   {
     number: 4,
     title: "Configuration Generation",
-    description: "A two-phase strategist analyzes failures, groups them into action groups, and applies coordinated changes across 5 optimization levers.",
+    description: "An adaptive loop re-clusters failures each iteration, ranks them by impact, generates one targeted action group, applies it, and reflects on the outcome to guide the next iteration.",
     icon: Wrench,
     leaves: [
-      { id: "s4-strategist", title: "Two-Phase Strategist", description: "Phase 1 triages failure clusters into action group skeletons; Phase 2 produces concrete lever directives per AG", icon: Brain, detail: StrategistDetail },
+      { id: "s4-strategist", title: "Adaptive Strategist", description: "Each iteration: re-cluster from latest eval, filter already-tried patches, rank by impact score, then a single LLM call produces exactly one action group", icon: Brain, detail: StrategistDetail },
+      { id: "s4-ranking", title: "Cluster Ranking", description: "Clusters scored by question_count × causal_weight × severity × fixability; highest-impact cluster addressed first", icon: Target },
+      { id: "s4-reflection", title: "Reflection Buffer", description: "Memory of prior iterations (accepted/rolled back, score deltas, do-not-retry list) passed to the strategist to avoid repeating mistakes", icon: Layers },
       { id: "s4-levers", title: "5 Optimization Levers", description: "Tables & Columns, Metric Views, TVFs, Join Specs, and Instructions — each lever is an executor that generates patch proposals", icon: Wrench, detail: LeversDetail },
       { id: "s4-routing", title: "Failure-to-Lever Routing", description: "Judge failure types are automatically mapped to the appropriate optimization lever", icon: GitBranch, detail: FailureRoutingDetail },
+      { id: "s4-fallback", title: "Fallback Retry", description: "When all action groups are rolled back, a conservative single-lever retry using the holistic strategist is attempted as a last resort", icon: RotateCw },
     ],
     mlflow: [
       { label: "Tracing Spans", api: "mlflow.start_span()", icon: Activity },
@@ -333,9 +353,9 @@ const STEPS: StepDef[] = [
     description: "Each action group's changes pass through a 3-gate evaluation system. Only improvements that survive all gates are kept.",
     icon: CheckCircle2,
     leaves: [
-      { id: "s5-gates", title: "3-Gate Evaluation", description: "Slice Eval, P0 Eval, and Full Eval — progressively broader checks to catch regressions early", icon: ShieldCheck, detail: ThreeGateDetail },
-      { id: "s5-rollback", title: "Rollback Protection", description: "Regressions on any gate cause automatic rollback of the action group's patches to the previous known-good state", icon: Repeat },
-      { id: "s5-convergence", title: "Convergence", description: "Pipeline stops when all thresholds are met, no further improvement is possible, or the maximum iteration count is reached", icon: Target },
+      { id: "s5-gates", title: "3-Gate Evaluation", description: "Slice Eval, P0 Eval, and Full Eval with confirmation — the Full gate runs twice and averages scores to smooth Genie non-determinism", icon: ShieldCheck, detail: ThreeGateDetail },
+      { id: "s5-rollback", title: "Rollback Protection", description: "Regressions cause automatic rollback, but single-question noise is filtered — if all regressions fall within one question's weight band, they're treated as Genie variance and the changes are kept", icon: Repeat },
+      { id: "s5-convergence", title: "Convergence", description: "Pipeline stops when all thresholds are met, diminishing returns are detected (last N iterations each improved by less than epsilon), no actionable clusters remain, or max iterations reached", icon: Target },
     ],
     mlflow: [
       { label: "3-Gate Evaluations", api: "mlflow.genai.evaluate()", icon: Scale },

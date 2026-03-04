@@ -34,6 +34,7 @@ _THREE_LEVEL_RE = re.compile(r"^[^.]+\.[^.]+\.[^.]+$")
 
 MAX_STRING_LENGTH = 25_000
 MAX_ARRAY_SIZE = 10_000
+MAX_INSTRUCTION_SLOTS = 100
 
 
 # ── ID generation utility ────────────────────────────────────────────
@@ -448,6 +449,23 @@ def _check_string_lengths(obj: Any, path: str, errors: list[str]) -> None:
             _check_string_lengths(v, f"{path}.{k}", errors)
 
 
+def count_instruction_slots(config: dict) -> int:
+    """Count the number of Genie API instruction slots consumed by *config*.
+
+    Per Databricks docs the limit is 100 slots total:
+    - Each ``example_question_sqls`` entry = 1 slot
+    - Each ``sql_functions`` entry = 1 slot
+    - The entire ``text_instructions`` block = 1 slot (regardless of length)
+
+    ``join_specs`` and ``sql_snippets`` do **not** count.
+    """
+    instructions = config.get("instructions") or {}
+    text_count = min(len(instructions.get("text_instructions") or []), 1)
+    example_count = len(instructions.get("example_question_sqls") or [])
+    function_count = len(instructions.get("sql_functions") or [])
+    return text_count + example_count + function_count
+
+
 def _strict_validate(config: dict) -> list[str]:
     """Run all strict validation rules against a parsed config dict.
 
@@ -604,6 +622,18 @@ def _strict_validate(config: dict) -> list[str]:
     if len(ti_list) > 1:
         errors.append(
             f"instructions.text_instructions: at most 1 allowed, got {len(ti_list)}"
+        )
+
+    # ── Instruction slot budget (100 total) ──────────────────────
+    slot_count = count_instruction_slots(config)
+    if slot_count > MAX_INSTRUCTION_SLOTS:
+        _text_ct = min(len(ti_list), 1)
+        _eq_ct = len(inst.get("example_question_sqls") or [])
+        _fn_ct = len(inst.get("sql_functions") or [])
+        errors.append(
+            f"Instruction slot budget exceeded: {slot_count}/{MAX_INSTRUCTION_SLOTS} "
+            f"(example_sqls={_eq_ct}, sql_functions={_fn_ct}, "
+            f"text_instructions={_text_ct})"
         )
 
     # ── Table identifier format ──────────────────────────────────

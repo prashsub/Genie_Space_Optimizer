@@ -148,17 +148,17 @@ Genie_Space_Optimizer/
 │   ├── common/                       # Shared utilities
 │   │   ├── config.py                 # All constants (thresholds, prompts, taxonomy, noise floor)
 │   │   ├── genie_client.py           # Genie Space API wrapper (list, fetch, patch, query, result DFs)
-│   │   ├── genie_schema.py           # Genie Space config schema validation (lenient + strict modes)
+│   │   ├── genie_schema.py           # Genie Space config schema validation (lenient + strict), instruction slot budget (100 max)
 │   │   ├── uc_metadata.py            # Unity Catalog introspection (REST API + Spark SQL fallback + FK extraction)
 │   │   └── delta_helpers.py          # Delta table read/write operations
 │   │
 │   ├── optimization/                 # Core optimization engine
 │   │   ├── optimizer.py              # Strategist, failure analysis, proposal generation, table/column enrichment, example SQL mining
-│   │   ├── evaluation.py             # Benchmark generation, temporal date resolution, 9-judge scoring, MLflow tracking
+│   │   ├── evaluation.py             # Benchmark generation, temporal date resolution, 9-judge scoring, MLflow tracking, expected SQL on traces
 │   │   ├── applier.py                # Patch application & rollback
 │   │   ├── harness.py                # Full pipeline orchestration
 │   │   ├── preflight.py              # Pre-flight validation
-│   │   ├── labeling.py               # MLflow labeling sessions (human-in-the-loop review)
+│   │   ├── labeling.py               # MLflow labeling sessions (human-in-the-loop review, eval-run-based trace population)
 │   │   ├── state.py                  # Delta-backed state machine (6 tables + provenance)
 │   │   ├── benchmarks.py             # Benchmark question definitions
 │   │   ├── repeatability.py          # Repeatability testing & variance classification
@@ -219,7 +219,7 @@ The optimizer maintains state across 6 Delta tables (partitioned by `run_id` or 
 
 | Table | Purpose |
 |-------|---------|
-| `genie_opt_runs` | Run lifecycle: status, scores, config snapshots, convergence reason |
+| `genie_opt_runs` | Run lifecycle: status, scores, config snapshots, convergence reason, labeling session URL |
 | `genie_opt_stages` | Per-stage tracking: preflight, lever iterations, finalize |
 | `genie_opt_iterations` | Per-iteration scores across all 7 quality dimensions, adaptive loop reflection entries |
 | `genie_opt_patches` | Individual patches: type, lever, old/new values, applied/rolled-back, provenance chain |

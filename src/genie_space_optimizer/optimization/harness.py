@@ -396,25 +396,38 @@ def _run_baseline(
             catalog=catalog, schema=schema,
         )
 
+        try:
+            from genie_space_optimizer.optimization.evaluation import log_expectations_on_traces
+            log_expectations_on_traces(eval_result)
+        except Exception:
+            logger.debug("Failed to log expectations on baseline traces", exc_info=True)
+
         _bl_trace_map = eval_result.get("trace_map", {})
         _bl_failures = set(eval_result.get("failure_question_ids", []))
         _bl_fail_tids = [tid for qid, tid in _bl_trace_map.items() if qid in _bl_failures]
+        _bl_eval_run_id = eval_result.get("mlflow_run_id") or eval_result.get("run_id", "")
+        _bl_eval_run_ids = [_bl_eval_run_id] if _bl_eval_run_id else []
         _bl_session_name = ""
-        if _bl_fail_tids:
+        if _bl_fail_tids or _bl_eval_run_ids:
             try:
                 from genie_space_optimizer.optimization.labeling import create_review_session
                 _bl_session_info = create_review_session(
                     run_id=run_id, domain=domain, experiment_name=exp_name,
                     uc_schema=f"{catalog}.{schema}",
                     failure_trace_ids=_bl_fail_tids, regression_trace_ids=[],
+                    eval_mlflow_run_ids=_bl_eval_run_ids,
                 )
                 _bl_session_name = _bl_session_info.get("session_name", "")
+                _bl_session_url = _bl_session_info.get("session_url", "")
                 if _bl_session_name:
                     update_run_status(
                         spark, run_id, catalog, schema,
                         labeling_session_name=_bl_session_name,
+                        labeling_session_url=_bl_session_url,
                     )
                     print(f"\n[MLflow Review] Baseline labeling session: {_bl_session_name}")
+                    if _bl_session_url:
+                        print(f"  URL: {_bl_session_url}")
             except Exception:
                 logger.warning("Failed to create baseline labeling session", exc_info=True)
 
@@ -2327,6 +2340,7 @@ def _run_lever_loop(
     lever_changes: list[dict] = []
     all_failure_trace_ids: list[str] = []
     all_regression_trace_ids: list[str] = []
+    all_eval_mlflow_run_ids: list[str] = []
 
     _human_sql_fixes = [
         {"question": c.get("question", ""), "new_expected_sql": c["corrected_sql"], "verdict": "genie_correct"}
@@ -2801,6 +2815,9 @@ def _run_lever_loop(
                     all_failure_trace_ids.append(tid)
                 elif "regressions" in gate_result:
                     all_regression_trace_ids.append(tid)
+            _fail_run_id = _failed_eval.get("mlflow_run_id") or _failed_eval.get("run_id", "")
+            if _fail_run_id:
+                all_eval_mlflow_run_ids.append(_fail_run_id)
 
             _failed_scores = gate_result.get("full_scores", best_scores)
             reflection = _build_reflection_entry(
@@ -2833,6 +2850,15 @@ def _run_lever_loop(
         for qid, tid in _full_trace_map.items():
             if qid in _full_failures:
                 all_failure_trace_ids.append(tid)
+        _full_run_id = full_result.get("mlflow_run_id") or full_result.get("run_id", "")
+        if _full_run_id:
+            all_eval_mlflow_run_ids.append(_full_run_id)
+
+        try:
+            from genie_space_optimizer.optimization.evaluation import log_expectations_on_traces
+            log_expectations_on_traces(full_result)
+        except Exception:
+            logger.debug("Failed to log expectations on iter %d traces", iteration_counter, exc_info=True)
 
         lever_changes.append({
             "lever": ag_id,
@@ -2914,7 +2940,7 @@ def _run_lever_loop(
     )
 
     session_info: dict = {}
-    if all_failure_trace_ids or all_regression_trace_ids:
+    if all_failure_trace_ids or all_regression_trace_ids or all_eval_mlflow_run_ids:
         try:
             from genie_space_optimizer.optimization.labeling import create_review_session
             session_info = create_review_session(
@@ -2924,20 +2950,25 @@ def _run_lever_loop(
                 uc_schema=f"{catalog}.{schema}",
                 failure_trace_ids=list(dict.fromkeys(all_failure_trace_ids)),
                 regression_trace_ids=list(dict.fromkeys(all_regression_trace_ids)),
+                eval_mlflow_run_ids=list(dict.fromkeys(all_eval_mlflow_run_ids)),
             )
             _sname = session_info.get("session_name", "")
             _srun = session_info.get("session_run_id", "")
+            _surl = session_info.get("session_url", "")
             if _sname:
                 print(
                     f"\n[MLflow Review] Labeling session created for human review:\n"
                     f"  Name: {_sname}\n"
                     f"  Traces: {session_info.get('trace_count', 0)}\n"
                 )
+                if _surl:
+                    print(f"  URL: {_surl}\n")
             if _sname or _srun:
                 update_run_status(
                     spark, run_id, catalog, schema,
                     labeling_session_name=_sname,
                     labeling_session_run_id=_srun,
+                    labeling_session_url=_surl,
                 )
         except Exception:
             logger.warning("Failed to create labeling session", exc_info=True)

@@ -6,6 +6,36 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Instruction Slot Budget, Labeling Session URLs, Expected SQL on Traces
+- **Instruction slot budget** (`genie_schema.py`, `optimizer.py`, `applier.py`):
+  `count_instruction_slots()` counts consumed slots (example SQLs + SQL functions +
+  text instructions, max 100). Enforced at 3 levels: proposal validation
+  (`_validate_lever5_proposals()` caps `add_example_sql` at remaining budget), post-apply
+  guard (`apply_patch_set()` trims excess examples), and structural validation
+  (`_strict_validate()` rejects configs exceeding 100 slots)
+- **Labeling session URLs** (`labeling.py`, `state.py`, `runs.py`): `session_url`
+  extracted from `session.url` and persisted to `labeling_session_url` column on
+  `genie_opt_runs`. Surfaced as a "Human Review" link in the run detail UI via
+  `_build_links()`. Baseline labeling session also captures and persists URL.
+- **Expected SQL on traces** (`evaluation.py`, `harness.py`): `log_expectations_on_traces()`
+  logs `expected_sql` as MLflow `Expectation` assessments on every evaluation trace,
+  making traces self-contained for labeling reviewers
+- **Eval-run-based trace population** (`labeling.py`): `create_review_session()` accepts
+  `eval_mlflow_run_ids` and searches traces per eval run (`mlflow.search_traces(run_id=...)`),
+  avoiding the 200-trace cap and format mismatches from experiment-wide search. Falls back
+  to experiment-wide search when no eval run IDs are available.
+- **Trace ID diagnostics** (`evaluation.py`): warns when evaluation produces 0 trace IDs;
+  logs count of rows with/without trace IDs for debugging
+- **Synonym value list support** (`applier.py`): `proposals_to_patches()` now handles
+  synonym values as lists (not just comma-separated strings)
+- **Job notebook documentation** (`run_lever_loop.py`): extensive documentation update
+  covering adaptive loop architecture, 3-gate pattern, reflection buffer, cluster impact
+  scoring, instruction slot budget, and MLflow labeling session
+- **ProcessFlow UI**: updated pipeline visualization to reflect adaptive loop steps
+- **ResourceLinks**: labeling session link with review category
+
+---
+
 ### Changed — Adaptive Lever Loop Architecture
 - **Adaptive lever loop** (`harness.py`): replaced batch strategist (analyze once → execute
   all AGs) with an iterative adaptive loop: re-cluster from fresh eval → priority-score →

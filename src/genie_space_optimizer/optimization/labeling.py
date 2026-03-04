@@ -165,14 +165,20 @@ def create_review_session(
     failure_trace_ids: list[str],
     regression_trace_ids: list[str],
     reviewers: list[str] | None = None,
+    eval_mlflow_run_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a labeling session populated with evaluation traces for human review.
 
-    Searches for traces from the experiment and adds them to the session.
-    Prioritises failure and regression traces, then backfills with recent
-    traces so reviewers can also spot-check "correct" answers.
+    Uses *eval_mlflow_run_ids* (the MLflow run IDs from each evaluation)
+    as the primary source of traces.  This is far more reliable than
+    searching the whole experiment and filtering by individual trace IDs,
+    which can fail due to format mismatches, indexing lag, or the 200-trace
+    cap on ``mlflow.search_traces()``.
 
-    Returns dict with session_name, session_run_id, trace_count (or empty on failure).
+    Falls back to experiment-wide search when no eval run IDs are provided.
+
+    Returns dict with session_name, session_run_id, session_url,
+    trace_count (or empty on failure).
     """
     try:
         import mlflow.genai.labeling as labeling
@@ -188,6 +194,12 @@ def create_review_session(
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_name = f"genie_opt_review_{domain}_{run_id[:8]}_{ts}"
 
+    logger.info(
+        "Creating labeling session %s — %d failure tids, %d regression tids, %d eval run ids",
+        session_name, len(failure_trace_ids), len(regression_trace_ids),
+        len(eval_mlflow_run_ids or []),
+    )
+
     try:
         session = labeling.create_labeling_session(
             name=session_name,
@@ -200,66 +212,126 @@ def create_review_session(
 
     traces_added = 0
     try:
-        exp = mlflow.get_experiment_by_name(experiment_name)
-        if not exp:
-            logger.warning("Experiment '%s' not found — session will be empty", experiment_name)
-        else:
-            traces_df = mlflow.search_traces(
-                experiment_ids=[exp.experiment_id],
-                max_results=200,
-            )
-            if traces_df is not None and len(traces_df) > 0:
-                priority_ids = list(dict.fromkeys(
-                    regression_trace_ids + failure_trace_ids
-                ))
-                priority_set = set(priority_ids)
-
-                priority_mask = traces_df["trace_id"].isin(priority_set)
-                priority_traces = traces_df[priority_mask]
-                other_traces = traces_df[~priority_mask]
-
-                _MAX_TRACES = 100
-                remaining = _MAX_TRACES - len(priority_traces)
-                if remaining > 0 and len(other_traces) > 0:
-                    backfill = other_traces.head(remaining)
-                    import pandas as pd
-                    combined = pd.concat([priority_traces, backfill], ignore_index=True)
-                else:
-                    combined = priority_traces.head(_MAX_TRACES)
-
-                if len(combined) > 0:
-                    session.add_traces(combined)
-                    traces_added = len(combined)
-                    logger.info(
-                        "Added %d traces to labeling session %s "
-                        "(%d priority + %d backfill)",
-                        traces_added, session_name,
-                        len(priority_traces),
-                        traces_added - len(priority_traces),
-                    )
-                else:
-                    logger.warning(
-                        "No traces found in experiment '%s' — "
-                        "labeling session will be empty", experiment_name,
-                    )
-            else:
-                logger.warning("No traces found for experiment %s", experiment_name)
+        traces_added = _populate_session_traces(
+            session=session,
+            session_name=session_name,
+            experiment_name=experiment_name,
+            failure_trace_ids=failure_trace_ids,
+            regression_trace_ids=regression_trace_ids,
+            eval_mlflow_run_ids=eval_mlflow_run_ids or [],
+        )
     except Exception:
         logger.exception("Failed to add traces to labeling session")
 
     session_run_id = getattr(session, "mlflow_run_id", "")
     session_id = getattr(session, "labeling_session_id", "")
+    session_url = getattr(session, "url", "")
 
     logger.info(
-        "Created labeling session: %s (run_id=%s, session_id=%s, traces=%d)",
+        "Created labeling session: %s (run_id=%s, session_id=%s, traces=%d, url=%s)",
         session_name, session_run_id, session_id, traces_added,
+        session_url or "(none)",
     )
     return {
         "session_name": session_name,
         "session_run_id": session_run_id,
         "labeling_session_id": session_id,
+        "session_url": session_url,
         "trace_count": traces_added,
     }
+
+
+_MAX_SESSION_TRACES = 100
+
+
+def _populate_session_traces(
+    *,
+    session: Any,
+    session_name: str,
+    experiment_name: str,
+    failure_trace_ids: list[str],
+    regression_trace_ids: list[str],
+    eval_mlflow_run_ids: list[str],
+) -> int:
+    """Collect traces from eval runs and add them to the labeling session.
+
+    Strategy:
+      1. If *eval_mlflow_run_ids* are available, search traces per eval run.
+         This is the reliable path — each eval run's traces are directly
+         addressable by ``mlflow.search_traces(run_id=...)``.
+      2. Fall back to experiment-wide search (legacy path) when no run IDs
+         are provided.
+
+    Within the collected traces, priority-filter by failure/regression
+    trace IDs, then backfill with passing traces for spot-checking.
+    """
+    import pandas as pd
+
+    all_traces: pd.DataFrame | None = None
+
+    if eval_mlflow_run_ids:
+        frames: list[pd.DataFrame] = []
+        unique_run_ids = list(dict.fromkeys(eval_mlflow_run_ids))
+        for rid in unique_run_ids:
+            try:
+                run_traces = mlflow.search_traces(run_id=rid)
+                if run_traces is not None and len(run_traces) > 0:
+                    logger.info("Found %d traces in eval run %s", len(run_traces), rid)
+                    frames.append(run_traces)
+            except Exception:
+                logger.warning("Failed to search traces for eval run %s", rid, exc_info=True)
+        if frames:
+            all_traces = pd.concat(frames, ignore_index=True)
+            all_traces = all_traces.drop_duplicates(subset=["trace_id"], keep="first")
+            logger.info(
+                "Collected %d unique traces from %d eval runs",
+                len(all_traces), len(unique_run_ids),
+            )
+
+    if all_traces is None or len(all_traces) == 0:
+        logger.info("Falling back to experiment-wide trace search for session %s", session_name)
+        exp = mlflow.get_experiment_by_name(experiment_name)
+        if not exp:
+            logger.warning("Experiment '%s' not found — session will be empty", experiment_name)
+            return 0
+        all_traces = mlflow.search_traces(
+            experiment_ids=[exp.experiment_id],
+            max_results=500,
+        )
+        if all_traces is None or len(all_traces) == 0:
+            logger.warning("No traces found for experiment '%s'", experiment_name)
+            return 0
+
+    priority_set = set(
+        dict.fromkeys(regression_trace_ids + failure_trace_ids)
+    )
+
+    if priority_set and "trace_id" in all_traces.columns:
+        priority_mask = all_traces["trace_id"].isin(priority_set)
+        priority_traces = all_traces[priority_mask]
+        other_traces = all_traces[~priority_mask]
+    else:
+        priority_traces = pd.DataFrame()
+        other_traces = all_traces
+
+    remaining = _MAX_SESSION_TRACES - len(priority_traces)
+    if remaining > 0 and len(other_traces) > 0:
+        backfill = other_traces.head(remaining)
+        combined = pd.concat([priority_traces, backfill], ignore_index=True)
+    else:
+        combined = priority_traces.head(_MAX_SESSION_TRACES)
+
+    if len(combined) == 0:
+        logger.warning("No traces to add to labeling session %s", session_name)
+        return 0
+
+    session.add_traces(combined)
+    logger.info(
+        "Added %d traces to labeling session %s (%d priority + %d backfill)",
+        len(combined), session_name,
+        len(priority_traces), len(combined) - len(priority_traces),
+    )
+    return len(combined)
 
 
 def _find_session_by_name(session_name: str) -> Any | None:

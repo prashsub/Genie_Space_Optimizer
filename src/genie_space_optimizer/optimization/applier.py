@@ -561,7 +561,10 @@ def proposals_to_patches(proposals: list[dict]) -> list[dict]:
                     "column_entity_type": p.get("column_entity_type", ""),
                 })
             if synonym_value:
-                new_syns = [s.strip() for s in synonym_value.split(",") if s.strip()]
+                if isinstance(synonym_value, list):
+                    new_syns = [str(s).strip() for s in synonym_value if str(s).strip()]
+                else:
+                    new_syns = [s.strip() for s in str(synonym_value).split(",") if s.strip()]
                 if new_syns:
                     patches.append({
                         **base,
@@ -1495,7 +1498,23 @@ def apply_patch_set(
     sort_genie_config(config)
     _enforce_instruction_limit(config)
 
-    from genie_space_optimizer.common.genie_schema import validate_serialized_space
+    from genie_space_optimizer.common.genie_schema import (
+        count_instruction_slots,
+        MAX_INSTRUCTION_SLOTS,
+        validate_serialized_space,
+    )
+
+    slot_count = count_instruction_slots(config)
+    if slot_count > MAX_INSTRUCTION_SLOTS:
+        logger.warning(
+            "Post-apply config exceeds instruction slot budget (%d/%d) — "
+            "trimming newest example_question_sqls",
+            slot_count, MAX_INSTRUCTION_SLOTS,
+        )
+        excess = slot_count - MAX_INSTRUCTION_SLOTS
+        eqs = (config.get("instructions") or {}).get("example_question_sqls", [])
+        if len(eqs) > excess:
+            config["instructions"]["example_question_sqls"] = eqs[:-excess]
 
     config_ok, validation_errors = validate_serialized_space(config, strict=True)
     if not config_ok:

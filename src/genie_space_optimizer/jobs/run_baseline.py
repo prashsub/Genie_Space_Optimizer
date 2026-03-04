@@ -13,7 +13,7 @@
 # MAGIC
 # MAGIC ## 🎯 Purpose
 # MAGIC
-# MAGIC This task establishes the **quality baseline** for the Genie Space before any optimization. It runs the full 8-judge evaluation suite against the benchmark dataset and records scores that the downstream **lever_loop** task will use to measure improvement.
+# MAGIC This task establishes the **quality baseline** for the Genie Space before any optimization. It runs the full 9-judge evaluation suite against the benchmark dataset and records scores that the downstream **lever_loop** task will use to measure improvement.
 # MAGIC
 # MAGIC ## 🏗️ DAG Position
 # MAGIC
@@ -25,9 +25,9 @@
 # MAGIC | 4 | finalize | Pending | lever_loop | deploy |
 # MAGIC | 5 | deploy | Pending | preflight + finalize | *(terminal)* |
 # MAGIC
-# MAGIC ## 8-Judge Scoring System
+# MAGIC ## 9-Judge Scoring System
 # MAGIC
-# MAGIC The evaluation uses 8 custom scorers passed to `mlflow.genai.evaluate(scorers=all_scorers)`:
+# MAGIC The evaluation uses 9 custom scorers passed to `mlflow.genai.evaluate(scorers=all_scorers)`:
 # MAGIC
 # MAGIC | Judge | Purpose |
 # MAGIC |-------|---------|
@@ -36,6 +36,7 @@
 # MAGIC | logical_accuracy | Correct aggregations, filters, GROUP BY, ORDER BY |
 # MAGIC | semantic_equivalence | Same business metric even if written differently |
 # MAGIC | completeness | No missing dimensions, measures, or filters |
+# MAGIC | response_quality | Overall quality of Genie's natural-language analysis and SQL response |
 # MAGIC | result_correctness | Query results match expected (hash/signature comparison) |
 # MAGIC | asset_routing | Correct asset type (TABLE/MV/TVF) selected |
 # MAGIC | arbiter | Tie-breaker when results disagree (LLM-based) |
@@ -56,12 +57,16 @@
 # MAGIC | Step | Action | Key Function | Output |
 # MAGIC |:----:|--------|-------------|--------|
 # MAGIC | 1 | Create predict function | `make_predict_fn(w, space_id, spark, catalog, schema)` | closure (rate-limits, calls Genie, executes SQL, normalizes, compares hashes) |
-# MAGIC | 2 | Assemble 8 scorers | `make_all_scorers(w, spark, catalog, schema)` | scorer list for `mlflow.genai.evaluate()` |
+# MAGIC | 2 | Assemble 9 scorers | `make_all_scorers(w, spark, catalog, schema)` | scorer list for `mlflow.genai.evaluate()` |
 # MAGIC | 3 | Run evaluation with retry | `run_evaluation()` → `_run_evaluate_with_retries()` | scores, accuracy (up to 4 attempts, exponential backoff, single-worker fallback) |
 # MAGIC | 4 | Check thresholds | `all_thresholds_met(scores, MLFLOW_THRESHOLDS)` | `thresholds_met` boolean |
 # MAGIC | 5 | Write state | Delta iteration 0, link scores to model, update run status | Delta records |
 # MAGIC
 # MAGIC > **📝 Note:** Benchmark quarantine (SQL/routine gating) is now integrated inside `run_evaluation()` — invalid benchmarks are quarantined within the shared evaluation path rather than as a separate pre-step.
+# MAGIC
+# MAGIC ### Labeling Session and Expectations
+# MAGIC
+# MAGIC After evaluation, `log_expectations_on_traces()` logs each benchmark's expected SQL as an MLflow expectation on the corresponding trace, giving human reviewers ground-truth context. If failures are detected, a **labeling session** is created via `create_review_session()` using the evaluation's MLflow run IDs for reliable trace population. The session URL is persisted to the `genie_opt_runs` Delta table and surfaced in the application UI as a "Human Review" link.
 # MAGIC
 # MAGIC Results flow to lever_loop via task values: `scores`, `overall_accuracy`, `thresholds_met`, `model_id` are consumed to decide whether to proceed and to compare against post-lever scores.
 
@@ -302,7 +307,7 @@ dbutils.notebook.exit(json.dumps({
 # MAGIC [TASK-2 BASELINE] Running _run_baseline
 # MAGIC ════════════════════════════════════════════════════════════════
 # MAGIC [2026-02-28 10:15:12 UTC] [TASK-2 BASELINE] Baseline finished
-# MAGIC   {"overall_accuracy": 72.5, "thresholds_met": false, "model_id": "mv-abc123", "judge_count": 8}
+# MAGIC   {"overall_accuracy": 72.5, "thresholds_met": false, "model_id": "mv-abc123", "judge_count": 9}
 # MAGIC ════════════════════════════════════════════════════════════════
 # MAGIC [TASK-2 BASELINE] Publishing Task Values
 # MAGIC ════════════════════════════════════════════════════════════════

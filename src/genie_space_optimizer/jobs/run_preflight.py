@@ -18,7 +18,7 @@
 # MAGIC | Responsibility | Why It Matters |
 # MAGIC |----------------|----------------|
 # MAGIC | **Validate orchestration parameters** | Ensures `run_id`, `space_id`, `catalog`, `schema`, etc. are present and sane before any work begins |
-# MAGIC | **Ensure Delta state tables exist** | Creates `genie_opt_runs`, `genie_opt_stages`, `genie_opt_iterations`, `genie_opt_patches`, `genie_eval_asi_results` if missing |
+# MAGIC | **Ensure Delta state tables exist** | Creates 7 Delta tables (`genie_opt_runs`, `genie_opt_stages`, `genie_opt_iterations`, `genie_opt_patches`, `genie_eval_asi_results`, `genie_opt_data_access_grants`, `genie_opt_provenance`) if missing; runs column migrations on existing tables |
 # MAGIC | **Fetch Genie Space config** | Baseline configuration is needed for lever proposals and rollback |
 # MAGIC | **Collect UC metadata** | Columns, tags, routines inform benchmark generation and model context |
 # MAGIC | **Load or generate benchmarks** | Evaluation queries that drive accuracy scoring; LLM generates if none exist |
@@ -98,7 +98,7 @@
 # MAGIC | `WorkspaceClient` | Databricks SDK — Genie API, MLflow, workspace operations |
 # MAGIC | `SparkSession` | Delta table creation and SQL execution |
 # MAGIC | `_run_preflight` | Harness stage function: config fetch, UC metadata, benchmarks, model creation |
-# MAGIC | `ensure_optimization_tables` | Creates the 5 Delta tables if they don't exist |
+# MAGIC | `ensure_optimization_tables` | Creates the 7 Delta tables if they don't exist; runs column migrations on existing tables |
 # MAGIC
 # MAGIC ### Helper Functions
 # MAGIC
@@ -209,17 +209,19 @@ _log(
 # MAGIC %md
 # MAGIC ## 💾 Delta State Tables
 # MAGIC
-# MAGIC `ensure_optimization_tables(spark, catalog, schema)` creates these tables with `CREATE TABLE IF NOT EXISTS`:
+# MAGIC `ensure_optimization_tables(spark, catalog, schema)` creates these 7 tables with `CREATE TABLE IF NOT EXISTS`:
 # MAGIC
 # MAGIC | Table | Purpose |
 # MAGIC |-------|---------|
-# MAGIC | `genie_opt_runs` | One row per run: status, config snapshot, best iteration, convergence reason |
+# MAGIC | `genie_opt_runs` | One row per run: status, config snapshot, best iteration, convergence reason, labeling session URL |
 # MAGIC | `genie_opt_stages` | Stage transitions (PREFLIGHT_STARTED, BASELINE_EVAL_STARTED, etc.) with timestamps |
-# MAGIC | `genie_opt_iterations` | Per-iteration scores and evaluation results |
-# MAGIC | `genie_opt_patches` | Applied patches per iteration/lever; rollback tracking |
-# MAGIC | `genie_eval_asi_results` | ASI (Automated Semantic Inference) judge feedback |
+# MAGIC | `genie_opt_iterations` | Per-iteration scores, evaluation results, and adaptive reflection entries |
+# MAGIC | `genie_opt_patches` | Applied patches per iteration/lever; rollback tracking and provenance chain |
+# MAGIC | `genie_eval_asi_results` | ASI (Automated Structured Investigation) judge feedback |
+# MAGIC | `genie_opt_data_access_grants` | Tracks data access grants applied during optimization |
+# MAGIC | `genie_opt_provenance` | End-to-end provenance linking patches to judge verdicts and gate outcomes |
 # MAGIC
-# MAGIC > **📝 Note:** Idempotent — safe to call on every run. Missing catalog/schema permissions will raise.
+# MAGIC > **📝 Note:** Idempotent — safe to call on every run. For existing tables, `_migrate_add_columns()` adds any new columns (e.g. `reflection_json`, `labeling_session_url`) that were introduced in newer versions, making upgrades seamless. Missing catalog/schema permissions will raise.
 
 # COMMAND ----------
 
@@ -382,4 +384,4 @@ dbutils.notebook.exit(json.dumps({
 # MAGIC - **Task 1 (Preflight)** validates inputs, ensures Delta tables, fetches config and UC metadata, loads or generates benchmarks, sets up the MLflow experiment and iteration 0 model, and publishes task values for Tasks 2–5.
 # MAGIC - **On success:** Run status is `IN_PROGRESS`; baseline task can proceed.
 # MAGIC - **On failure:** Run status is `FAILED`; inspect logs and `genie_opt_stages` for diagnostics.
-# MAGIC - **Next:** Task 2 (baseline_eval) runs the full 8-judge evaluation on iteration 0 and checks quality thresholds.
+# MAGIC - **Next:** Task 2 (baseline_eval) runs the full 9-judge evaluation on iteration 0 and checks quality thresholds.
