@@ -1139,7 +1139,15 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Lever loop Stage 2.75: example SQL mining with 0-row validation, applied proactively via Genie API
 - [ ] Lever loop Stage 2.95: proactive instruction seeding for spaces with < 50 char instructions
 - [ ] Lever loop noise floor: score improvements < 5.0 pts rejected as cosmetic noise
-- [ ] Lever loop strategist: holistic strategy generated triaging all failures to levers
+- [ ] Adaptive loop: re-clusters failures from fresh eval each iteration (not stale baseline)
+- [ ] Adaptive loop: `rank_clusters()` scores clusters by impact (question_count × causal × severity × fixability)
+- [ ] Adaptive strategist: produces exactly 1 action group per iteration (not batch)
+- [ ] Adaptive strategist prompt includes priority ranking and reflection buffer with DO NOT RETRY list
+- [ ] Holistic fallback on iteration 1: if adaptive strategist returns 0 AGs, falls back to holistic strategy
+- [ ] Reflection buffer: each iteration records accepted/rolled-back, score deltas, target objects, patches
+- [ ] Reflection buffer persisted in `genie_opt_iterations.reflection_json` column
+- [ ] Tried-patch filtering: clusters with already-tried-and-rolled-back (failure_type, blame_set) excluded
+- [ ] Diminishing returns: loop stops when last 2 accepted iterations each improved < 2%
 - [ ] Lever loop arbiter corrections: applied if ≥3 `genie_correct` verdicts in baseline
 - [ ] Lever loop arbiter filter: `both_correct` AND `genie_correct` excluded from hard failure rows
 - [ ] Lever loop tiered arbiter: soft signal rows extracted (individual judge failures on correct verdicts)
@@ -1147,8 +1155,7 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Lever 4: join discovery runs even without explicit join failure clusters
 - [ ] Lever 5: uses `instruction_guidance` from lever directives for instruction rewrite
 - [ ] Full-eval gate: confirmation double-run (two evaluations averaged) to smooth Genie non-determinism
-- [ ] Fallback: if all AGs rolled back, re-strategize and retry with single highest-priority lever
-- [ ] Lever loop 5-lever iteration completes (or skips if thresholds met): patches in `genie_opt_patches`
+- [ ] Lever loop iteration completes (or skips if thresholds met): patches in `genie_opt_patches`
 - [ ] ASI data present on clusters (failure_type not None for applicable questions)
 - [ ] ASI results written to `genie_eval_asi_results` with `mlflow_run_id` for trace linking
 - [ ] Provenance rows written to `genie_opt_provenance` linking judges → clusters → proposals → gates

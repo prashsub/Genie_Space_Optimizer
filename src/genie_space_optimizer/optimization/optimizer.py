@@ -20,6 +20,7 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
 from genie_space_optimizer.common.config import (
+    ADAPTIVE_STRATEGIST_PROMPT,
     APPLY_MODE,
     CONFLICT_RULES,
     DEFAULT_THRESHOLDS,
@@ -815,6 +816,121 @@ def cluster_failures(
         print("\n".join(lines))
 
     return clusters
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2a. Cluster Priority Scoring (adaptive lever loop)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def cluster_impact(cluster: dict) -> float:
+    """Score a failure cluster by estimated optimisation impact.
+
+    ``impact = question_count × causal_weight × severity × fixability``
+
+    Higher is more impactful.  Used to rank clusters before the adaptive
+    strategist call so the LLM receives a suggested priority order.
+    """
+    from genie_space_optimizer.common.config import (
+        CAUSAL_WEIGHT,
+        FIXABILITY_WITH_COUNTERFACTUAL,
+        FIXABILITY_WITHOUT_COUNTERFACTUAL,
+        SEVERITY_WEIGHT,
+    )
+
+    q_count = max(len(cluster.get("question_ids", [])), 1)
+    judge = cluster.get("affected_judge", "")
+    failure_type = cluster.get("asi_failure_type") or cluster.get("root_cause", "other")
+
+    causal = CAUSAL_WEIGHT.get(judge, 1.0)
+    severity = SEVERITY_WEIGHT.get(failure_type, 0.5)
+
+    has_cf = bool(cluster.get("asi_counterfactual_fixes"))
+    fixability = FIXABILITY_WITH_COUNTERFACTUAL if has_cf else FIXABILITY_WITHOUT_COUNTERFACTUAL
+
+    return q_count * causal * severity * fixability
+
+
+def rank_clusters(clusters: list[dict]) -> list[dict]:
+    """Return *clusters* sorted by :func:`cluster_impact` (descending).
+
+    Each cluster dict gets ``impact_score`` and ``rank`` keys added.
+    The original list is **not** mutated.
+    """
+    scored = []
+    for c in clusters:
+        enriched = dict(c)
+        enriched["impact_score"] = cluster_impact(c)
+        scored.append(enriched)
+    scored.sort(key=lambda c: c["impact_score"], reverse=True)
+    for i, c in enumerate(scored, 1):
+        c["rank"] = i
+    return scored
+
+
+def format_reflection_buffer(
+    reflection_buffer: list[dict],
+    full_window: int | None = None,
+) -> str:
+    """Render the reflection buffer as a prompt-ready string.
+
+    The most recent *full_window* entries are shown in full detail.  Older
+    entries are compressed to a single line each.  A DO NOT RETRY block is
+    appended at the end listing every target that was previously tried and
+    rolled back.
+    """
+    from genie_space_optimizer.common.config import REFLECTION_WINDOW_FULL
+
+    if full_window is None:
+        full_window = REFLECTION_WINDOW_FULL
+
+    if not reflection_buffer:
+        return "(No prior iterations. This is the first attempt after baseline evaluation.)"
+
+    lines: list[str] = []
+    do_not_retry: list[str] = []
+    cutoff = max(0, len(reflection_buffer) - full_window)
+
+    for entry in reflection_buffer[:cutoff]:
+        status = "ACCEPTED" if entry.get("accepted") else "ROLLED_BACK"
+        action = entry.get("action", "?")[:100]
+        delta = entry.get("accuracy_delta", 0.0)
+        lines.append(
+            f"Iter {entry.get('iteration', '?')}: {action} "
+            f"({status}, accuracy delta {delta:+.1f}%)"
+        )
+        if not entry.get("accepted"):
+            do_not_retry.extend(entry.get("do_not_retry", []))
+
+    for entry in reflection_buffer[cutoff:]:
+        status = "ACCEPTED" if entry.get("accepted") else "ROLLED_BACK"
+        lines.append(f"\nITERATION {entry.get('iteration', '?')} | {status}")
+        lines.append(f"  Action: {entry.get('action', '?')}")
+        levers = entry.get("levers", [])
+        if levers:
+            lines.append(f"  Levers: {', '.join(str(l) for l in levers)}")
+        targets = entry.get("target_objects", [])
+        if targets:
+            lines.append(f"  Targets: {', '.join(targets[:10])}")
+        deltas = entry.get("score_deltas", {})
+        if deltas:
+            delta_parts = [f"{k} {v:+.1f}%" for k, v in sorted(deltas.items()) if v != 0]
+            if delta_parts:
+                lines.append(f"  Score changes: {', '.join(delta_parts)}")
+        new_failures = entry.get("new_failures")
+        if new_failures:
+            lines.append(f"  New failures: {new_failures}")
+        if entry.get("rollback_reason"):
+            lines.append(f"  Rollback reason: {entry['rollback_reason']}")
+        if not entry.get("accepted"):
+            do_not_retry.extend(entry.get("do_not_retry", []))
+
+    if do_not_retry:
+        lines.append("\nDO NOT RETRY:")
+        for item in sorted(set(do_not_retry)):
+            lines.append(f"  - {item}")
+
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -4468,6 +4584,236 @@ def _call_llm_for_strategy(
                 logger.exception(
                     "Strategist LLM call failed after %d retries (prompt len: %d)",
                     LLM_MAX_RETRIES, len(prompt),
+                )
+                return {**_EMPTY_STRATEGY, "rationale": "LLM call failed"}
+    return {**_EMPTY_STRATEGY, "rationale": "All retries exhausted"}
+
+
+# ── Adaptive Strategist (single-call, one AG per iteration) ─────────────
+
+
+def _call_llm_for_adaptive_strategy(
+    clusters: list[dict],
+    soft_signal_clusters: list[dict],
+    metadata_snapshot: dict,
+    reflection_buffer: list[dict],
+    priority_ranking: list[dict],
+    tried_patches: set[tuple[str, str]],
+    w: WorkspaceClient | None = None,
+    *,
+    total_benchmarks: int = 0,
+    passing_benchmarks: int = 0,
+) -> dict:
+    """Single-call strategist that produces exactly ONE action group.
+
+    Combines schema context, failure clusters, SQL diffs, a priority
+    ranking, and a reflection buffer into one prompt.  Designed for the
+    adaptive lever loop where this call is made every iteration with
+    fresh evaluation results.
+    """
+    import time
+
+    from genie_space_optimizer.optimization.evaluation import (
+        _extract_json,
+        _link_prompt_to_trace,
+    )
+
+    blame_set: Any = None
+    for c in clusters:
+        if c.get("asi_blame_set"):
+            blame_set = c["asi_blame_set"]
+            break
+
+    # ── Build priority ranking text ──────────────────────────────────
+    ranking_lines: list[str] = []
+    for c in priority_ranking[:10]:
+        ranking_lines.append(
+            f"  Rank {c.get('rank', '?')}: "
+            f"[{c.get('cluster_id', '?')}] {c.get('root_cause', '?')} "
+            f"(judge={c.get('affected_judge', '?')}, "
+            f"questions={len(c.get('question_ids', []))}, "
+            f"impact={c.get('impact_score', 0):.1f})"
+        )
+    ranking_text = "\n".join(ranking_lines) if ranking_lines else "(no clusters)"
+
+    # ── Build success summary ────────────────────────────────────────
+    failing = total_benchmarks - passing_benchmarks
+    success_summary = (
+        f"{passing_benchmarks} of {total_benchmarks} benchmarks pass all judges. "
+        f"{failing} failures remain."
+        if total_benchmarks > 0
+        else "(benchmark counts not available)"
+    )
+
+    # ── Build reflection text ────────────────────────────────────────
+    reflection_text = format_reflection_buffer(reflection_buffer)
+
+    # ── Assemble prompt kwargs ───────────────────────────────────────
+    format_kwargs: dict[str, Any] = {
+        "success_summary": success_summary,
+        "priority_ranking": ranking_text,
+        "reflection_buffer": reflection_text,
+        "full_schema_context": _format_full_schema_context(metadata_snapshot),
+        "cluster_briefs": _format_cluster_briefs(clusters),
+        "soft_signal_summary": _format_soft_signal_summary(soft_signal_clusters),
+        "structured_table_context": _format_structured_table_context(
+            metadata_snapshot, blame_set, lever=1,
+        ),
+        "structured_column_context": _format_structured_column_context(
+            metadata_snapshot, blame_set, lever=1,
+        ),
+        "structured_function_context": _format_structured_function_context(
+            metadata_snapshot, lever=3,
+        ),
+        "current_join_specs": _format_join_specs_context(metadata_snapshot),
+        "current_instructions": (
+            metadata_snapshot.get("general_instructions", "")
+            or "(No current instructions.)"
+        ),
+        "existing_example_sqls": _format_existing_example_sqls(metadata_snapshot),
+        "identifier_allowlist": _format_identifier_allowlist(
+            _build_identifier_allowlist(metadata_snapshot)
+        ),
+        "instruction_char_budget": max(0, 24500 - 500),
+    }
+
+    format_kwargs = _truncate_to_budget(
+        format_kwargs,
+        ADAPTIVE_STRATEGIST_PROMPT,
+        priority_keys=[
+            "soft_signal_summary",
+            "existing_example_sqls",
+            "structured_function_context",
+            "full_schema_context",
+            "structured_column_context",
+            "cluster_briefs",
+        ],
+    )
+
+    prompt = format_mlflow_template(ADAPTIVE_STRATEGIST_PROMPT, **format_kwargs)
+
+    _W = 78
+    logger.info(
+        "\n┌─── LLM Call [ADAPTIVE STRATEGIST] %s\n"
+        "│ Clusters: %d hard, %d soft\n"
+        "│ Reflections: %d\n"
+        "│ Prompt: %d chars\n"
+        "└%s",
+        "─" * max(0, _W - 37),
+        len(clusters),
+        len(soft_signal_clusters),
+        len(reflection_buffer),
+        len(prompt),
+        "─" * (_W - 1),
+    )
+    print(
+        f"\n{'=' * _W}\n"
+        f"  ADAPTIVE STRATEGIST (iteration {len(reflection_buffer) + 1})\n"
+        f"  Clusters: {len(clusters)} hard, {len(soft_signal_clusters)} soft\n"
+        f"  Reflections: {len(reflection_buffer)}\n"
+        f"  Prompt: {len(prompt):,} chars\n"
+        f"{'=' * _W}"
+    )
+
+    _link_prompt_to_trace("adaptive_strategist")
+
+    system_msg = (
+        "You are a JSON API. You MUST respond with ONLY a valid JSON object. "
+        "Do NOT include any explanation, analysis, or markdown outside the JSON. "
+        "Your entire response must be parseable by json.loads(). "
+        "The JSON must contain an 'action_groups' array with EXACTLY one entry."
+    )
+
+    text = ""
+    for attempt in range(LLM_MAX_RETRIES):
+        try:
+            wc = _ws_with_timeout(w)
+            response = wc.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[
+                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
+                temperature=LLM_TEMPERATURE,
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise ValueError("LLM response had no choices")
+            first_choice = choices[0]
+            message = getattr(first_choice, "message", None)
+            content = getattr(message, "content", None)
+            if not content:
+                raise ValueError("LLM response content is empty")
+            text = str(content).strip()
+
+            try:
+                result = _extract_json(text)
+            except json.JSONDecodeError:
+                result = _repair_truncated_strategy_json(text)
+
+            action_groups = result.get("action_groups", [])
+            if not isinstance(action_groups, list):
+                action_groups = []
+            global_rewrite = result.get("global_instruction_rewrite", "")
+            if isinstance(global_rewrite, str) and global_rewrite:
+                global_rewrite = _sanitize_plaintext_instructions(global_rewrite)
+            if isinstance(global_rewrite, str) and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+                global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+            rationale = result.get("rationale", "")
+
+            logger.info(
+                "\n┌─── LLM Response [ADAPTIVE STRATEGIST] ──────────────────────────────\n"
+                "│ Action groups: %d\n"
+                "│ Global instruction rewrite: %d chars\n"
+                "│ Rationale: %s\n"
+                "└─────────────────────────────────────────────────────────────────────────",
+                len(action_groups),
+                len(global_rewrite),
+                str(rationale)[:300],
+            )
+            if action_groups:
+                ag = action_groups[0]
+                levers = sorted(ag.get("lever_directives", {}).keys())
+                qs = ag.get("affected_questions", [])
+                print(
+                    f"  → AG: {ag.get('root_cause_summary', '?')[:100]}\n"
+                    f"    Levers: {levers} | Questions: {len(qs)}"
+                )
+            else:
+                print("  → No action group produced")
+
+            return {
+                "action_groups": action_groups[:1],
+                "global_instruction_rewrite": global_rewrite,
+                "rationale": rationale,
+            }
+        except json.JSONDecodeError:
+            logger.warning(
+                "Adaptive strategist response not valid JSON (attempt %d): %.500s",
+                attempt + 1,
+                text,
+            )
+            if attempt >= LLM_MAX_RETRIES - 1:
+                try:
+                    repaired = _repair_truncated_strategy_json(text)
+                    ags = repaired.get("action_groups", [])
+                    return {
+                        "action_groups": ags[:1],
+                        "global_instruction_rewrite": repaired.get(
+                            "global_instruction_rewrite", ""
+                        ),
+                        "rationale": repaired.get("rationale", ""),
+                    }
+                except json.JSONDecodeError:
+                    pass
+                return {**_EMPTY_STRATEGY, "rationale": "JSON parse failed"}
+        except Exception:
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(2**attempt)
+            else:
+                logger.exception(
+                    "Adaptive strategist LLM call failed after %d retries",
+                    LLM_MAX_RETRIES,
                 )
                 return {**_EMPTY_STRATEGY, "rationale": "LLM call failed"}
     return {**_EMPTY_STRATEGY, "rationale": "All retries exhausted"}

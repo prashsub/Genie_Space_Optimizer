@@ -36,6 +36,8 @@ from genie_space_optimizer.common.config import (
     ARBITER_CORRECTION_TRIGGER,
     DEFAULT_LEVER_ORDER,
     DEFAULT_THRESHOLDS,
+    DIMINISHING_RETURNS_EPSILON,
+    DIMINISHING_RETURNS_LOOKBACK,
     ENABLE_PROMPT_MATCHING_AUTO_APPLY,
     INLINE_EVAL_DELAY,
     LEVER_NAMES,
@@ -71,6 +73,7 @@ from genie_space_optimizer.optimization.models import (
     promote_best_model,
 )
 from genie_space_optimizer.optimization.optimizer import (
+    _call_llm_for_adaptive_strategy,
     _enrich_blank_descriptions,
     _enrich_table_descriptions,
     _generate_holistic_strategy,
@@ -78,8 +81,10 @@ from genie_space_optimizer.optimization.optimizer import (
     cluster_failures,
     detect_regressions,
     enrich_metadata_with_uc_types,
+    format_reflection_buffer,
     generate_metadata_proposals,
     generate_proposals_from_strategy,
+    rank_clusters,
 )
 from genie_space_optimizer.optimization.preflight import run_preflight
 from genie_space_optimizer.optimization.repeatability import run_repeatability_test
@@ -1517,6 +1522,105 @@ def _prepare_lever_loop(
 
 # ── Stage 3: LEVER LOOP ─────────────────────────────────────────────
 
+# ── Adaptive loop helpers ───────────────────────────────────────────
+
+
+def _build_reflection_entry(
+    iteration: int,
+    ag_id: str,
+    accepted: bool,
+    levers: list[int],
+    target_objects: list[str],
+    prev_scores: dict[str, float],
+    new_scores: dict[str, float],
+    rollback_reason: str | None,
+    patches: list[dict],
+) -> dict:
+    """Build a structured reflection dict for the adaptive loop memory."""
+    score_deltas = {
+        k: new_scores.get(k, 0.0) - prev_scores.get(k, 0.0)
+        for k in set(prev_scores) | set(new_scores)
+    }
+    prev_acc = sum(prev_scores.values()) / max(len(prev_scores), 1)
+    new_acc = sum(new_scores.values()) / max(len(new_scores), 1)
+
+    patch_summary_parts: list[str] = []
+    do_not_retry: list[str] = []
+    for p in patches:
+        ptype = p.get("patch_type", "?")
+        target = p.get("target_object", "?")
+        patch_summary_parts.append(f"{ptype} on {target}")
+        if not accepted:
+            do_not_retry.append(f"{ptype} on {target}")
+
+    action = ", ".join(patch_summary_parts[:8])
+    if len(patch_summary_parts) > 8:
+        action += f" (+{len(patch_summary_parts) - 8} more)"
+
+    new_failure_parts: list[str] = []
+    for k, delta in score_deltas.items():
+        if delta < -1.0:
+            new_failure_parts.append(f"{k} {delta:+.1f}%")
+    new_failures = ", ".join(new_failure_parts) if new_failure_parts else None
+
+    return {
+        "iteration": iteration,
+        "ag_id": ag_id,
+        "accepted": accepted,
+        "action": action,
+        "levers": levers,
+        "target_objects": target_objects[:15],
+        "score_deltas": score_deltas,
+        "accuracy_delta": new_acc - prev_acc,
+        "new_failures": new_failures,
+        "rollback_reason": rollback_reason,
+        "do_not_retry": do_not_retry,
+    }
+
+
+def _diminishing_returns(
+    reflection_buffer: list[dict],
+    epsilon: float | None = None,
+    lookback: int | None = None,
+) -> bool:
+    """Return True if the last *lookback* accepted iterations each improved
+    by less than *epsilon* percent on average across judges."""
+    if epsilon is None:
+        epsilon = DIMINISHING_RETURNS_EPSILON
+    if lookback is None:
+        lookback = DIMINISHING_RETURNS_LOOKBACK
+
+    recent_accepted = [r for r in reflection_buffer if r.get("accepted")][-lookback:]
+    if len(recent_accepted) < lookback:
+        return False
+
+    for r in recent_accepted:
+        deltas = r.get("score_deltas", {})
+        if not deltas:
+            continue
+        mean_delta = sum(deltas.values()) / len(deltas)
+        if mean_delta >= epsilon:
+            return False
+    return True
+
+
+def _filter_tried_clusters(
+    clusters: list[dict],
+    tried_patches: set[tuple[str, str]],
+) -> list[dict]:
+    """Remove clusters whose (failure_type, blame_set) was already tried
+    and rolled back.  Keeps clusters that were tried and *accepted* (they
+    should no longer appear in fresh failure data anyway)."""
+    if not tried_patches:
+        return clusters
+    filtered: list[dict] = []
+    for c in clusters:
+        ft = c.get("asi_failure_type") or c.get("root_cause", "other")
+        blame = c.get("asi_blame_set") or ""
+        if (ft, blame) not in tried_patches:
+            filtered.append(c)
+    return filtered
+
 
 def _extract_arbiter_actions_from_baseline(
     spark: SparkSession,
@@ -2360,25 +2464,7 @@ def _run_lever_loop(
             f"(below threshold {ARBITER_CORRECTION_TRIGGER}, no corrections applied)"
         )
 
-    # ── Analyze failures once before the lever loop ─────────────────
-    _analysis = _analyze_and_distribute(
-        spark, run_id, catalog, schema, metadata_snapshot,
-        iteration_counter, lever_label=0,
-    )
-    lever_assignments = _analysis["lever_assignments"]
-    clusters = _analysis["all_clusters"]
-    soft_signal_clusters = _analysis["soft_signal_clusters"]
-
-    try:
-        write_asi_results(spark, run_id, iteration_counter, _analysis["asi_rows"], catalog, schema, mlflow_run_id="")
-    except Exception:
-        logger.debug("Failed to write ASI results", exc_info=True)
-    try:
-        write_provenance(spark, run_id, iteration_counter, 0, _analysis["prov_rows"], catalog, schema)
-    except Exception:
-        logger.debug("Failed to write provenance rows", exc_info=True)
-
-    # ── Mine benchmark examples once (proactive, before strategy) ────
+    # ── Mine benchmark examples once (proactive, before loop) ──────────
     mined_example_proposals = _mine_benchmark_example_sqls(
         benchmarks, metadata_snapshot,
         spark=spark, catalog=catalog, gold_schema=schema,
@@ -2396,44 +2482,96 @@ def _run_lever_loop(
             enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
     # ═══════════════════════════════════════════════════════════════════
-    # PHASE 1: Holistic Strategist
-    # ═══════════════════════════════════════════════════════════════════
-    print(_section("PHASE 1: HOLISTIC STRATEGIST", "="))
-    strategy = _generate_holistic_strategy(
-        clusters=clusters,
-        soft_signal_clusters=soft_signal_clusters,
-        metadata_snapshot=metadata_snapshot,
-        w=w,
-    )
-    action_groups = strategy.get("action_groups", [])
-    action_groups.sort(key=lambda a: a.get("priority", 999))
-
-    if not action_groups:
-        print(
-            _section("Strategy produced 0 action groups — nothing to do", "-") + "\n"
-            + _bar("-")
-        )
-        logger.info("Strategist returned 0 action groups — lever loop ending early")
-
-    # ═══════════════════════════════════════════════════════════════════
-    # PHASE 2 + 3: Execute Action Groups with Gating
+    # ADAPTIVE LEVER LOOP
+    # Re-cluster → priority score → strategist (1 AG) → apply → gate
+    # → accept/rollback → reflect … repeat
     # ═══════════════════════════════════════════════════════════════════
     ags_attempted: list[str] = []
     ags_accepted: list[str] = []
     ags_rolled_back: list[str] = []
     noise_floor = min(100.0 / max(len(benchmarks), 1), MAX_NOISE_FLOOR)
 
-    for ag in action_groups:
-        ag_id = ag.get("id", f"AG{len(ags_attempted) + 1}")
+    reflection_buffer: list[dict] = []
+    tried_patches: set[tuple[str, str]] = set()
 
+    for _iter_num in range(1, max_iterations + 1):
+        # ── Exit checks ──────────────────────────────────────────────
         if all_thresholds_met(best_scores, thresholds):
-            logger.info("Convergence: all thresholds met before AG %s", ag_id)
+            logger.info("Convergence: all thresholds met before iteration %d", _iter_num)
             break
-        if iteration_counter >= max_iterations:
-            logger.info("Max iterations (%d) reached before AG %s", max_iterations, ag_id)
+        if _diminishing_returns(reflection_buffer):
+            logger.info("Diminishing returns detected — stopping at iteration %d", _iter_num)
             break
 
         iteration_counter += 1
+
+        # ── 3B.2: Re-cluster from latest eval ────────────────────────
+        _analysis = _analyze_and_distribute(
+            spark, run_id, catalog, schema, metadata_snapshot,
+            iteration_counter - 1, lever_label=0,
+        )
+        clusters = _analysis["all_clusters"]
+        soft_signal_clusters = _analysis["soft_signal_clusters"]
+
+        try:
+            write_asi_results(spark, run_id, iteration_counter - 1, _analysis["asi_rows"], catalog, schema, mlflow_run_id="")
+        except Exception:
+            logger.debug("Failed to write ASI results", exc_info=True)
+        try:
+            write_provenance(spark, run_id, iteration_counter - 1, 0, _analysis["prov_rows"], catalog, schema)
+        except Exception:
+            logger.debug("Failed to write provenance rows", exc_info=True)
+
+        clusters = _filter_tried_clusters(clusters, tried_patches)
+        if not clusters and not soft_signal_clusters:
+            logger.info("No actionable clusters remain — stopping at iteration %d", _iter_num)
+            break
+
+        # ── 3B.3: Priority scoring ───────────────────────────────────
+        ranked = rank_clusters(clusters)
+
+        # ── 3B.4: Adaptive strategist (1 LLM call → 1 AG) ───────────
+        print(_section(f"ADAPTIVE STRATEGIST — Iteration {iteration_counter}", "="))
+
+        _total_q = len(benchmarks)
+        _passing_q = _total_q - sum(len(c.get("question_ids", [])) for c in clusters)
+        strategy = _call_llm_for_adaptive_strategy(
+            clusters=clusters,
+            soft_signal_clusters=soft_signal_clusters,
+            metadata_snapshot=metadata_snapshot,
+            reflection_buffer=reflection_buffer,
+            priority_ranking=ranked,
+            tried_patches=tried_patches,
+            w=w,
+            total_benchmarks=_total_q,
+            passing_benchmarks=max(0, _passing_q),
+        )
+        action_groups = strategy.get("action_groups", [])
+        ag = action_groups[0] if action_groups else None
+
+        if ag is None and _iter_num == 1:
+            logger.info("Adaptive strategist returned 0 AGs on iter 1 — trying holistic fallback")
+            fallback_strategy = _generate_holistic_strategy(
+                clusters=clusters,
+                soft_signal_clusters=soft_signal_clusters,
+                metadata_snapshot=metadata_snapshot,
+                w=w,
+            )
+            _fb_ags = fallback_strategy.get("action_groups", [])
+            _fb_ags.sort(key=lambda a: a.get("priority", 999))
+            if _fb_ags:
+                ag = _fb_ags[0]
+                strategy = fallback_strategy
+
+        if ag is None:
+            logger.info("Strategist produced 0 action groups — ending lever loop")
+            print(
+                _section("Strategy produced 0 action groups — nothing to do", "-") + "\n"
+                + _bar("-")
+            )
+            break
+
+        ag_id = ag.get("id", f"AG{iteration_counter}")
         ags_attempted.append(ag_id)
         lever_keys = sorted(ag.get("lever_directives", {}).keys())
 
@@ -2453,7 +2591,7 @@ def _run_lever_loop(
             catalog=catalog, schema=schema,
         )
 
-        # ── Generate proposals for ALL levers in this action group ──
+        # ── 3B.5: Generate proposals + apply patches ─────────────────
         all_proposals: list[dict] = []
         for lever_key in lever_keys:
             lever_int = int(lever_key)
@@ -2478,17 +2616,16 @@ def _run_lever_loop(
         for pi, p in enumerate(all_proposals, 1):
             cluster_id = p.get("cluster_id", "?")
             ptype = p.get("type", p.get("patch_type", "?"))
-            target = p.get("target", p.get("target_object", "")) or "(none)"
             rationale = str(p.get("rationale", ""))
             proposed_value = str(p.get("proposed_value", ""))
             table = p.get("table", "")
             column = p.get("column", "")
             is_failed = "not valid JSON" in rationale or "non-JSON" in rationale.lower()
-            status = "FAILED (non-JSON)" if is_failed else "OK"
             if is_failed:
                 _n_failed += 1
             else:
                 _n_valid += 1
+            status = "FAILED (non-JSON)" if is_failed else "OK"
 
             proposal_lines.append(f"|  Proposal {pi} / {len(all_proposals)}  [{cluster_id}]")
             proposal_lines.append(f"|    {'Type:':<24s} {ptype}")
@@ -2549,13 +2686,18 @@ def _run_lever_loop(
             logger.debug("Failed to update provenance proposals", exc_info=True)
 
         if not all_proposals:
-            print(_section(f"[{ag_id}] No proposals — SKIPPING action group", "-"))
+            print(_section(f"[{ag_id}] No proposals — SKIPPING iteration", "-"))
             write_stage(
                 spark, run_id, f"AG_{ag_id}_STARTED", "SKIPPED",
                 task_key="lever_loop", iteration=iteration_counter,
                 detail={"reason": "no_proposals"},
                 catalog=catalog, schema=schema,
             )
+            reflection_buffer.append(_build_reflection_entry(
+                iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                levers=[], target_objects=[], prev_scores=best_scores,
+                new_scores=best_scores, rollback_reason="no_proposals", patches=[],
+            ))
             continue
 
         # ── Apply coordinated patch set ──────────────────────────────
@@ -2584,6 +2726,13 @@ def _run_lever_loop(
                 error_message=str(_pe)[:500],
                 catalog=catalog, schema=schema,
             )
+            reflection_buffer.append(_build_reflection_entry(
+                iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                levers=[int(lk) for lk in lever_keys], target_objects=[],
+                prev_scores=best_scores, new_scores=best_scores,
+                rollback_reason=f"patch_deploy_failed: {str(_pe)[:100]}",
+                patches=patches,
+            ))
             continue
 
         # ── Applied Patches Detail ───────────────────────────────────
@@ -2597,7 +2746,7 @@ def _run_lever_loop(
             _ap_lines.append(_bar("="))
             print("\n".join(_ap_lines))
 
-        # ── Gate checks (slice → P0 → full eval) ────────────────────
+        # ── 3B.6: Three-gate eval ───────────────────────────────────
         gate_result = _run_gate_checks(
             spark=spark,
             w=w,
@@ -2624,6 +2773,11 @@ def _run_lever_loop(
             noise_floor=noise_floor,
         )
 
+        # ── 3B.7: Accept or rollback ────────────────────────────────
+        _target_objects = [
+            p.get("target_object", "") for p in patches if p.get("target_object")
+        ]
+
         if not gate_result.get("passed"):
             reason = gate_result.get("rollback_reason", "unknown")
             rollback(apply_log, w, space_id, metadata_snapshot)
@@ -2647,6 +2801,21 @@ def _run_lever_loop(
                     all_failure_trace_ids.append(tid)
                 elif "regressions" in gate_result:
                     all_regression_trace_ids.append(tid)
+
+            _failed_scores = gate_result.get("full_scores", best_scores)
+            reflection = _build_reflection_entry(
+                iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                levers=[int(lk) for lk in lever_keys],
+                target_objects=_target_objects,
+                prev_scores=best_scores, new_scores=_failed_scores,
+                rollback_reason=reason, patches=patches,
+            )
+            reflection_buffer.append(reflection)
+            for p in patches:
+                ft = p.get("patch_type", "")
+                tgt = p.get("target_object", "")
+                if ft and tgt:
+                    tried_patches.add((ft, tgt))
             continue
 
         # ── Accept action group ──────────────────────────────────────
@@ -2674,6 +2843,16 @@ def _run_lever_loop(
             ],
             "accuracy_delta": full_accuracy - best_accuracy,
         })
+
+        reflection = _build_reflection_entry(
+            iteration=iteration_counter, ag_id=ag_id, accepted=True,
+            levers=[int(lk) for lk in lever_keys],
+            target_objects=_target_objects,
+            prev_scores=best_scores, new_scores=full_scores,
+            rollback_reason=None, patches=patches,
+        )
+        reflection_buffer.append(reflection)
+
         best_scores = full_scores
         best_accuracy = full_accuracy
         best_model_id = new_model_id
@@ -2729,122 +2908,10 @@ def _run_lever_loop(
             "levers_attempted": levers_attempted,
             "levers_accepted": levers_accepted,
             "levers_rolled_back": levers_rolled_back,
+            "reflection_buffer": reflection_buffer,
         },
         catalog=catalog, schema=schema,
     )
-
-    # ── Fallback: conservative single-lever retry when all AGs failed ──
-    if (
-        ags_attempted
-        and not ags_accepted
-        and iteration_counter < max_iterations
-    ):
-        print(_section("FALLBACK: ALL AGs ROLLED BACK — TRYING CONSERVATIVE RETRY", "="))
-        _fb_analysis = _analyze_and_distribute(
-            spark, run_id, catalog, schema, metadata_snapshot,
-            iteration_counter, lever_label=0,
-        )
-        _fb_clusters = _fb_analysis["all_clusters"]
-        _fb_soft = _fb_analysis["soft_signal_clusters"]
-
-        _fb_strategy = _generate_holistic_strategy(
-            clusters=_fb_clusters,
-            soft_signal_clusters=_fb_soft,
-            metadata_snapshot=metadata_snapshot,
-            w=w,
-        )
-        _fb_ags = _fb_strategy.get("action_groups", [])
-        _fb_ags.sort(key=lambda a: a.get("priority", 999))
-
-        if _fb_ags:
-            _fb_ag = _fb_ags[0]
-            _fb_ag_id = _fb_ag.get("id", "FB1")
-            _fb_lever_dirs = _fb_ag.get("lever_directives", {})
-            _fb_lever_keys = sorted(_fb_lever_dirs.keys())
-
-            # Pick only the highest-priority single lever
-            if len(_fb_lever_keys) > 1:
-                _fb_lever_keys = _fb_lever_keys[:1]
-                _fb_ag["lever_directives"] = {_fb_lever_keys[0]: _fb_lever_dirs[_fb_lever_keys[0]]}
-
-            iteration_counter += 1
-            ags_attempted.append(f"{_fb_ag_id}_FB")
-            print(
-                _kv("Fallback AG", _fb_ag_id) + "\n"
-                + _kv("Lever", ", ".join(_fb_lever_keys)) + "\n"
-                + _kv("Root cause", _fb_ag.get("root_cause_summary", "?")[:120])
-            )
-
-            _fb_proposals: list[dict] = []
-            for lk in _fb_lever_keys:
-                _fb_proposals.extend(generate_proposals_from_strategy(
-                    strategy=_fb_strategy,
-                    action_group=_fb_ag,
-                    metadata_snapshot=metadata_snapshot,
-                    target_lever=int(lk),
-                    apply_mode=apply_mode,
-                    w=w,
-                    spark=spark,
-                    catalog=catalog,
-                    gold_schema=schema,
-                ))
-
-            if _fb_proposals:
-                from genie_space_optimizer.optimization.applier import (
-                    proposals_to_patches as _fb_p2p,
-                    apply_patch_set as _fb_apply,
-                    rollback as _fb_rollback,
-                )
-                _fb_patches = _fb_p2p(_fb_proposals)
-                _fb_apply_log = _fb_apply(
-                    w, space_id, _fb_patches, metadata_snapshot, apply_mode=apply_mode,
-                )
-
-                if _fb_apply_log.get("applied"):
-                    _fb_gate = _run_gate_checks(
-                        spark=spark, w=w, run_id=run_id, space_id=space_id,
-                        exp_name=exp_name, domain=domain,
-                        iteration_counter=iteration_counter,
-                        ag_id=f"{_fb_ag_id}_FB",
-                        benchmarks=benchmarks, proposals=_fb_proposals,
-                        patches=_fb_patches, apply_log=_fb_apply_log,
-                        clusters=_fb_clusters, metadata_snapshot=metadata_snapshot,
-                        predict_fn=predict_fn, scorers=scorers,
-                        prev_model_id=prev_model_id, best_scores=best_scores,
-                        best_accuracy=best_accuracy, catalog=catalog, schema=schema,
-                        reference_sqls=reference_sqls, noise_floor=noise_floor,
-                    )
-
-                    if _fb_gate.get("passed"):
-                        _fb_full_scores = _fb_gate["full_scores"]
-                        _fb_full_accuracy = _fb_gate["full_accuracy"]
-                        ags_accepted.append(f"{_fb_ag_id}_FB")
-                        levers_accepted.extend([int(lk) for lk in _fb_lever_keys])
-                        best_scores = _fb_full_scores
-                        best_accuracy = _fb_full_accuracy
-                        best_iteration = iteration_counter
-                        best_model_id = _fb_gate.get("new_model_id", best_model_id)
-                        prev_model_id = best_model_id
-                        metadata_snapshot = _fb_apply_log.get("post_snapshot", metadata_snapshot)
-                        new_refs = extract_reference_sqls(_fb_gate.get("full_result", {}))
-                        if new_refs:
-                            reference_sqls.update(new_refs)
-                        print(_section(f"FALLBACK [{_fb_ag_id}_FB]: ACCEPTED", "="))
-                    else:
-                        _fb_rollback(w, space_id, _fb_apply_log)
-                        ags_rolled_back.append(f"{_fb_ag_id}_FB")
-                        levers_rolled_back.extend([int(lk) for lk in _fb_lever_keys])
-                        print(
-                            _section(f"FALLBACK [{_fb_ag_id}_FB]: ROLLED BACK", "-") + "\n"
-                            + _kv("Reason", _fb_gate.get("rollback_reason", "regression"))
-                        )
-                else:
-                    print(_kv("Fallback", "no patches applied — skipping"))
-            else:
-                print(_kv("Fallback", "no proposals generated — skipping"))
-        else:
-            print(_kv("Fallback", "strategy regeneration produced 0 action groups — skipping"))
-        print(_bar("="))
 
     session_info: dict = {}
     if all_failure_trace_ids or all_regression_trace_ids:

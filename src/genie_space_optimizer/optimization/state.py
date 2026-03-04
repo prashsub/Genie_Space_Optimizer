@@ -120,7 +120,8 @@ CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_iterations (
     repeatability_pct   DOUBLE                 COMMENT 'Repeatability percentage (0-100) if measured',
     repeatability_json  STRING                 COMMENT 'JSON: per-question repeatability details',
     thresholds_met      BOOLEAN       NOT NULL COMMENT 'True if all quality thresholds passed',
-    rows_json           STRING                 COMMENT 'JSON: per-question evaluation detail rows'
+    rows_json           STRING                 COMMENT 'JSON: per-question evaluation detail rows',
+    reflection_json     STRING                 COMMENT 'JSON: adaptive loop reflection entry for this iteration'
 )
 USING DELTA
 PARTITIONED BY (run_id)
@@ -504,6 +505,7 @@ def write_iteration(
     lever: int | None = None,
     eval_scope: str = "full",
     model_id: str | None = None,
+    reflection_json: dict | None = None,
 ) -> None:
     """Insert into ``genie_opt_iterations`` with scores, failures, etc."""
     now = datetime.now(timezone.utc).isoformat()
@@ -538,7 +540,7 @@ def write_iteration(
         "run_id, iteration, lever, eval_scope, timestamp, mlflow_run_id, model_id, "
         "overall_accuracy, total_questions, correct_count, scores_json, failures_json, "
         "remaining_failures, arbiter_actions_json, repeatability_pct, repeatability_json, "
-        "thresholds_met, rows_json"
+        "thresholds_met, rows_json, reflection_json"
     )
     vals = ", ".join(
         [
@@ -560,6 +562,7 @@ def write_iteration(
             _opt_json(repeatability_details),
             str(thresholds_met).lower(),
             _opt_json(rows_data),
+            _opt_json(reflection_json),
         ]
     )
 

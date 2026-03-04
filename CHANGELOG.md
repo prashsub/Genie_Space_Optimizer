@@ -6,6 +6,41 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Changed — Adaptive Lever Loop Architecture
+- **Adaptive lever loop** (`harness.py`): replaced batch strategist (analyze once → execute
+  all AGs) with an iterative adaptive loop: re-cluster from fresh eval → priority-score →
+  adaptive strategist (1 AG) → apply → gate → accept/rollback → reflect → repeat. Each
+  iteration sees the latest failure state, not a stale snapshot from baseline.
+- **Adaptive strategist** (`optimizer.py`, `config.py`): new `ADAPTIVE_STRATEGIST_PROMPT`
+  and `_call_llm_for_adaptive_strategy()` — single LLM call per iteration producing exactly
+  one action group. Prompt includes priority ranking, reflection history with DO NOT RETRY
+  list, schema context, structured metadata, and join specs.
+- **Cluster priority scoring** (`optimizer.py`): `cluster_impact()` scores clusters by
+  `question_count × causal_weight × severity × fixability`; `rank_clusters()` sorts and
+  annotates clusters with `impact_score` and `rank` for the strategist.
+- **Reflection buffer** (`harness.py`): `_build_reflection_entry()` records per-iteration
+  outcomes (accepted/rolled-back, score deltas, patches applied, new failures). Buffer is
+  passed to the adaptive strategist and persisted in `reflection_json` column on
+  `genie_opt_iterations`. `format_reflection_buffer()` renders recent entries in full detail
+  with older entries compressed to one line.
+- **Diminishing returns detection** (`harness.py`, `config.py`):
+  `DIMINISHING_RETURNS_EPSILON = 2.0` and `DIMINISHING_RETURNS_LOOKBACK = 2` — stops
+  the loop when the last N accepted iterations each improved by < epsilon percent.
+- **Tried-patch filtering** (`harness.py`): `_filter_tried_clusters()` removes clusters
+  whose `(failure_type, blame_set)` was already attempted and rolled back, preventing
+  the strategist from repeating failed approaches.
+- **Removed old fallback retry**: the ad-hoc post-loop fallback is replaced by the
+  adaptive loop itself, which naturally retries with fresh strategy each iteration.
+- **Holistic fallback on iter 1**: if the adaptive strategist returns 0 AGs on the first
+  iteration, falls back to `_generate_holistic_strategy()` for a cold-start action group.
+- **Delta schema**: `genie_opt_iterations` gains `reflection_json` column for per-iteration
+  reflection persistence.
+- **New test suite**: `tests/unit/test_adaptive_loop.py` (346 lines) covering reflection
+  entry building, diminishing returns detection, cluster filtering, and priority scoring.
+- **Preflight return type**: now `tuple[..., list[dict]]` including `human_corrections`.
+
+---
+
 ### Added — Instruction Seeding, Confirmation Eval, Fallback Retry, Labeling Schema Reuse
 - **Stage 2.95: Proactive instruction seeding** (`harness.py`, `optimizer.py`, `config.py`):
   `_run_proactive_instruction_seeding()` generates conservative routing instructions for

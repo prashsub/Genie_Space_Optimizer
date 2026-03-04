@@ -195,8 +195,8 @@ class TestApplyActionToConfig:
             "command": json.dumps({"op": "add", "section": "join_specs", "join_spec": js}),
         }
         assert _apply_action_to_config(config, action) is True
-        assert len(config["data_sources"]["join_specs"]) == 1
-        assert config["data_sources"]["join_specs"][0]["left"]["identifier"] == "catalog.schema.orders"
+        assert len(config["instructions"]["join_specs"]) == 1
+        assert config["instructions"]["join_specs"][0]["left"]["identifier"] == "catalog.schema.orders"
 
     def test_remove_join_spec_api_format(self):
         config = self._make_config()
@@ -205,7 +205,7 @@ class TestApplyActionToConfig:
             "right": {"identifier": "catalog.schema.items", "alias": "items"},
             "sql": ["`orders`.`item_id` = `items`.`item_id`"],
         }
-        config["data_sources"]["join_specs"] = [js]
+        config["instructions"]["join_specs"] = [js]
         action = {
             "command": json.dumps({
                 "op": "remove", "section": "join_specs",
@@ -214,7 +214,7 @@ class TestApplyActionToConfig:
             }),
         }
         assert _apply_action_to_config(config, action) is True
-        assert len(config["data_sources"]["join_specs"]) == 0
+        assert len(config["instructions"]["join_specs"]) == 0
 
     def test_update_join_spec_api_format(self):
         config = self._make_config()
@@ -223,7 +223,7 @@ class TestApplyActionToConfig:
             "right": {"identifier": "catalog.schema.items", "alias": "items"},
             "sql": ["`orders`.`old_key` = `items`.`old_key`"],
         }
-        config["data_sources"]["join_specs"] = [old_js]
+        config["instructions"]["join_specs"] = [old_js]
         new_js = {
             "left": {"identifier": "catalog.schema.orders", "alias": "orders"},
             "right": {"identifier": "catalog.schema.items", "alias": "items"},
@@ -238,7 +238,7 @@ class TestApplyActionToConfig:
             }),
         }
         assert _apply_action_to_config(config, action) is True
-        assert config["data_sources"]["join_specs"][0]["sql"][-1] == "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"
+        assert config["instructions"]["join_specs"][0]["sql"][-1] == "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"
 
     def test_add_join_spec_legacy_format(self):
         config = self._make_config()
@@ -247,7 +247,7 @@ class TestApplyActionToConfig:
             "command": json.dumps({"op": "add", "section": "join_specs", "join_spec": js}),
         }
         assert _apply_action_to_config(config, action) is True
-        assert len(config["data_sources"]["join_specs"]) == 1
+        assert len(config["instructions"]["join_specs"]) == 1
 
     def test_invalid_json_command(self):
         config = self._make_config()

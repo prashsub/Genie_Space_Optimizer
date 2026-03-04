@@ -82,6 +82,13 @@ MAX_NOISE_FLOOR = 5.0
 PLATEAU_ITERATIONS = 2
 ARBITER_CORRECTION_TRIGGER = 3
 REPEATABILITY_EXTRA_QUERIES = 2
+DIMINISHING_RETURNS_EPSILON = 2.0
+"""Stop the lever loop when the last DIMINISHING_RETURNS_LOOKBACK accepted
+iterations each improved mean accuracy by less than this percentage."""
+DIMINISHING_RETURNS_LOOKBACK = 2
+REFLECTION_WINDOW_FULL = 3
+"""Number of most-recent reflection entries shown in full detail inside the
+adaptive strategist prompt.  Older entries are compressed to one line."""
 
 # ── 4. LLM Configuration ──────────────────────────────────────────────
 
@@ -1619,6 +1626,150 @@ STRATEGIST_DETAIL_PROMPT = (
     '</output_schema>'
 )
 
+# ── 5d. Adaptive Strategist Prompt (single-call, one AG) ──────────────
+
+ADAPTIVE_STRATEGIST_PROMPT = (
+    '<role>\n'
+    'You are the Adaptive Strategist for a Databricks Genie Space optimization '
+    'framework.  You operate in an iterative loop: after each action you receive '
+    'fresh evaluation results and must decide the SINGLE best next action.\n'
+    '</role>\n'
+    '\n'
+    '<instructions>\n'
+    '## Purpose\n'
+    'Analyze the CURRENT failure clusters (from the most recent evaluation) and '
+    'produce exactly ONE action group — the single highest-impact fix for the '
+    'remaining failures.  Prior iterations and their outcomes are provided in '
+    'the reflection history so you can build on successes and avoid repeating '
+    'failed approaches.\n'
+    '\n'
+    '## When to create an action group\n'
+    '- Systematic failure pattern (wrong column, missing join, wrong aggregation, etc.)\n'
+    '- Correct-but-suboptimal soft signal suggesting preventive improvement\n'
+    '\n'
+    '## When NOT to create an action group\n'
+    '- Format-only differences (extra_columns_only, select_star, format_difference)\n'
+    '- Cannot identify a specific table, column, join, or instruction to change\n'
+    '- The approach was already tried and failed (see DO NOT RETRY list)\n'
+    '\n'
+    '## Contract: All Instruments of Power\n'
+    'For the root cause you target, specify EVERY lever that should act:\n'
+    '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5\n'
+    '- wrong_aggregation / missing_filter: Primary Lever 2, also Lever 5\n'
+    '- tvf_parameter_error: Primary Lever 3, also Lever 5\n'
+    '- wrong_join / missing_join_spec: Primary Lever 4, also Lever 1 + 5\n'
+    '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1\n'
+    '\n'
+    '## Contract: Structured Metadata Format\n'
+    'ALL metadata changes MUST use structured sections.\n'
+    'Tables: purpose, best_for, grain, scd, relationships.\n'
+    'Columns by type: column_dim (definition, values, synonyms), '
+    'column_measure (definition, aggregation, grain_note, synonyms), '
+    'column_key (definition, join, synonyms).\n'
+    'Functions: purpose, best_for, use_instead_of, parameters, example.\n'
+    'Use section KEYS, not labels.\n'
+    '\n'
+    '## Contract: Non-Regressive / Augment-Not-Overwrite\n'
+    '[EDITABLE] sections can be updated. [LOCKED] must NOT be changed.\n'
+    'INCORPORATE existing content and ADD new details. Only replace if empty or wrong.\n'
+    'Existing synonyms are auto-preserved; propose only NEW terms.\n'
+    '\n'
+    '## Contract: Example SQL\n'
+    'For any recurring failure pattern (routing, aggregation, temporal, join, filter), '
+    'include example_sqls in lever 5. Propose multiple example SQLs covering distinct '
+    'failure patterns — aim for 1 per affected question where a valid SQL sketch exists.\n'
+    '\n'
+    '## Identifier Allowlist\n'
+    'ONLY reference identifiers from this allowlist:\n'
+    '{{ identifier_allowlist }}\n'
+    '</instructions>\n'
+    '\n'
+    '<context>\n'
+    '## Progress Summary\n'
+    '{{ success_summary }}\n'
+    '\n'
+    '## Priority Analysis\n'
+    'The following ranking is computed from failure count, judge importance, and '
+    'fixability.  Use it as guidance — you may override if you see cross-cutting '
+    'patterns that a single-cluster score misses.\n'
+    '{{ priority_ranking }}\n'
+    '\n'
+    '## Reflection History\n'
+    '{{ reflection_buffer }}\n'
+    '\n'
+    '## Schema Context\n'
+    '{{ full_schema_context }}\n'
+    '\n'
+    '## Failure Clusters (from latest evaluation)\n'
+    '{{ cluster_briefs }}\n'
+    '\n'
+    '## Soft Signal Clusters\n'
+    '{{ soft_signal_summary }}\n'
+    '\n'
+    '## Current Structured Metadata\n'
+    '### Tables\n'
+    '{{ structured_table_context }}\n'
+    '### Columns\n'
+    '{{ structured_column_context }}\n'
+    '### Functions\n'
+    '{{ structured_function_context }}\n'
+    '\n'
+    '## Current Join Specifications\n'
+    '{{ current_join_specs }}\n'
+    '\n'
+    '## Current Instructions\n'
+    '{{ current_instructions }}\n'
+    '\n'
+    '## Existing Example SQL\n'
+    '{{ existing_example_sqls }}\n'
+    '</context>\n'
+    '\n'
+    '<output_schema>\n'
+    'Return ONLY this JSON structure with EXACTLY ONE action group:\n'
+    '{\n'
+    '  "action_groups": [\n'
+    '    {\n'
+    '      "id": "AG<iteration_number>",\n'
+    '      "root_cause_summary": "<one sentence>",\n'
+    '      "source_cluster_ids": ["C001"],\n'
+    '      "affected_questions": ["<question_id>"],\n'
+    '      "priority": 1,\n'
+    '      "lever_directives": {\n'
+    '        "1": {"tables": [{"table": "<fq_name>", "entity_type": "table", '
+    '"sections": {"<key>": "<value>"}}\n'
+    '              ], "columns": [{"table": "<fq_name>", "column": "<col>", '
+    '"entity_type": "<column_dim|column_measure|column_key>", '
+    '"sections": {"<key>": "<value>"}}]},\n'
+    '        "4": {"join_specs": [{"left_table": "<fq>", "right_table": "<fq>", '
+    '"join_guidance": "<condition + type>"}]},\n'
+    '        "5": {"instruction_guidance": "<text>", "example_sqls": ['
+    '{"question": "<prompt>", "sql_sketch": "<SQL>", '
+    '"parameters": [{"name": "...", "type_hint": "STRING", "default_value": "..."}], '
+    '"usage_guidance": "<when to match>"}]}\n'
+    '      },\n'
+    '      "coordination_notes": "<how levers reference each other>"\n'
+    '    }\n'
+    '  ],\n'
+    '  "global_instruction_rewrite": "PURPOSE:\\nOne paragraph...\\n\\n'
+    'ASSET ROUTING:\\n- topic -> table/TVF/MV\\n\\n'
+    'BUSINESS DEFINITIONS:\\n- term = column from table\\n\\n'
+    '... (ALL-CAPS SECTION HEADERS with colon, plain text, no Markdown)",\n'
+    '  "rationale": "<why this action group is the highest-impact next step>"\n'
+    '}\n'
+    '\n'
+    'Rules:\n'
+    '- EXACTLY one action group. Pick the single highest-impact fix.\n'
+    '- "lever_directives" keys "1"-"5". Only include levers with work to do.\n'
+    '- "sections" keys from structured metadata schema.\n'
+    '- Lever 2 uses same column format as Lever 1. Lever 3: {"functions": [...]}.\n'
+    '- global_instruction_rewrite: {{ instruction_char_budget }} chars MAX.\n'
+    '- Do NOT repeat any approach listed in the DO NOT RETRY section.\n'
+    '- If no actionable improvements remain:\n'
+    '  {"action_groups": [], "global_instruction_rewrite": "", '
+    '"rationale": "No actionable failures"}\n'
+    '</output_schema>'
+)
+
 
 # ── 6. Non-Exportable Genie Config Fields ──────────────────────────────
 
@@ -1793,10 +1944,10 @@ MAX_PATCH_OBJECTS = 5
 MAX_INSTRUCTION_TEXT_CHARS = 2000
 MAX_HOLISTIC_INSTRUCTION_CHARS = 8000
 
-PROMPT_TOKEN_BUDGET = 28000
-"""Conservative token budget for LLM prompts (for 32k-context models).
-_call_llm_for_* functions use this to truncate context sections when the
-assembled prompt would exceed the limit."""
+PROMPT_TOKEN_BUDGET = 70_000
+"""Token budget for LLM prompts.  Claude Opus 4.6 supports 200k tokens;
+we target ~70k to stay in the quality sweet-spot while leaving headroom
+for the response."""
 
 RISK_LEVEL_SCORE = {
     "low": 1,
@@ -2132,6 +2283,52 @@ FAILURE_TAXONOMY = {
     "missing_format_assistance",
     "missing_entity_matching",
 }
+
+# ── 19b. Cluster Priority Weights (adaptive lever loop) ───────────────
+
+CAUSAL_WEIGHT: dict[str, float] = {
+    "syntax_validity": 5.0,
+    "schema_accuracy": 4.0,
+    "asset_routing": 3.5,
+    "logical_accuracy": 3.0,
+    "semantic_equivalence": 2.0,
+    "completeness": 1.5,
+    "result_correctness": 1.0,
+    "response_quality": 0.5,
+}
+"""Weight reflecting a judge's position in the causal chain.
+Upstream judges (syntax, schema) cascade failures downstream, so
+fixing them has higher leverage."""
+
+SEVERITY_WEIGHT: dict[str, float] = {
+    "wrong_table": 1.0,
+    "wrong_column": 0.9,
+    "wrong_join": 0.9,
+    "missing_join_spec": 0.85,
+    "wrong_join_spec": 0.85,
+    "wrong_aggregation": 0.8,
+    "wrong_measure": 0.8,
+    "asset_routing_error": 0.9,
+    "missing_filter": 0.7,
+    "missing_temporal_filter": 0.7,
+    "tvf_parameter_error": 0.7,
+    "missing_instruction": 0.6,
+    "description_mismatch": 0.4,
+    "compliance_violation": 0.5,
+    "performance_issue": 0.3,
+    "repeatability_issue": 0.4,
+    "missing_synonym": 0.3,
+    "ambiguous_question": 0.3,
+    "stale_data": 0.3,
+    "data_freshness": 0.3,
+    "missing_format_assistance": 0.3,
+    "missing_entity_matching": 0.3,
+}
+"""Severity weight per failure type.  Higher values mean the failure
+type is more impactful and should be prioritized."""
+
+FIXABILITY_WITH_COUNTERFACTUAL = 1.0
+FIXABILITY_WITHOUT_COUNTERFACTUAL = 0.4
 
 # ── 20. Judge Prompts (5 templates) ───────────────────────────────────
 

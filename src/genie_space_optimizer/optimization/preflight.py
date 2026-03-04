@@ -220,7 +220,7 @@ def run_preflight(
     domain: str,
     experiment_name: str | None = None,
     apply_mode: str = "genie_config",
-) -> tuple[dict, list[dict], str, str]:
+) -> tuple[dict, list[dict], str, str, list[dict]]:
     """Execute the full preflight sequence (Stage 1).
 
     Steps:
