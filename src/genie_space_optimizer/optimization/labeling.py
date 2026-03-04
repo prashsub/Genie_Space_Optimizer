@@ -35,10 +35,50 @@ ALL_SCHEMA_NAMES = [
 ]
 
 
-def ensure_labeling_schemas() -> list[str]:
-    """Create or update custom labeling schemas for Genie optimization review.
+def _create_or_reuse_schema(schemas_mod: Any, **kwargs: Any) -> bool:
+    """Create a label schema if it doesn't exist; reuse it if it does.
 
-    Returns the list of schema names that were created/updated.
+    MLflow's ``create_label_schema`` internally deletes-then-recreates when
+    a schema with the same name exists, which fails when a labeling session
+    references the schema.  We check existence first via ``get_label_schema``
+    and treat "referenced by labeling sessions" errors as proof the schema
+    already exists.
+    """
+    name = kwargs["name"]
+    kwargs.pop("overwrite", None)
+    try:
+        existing = schemas_mod.get_label_schema(name)
+        if existing is not None:
+            logger.info("Label schema '%s' already exists — reusing", name)
+            return True
+    except Exception:
+        pass
+
+    try:
+        schemas_mod.create_label_schema(**kwargs, overwrite=False)
+        logger.info("Created label schema '%s'", name)
+        return True
+    except Exception as exc:
+        err_lower = str(exc).lower()
+        _exists_signals = [
+            "already exists",
+            "referenced by",
+            "cannot rename or remove",
+            "labeling sessions",
+        ]
+        if any(s in err_lower for s in _exists_signals):
+            logger.info(
+                "Label schema '%s' already exists (confirmed by error) — reusing", name,
+            )
+            return True
+        logger.warning("Failed to create label schema '%s': %s", name, exc)
+        return False
+
+
+def ensure_labeling_schemas() -> list[str]:
+    """Create or reuse custom labeling schemas for Genie optimization review.
+
+    Returns the list of schema names that are available (created or pre-existing).
     Gracefully degrades if the MLflow version doesn't support labeling.
     """
     try:
@@ -52,80 +92,69 @@ def ensure_labeling_schemas() -> list[str]:
         logger.warning("mlflow.genai.label_schemas not available — skipping schema creation")
         return []
 
-    created: list[str] = []
-    try:
-        schemas.create_label_schema(
-            name=SCHEMA_JUDGE_VERDICT,
-            type="feedback",
-            title="Is the judge's verdict correct for this question?",
-            input=InputCategorical(options=[
-                "Correct - judge is right",
-                "Wrong - Genie answer is actually fine",
-                "Wrong - both answers are wrong",
-                "Ambiguous - question is unclear",
-            ]),
-            instruction=(
-                "Review the benchmark question, expected SQL, Genie-generated SQL, "
-                "and each judge's rationale. Was the overall verdict correct?"
-            ),
-            enable_comment=True,
-            overwrite=True,
-        )
-        created.append(SCHEMA_JUDGE_VERDICT)
-    except Exception:
-        logger.warning("Failed to create schema %s", SCHEMA_JUDGE_VERDICT, exc_info=True)
+    available: list[str] = []
 
-    try:
-        schemas.create_label_schema(
-            name=SCHEMA_CORRECTED_SQL,
-            type="expectation",
-            title="Provide the correct expected SQL (if benchmark is wrong)",
-            input=InputText(),
-            instruction=(
-                "If the benchmark's expected SQL is incorrect or suboptimal, "
-                "provide the corrected SQL. Leave blank if the benchmark is correct."
-            ),
-            overwrite=True,
-        )
-        created.append(SCHEMA_CORRECTED_SQL)
-    except Exception:
-        logger.warning("Failed to create schema %s", SCHEMA_CORRECTED_SQL, exc_info=True)
+    if _create_or_reuse_schema(
+        schemas,
+        name=SCHEMA_JUDGE_VERDICT,
+        type="feedback",
+        title="Is the judge's verdict correct for this question?",
+        input=InputCategorical(options=[
+            "Correct - judge is right",
+            "Wrong - Genie answer is actually fine",
+            "Wrong - both answers are wrong",
+            "Ambiguous - question is unclear",
+        ]),
+        instruction=(
+            "Review the benchmark question, expected SQL, Genie-generated SQL, "
+            "and each judge's rationale. Was the overall verdict correct?"
+        ),
+        enable_comment=True,
+    ):
+        available.append(SCHEMA_JUDGE_VERDICT)
 
-    try:
-        schemas.create_label_schema(
-            name=SCHEMA_PATCH_APPROVAL,
-            type="feedback",
-            title="Should the proposed optimization patch be applied?",
-            input=InputCategorical(options=["Approve", "Reject", "Modify"]),
-            instruction=(
-                "Review the proposed metadata change (column description, instruction, "
-                "join condition, etc.). Approve it, reject it, or suggest modifications."
-            ),
-            enable_comment=True,
-            overwrite=True,
-        )
-        created.append(SCHEMA_PATCH_APPROVAL)
-    except Exception:
-        logger.warning("Failed to create schema %s", SCHEMA_PATCH_APPROVAL, exc_info=True)
+    if _create_or_reuse_schema(
+        schemas,
+        name=SCHEMA_CORRECTED_SQL,
+        type="expectation",
+        title="Provide the correct expected SQL (if benchmark is wrong)",
+        input=InputText(),
+        instruction=(
+            "If the benchmark's expected SQL is incorrect or suboptimal, "
+            "provide the corrected SQL. Leave blank if the benchmark is correct."
+        ),
+    ):
+        available.append(SCHEMA_CORRECTED_SQL)
 
-    try:
-        schemas.create_label_schema(
-            name=SCHEMA_IMPROVEMENTS,
-            type="expectation",
-            title="Suggest improvements for this Genie Space",
-            input=InputTextList(max_count=5, max_length_each=500),
-            instruction=(
-                "Provide specific, actionable improvements: better column descriptions, "
-                "missing join conditions, instruction changes, or table-level fixes."
-            ),
-            overwrite=True,
-        )
-        created.append(SCHEMA_IMPROVEMENTS)
-    except Exception:
-        logger.warning("Failed to create schema %s", SCHEMA_IMPROVEMENTS, exc_info=True)
+    if _create_or_reuse_schema(
+        schemas,
+        name=SCHEMA_PATCH_APPROVAL,
+        type="feedback",
+        title="Should the proposed optimization patch be applied?",
+        input=InputCategorical(options=["Approve", "Reject", "Modify"]),
+        instruction=(
+            "Review the proposed metadata change (column description, instruction, "
+            "join condition, etc.). Approve it, reject it, or suggest modifications."
+        ),
+        enable_comment=True,
+    ):
+        available.append(SCHEMA_PATCH_APPROVAL)
 
-    logger.info("Ensured %d labeling schemas: %s", len(created), ", ".join(created))
-    return created
+    if _create_or_reuse_schema(
+        schemas,
+        name=SCHEMA_IMPROVEMENTS,
+        type="expectation",
+        title="Suggest improvements for this Genie Space",
+        input=InputTextList(max_count=5, max_length_each=500),
+        instruction=(
+            "Provide specific, actionable improvements: better column descriptions, "
+            "missing join conditions, instruction changes, or table-level fixes."
+        ),
+    ):
+        available.append(SCHEMA_IMPROVEMENTS)
+
+    logger.info("Ensured %d labeling schemas: %s", len(available), ", ".join(available))
+    return available
 
 
 def create_review_session(

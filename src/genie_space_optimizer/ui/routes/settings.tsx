@@ -2,7 +2,6 @@ import { createFileRoute } from "@tanstack/react-router";
 import {
   useGetPermissionDashboardSuspense,
   type SpacePermissions,
-  type SchemaPermission,
 } from "@/lib/api";
 import selector from "@/lib/selector";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";

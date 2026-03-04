@@ -39,16 +39,9 @@ const chartConfig = {
   optimized: { label: "Optimized", color: OPTIMIZED_COLOR },
 } satisfies ChartConfig;
 
-function formatLabel(timestamp: string, runId: string): string {
+function formatShortDate(timestamp: string): string {
   const d = new Date(timestamp);
-  const month = d.toLocaleDateString("en-US", { month: "short" });
-  const day = d.getDate();
-  const time = d.toLocaleTimeString("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  });
-  return `${month} ${day}, ${time}\n#${runId.slice(0, 6)}`;
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
 function formatTooltipDate(timestamp: string): string {
@@ -62,20 +55,26 @@ function formatTooltipDate(timestamp: string): string {
 }
 
 export function CrossRunChart({ runs }: CrossRunChartProps) {
-  const chartData = runs
-    .filter((r) => r.baselineScore != null || r.optimizedScore != null)
-    .map((r) => {
-      const baseline = r.baselineScore ?? 0;
-      const optimized = r.optimizedScore ?? 0;
-      return {
-        runId: r.runId,
-        label: formatLabel(r.timestamp, r.runId),
-        tooltipDate: formatTooltipDate(r.timestamp),
-        baseline,
-        optimized,
-        delta: optimized - baseline,
-      };
-    });
+  const filtered = runs.filter(
+    (r) => r.baselineScore != null || r.optimizedScore != null,
+  );
+
+  let prevDate = "";
+  const chartData = filtered.map((r, idx) => {
+    const baseline = r.baselineScore ?? 0;
+    const optimized = r.optimizedScore ?? 0;
+    const shortDate = formatShortDate(r.timestamp);
+    const showDate = shortDate !== prevDate;
+    prevDate = shortDate;
+    return {
+      runId: r.runId,
+      label: showDate ? `${shortDate} #${idx + 1}` : `#${idx + 1}`,
+      tooltipDate: formatTooltipDate(r.timestamp),
+      baseline,
+      optimized,
+      delta: optimized - baseline,
+    };
+  });
 
   if (chartData.length === 0) {
     return (
@@ -197,9 +196,6 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
               axisLine={false}
               fontSize={10}
               interval={0}
-              angle={-30}
-              textAnchor="end"
-              height={50}
             />
             <YAxis
               domain={[yMin, yMax]}

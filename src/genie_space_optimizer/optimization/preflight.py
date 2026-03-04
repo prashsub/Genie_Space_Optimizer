@@ -113,34 +113,64 @@ def _ensure_experiment_parent_dir(ws: WorkspaceClient, experiment_path: str) -> 
         return False
 
 
-def _validate_core_access(spark: SparkSession, genie_table_refs: list) -> None:
-    """Early-fail if the runtime identity cannot read information_schema for the primary schemas."""
-    schemas: set[tuple[str, str]] = set()
+def _validate_core_access(
+    w: "WorkspaceClient",
+    spark: SparkSession,
+    genie_table_refs: list,
+) -> None:
+    """Early-fail if the SP cannot read table metadata for referenced schemas.
+
+    Uses the REST API (``w.tables.get``) to validate access — the same path
+    the harness uses for UC metadata extraction.  This avoids Spark SQL
+    ``information_schema`` queries which have a hidden dependency on the
+    ``system`` catalog.
+    """
+    schema_sample: dict[tuple[str, str], str] = {}
     for ref in genie_table_refs:
         cat = ref[0] if isinstance(ref, (list, tuple)) else ""
         sch = ref[1] if isinstance(ref, (list, tuple)) and len(ref) > 1 else ""
-        if cat and sch:
-            schemas.add((cat, sch))
+        tbl = ref[2] if isinstance(ref, (list, tuple)) and len(ref) > 2 else ""
+        if cat and sch and tbl:
+            key = (cat, sch)
+            if key not in schema_sample:
+                schema_sample[key] = f"{cat}.{sch}.{tbl}"
 
-    if not schemas:
+    if not schema_sample:
         return
 
-    failed: list[str] = []
-    for cat, sch in sorted(schemas):
-        try:
-            spark.sql(
-                f"SELECT 1 FROM `{cat}`.`information_schema`.`columns` "
-                f"WHERE table_schema = '{sch}' LIMIT 1"
-            ).collect()
-        except Exception as exc:
-            logger.warning("Core access check failed for %s.%s: %s", cat, sch, exc)
-            failed.append(f"`{cat}`.`{sch}`")
+    try:
+        who = spark.sql("SELECT current_user() AS user").collect()[0]["user"]
+        logger.info("Spark runtime identity: %s", who)
+    except Exception:
+        logger.warning("Could not determine Spark runtime identity")
 
-    if failed:
+    failures: list[tuple[str, str, str]] = []
+
+    for (cat, sch), sample_fqn in sorted(schema_sample.items()):
+        try:
+            table_info = w.tables.get(full_name=sample_fqn)
+            if not table_info.columns:
+                logger.warning(
+                    "REST access check: %s returned no columns", sample_fqn,
+                )
+            else:
+                logger.info(
+                    "REST access check: %s.%s OK (%d columns on %s)",
+                    cat, sch, len(table_info.columns), sample_fqn,
+                )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            logger.warning("REST access check failed for %s.%s via %s: %s", cat, sch, sample_fqn, err)
+            failures.append((cat, sch, f"w.tables.get('{sample_fqn}') failed: {err}"))
+
+    if failures:
+        detail_lines = [f"  `{cat}`.`{sch}`: {reason}" for cat, sch, reason in failures]
         raise RuntimeError(
-            f"Cannot read information_schema for: {', '.join(failed)}. "
-            "The service principal or runtime identity is missing required "
-            "read permissions. Grant access from the Settings page."
+            "Cannot access Unity Catalog tables for required schemas.\n"
+            + "\n".join(detail_lines)
+            + "\n\nEnsure the service principal has: "
+            "USE CATALOG on the catalog, plus USE SCHEMA + SELECT on each schema. "
+            "Grant access from the Settings page."
         )
 
 
@@ -277,9 +307,8 @@ def run_preflight(
         print(f"    FUNCTION: {_fid}")
     print(f"{'-' * 60}\n")
 
-    # OBO-first: jobs run as the triggering user, so Spark can query
-    # information_schema for user catalogs directly.  Prefetched metadata
-    # from the backend OBO call is kept as a cache optimisation only.
+    # Prefetched UC metadata from the backend OBO call is used as a cache
+    # optimisation; the harness falls back to REST API (w.tables.get) if absent.
     prefetched = snapshot.get("_prefetched_uc_metadata", {}) if isinstance(snapshot, dict) else {}
 
     genie_table_refs = extract_genie_space_table_refs(config)
@@ -290,7 +319,7 @@ def run_preflight(
             sorted({f"{c}.{s}" for c, s, _ in genie_table_refs if c and s}),
         )
 
-    _validate_core_access(spark, genie_table_refs)
+    _validate_core_access(w, spark, genie_table_refs)
 
     if apply_mode in ("both", "uc_artifact"):
         _validate_write_access(spark, genie_table_refs)

@@ -1126,6 +1126,7 @@ databricks apps logs genie-space-optimizer -p <profile>
 ### Job Execution (check each task)
 
 - [ ] Preflight completes: config fetched, benchmarks generated, experiment created, experiment-level tags set
+- [ ] Preflight `_validate_core_access()` uses REST API (`w.tables.get`) instead of `information_schema`
 - [ ] Preflight returns `human_corrections` from prior labeling session (if available)
 - [ ] Preflight `_validate_write_access()`: fails fast if `apply_mode=both/uc_artifact` and MODIFY missing
 - [ ] Baseline eval completes: scores recorded in `genie_opt_iterations` with iteration=0
@@ -1135,24 +1136,28 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Lever loop Stage 2.5: prompt matching auto-config applied (format assistance + entity matching)
 - [ ] Lever loop Stage 2.75: proactive description enrichment for insufficient columns (< 10 chars)
 - [ ] Lever loop Stage 2.75: table description enrichment for tables with no/insufficient descriptions
-- [ ] Lever loop Stage 2.75: example SQL mining from high-scoring benchmark questions
-- [ ] Lever loop noise floor: score improvements < 3.0 pts rejected as cosmetic noise
+- [ ] Lever loop Stage 2.75: example SQL mining with 0-row validation, applied proactively via Genie API
+- [ ] Lever loop Stage 2.95: proactive instruction seeding for spaces with < 50 char instructions
+- [ ] Lever loop noise floor: score improvements < 5.0 pts rejected as cosmetic noise
 - [ ] Lever loop strategist: holistic strategy generated triaging all failures to levers
 - [ ] Lever loop arbiter corrections: applied if ≥3 `genie_correct` verdicts in baseline
 - [ ] Lever loop arbiter filter: `both_correct` AND `genie_correct` excluded from hard failure rows
 - [ ] Lever loop tiered arbiter: soft signal rows extracted (individual judge failures on correct verdicts)
 - [ ] Lever loop soft clusters: tagged `signal_type: soft`, passed to Levers 4 and 5
 - [ ] Lever 4: join discovery runs even without explicit join failure clusters
-- [ ] Lever 5: holistic instruction rewrite produces `rewrite_instruction` patch
+- [ ] Lever 5: uses `instruction_guidance` from lever directives for instruction rewrite
+- [ ] Full-eval gate: confirmation double-run (two evaluations averaged) to smooth Genie non-determinism
+- [ ] Fallback: if all AGs rolled back, re-strategize and retry with single highest-priority lever
 - [ ] Lever loop 5-lever iteration completes (or skips if thresholds met): patches in `genie_opt_patches`
 - [ ] ASI data present on clusters (failure_type not None for applicable questions)
 - [ ] ASI results written to `genie_eval_asi_results` with `mlflow_run_id` for trace linking
 - [ ] Provenance rows written to `genie_opt_provenance` linking judges → clusters → proposals → gates
 - [ ] ASI Feedback logged on MLflow traces (`asi_{judge}` entries)
 - [ ] Gate Feedback logged on MLflow traces (`gate_{type}` entries with pass/fail + regression details)
-- [ ] Finalize completes: 2 repeatability runs averaged, model promoted, run status set to terminal
+- [ ] Finalize: repeatability eval prints per-judge scores to console; falls back to benchmark `expected_sql` if no reference SQLs
 - [ ] Finalize heartbeats visible in `genie_opt_stages` (FINALIZE_HEARTBEAT events)
 - [ ] Deploy skipped (deploy_target empty): deploy_check condition evaluates to false
+- [ ] Labeling schemas created/reused without overwrite conflicts (handles "referenced by labeling sessions")
 
 ### Comparison
 

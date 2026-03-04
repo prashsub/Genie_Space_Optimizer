@@ -30,15 +30,16 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 1. **Configuration Analysis** -- Scans the Genie Space config, counts tables/instructions/sample questions, and validates structure.
 2. **Metadata Collection** -- Queries Unity Catalog via REST API (with Spark SQL fallback) for columns, data types, tags, routines, and table descriptions.
 3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges. All evaluation traces are tagged with `genie.optimization_run_id`, `genie.iteration`, and `genie.lever` for end-to-end traceability. The arbiter judge identifies `genie_correct` verdicts for benchmark correction and tiered soft signals for best-practice guidance.
-4. **Configuration Generation (Lever Loop)** -- Stage 2.5 applies deterministic prompt matching (format assistance + entity matching). Stage 2.75 proactively enriches insufficient column *and table* descriptions using UC metadata, and mines proven example SQLs from high-scoring benchmark questions. Arbiter benchmark corrections rewrite stale gold SQL. A holistic strategist then triages all failures and generates a unified optimization strategy. Iterates through 5 optimization levers (up to 5 iterations), applying targeted patches with tiered failure analysis (hard failures + soft signals). Each patch is evaluated via a 3-gate system (slice, P0, full); regressions trigger automatic rollback. Score improvements below the noise floor (3 pts) are treated as cosmetic and rejected.
+4. **Configuration Generation (Lever Loop)** -- Stage 2.5 applies deterministic prompt matching (format assistance + entity matching). Stage 2.75 proactively enriches insufficient column *and table* descriptions using UC metadata, and mines proven example SQLs (with 0-row validation) which are applied proactively via the Genie API. Stage 2.95 seeds conservative routing instructions for spaces with no/insufficient instructions. Arbiter benchmark corrections rewrite stale gold SQL. A holistic strategist then triages all failures and generates a unified optimization strategy. Iterates through 5 optimization levers (up to 5 iterations), applying targeted patches with tiered failure analysis (hard failures + soft signals). Each patch is evaluated via a 3-gate system (slice, P0, confirmation double-run full eval); regressions trigger automatic rollback. Score improvements below the noise floor (5 pts) are treated as cosmetic and rejected. If all action groups are rolled back, a conservative fallback re-strategizes and retries with a single lever.
 5. **Optimized Evaluation & Repeatability** -- Final evaluation of the optimized config, including repeatability testing to ensure consistent results.
 
 ### Optimization Levers
 
-Before the main lever loop, four preparatory stages run:
+Before the main lever loop, five preparatory stages run:
 - **Stage 2.5 (Prompt Matching)** -- Deterministic format assistance (`get_example_values`) and entity matching (`build_value_dictionary`) on prioritized columns. No LLM involved.
-- **Stage 2.75 (Description Enrichment)** -- LLM-generated structured descriptions for columns *and tables* with insufficient descriptions (< 10 chars). Also generates space descriptions and sample questions for spaces that lack them, and mines proven example SQLs from high-scoring benchmark questions.
+- **Stage 2.75 (Description Enrichment)** -- LLM-generated structured descriptions for columns *and tables* with insufficient descriptions (< 10 chars). Also generates space descriptions and sample questions for spaces that lack them. Mines proven example SQLs from high-scoring benchmarks (with 0-row validation) and applies them proactively via the Genie API.
 - **Stage 2.85 (Proactive Join Discovery)** -- Parses JOIN clauses from successful baseline queries, corroborates with UC foreign key constraints, and codifies execution-proven joins as Genie Space join specifications.
+- **Stage 2.95 (Proactive Instruction Seeding)** -- Seeds conservative routing instructions for spaces with no/insufficient instructions (< 50 chars). Covers asset routing, temporal conventions, null handling, and common joins.
 - **Strategist** -- Holistic triage of all failures into a unified optimization strategy with per-lever action plans.
 
 The **5-lever loop** then iterates up to 5 times:
@@ -51,7 +52,7 @@ The **5-lever loop** then iterates up to 5 times:
 | 4 | Join Specifications | Table relationships, join columns, cardinality (always runs discovery) |
 | 5 | Genie Instructions | Holistic instruction rewrite (routing, disambiguation, best practices) |
 
-Lever 4 always runs its join discovery path, even without explicit join failures, to document implicit joins from successful Genie queries. Lever 5 generates a single cohesive instruction document considering the space's purpose, all evaluation learnings, and prior lever tweaks.
+Lever 4 always runs its join discovery path, even without explicit join failures, to document implicit joins from successful Genie queries. Lever 5 generates a single cohesive instruction document considering the space's purpose, all evaluation learnings, and prior lever tweaks. If all action groups are rolled back, a **conservative fallback** re-strategizes and retries with the single highest-priority lever.
 
 ### 7 Quality Dimensions (9 Scorers)
 

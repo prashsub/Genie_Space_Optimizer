@@ -55,7 +55,8 @@ def get_space_permissions_rest(w: WorkspaceClient, space_id: str) -> dict | None
     OAuth scopes that OBO tokens may lack.
     """
     try:
-        return w.api_client.do("GET", f"/api/2.0/permissions/genie/{space_id}")
+        resp = w.api_client.do("GET", f"/api/2.0/permissions/genie/{space_id}")
+        return resp if isinstance(resp, dict) else None
     except Exception:
         return None
 

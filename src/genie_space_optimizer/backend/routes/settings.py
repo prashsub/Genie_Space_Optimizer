@@ -321,7 +321,10 @@ def get_permission_dashboard(
             read_cmd: str | None = None
             if not is_read:
                 read_cmd = (
+                    f"-- Catalog-level (run once per catalog)\n"
                     f"GRANT USE CATALOG ON CATALOG `{cat}` TO `{sp_sql_name}`;\n"
+                    f"\n"
+                    f"-- Schema-level\n"
                     f"GRANT USE SCHEMA ON SCHEMA `{cat}`.`{sch}` TO `{sp_sql_name}`;\n"
                     f"GRANT SELECT ON SCHEMA `{cat}`.`{sch}` TO `{sp_sql_name}`;\n"
                     f"GRANT EXECUTE ON SCHEMA `{cat}`.`{sch}` TO `{sp_sql_name}`;"

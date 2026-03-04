@@ -78,7 +78,7 @@ INLINE_EVAL_DELAY = 12
 MAX_ITERATIONS = 5
 SLICE_GATE_TOLERANCE = 15.0
 REGRESSION_THRESHOLD = 5.0
-MAX_NOISE_FLOOR = 3.0
+MAX_NOISE_FLOOR = 5.0
 PLATEAU_ITERATIONS = 2
 ARBITER_CORRECTION_TRIGGER = 3
 REPEATABILITY_EXTRA_QUERIES = 2
@@ -645,6 +645,51 @@ SPACE_DESCRIPTION_PROMPT = (
     '\n'
     '<output_schema>\n'
     'Respond with ONLY the description text — no JSON wrapper, no code fences.\n'
+    '</output_schema>'
+)
+
+PROACTIVE_INSTRUCTION_PROMPT = (
+    '<role>\n'
+    'You are a Databricks Genie Space configuration expert. Your job is to '
+    'write a concise set of routing instructions for a Genie Space that has '
+    'NO instructions yet. These instructions help Genie correctly route '
+    'user questions to the right tables and generate accurate SQL.\n'
+    '</role>\n'
+    '\n'
+    '<context>\n'
+    '## Tables\n'
+    '{{ tables_context }}\n'
+    '\n'
+    '## Metric Views\n'
+    '{{ metric_views_context }}\n'
+    '\n'
+    '## Join Specifications\n'
+    '{{ join_specs_context }}\n'
+    '</context>\n'
+    '\n'
+    '<instructions>\n'
+    'Write plain-text instructions (500-1500 characters) covering ONLY:\n'
+    '\n'
+    '1. ASSET ROUTING: Which table(s) to use for which topic/entity.\n'
+    '   Example: "For revenue questions, use fact_sales. For product info, use dim_product."\n'
+    '\n'
+    '2. TEMPORAL CONVENTIONS: Default date filters, fiscal year logic, or timezone rules.\n'
+    '   Example: "Default to the last 12 months when no date range is specified."\n'
+    '\n'
+    '3. NULL / DEFAULT HANDLING: Important columns that need COALESCE or special treatment.\n'
+    '\n'
+    '4. COMMON JOINS: Key join patterns if join specs exist.\n'
+    '\n'
+    'Rules:\n'
+    '- Be factual — infer ONLY from the schema provided.\n'
+    '- Do NOT invent business rules not evident in column names or descriptions.\n'
+    '- Use short, imperative sentences.\n'
+    '- Do NOT use Markdown formatting (no #, **, ```, etc.).\n'
+    '- Keep total output between 500 and 1500 characters.\n'
+    '</instructions>\n'
+    '\n'
+    '<output_schema>\n'
+    'Respond with ONLY the instruction text — no JSON wrapper, no code fences.\n'
     '</output_schema>'
 )
 

@@ -686,7 +686,7 @@ def _check_sp_data_access(
     spark, catalog: str, schema_name: str, genie_refs: list, sp_ws: WorkspaceClient,
 ) -> list[tuple[str, str]]:
     """Return list of (catalog, schema) pairs the SP does NOT have grants for."""
-    from .settings import _load_grants
+    from .settings import _probe_sp_required_access
 
     needed: set[tuple[str, str]] = set()
     for ref in genie_refs:
@@ -698,21 +698,15 @@ def _check_sp_data_access(
     if not needed:
         return []
 
-    grants = _load_grants(spark, catalog, schema_name)
-    granted = {
-        (str(g.get("target_catalog", "")).lower(), str(g.get("target_schema", "")).lower())
-        for g in grants
-    }
-
-    missing = sorted(needed - granted)
-    return missing
+    read_granted, _write_granted = _probe_sp_required_access(sp_ws, needed)
+    return sorted(needed - read_granted)
 
 
 def _check_sp_write_access(
     spark, catalog: str, schema_name: str, genie_refs: list, sp_ws: WorkspaceClient,
 ) -> list[tuple[str, str]]:
     """Return (catalog, schema) pairs where the SP lacks MODIFY (write) grant."""
-    from .settings import _load_grants
+    from .settings import _probe_sp_required_access
 
     needed: set[tuple[str, str]] = set()
     for ref in genie_refs:
@@ -724,12 +718,7 @@ def _check_sp_write_access(
     if not needed:
         return []
 
-    grants = _load_grants(spark, catalog, schema_name)
-    write_granted = {
-        (str(g.get("target_catalog", "")).lower(), str(g.get("target_schema", "")).lower())
-        for g in grants if g.get("grant_type") == "write"
-    }
-
+    _read_granted, write_granted = _probe_sp_required_access(sp_ws, needed)
     return sorted(needed - write_granted)
 
 

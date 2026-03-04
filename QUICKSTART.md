@@ -159,7 +159,7 @@ Click **Optimize** to kick off the pipeline. This submits a multi-task Databrick
 | ------------- | ---------- | ---------------------------------------------------------------------------------------------------- |
 | Preflight     | ~1 min     | Validates config, collects UC metadata                                                               |
 | Baseline Eval | ~5-15 min  | Generates 20 benchmark questions, runs through Genie, scores with 9 LLM judges                       |
-| Lever Loop    | ~10-30 min | Stage 2.5 prompt matching, arbiter benchmark corrections, then 5 levers with tiered failure analysis |
+| Lever Loop    | ~10-30 min | Stages 2.5/2.75/2.85/2.95 (prompt matching, description enrichment, join discovery, instruction seeding), then 5 levers with fallback retry |
 | Finalize      | ~5-10 min  | Repeatability testing, final scoring, report generation                                              |
 | Deploy        | ~1 min     | (Optional) Deploys optimized config to version control                                               |
 
@@ -314,7 +314,7 @@ MAX_ITERATIONS = 5            # Max lever loop iterations
 REGRESSION_THRESHOLD = 10.0   # % drop that triggers rollback
 SLICE_GATE_TOLERANCE = 15.0   # % tolerance for per-dimension slice gate
 PLATEAU_ITERATIONS = 2        # Consecutive no-improvement before stopping
-MAX_NOISE_FLOOR = 3.0         # Min score improvement to accept (below = cosmetic noise)
+MAX_NOISE_FLOOR = 5.0         # Min score improvement to accept (below = cosmetic noise)
 ```
 
 ### Benchmark Generation

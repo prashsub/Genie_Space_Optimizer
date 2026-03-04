@@ -6,6 +6,42 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Instruction Seeding, Confirmation Eval, Fallback Retry, Labeling Schema Reuse
+- **Stage 2.95: Proactive instruction seeding** (`harness.py`, `optimizer.py`, `config.py`):
+  `_run_proactive_instruction_seeding()` generates conservative routing instructions for
+  Genie Spaces with no/insufficient instructions (< 50 chars). Uses new
+  `PROACTIVE_INSTRUCTION_PROMPT` covering asset routing, temporal conventions, null handling,
+  and common joins. Writes `proactive_instruction_seeding` patch to Delta.
+- **Confirmation eval (double-run)** (`harness.py`): full-eval gate now runs two evaluations
+  and averages scores to smooth Genie non-determinism, reducing false regressions
+- **Fallback conservative retry** (`harness.py`): when all action groups are rolled back,
+  re-generates strategy and attempts a single highest-priority lever in isolation
+- **Proactive benchmark example SQL application** (`harness.py`): mined example SQLs are
+  now applied proactively via the Genie API before the strategy phase, with 0-row result
+  validation to skip empty-result queries
+- **Labeling schema create-or-reuse** (`labeling.py`): `_create_or_reuse_schema()` checks
+  existence before creating; gracefully handles "referenced by labeling sessions" errors
+  instead of failing on overwrite conflicts
+- **REST-based preflight access validation** (`preflight.py`): `_validate_core_access()`
+  now uses `w.tables.get()` instead of Spark `information_schema` queries, avoiding hidden
+  `system` catalog dependency; logs Spark runtime identity for debugging
+- **Noise floor raised** (`config.py`): `MAX_NOISE_FLOOR` increased from 3.0 to 5.0
+- **Slice gate tolerance floor** (`harness.py`): effective slice tolerance now also accounts
+  for single-question weight (`100/num_questions + 0.5`) to prevent false drops on small
+  benchmark sets
+- **Repeatability reference SQL fallback** (`harness.py`): falls back to benchmark
+  `expected_sql` when no reference SQLs available from prior iterations
+- **Repeatability eval console output** (`evaluation.py`): per-judge scores printed to logs
+- **Delta migration fix** (`state.py`): `ALTER TABLE ADD COLUMN` now strips `DEFAULT`
+  clauses and applies them separately via `ALTER COLUMN SET DEFAULT` (Delta Lake compat)
+- **Grant SQL formatting** (`settings.py`): copyable grant commands now include catalog-level
+  vs schema-level SQL comments for clarity
+- **CrossRunChart label dedup**: short date labels deduplicated when multiple runs share a day
+- **Lever 5 instruction guidance** (`optimizer.py`): uses `instruction_guidance` from lever
+  directives instead of deprecated `global_instruction_rewrite`
+
+---
+
 ### Changed — Advisor-Only Auth Model, Permission Filtering, Human Feedback Loop
 - **Advisor-only settings** (`settings.py`): removed all GRANT/REVOKE execution;
   the app now reads UC & Genie Space permissions via OBO + SP fallback and provides

@@ -1423,6 +1423,74 @@ def _generate_space_description(
         return ""
 
 
+def _generate_proactive_instructions(
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> str:
+    """Generate conservative routing instructions for an empty Genie Space.
+
+    Returns the instruction text (500-1500 chars), or ``""`` on failure.
+    """
+    from genie_space_optimizer.common.config import PROACTIVE_INSTRUCTION_PROMPT
+
+    ctx = _build_space_schema_context(metadata_snapshot)
+
+    join_specs = []
+    ds = metadata_snapshot.get("data_sources", {})
+    if isinstance(ds, dict):
+        for tbl in ds.get("tables", []):
+            if isinstance(tbl, dict):
+                for js in tbl.get("join_specs", []):
+                    if isinstance(js, dict):
+                        sql_parts = js.get("sql", [])
+                        cond = sql_parts[0] if sql_parts else ""
+                        if cond:
+                            join_specs.append(cond)
+    ctx["join_specs_context"] = "\n".join(f"- {j}" for j in join_specs) if join_specs else "(none)"
+
+    format_kwargs = _truncate_to_budget(
+        ctx, PROACTIVE_INSTRUCTION_PROMPT,
+        priority_keys=["tables_context"],
+    )
+    prompt = format_mlflow_template(PROACTIVE_INSTRUCTION_PROMPT, **format_kwargs)
+
+    try:
+        wc = _ws_with_timeout(w)
+        response = wc.serving_endpoints.query(
+            name=LLM_ENDPOINT,
+            messages=[
+                ChatMessage(
+                    role=ChatMessageRole.SYSTEM,
+                    content="You generate routing instructions for Databricks Genie Spaces.",
+                ),
+                ChatMessage(role=ChatMessageRole.USER, content=prompt),
+            ],
+            temperature=LLM_TEMPERATURE,
+            max_tokens=2048,
+        )
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            logger.warning("Proactive instruction generation: empty LLM response")
+            return ""
+        message = choices[0].message if hasattr(choices[0], "message") else choices[0]
+        content = getattr(message, "content", None)
+        if not content:
+            logger.warning("Proactive instruction generation: LLM content is empty")
+            return ""
+        text = str(content).strip()
+        text = re.sub(r"```[a-z]*\n?", "", text).strip().rstrip("`")
+        if len(text) < 50:
+            logger.warning("Proactive instruction generation: result too short (%d chars)", len(text))
+            return ""
+        if len(text) > 1500:
+            text = text[:1500].rsplit("\n", 1)[0]
+        logger.info("Proactive instruction generation: produced %d chars", len(text))
+        return text
+    except Exception:
+        logger.warning("Proactive instruction generation: LLM call failed", exc_info=True)
+        return ""
+
+
 def _generate_sample_questions(
     metadata_snapshot: dict,
     description: str = "",
@@ -5281,6 +5349,17 @@ def _mine_benchmark_example_sqls(
                     )
                     skipped_invalid += 1
                     continue
+                try:
+                    test_rows = spark.sql(f"SELECT * FROM ({sql}) LIMIT 1").collect()
+                    if not test_rows:
+                        logger.info(
+                            "Benchmark mining: skipping 0-row result for '%.60s'",
+                            question,
+                        )
+                        skipped_invalid += 1
+                        continue
+                except Exception:
+                    pass
             except Exception:
                 logger.debug("Benchmark mining: validation error, skipping", exc_info=True)
                 skipped_invalid += 1
@@ -5802,9 +5881,8 @@ def generate_proposals_from_strategy(
 
         # ── Lever 5: instructions + example SQL ──────────────────────────
         elif target_lever == 5:
-            global_rewrite = strategy.get("global_instruction_rewrite", "")
             l5_dir = lever_dir or {}
-            instruction_guidance = l5_dir.get("instruction_guidance", "")
+            instruction_guidance = (l5_dir.get("instruction_guidance") or "").strip()
 
             example_sqls_list = l5_dir.get("example_sqls", [])
             if not example_sqls_list:
@@ -5814,21 +5892,15 @@ def generate_proposals_from_strategy(
             if not isinstance(example_sqls_list, list):
                 example_sqls_list = [example_sqls_list] if isinstance(example_sqls_list, dict) else []
 
-            if global_rewrite:
-                from genie_space_optimizer.optimization.applier import _get_general_instructions
-
-                current_instructions = _get_general_instructions(
-                    metadata_snapshot.get("config") or metadata_snapshot
-                )
+            if instruction_guidance:
                 proposals.append({
                     "proposal_id": f"P{len(proposals) + 1:03d}",
                     "cluster_id": ag_id,
                     "lever": 5,
                     "scope": "genie_config",
-                    "patch_type": "rewrite_instruction",
-                    "change_description": f"[{ag_id}] Holistic instruction rewrite ({len(global_rewrite)} chars)",
-                    "proposed_value": global_rewrite,
-                    "old_value": current_instructions,
+                    "patch_type": "add_instruction",
+                    "change_description": f"[{ag_id}] Instruction contribution ({len(instruction_guidance)} chars)",
+                    "proposed_value": instruction_guidance,
                     "rationale": f"Strategy: {root_cause}. {coordination_notes}",
                     "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
                     "confidence": 0.85,
@@ -5842,7 +5914,7 @@ def generate_proposals_from_strategy(
                         "counterfactual_fixes": [],
                         "ambiguity_detected": False,
                     },
-                    "provenance": {**provenance_base, "patch_type": "rewrite_instruction"},
+                    "provenance": {**provenance_base, "patch_type": "add_instruction"},
                 })
 
             for ex_idx, example_sql_dir in enumerate(example_sqls_list):

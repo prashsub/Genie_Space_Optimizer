@@ -275,6 +275,9 @@ def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None
         (TABLE_RUNS, "labeling_session_run_id", "STRING COMMENT 'MLflow run ID associated with the labeling session'"),
         (TABLE_DATA_ACCESS_GRANTS, "grant_type", "STRING DEFAULT 'read' COMMENT 'read|write — read grants SELECT/EXECUTE, write adds MODIFY'"),
     ]
+    import re as _re
+    _default_re = _re.compile(r"\bDEFAULT\s+'[^']*'", _re.IGNORECASE)
+
     for table, col, col_def in migrations:
         fqn = _fqn(catalog, schema, table)
         try:
@@ -290,7 +293,11 @@ def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None
             continue
 
         try:
-            spark.sql(f"ALTER TABLE {fqn} ADD COLUMN {col} {col_def}")
+            default_match = _default_re.search(col_def)
+            add_def = _default_re.sub("", col_def).strip() if default_match else col_def
+            spark.sql(f"ALTER TABLE {fqn} ADD COLUMN {col} {add_def}")
+            if default_match:
+                spark.sql(f"ALTER TABLE {fqn} ALTER COLUMN {col} SET {default_match.group()}")
             print(f"  [MIGRATED] Added {fqn}.{col}")
         except Exception as exc:
             if "already exists" in str(exc).lower():

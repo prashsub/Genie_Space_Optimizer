@@ -3516,6 +3516,18 @@ def run_repeatability_evaluation(
         repeatability_pct,
     )
 
+    _rep_lines = [
+        f"\n-- REPEATABILITY EVALUATION: {run_name} " + "-" * 30,
+        f"  |  Repeatability:  {repeatability_pct:.1f}%",
+        f"  |  Questions:      {len(benchmarks)}",
+        f"  |  Reference SQLs: {sum(1 for v in reference_sqls.values() if v)}",
+    ]
+    for _judge, _score in per_judge.items():
+        _disp = _score * 100 if _score <= 1.0 else _score
+        _rep_lines.append(f"  |  {_judge}: {_disp:.1f}")
+    _rep_lines.append("-" * 60)
+    print("\n".join(_rep_lines))
+
     rep_trace_map: dict[str, str] = {}
     for _row in rows_for_output:
         _qid = (

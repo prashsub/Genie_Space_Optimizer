@@ -1196,6 +1196,166 @@ def _run_space_metadata_enrichment(
         return result
 
 
+# ── Proactive Benchmark Example SQL Application ─────────────────────
+
+
+def _apply_proactive_example_sqls(
+    w: WorkspaceClient,
+    spark: Any,
+    run_id: str,
+    space_id: str,
+    mined_proposals: list[dict],
+    metadata_snapshot: dict,
+    config: dict,
+    catalog: str,
+    schema: str,
+) -> None:
+    """Apply mined benchmark example SQLs proactively via the Genie API."""
+    from genie_space_optimizer.optimization.applier import (
+        proposals_to_patches,
+        apply_patch_set,
+    )
+
+    patches = proposals_to_patches(mined_proposals)
+    apply_log = apply_patch_set(w, space_id, patches, metadata_snapshot, apply_mode="api")
+
+    applied = apply_log.get("applied", [])
+    _lines = [_section("PROACTIVE BENCHMARK EXAMPLE SQLs", "-")]
+    _lines.append(_kv("Mined proposals", len(mined_proposals)))
+    _lines.append(_kv("Applied", len(applied)))
+    if apply_log.get("patch_error"):
+        _lines.append(_kv("Error", str(apply_log["patch_error"])[:200]))
+    for idx, entry in enumerate(applied, 1):
+        _ap = entry.get("patch", {})
+        q = _ap.get("example_question", _ap.get("question", ""))
+        if isinstance(q, list):
+            q = q[0] if q else ""
+        _lines.append(f"|  [{idx}] {q[:80]}")
+    _lines.append(_bar("-"))
+    print("\n".join(_lines))
+
+    for idx, entry in enumerate(applied):
+        write_patch(
+            spark, run_id, 0, 0, idx,
+            {
+                "patch_type": "proactive_example_sql",
+                "scope": "genie_config",
+                "risk_level": "low",
+                "target_object": f"example_question_sqls[{idx}]",
+                "patch": {"question": str(entry.get("patch", {}).get("example_question", ""))[:100]},
+                "command": None,
+                "rollback": None,
+                "proposal_id": "proactive_benchmark_mining",
+            },
+            catalog, schema,
+        )
+
+
+# ── Stage 2.95: PROACTIVE INSTRUCTION SEEDING ────────────────────────
+
+
+def _run_proactive_instruction_seeding(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    config: dict,
+    metadata_snapshot: dict,
+    catalog: str,
+    schema: str,
+) -> dict:
+    """Stage 2.95: Seed conservative routing instructions if the space has none.
+
+    Only fires when existing instructions are empty or below 50 chars.
+    """
+    from genie_space_optimizer.common.genie_client import patch_space_config
+    from genie_space_optimizer.optimization.optimizer import (
+        _generate_proactive_instructions,
+    )
+    from genie_space_optimizer.optimization.applier import (
+        _get_general_instructions,
+        _set_general_instructions,
+    )
+
+    _INSTRUCTION_SEED_THRESHOLD = 50
+    parsed = config.get("_parsed_space", config)
+    current_instructions = _get_general_instructions(parsed)
+    needs_seeding = len(current_instructions.strip()) < _INSTRUCTION_SEED_THRESHOLD
+
+    result: dict = {"instructions_seeded": False, "instruction_chars": 0}
+
+    if not needs_seeding:
+        _lines = [_section("PROACTIVE INSTRUCTION SEEDING", "-")]
+        _lines.append(_kv("Instructions", f"already present ({len(current_instructions)} chars)"))
+        _lines.append(_kv("Status", "No seeding needed"))
+        _lines.append(_bar("-"))
+        print("\n".join(_lines))
+        return result
+
+    write_stage(
+        spark, run_id, "PROACTIVE_INSTRUCTION_SEEDING", "STARTED",
+        task_key="instruction_seeding", catalog=catalog, schema=schema,
+    )
+
+    try:
+        instruction_text = _generate_proactive_instructions(metadata_snapshot, w)
+        if instruction_text:
+            _set_general_instructions(parsed, instruction_text)
+            try:
+                patch_space_config(w, space_id, parsed)
+                result["instructions_seeded"] = True
+                result["instruction_chars"] = len(instruction_text)
+                write_patch(
+                    spark, run_id, 0, 0, 0,
+                    {
+                        "patch_type": "proactive_instruction_seeding",
+                        "scope": "genie_config",
+                        "risk_level": "low",
+                        "target_object": "instructions.text_instructions",
+                        "patch": {"instructions": instruction_text[:200] + "..."},
+                        "command": None,
+                        "rollback": None,
+                        "proposal_id": "proactive_instruction_seeding",
+                    },
+                    catalog, schema,
+                )
+            except Exception:
+                logger.warning(
+                    "Proactive instruction seeding: PATCH failed",
+                    exc_info=True,
+                )
+
+        _status = (
+            f"generated ({len(instruction_text)} chars)"
+            if result["instructions_seeded"]
+            else "FAILED"
+        )
+        _lines = [_section("PROACTIVE INSTRUCTION SEEDING", "-")]
+        _lines.append(_kv("Instructions", _status))
+        if result["instructions_seeded"] and instruction_text:
+            _lines.append(f"|      {instruction_text[:200]}...")
+        _lines.append(_bar("-"))
+        print("\n".join(_lines))
+
+        write_stage(
+            spark, run_id, "PROACTIVE_INSTRUCTION_SEEDING", "COMPLETE",
+            task_key="instruction_seeding",
+            detail=result, catalog=catalog, schema=schema,
+        )
+        return result
+
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("PROACTIVE_INSTRUCTION_SEEDING FAILED for run %s", run_id)
+        write_stage(
+            spark, run_id, "PROACTIVE_INSTRUCTION_SEEDING", "FAILED",
+            task_key="instruction_seeding",
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        return result
+
+
 # ── Stage 2.5b: PREPARE LEVER LOOP ──────────────────────────────────
 
 
@@ -1750,7 +1910,8 @@ def _run_gate_checks(
         )
         slice_scores = slice_result.get("scores", {})
         slice_accuracy = slice_result.get("overall_accuracy", 0.0)
-        effective_slice_tol = max(SLICE_GATE_TOLERANCE, noise_floor + 2.0)
+        _slice_qw = 100.0 / max(len(benchmarks), 1)
+        effective_slice_tol = max(SLICE_GATE_TOLERANCE, noise_floor + 2.0, _slice_qw + 0.5)
         _informational_judges = {j for j, t in DEFAULT_THRESHOLDS.items() if t == 0.0}
         if slice_accuracy >= best_accuracy - 2 * noise_floor:
             _informational_judges.add("asset_routing")
@@ -1849,7 +2010,7 @@ def _run_gate_checks(
     )
 
     _ensure_sql_context(spark, catalog, schema)
-    full_result = run_evaluation(
+    full_result_1 = run_evaluation(
         space_id, exp_name, iteration_counter, benchmarks,
         domain, new_model_id, "full",
         predict_fn, scorers,
@@ -1857,8 +2018,39 @@ def _run_gate_checks(
         reference_sqls=reference_sqls if reference_sqls else None,
     )
 
-    full_scores = full_result.get("scores", {})
-    full_accuracy = full_result.get("overall_accuracy", 0.0)
+    scores_1 = full_result_1.get("scores", {})
+    accuracy_1 = full_result_1.get("overall_accuracy", 0.0)
+
+    # ── Confirmation eval (2nd run) to smooth Genie non-determinism ──
+    try:
+        mlflow.end_run()
+    except Exception:
+        pass
+    print(_kv("Confirmation eval", "running 2nd evaluation to average out variance"))
+    _ensure_sql_context(spark, catalog, schema)
+    full_result_2 = run_evaluation(
+        space_id, exp_name, iteration_counter, benchmarks,
+        domain, new_model_id, "full_confirm",
+        predict_fn, scorers,
+        spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+        reference_sqls=reference_sqls if reference_sqls else None,
+    )
+    scores_2 = full_result_2.get("scores", {})
+    accuracy_2 = full_result_2.get("overall_accuracy", 0.0)
+
+    all_judge_keys = set(scores_1) | set(scores_2)
+    full_scores = {
+        j: (scores_1.get(j, 0.0) + scores_2.get(j, 0.0)) / 2.0
+        for j in all_judge_keys
+    }
+    full_accuracy = (accuracy_1 + accuracy_2) / 2.0
+    full_result = full_result_1
+
+    print(
+        _kv("Eval run 1 accuracy", f"{accuracy_1:.1f}%") + "\n"
+        + _kv("Eval run 2 accuracy", f"{accuracy_2:.1f}%") + "\n"
+        + _kv("Averaged accuracy", f"{full_accuracy:.1f}%")
+    )
 
     write_iteration(
         spark, run_id, iteration_counter, full_result,
@@ -1876,7 +2068,8 @@ def _run_gate_checks(
     )
 
     accuracy_drop = best_accuracy - full_accuracy
-    accuracy_threshold = max(effective_regression_tol / 2, noise_floor)
+    question_weight = 100.0 / max(len(benchmarks), 1)
+    accuracy_threshold = max(effective_regression_tol / 2, noise_floor, question_weight + 0.5)
     if accuracy_drop >= accuracy_threshold:
         regressions.append({
             "judge": "overall_accuracy",
@@ -1884,6 +2077,28 @@ def _run_gate_checks(
             "current": full_accuracy,
             "drop": accuracy_drop,
         })
+
+    # ── Per-question noise filtering ──────────────────────────────
+    # If all detected regressions are within a single question's weight,
+    # they are likely Genie non-determinism, not a true patch-caused
+    # regression.  Downgrade them to warnings and proceed.
+    if regressions and patched_objects:
+        _noise_limit = question_weight * 1.5
+        _noise_regs = [r for r in regressions if r["drop"] <= _noise_limit]
+        if len(_noise_regs) == len(regressions):
+            _noise_details = ", ".join(
+                f"{r['judge']} drop={r['drop']:.1f} (limit={_noise_limit:.1f})"
+                for r in _noise_regs
+            )
+            logger.info(
+                "Noise filter: %d regression(s) within single-question noise band — treating as pass: %s",
+                len(_noise_regs), _noise_details,
+            )
+            print(
+                _kv("Noise filter", f"APPLIED — {len(_noise_regs)} regression(s) within ±{_noise_limit:.1f}pp noise band") + "\n"
+                + _kv("Details", _noise_details)
+            )
+            regressions = []
 
     if regressions:
         _reg_details = ", ".join(
@@ -2078,6 +2293,18 @@ def _run_lever_loop(
         if uc_columns:
             enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
+    # Stage 2.95: Proactive instruction seeding for empty spaces
+    instruction_result = _run_proactive_instruction_seeding(
+        w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+    )
+    if instruction_result.get("instructions_seeded"):
+        from genie_space_optimizer.common.genie_client import fetch_space_config
+        config = fetch_space_config(w, space_id)
+        config["_uc_columns"] = uc_columns
+        metadata_snapshot = config.get("_parsed_space", config)
+        if uc_columns:
+            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
     baseline_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
     reference_sqls: dict[str, str] = {}
     if baseline_iter:
@@ -2151,6 +2378,23 @@ def _run_lever_loop(
     except Exception:
         logger.debug("Failed to write provenance rows", exc_info=True)
 
+    # ── Mine benchmark examples once (proactive, before strategy) ────
+    mined_example_proposals = _mine_benchmark_example_sqls(
+        benchmarks, metadata_snapshot,
+        spark=spark, catalog=catalog, gold_schema=schema,
+    )
+    if mined_example_proposals:
+        _apply_proactive_example_sqls(
+            w, spark, run_id, space_id, mined_example_proposals,
+            metadata_snapshot, config, catalog, schema,
+        )
+        from genie_space_optimizer.common.genie_client import fetch_space_config
+        config = fetch_space_config(w, space_id)
+        config["_uc_columns"] = uc_columns
+        metadata_snapshot = config.get("_parsed_space", config)
+        if uc_columns:
+            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1: Holistic Strategist
     # ═══════════════════════════════════════════════════════════════════
@@ -2178,7 +2422,6 @@ def _run_lever_loop(
     ags_accepted: list[str] = []
     ags_rolled_back: list[str] = []
     noise_floor = min(100.0 / max(len(benchmarks), 1), MAX_NOISE_FLOOR)
-    global_rewrite_applied = False
 
     for ag in action_groups:
         ag_id = ag.get("id", f"AG{len(ags_attempted) + 1}")
@@ -2227,39 +2470,6 @@ def _run_lever_loop(
                 gold_schema=schema,
             )
             all_proposals.extend(lever_proposals)
-
-        # Lever 5: apply global instruction rewrite only once (on first AG with L5)
-        if "5" in lever_keys and not global_rewrite_applied:
-            global_rewrite_applied = True
-        elif "5" not in lever_keys and not global_rewrite_applied:
-            gi = strategy.get("global_instruction_rewrite", "")
-            if gi and ag == action_groups[-1]:
-                l5_proposals = generate_proposals_from_strategy(
-                    strategy=strategy,
-                    action_group={**ag, "lever_directives": {**ag.get("lever_directives", {}), "5": {}}},
-                    metadata_snapshot=metadata_snapshot,
-                    target_lever=5,
-                    apply_mode=apply_mode,
-                    w=w,
-                    spark=spark,
-                    catalog=catalog,
-                    gold_schema=schema,
-                )
-                all_proposals.extend(l5_proposals)
-                global_rewrite_applied = True
-
-        # ── Mine benchmarks for example SQLs ──────────────────────────
-        if "5" in lever_keys or (ag == action_groups[-1]):
-            mined_proposals = _mine_benchmark_example_sqls(
-                benchmarks, metadata_snapshot,
-                spark=spark, catalog=catalog, gold_schema=schema,
-            )
-            if mined_proposals:
-                logger.info(
-                    "Benchmark mining added %d example SQL proposals to AG %s",
-                    len(mined_proposals), ag_id,
-                )
-                all_proposals.extend(mined_proposals)
 
         # ── Log proposals ────────────────────────────────────────────
         _n_valid = 0
@@ -2523,6 +2733,119 @@ def _run_lever_loop(
         catalog=catalog, schema=schema,
     )
 
+    # ── Fallback: conservative single-lever retry when all AGs failed ──
+    if (
+        ags_attempted
+        and not ags_accepted
+        and iteration_counter < max_iterations
+    ):
+        print(_section("FALLBACK: ALL AGs ROLLED BACK — TRYING CONSERVATIVE RETRY", "="))
+        _fb_analysis = _analyze_and_distribute(
+            spark, run_id, catalog, schema, metadata_snapshot,
+            iteration_counter, lever_label=0,
+        )
+        _fb_clusters = _fb_analysis["all_clusters"]
+        _fb_soft = _fb_analysis["soft_signal_clusters"]
+
+        _fb_strategy = _generate_holistic_strategy(
+            clusters=_fb_clusters,
+            soft_signal_clusters=_fb_soft,
+            metadata_snapshot=metadata_snapshot,
+            w=w,
+        )
+        _fb_ags = _fb_strategy.get("action_groups", [])
+        _fb_ags.sort(key=lambda a: a.get("priority", 999))
+
+        if _fb_ags:
+            _fb_ag = _fb_ags[0]
+            _fb_ag_id = _fb_ag.get("id", "FB1")
+            _fb_lever_dirs = _fb_ag.get("lever_directives", {})
+            _fb_lever_keys = sorted(_fb_lever_dirs.keys())
+
+            # Pick only the highest-priority single lever
+            if len(_fb_lever_keys) > 1:
+                _fb_lever_keys = _fb_lever_keys[:1]
+                _fb_ag["lever_directives"] = {_fb_lever_keys[0]: _fb_lever_dirs[_fb_lever_keys[0]]}
+
+            iteration_counter += 1
+            ags_attempted.append(f"{_fb_ag_id}_FB")
+            print(
+                _kv("Fallback AG", _fb_ag_id) + "\n"
+                + _kv("Lever", ", ".join(_fb_lever_keys)) + "\n"
+                + _kv("Root cause", _fb_ag.get("root_cause_summary", "?")[:120])
+            )
+
+            _fb_proposals: list[dict] = []
+            for lk in _fb_lever_keys:
+                _fb_proposals.extend(generate_proposals_from_strategy(
+                    strategy=_fb_strategy,
+                    action_group=_fb_ag,
+                    metadata_snapshot=metadata_snapshot,
+                    target_lever=int(lk),
+                    apply_mode=apply_mode,
+                    w=w,
+                    spark=spark,
+                    catalog=catalog,
+                    gold_schema=schema,
+                ))
+
+            if _fb_proposals:
+                from genie_space_optimizer.optimization.applier import (
+                    proposals_to_patches as _fb_p2p,
+                    apply_patch_set as _fb_apply,
+                    rollback as _fb_rollback,
+                )
+                _fb_patches = _fb_p2p(_fb_proposals)
+                _fb_apply_log = _fb_apply(
+                    w, space_id, _fb_patches, metadata_snapshot, apply_mode=apply_mode,
+                )
+
+                if _fb_apply_log.get("applied"):
+                    _fb_gate = _run_gate_checks(
+                        spark=spark, w=w, run_id=run_id, space_id=space_id,
+                        exp_name=exp_name, domain=domain,
+                        iteration_counter=iteration_counter,
+                        ag_id=f"{_fb_ag_id}_FB",
+                        benchmarks=benchmarks, proposals=_fb_proposals,
+                        patches=_fb_patches, apply_log=_fb_apply_log,
+                        clusters=_fb_clusters, metadata_snapshot=metadata_snapshot,
+                        predict_fn=predict_fn, scorers=scorers,
+                        prev_model_id=prev_model_id, best_scores=best_scores,
+                        best_accuracy=best_accuracy, catalog=catalog, schema=schema,
+                        reference_sqls=reference_sqls, noise_floor=noise_floor,
+                    )
+
+                    if _fb_gate.get("passed"):
+                        _fb_full_scores = _fb_gate["full_scores"]
+                        _fb_full_accuracy = _fb_gate["full_accuracy"]
+                        ags_accepted.append(f"{_fb_ag_id}_FB")
+                        levers_accepted.extend([int(lk) for lk in _fb_lever_keys])
+                        best_scores = _fb_full_scores
+                        best_accuracy = _fb_full_accuracy
+                        best_iteration = iteration_counter
+                        best_model_id = _fb_gate.get("new_model_id", best_model_id)
+                        prev_model_id = best_model_id
+                        metadata_snapshot = _fb_apply_log.get("post_snapshot", metadata_snapshot)
+                        new_refs = extract_reference_sqls(_fb_gate.get("full_result", {}))
+                        if new_refs:
+                            reference_sqls.update(new_refs)
+                        print(_section(f"FALLBACK [{_fb_ag_id}_FB]: ACCEPTED", "="))
+                    else:
+                        _fb_rollback(w, space_id, _fb_apply_log)
+                        ags_rolled_back.append(f"{_fb_ag_id}_FB")
+                        levers_rolled_back.extend([int(lk) for lk in _fb_lever_keys])
+                        print(
+                            _section(f"FALLBACK [{_fb_ag_id}_FB]: ROLLED BACK", "-") + "\n"
+                            + _kv("Reason", _fb_gate.get("rollback_reason", "regression"))
+                        )
+                else:
+                    print(_kv("Fallback", "no patches applied — skipping"))
+            else:
+                print(_kv("Fallback", "no proposals generated — skipping"))
+        else:
+            print(_kv("Fallback", "strategy regeneration produced 0 action groups — skipping"))
+        print(_bar("="))
+
     session_info: dict = {}
     if all_failure_trace_ids or all_regression_trace_ids:
         try:
@@ -2577,6 +2900,11 @@ def _run_lever_loop(
     _summary.append(_kv("Join specs discovered", _joins_applied))
     _summary.append(_kv("Space description", "generated" if _desc_gen else "unchanged"))
     _summary.append(_kv("Sample questions", f"generated ({_sq_count})" if _sq_gen else "unchanged"))
+    _instr_seeded = instruction_result.get("instructions_seeded", False)
+    _instr_chars = instruction_result.get("instruction_chars", 0)
+    _summary.append(_kv("Instructions seeded", f"generated ({_instr_chars} chars)" if _instr_seeded else "unchanged"))
+    _mined_count = len(mined_example_proposals) if mined_example_proposals else 0
+    _summary.append(_kv("Benchmark examples mined", _mined_count))
     _summary.append("|")
 
     # Lever loop changes
@@ -2743,10 +3071,18 @@ def _run_finalize(
                         )
                     except (json.JSONDecodeError, TypeError):
                         pass
+            if not reference_sqls and benchmarks:
+                logger.warning("No reference SQLs from iterations — extracting from benchmarks")
+                for b in benchmarks:
+                    qid = b.get("id", "")
+                    sql = b.get("expected_sql", "")
+                    if qid and sql:
+                        reference_sqls[qid] = sql
             logger.info(
-                "Repeatability: %d reference SQLs from latest iteration",
+                "Repeatability: %d reference SQLs loaded",
                 len(reference_sqls),
             )
+            print(f"  Repeatability: {len(reference_sqls)} reference SQLs loaded")
 
             _ensure_sql_context(spark, catalog, schema)
             predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
