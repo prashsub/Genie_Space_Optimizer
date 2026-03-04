@@ -73,7 +73,7 @@ def ensure_labeling_schemas() -> list[str]:
         )
         created.append(SCHEMA_JUDGE_VERDICT)
     except Exception:
-        logger.debug("Failed to create schema %s", SCHEMA_JUDGE_VERDICT, exc_info=True)
+        logger.warning("Failed to create schema %s", SCHEMA_JUDGE_VERDICT, exc_info=True)
 
     try:
         schemas.create_label_schema(
@@ -89,7 +89,7 @@ def ensure_labeling_schemas() -> list[str]:
         )
         created.append(SCHEMA_CORRECTED_SQL)
     except Exception:
-        logger.debug("Failed to create schema %s", SCHEMA_CORRECTED_SQL, exc_info=True)
+        logger.warning("Failed to create schema %s", SCHEMA_CORRECTED_SQL, exc_info=True)
 
     try:
         schemas.create_label_schema(
@@ -106,7 +106,7 @@ def ensure_labeling_schemas() -> list[str]:
         )
         created.append(SCHEMA_PATCH_APPROVAL)
     except Exception:
-        logger.debug("Failed to create schema %s", SCHEMA_PATCH_APPROVAL, exc_info=True)
+        logger.warning("Failed to create schema %s", SCHEMA_PATCH_APPROVAL, exc_info=True)
 
     try:
         schemas.create_label_schema(
@@ -122,7 +122,7 @@ def ensure_labeling_schemas() -> list[str]:
         )
         created.append(SCHEMA_IMPROVEMENTS)
     except Exception:
-        logger.debug("Failed to create schema %s", SCHEMA_IMPROVEMENTS, exc_info=True)
+        logger.warning("Failed to create schema %s", SCHEMA_IMPROVEMENTS, exc_info=True)
 
     logger.info("Ensured %d labeling schemas: %s", len(created), ", ".join(created))
     return created
@@ -304,10 +304,19 @@ def ingest_human_feedback(
                     "comment": a_rationale or "",
                 })
             elif a_name == SCHEMA_CORRECTED_SQL and a_value:
+                _q = ""
+                try:
+                    _req = row.get("request") or ""
+                    if isinstance(_req, str):
+                        import json
+                        _q = json.loads(_req).get("messages", [{}])[-1].get("content", "")
+                except Exception:
+                    pass
                 corrections.append({
                     "type": "benchmark_correction",
                     "trace_id": trace_id,
                     "corrected_sql": a_value,
+                    "question": _q,
                 })
             elif a_name == SCHEMA_IMPROVEMENTS and a_value:
                 corrections.append({

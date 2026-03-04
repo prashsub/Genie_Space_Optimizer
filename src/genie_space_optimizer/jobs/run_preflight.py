@@ -260,6 +260,7 @@ try:
     _log("Starting preflight", space_id=space_id, catalog=catalog, schema=schema)
     preflight_out = _run_preflight(
         w, spark, run_id, space_id, catalog, schema, domain, experiment_name,
+        apply_mode,
     )
     _benchmarks = preflight_out["benchmarks"]
     _config = preflight_out.get("config", {})
@@ -334,6 +335,7 @@ dbutils.jobs.taskValues.set(key="levers", value=json.dumps(levers))
 dbutils.jobs.taskValues.set(key="apply_mode", value=apply_mode)
 dbutils.jobs.taskValues.set(key="deploy_target", value=deploy_target or "")
 dbutils.jobs.taskValues.set(key="triggered_by", value=triggered_by)
+dbutils.jobs.taskValues.set(key="human_corrections", value=json.dumps(preflight_out.get("human_corrections", []), default=str))
 
 _log(
     "Task values published",

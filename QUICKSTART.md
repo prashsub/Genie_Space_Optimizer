@@ -106,7 +106,7 @@ Wait for the deployment to complete (~2-3 minutes).
 
 ### Grant Data Access
 
-After deployment, the app's service principal needs access to your Unity Catalog schemas. You can do this from the **Settings** page in the app, or run the grant script:
+After deployment, the app's service principal needs access to your Unity Catalog schemas. The app operates as an **advisor** — it shows you exactly what permissions are missing and provides **copyable SQL commands** on the Settings page. Run those commands in a SQL editor or use the grant script:
 
 ```bash
 python resources/grant_app_uc_permissions.py --catalog your_catalog --schema your_schema
@@ -130,10 +130,12 @@ Or navigate to **Apps** in the Databricks workspace sidebar and click **genie-sp
 
 ### Step 0: Configure Permissions (First Time Only)
 
-Navigate to the **Settings** page (gear icon in the navbar). The page is organized into two tabs:
+Navigate to the **Settings** page (gear icon in the navbar). The app is an **advisor** — it reads current permissions and tells you exactly what's missing, with **copyable SQL commands** and **sharing instructions**. You run those yourself:
 
-- **Data Access** — auto-detects available schemas and shows the service principal's current read/write privileges. Click **Grant Access** for each schema your Genie Spaces depend on.
-- **Space Access** — grant the app's service principal **CAN EDIT** on each Genie Space you want to optimize, so patches can be applied directly.
+- **Schema Permissions** — shows per-schema read/write status for the app service principal. Copy the provided `GRANT USE CATALOG/USE SCHEMA/SELECT/MODIFY` SQL into a query editor to grant missing access.
+- **Space Permissions** — shows whether the SP has CAN_MANAGE on each Genie Space. Use the provided sharing instructions to grant access from the Genie Space UI.
+
+If you prefer using `apply_mode = both` (writes UC artifacts), ensure MODIFY is granted on the relevant schemas — the preflight stage will fail fast with a clear error if it's missing.
 
 ### Step 1: Browse Your Spaces
 

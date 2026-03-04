@@ -6,6 +6,8 @@ import {
   XAxis,
   YAxis,
   CartesianGrid,
+  Cell,
+  ReferenceLine,
 } from "recharts";
 import {
   ChartContainer,
@@ -15,6 +17,7 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 
 export interface RunHistory {
   runId: string;
@@ -28,15 +31,33 @@ export interface CrossRunChartProps {
   runs: RunHistory[];
 }
 
+const BASELINE_COLOR = "#6366f1";
+const OPTIMIZED_COLOR = "#10b981";
+
 const chartConfig = {
-  baseline: { label: "Baseline", color: "hsl(var(--chart-4))" },
-  optimized: { label: "Optimized", color: "hsl(var(--chart-1))" },
+  baseline: { label: "Baseline", color: BASELINE_COLOR },
+  optimized: { label: "Optimized", color: OPTIMIZED_COLOR },
 } satisfies ChartConfig;
 
-function formatDate(timestamp: string): string {
+function formatLabel(timestamp: string, runId: string): string {
+  const d = new Date(timestamp);
+  const month = d.toLocaleDateString("en-US", { month: "short" });
+  const day = d.getDate();
+  const time = d.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  });
+  return `${month} ${day}, ${time}\n#${runId.slice(0, 6)}`;
+}
+
+function formatTooltipDate(timestamp: string): string {
   return new Date(timestamp).toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
   });
 }
 
@@ -48,7 +69,8 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
       const optimized = r.optimizedScore ?? 0;
       return {
         runId: r.runId,
-        date: formatDate(r.timestamp),
+        label: formatLabel(r.timestamp, r.runId),
+        tooltipDate: formatTooltipDate(r.timestamp),
         baseline,
         optimized,
         delta: optimized - baseline,
@@ -70,6 +92,14 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
     );
   }
 
+  const allValues = chartData.flatMap((d) => [d.baseline, d.optimized].filter(Boolean));
+  const dataMin = Math.min(...allValues);
+  const yMin = Math.max(0, Math.floor((dataMin - 5) / 5) * 5);
+  const yMax = 100;
+
+  const avgBaseline =
+    chartData.reduce((s, d) => s + d.baseline, 0) / chartData.length;
+
   const CustomTooltipContent = ({
     active,
     payload,
@@ -86,30 +116,43 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
     if (!data) return null;
 
     return (
-      <div className="grid min-w-[8rem] gap-1.5 rounded-lg border border-border/50 bg-background px-2.5 py-1.5 text-xs shadow-xl">
-        <div className="font-medium">
-          Run: {data.runId.slice(0, 8)} • {data.date}
+      <div className="grid min-w-[10rem] gap-1.5 rounded-lg border border-border/50 bg-background px-3 py-2 text-xs shadow-xl">
+        <div className="font-medium text-foreground">
+          Run #{data.runId.slice(0, 8)}
         </div>
-        <div className="grid gap-1">
-          <div className="flex justify-between gap-4">
-            <span className="text-muted-foreground">Baseline</span>
-            <span className="font-mono font-medium tabular-nums">
-              {data.baseline.toFixed(2)}%
+        <div className="text-muted-foreground">{data.tooltipDate}</div>
+        <div className="mt-1 grid gap-1.5">
+          <div className="flex justify-between gap-6">
+            <span className="flex items-center gap-1.5">
+              <span
+                className="inline-block h-2.5 w-2.5 rounded-sm"
+                style={{ backgroundColor: BASELINE_COLOR }}
+              />
+              Baseline
+            </span>
+            <span className="font-mono font-semibold tabular-nums">
+              {data.baseline.toFixed(1)}%
             </span>
           </div>
-          <div className="flex justify-between gap-4">
-            <span className="text-muted-foreground">Optimized</span>
-            <span className="font-mono font-medium tabular-nums">
-              {data.optimized.toFixed(2)}%
+          <div className="flex justify-between gap-6">
+            <span className="flex items-center gap-1.5">
+              <span
+                className="inline-block h-2.5 w-2.5 rounded-sm"
+                style={{ backgroundColor: OPTIMIZED_COLOR }}
+              />
+              Optimized
+            </span>
+            <span className="font-mono font-semibold tabular-nums">
+              {data.optimized.toFixed(1)}%
             </span>
           </div>
-          <div className="flex justify-between gap-4">
-            <span className="text-muted-foreground">Delta</span>
+          <div className="flex justify-between gap-6 border-t border-border/40 pt-1.5">
+            <span className="text-muted-foreground">Improvement</span>
             <span
-              className={`font-mono font-medium tabular-nums ${data.delta >= 0 ? "text-green-600" : "text-red-600"}`}
+              className={`font-mono font-semibold tabular-nums ${data.delta > 0 ? "text-emerald-600" : data.delta < 0 ? "text-red-600" : "text-muted-foreground"}`}
             >
-              {data.delta >= 0 ? "+" : ""}
-              {data.delta.toFixed(2)}%
+              {data.delta > 0 ? "+" : ""}
+              {data.delta.toFixed(1)}%
             </span>
           </div>
         </div>
@@ -119,26 +162,70 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
 
   return (
     <Card>
-      <CardHeader>
+      <CardHeader className="flex flex-row items-center justify-between pb-2">
         <CardTitle>Optimization Trend</CardTitle>
+        <div className="flex items-center gap-2">
+          <Badge variant="outline" className="text-xs font-normal gap-1.5">
+            <span
+              className="inline-block h-2 w-2 rounded-sm"
+              style={{ backgroundColor: BASELINE_COLOR }}
+            />
+            Baseline
+          </Badge>
+          <Badge variant="outline" className="text-xs font-normal gap-1.5">
+            <span
+              className="inline-block h-2 w-2 rounded-sm"
+              style={{ backgroundColor: OPTIMIZED_COLOR }}
+            />
+            Optimized
+          </Badge>
+        </div>
       </CardHeader>
       <CardContent>
-        <ChartContainer config={chartConfig} className="h-[300px] w-full">
-          <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
-            <CartesianGrid vertical={false} />
+        <ChartContainer config={chartConfig} className="h-[320px] w-full">
+          <BarChart
+            data={chartData}
+            margin={{ top: 12, right: 12, bottom: 4, left: 4 }}
+            barGap={2}
+            barCategoryGap="20%"
+          >
+            <CartesianGrid vertical={false} strokeDasharray="3 3" opacity={0.3} />
             <XAxis
-              dataKey="date"
+              dataKey="label"
               tickLine={false}
-              tickMargin={10}
+              tickMargin={8}
               axisLine={false}
+              fontSize={10}
+              interval={0}
+              angle={-30}
+              textAnchor="end"
+              height={50}
             />
             <YAxis
-              domain={[0, 100]}
-              tickFormatter={(v) => `${v}%`}
+              domain={[yMin, yMax]}
+              tickFormatter={(v: number) => `${v}%`}
               tickLine={false}
               axisLine={false}
+              fontSize={11}
+              width={42}
             />
-            <ChartTooltip content={<CustomTooltipContent />} />
+            <ReferenceLine
+              y={avgBaseline}
+              stroke={BASELINE_COLOR}
+              strokeDasharray="4 4"
+              strokeOpacity={0.4}
+              label={{
+                value: `Avg ${avgBaseline.toFixed(0)}%`,
+                position: "right",
+                fontSize: 10,
+                fill: BASELINE_COLOR,
+                opacity: 0.7,
+              }}
+            />
+            <ChartTooltip
+              content={<CustomTooltipContent />}
+              cursor={{ fill: "hsl(var(--muted))", opacity: 0.3 }}
+            />
             <ChartLegend
               content={(props) => (
                 <ChartLegendContent
@@ -146,17 +233,22 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
                   verticalAlign={props.verticalAlign ?? "bottom"}
                 />
               )}
+              wrapperStyle={{ display: "none" }}
             />
-            <Bar
-              dataKey="baseline"
-              fill="hsl(var(--chart-4))"
-              radius={[0, 0, 0, 0]}
-            />
-            <Bar
-              dataKey="optimized"
-              fill="hsl(var(--chart-1))"
-              radius={[0, 0, 0, 0]}
-            />
+            <Bar dataKey="baseline" radius={[4, 4, 0, 0]} maxBarSize={32}>
+              {chartData.map((_, i) => (
+                <Cell key={`b-${i}`} fill={BASELINE_COLOR} fillOpacity={0.75} />
+              ))}
+            </Bar>
+            <Bar dataKey="optimized" radius={[4, 4, 0, 0]} maxBarSize={32}>
+              {chartData.map((entry, i) => (
+                <Cell
+                  key={`o-${i}`}
+                  fill={OPTIMIZED_COLOR}
+                  fillOpacity={entry.optimized > 0 ? 0.85 : 0.3}
+                />
+              ))}
+            </Bar>
           </BarChart>
         </ChartContainer>
       </CardContent>

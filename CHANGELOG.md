@@ -6,6 +6,41 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Changed — Advisor-Only Auth Model, Permission Filtering, Human Feedback Loop
+- **Advisor-only settings** (`settings.py`): removed all GRANT/REVOKE execution;
+  the app now reads UC & Genie Space permissions via OBO + SP fallback and provides
+  copyable SQL commands and sharing instructions instead of mutating state
+- **Models cleanup** (`models.py`): removed `DataAccessGrant`, `DataAccessGrantRequest`,
+  `DataAccessOverview`, `DetectedSchema`, `MissingGrantDetail`, `SpaceAccessGrantRequest`;
+  `SchemaPermission` now carries `readGrantCommand`/`writeGrantCommand`; `SpacePermissions`
+  adds `spGrantInstructions`; `PermissionDashboard` adds `workspaceHost`/`jobUrl`
+- **Activity permission filtering** (`activity.py`): dashboard results restricted to
+  Genie Spaces where the calling user has CAN_MANAGE or CAN_EDIT
+- **REST-based ACL helpers** (`genie_client.py`): `get_space_permissions_rest()`,
+  `_check_user_edit_from_rest_acl()`, `_check_sp_manage_from_rest_acl()`,
+  `_check_user_manage_from_rest_acl()`, `_check_user_edit_from_perms()`; `user_can_edit_space()`
+  accepts `cached_perms` to avoid redundant REST calls
+- **Extended OBO scopes** (`databricks.yml`): `files.files`, `catalog.catalogs:read`,
+  `catalog.schemas:read`, `catalog.tables:read` added for OBO REST API access
+- **Write-access validation** (`preflight.py`): `_validate_write_access()` fail-fast check
+  when `apply_mode` is `both` or `uc_artifact` — verifies MODIFY on each target schema
+- **Human feedback closed loop** (`harness.py`, `preflight.py`, `labeling.py`):
+  preflight returns `human_corrections`; lever loop applies `benchmark_correction` entries
+  from prior MLflow labeling sessions; labeling ingestion extracts question text for context
+- **Baseline labeling session** (`harness.py`): automatically creates a review session
+  for baseline eval failures, linking failure trace IDs to the run for human review
+- **Gate `failed_eval_result`** (`harness.py`): slice, P0, and full-eval gates now return
+  the failed eval result and regressions in their output for downstream diagnostics
+- **Job URL resolution** (`job_launcher.py`): `get_job_url()` resolves the persistent
+  optimization job URL for display in the permission dashboard
+- **ProcessFlow UI overhaul**: added MLflow feature annotations per pipeline step,
+  expanded icon set, removed Collapsible dependency in favor of native expand/collapse
+- **Settings UI simplified**: stripped grant/revoke mutation buttons; advisor-only read view
+  with copyable grant commands
+- **Space detail permission loading**: shows "Checking permissions…" during load
+
+---
+
 ### Added — Permission Dashboard, Table Enrichment, Example SQL Mining, Noise Floor
 - **Permission dashboard** (`settings.py`, `settings.tsx`): overhauled settings page
   with tabbed layout (Data Access, Space Access); read/write privilege probing;

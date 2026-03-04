@@ -85,7 +85,7 @@ def sample_run():
         "best_accuracy": 92.5,
         "best_repeatability": 95.0,
         "convergence_reason": "threshold_met",
-        "experiment_name": "/Users/test/genie_opt_revenue",
+        "experiment_name": "/Shared/genie-space-optimizer/test-space/revenue",
         "triggered_by": "test@example.com",
         "config_snapshot": {
             "data_sources": {

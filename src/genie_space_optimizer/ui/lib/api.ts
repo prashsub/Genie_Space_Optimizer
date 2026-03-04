@@ -28,36 +28,6 @@ export interface ComplexValue {
     type?: string | null;
     value?: string | null;
 }
-export interface DataAccessGrant {
-    catalog: string;
-    grantType?: string;
-    grantedAt: string;
-    grantedBy: string;
-    id: string;
-    schema_name?: string;
-    source?: string;
-    status?: string;
-}
-export interface DataAccessGrantRequest {
-    catalog: string;
-    grant_type?: string;
-    schema_name: string;
-}
-export interface DataAccessOverview {
-    detectedSchemas: DetectedSchema[];
-    grants: DataAccessGrant[];
-    spPrincipalDisplayName?: string | null;
-    spPrincipalId: string;
-}
-export interface DetectedSchema {
-    canGrant?: boolean;
-    canGrantWrite?: boolean;
-    catalog: string;
-    granted: boolean;
-    schema_name: string;
-    spaceCount: number;
-    writeGranted?: boolean;
-}
 export type DimensionScore = unknown;
 export interface FunctionInfo {
     catalog: string;
@@ -84,9 +54,11 @@ export interface PermissionDashboard {
     frameworkCatalog: string;
     frameworkSchema: string;
     jobName: string;
+    jobUrl?: string | null;
     spPrincipalDisplayName?: string | null;
     spPrincipalId: string;
     spaces: SpacePermissions[];
+    workspaceHost?: string | null;
 }
 export interface PipelineLink {
     category: string;
@@ -100,17 +72,12 @@ export type ProvenanceSummary = unknown;
 export type RunStatusResponse = unknown;
 export type RunSummary = unknown;
 export interface SchemaPermission {
-    canGrantRead: boolean;
-    canGrantWrite: boolean;
     catalog: string;
-    readGrantId?: string | null;
+    readGrantCommand?: string | null;
     readGranted: boolean;
     schema_name: string;
-    writeGrantId?: string | null;
+    writeGrantCommand?: string | null;
     writeGranted: boolean;
-}
-export interface SpaceAccessGrantRequest {
-    space_id: string;
 }
 export interface SpaceConfiguration {
     instructions: string;
@@ -132,11 +99,11 @@ export interface SpaceDetail {
 }
 export interface SpacePermissions {
     schemas: SchemaPermission[];
+    spGrantInstructions?: string | null;
     spHasManage: boolean;
     spaceId: string;
     status: string;
     title: string;
-    userCanGrantManage: boolean;
 }
 export type SpaceSummary = unknown;
 export interface TableDescription {
@@ -192,6 +159,12 @@ export interface VersionOut {
 export interface GetActivityParams {
     space_id?: string | null;
     limit?: number;
+    "X-Forwarded-Host"?: string | null;
+    "X-Forwarded-Preferred-Username"?: string | null;
+    "X-Forwarded-User"?: string | null;
+    "X-Forwarded-Email"?: string | null;
+    "X-Request-Id"?: string | null;
+    "X-Forwarded-Access-Token"?: string | null;
 }
 export const getActivity = async (params?: GetActivityParams, options?: RequestInit): Promise<{
     data: ActivityItem[];
@@ -203,7 +176,28 @@ export const getActivity = async (params?: GetActivityParams, options?: RequestI
     const url = queryString ? `/api/genie/activity?${queryString}` : "/api/genie/activity";
     const res = await fetch(url, {
         ...options,
-        method: "GET"
+        method: "GET",
+        headers: {
+            ...(params?.["X-Forwarded-Host"] != null && {
+                "X-Forwarded-Host": params["X-Forwarded-Host"]
+            }),
+            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
+                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
+            }),
+            ...(params?.["X-Forwarded-User"] != null && {
+                "X-Forwarded-User": params["X-Forwarded-User"]
+            }),
+            ...(params?.["X-Forwarded-Email"] != null && {
+                "X-Forwarded-Email": params["X-Forwarded-Email"]
+            }),
+            ...(params?.["X-Request-Id"] != null && {
+                "X-Request-Id": params["X-Request-Id"]
+            }),
+            ...(params?.["X-Forwarded-Access-Token"] != null && {
+                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
+            }),
+            ...options?.headers
+        }
     });
     if (!res.ok) {
         const body = await res.text();
@@ -819,218 +813,6 @@ export function useGetProvenanceSuspense<TData = {
         ...options?.query
     });
 }
-export interface GetDataAccessParams {
-    "X-Forwarded-Host"?: string | null;
-    "X-Forwarded-Preferred-Username"?: string | null;
-    "X-Forwarded-User"?: string | null;
-    "X-Forwarded-Email"?: string | null;
-    "X-Request-Id"?: string | null;
-    "X-Forwarded-Access-Token"?: string | null;
-}
-export const getDataAccess = async (params?: GetDataAccessParams, options?: RequestInit): Promise<{
-    data: DataAccessOverview;
-}> =>{
-    const res = await fetch("/api/genie/settings/data-access", {
-        ...options,
-        method: "GET",
-        headers: {
-            ...(params?.["X-Forwarded-Host"] != null && {
-                "X-Forwarded-Host": params["X-Forwarded-Host"]
-            }),
-            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
-                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
-            }),
-            ...(params?.["X-Forwarded-User"] != null && {
-                "X-Forwarded-User": params["X-Forwarded-User"]
-            }),
-            ...(params?.["X-Forwarded-Email"] != null && {
-                "X-Forwarded-Email": params["X-Forwarded-Email"]
-            }),
-            ...(params?.["X-Request-Id"] != null && {
-                "X-Request-Id": params["X-Request-Id"]
-            }),
-            ...(params?.["X-Forwarded-Access-Token"] != null && {
-                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
-            }),
-            ...options?.headers
-        }
-    });
-    if (!res.ok) {
-        const body = await res.text();
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(body);
-        } catch  {
-            parsed = body;
-        }
-        throw new ApiError(res.status, res.statusText, parsed);
-    }
-    return {
-        data: await res.json()
-    };
-};
-export const getDataAccessKey = (params?: GetDataAccessParams)=>{
-    return [
-        "/api/genie/settings/data-access",
-        params
-    ] as const;
-};
-export function useGetDataAccess<TData = {
-    data: DataAccessOverview;
-}>(options?: {
-    params?: GetDataAccessParams;
-    query?: Omit<UseQueryOptions<{
-        data: DataAccessOverview;
-    }, ApiError, TData>, "queryKey" | "queryFn">;
-}) {
-    return useQuery({
-        queryKey: getDataAccessKey(options?.params),
-        queryFn: ()=>getDataAccess(options?.params),
-        ...options?.query
-    });
-}
-export function useGetDataAccessSuspense<TData = {
-    data: DataAccessOverview;
-}>(options?: {
-    params?: GetDataAccessParams;
-    query?: Omit<UseSuspenseQueryOptions<{
-        data: DataAccessOverview;
-    }, ApiError, TData>, "queryKey" | "queryFn">;
-}) {
-    return useSuspenseQuery({
-        queryKey: getDataAccessKey(options?.params),
-        queryFn: ()=>getDataAccess(options?.params),
-        ...options?.query
-    });
-}
-export interface GrantDataAccessParams {
-    "X-Forwarded-Host"?: string | null;
-    "X-Forwarded-Preferred-Username"?: string | null;
-    "X-Forwarded-User"?: string | null;
-    "X-Forwarded-Email"?: string | null;
-    "X-Request-Id"?: string | null;
-    "X-Forwarded-Access-Token"?: string | null;
-}
-export const grantDataAccess = async (data: DataAccessGrantRequest, params?: GrantDataAccessParams, options?: RequestInit): Promise<{
-    data: DataAccessGrant;
-}> =>{
-    const res = await fetch("/api/genie/settings/data-access", {
-        ...options,
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            ...(params?.["X-Forwarded-Host"] != null && {
-                "X-Forwarded-Host": params["X-Forwarded-Host"]
-            }),
-            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
-                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
-            }),
-            ...(params?.["X-Forwarded-User"] != null && {
-                "X-Forwarded-User": params["X-Forwarded-User"]
-            }),
-            ...(params?.["X-Forwarded-Email"] != null && {
-                "X-Forwarded-Email": params["X-Forwarded-Email"]
-            }),
-            ...(params?.["X-Request-Id"] != null && {
-                "X-Request-Id": params["X-Request-Id"]
-            }),
-            ...(params?.["X-Forwarded-Access-Token"] != null && {
-                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
-            }),
-            ...options?.headers
-        },
-        body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-        const body = await res.text();
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(body);
-        } catch  {
-            parsed = body;
-        }
-        throw new ApiError(res.status, res.statusText, parsed);
-    }
-    return {
-        data: await res.json()
-    };
-};
-export function useGrantDataAccess(options?: {
-    mutation?: UseMutationOptions<{
-        data: DataAccessGrant;
-    }, ApiError, {
-        params: GrantDataAccessParams;
-        data: DataAccessGrantRequest;
-    }>;
-}) {
-    return useMutation({
-        mutationFn: (vars)=>grantDataAccess(vars.data, vars.params),
-        ...options?.mutation
-    });
-}
-export interface RevokeDataAccessParams {
-    grant_id: string;
-    "X-Forwarded-Host"?: string | null;
-    "X-Forwarded-Preferred-Username"?: string | null;
-    "X-Forwarded-User"?: string | null;
-    "X-Forwarded-Email"?: string | null;
-    "X-Request-Id"?: string | null;
-    "X-Forwarded-Access-Token"?: string | null;
-}
-export const revokeDataAccess = async (params: RevokeDataAccessParams, options?: RequestInit): Promise<{
-    data: DataAccessGrant;
-}> =>{
-    const res = await fetch(`/api/genie/settings/data-access/${params.grant_id}`, {
-        ...options,
-        method: "DELETE",
-        headers: {
-            ...(params?.["X-Forwarded-Host"] != null && {
-                "X-Forwarded-Host": params["X-Forwarded-Host"]
-            }),
-            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
-                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
-            }),
-            ...(params?.["X-Forwarded-User"] != null && {
-                "X-Forwarded-User": params["X-Forwarded-User"]
-            }),
-            ...(params?.["X-Forwarded-Email"] != null && {
-                "X-Forwarded-Email": params["X-Forwarded-Email"]
-            }),
-            ...(params?.["X-Request-Id"] != null && {
-                "X-Request-Id": params["X-Request-Id"]
-            }),
-            ...(params?.["X-Forwarded-Access-Token"] != null && {
-                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
-            }),
-            ...options?.headers
-        }
-    });
-    if (!res.ok) {
-        const body = await res.text();
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(body);
-        } catch  {
-            parsed = body;
-        }
-        throw new ApiError(res.status, res.statusText, parsed);
-    }
-    return {
-        data: await res.json()
-    };
-};
-export function useRevokeDataAccess(options?: {
-    mutation?: UseMutationOptions<{
-        data: DataAccessGrant;
-    }, ApiError, {
-        params: RevokeDataAccessParams;
-    }>;
-}) {
-    return useMutation({
-        mutationFn: (vars)=>revokeDataAccess(vars.params),
-        ...options?.mutation
-    });
-}
 export interface GetPermissionDashboardParams {
     "X-Forwarded-Host"?: string | null;
     "X-Forwarded-Preferred-Username"?: string | null;
@@ -1113,134 +895,6 @@ export function useGetPermissionDashboardSuspense<TData = {
         queryKey: getPermissionDashboardKey(options?.params),
         queryFn: ()=>getPermissionDashboard(options?.params),
         ...options?.query
-    });
-}
-export interface GrantSpaceAccessParams {
-    "X-Forwarded-Host"?: string | null;
-    "X-Forwarded-Preferred-Username"?: string | null;
-    "X-Forwarded-User"?: string | null;
-    "X-Forwarded-Email"?: string | null;
-    "X-Request-Id"?: string | null;
-    "X-Forwarded-Access-Token"?: string | null;
-}
-export const grantSpaceAccess = async (data: SpaceAccessGrantRequest, params?: GrantSpaceAccessParams, options?: RequestInit): Promise<{
-    data: Record<string, unknown>;
-}> =>{
-    const res = await fetch("/api/genie/settings/space-access", {
-        ...options,
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            ...(params?.["X-Forwarded-Host"] != null && {
-                "X-Forwarded-Host": params["X-Forwarded-Host"]
-            }),
-            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
-                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
-            }),
-            ...(params?.["X-Forwarded-User"] != null && {
-                "X-Forwarded-User": params["X-Forwarded-User"]
-            }),
-            ...(params?.["X-Forwarded-Email"] != null && {
-                "X-Forwarded-Email": params["X-Forwarded-Email"]
-            }),
-            ...(params?.["X-Request-Id"] != null && {
-                "X-Request-Id": params["X-Request-Id"]
-            }),
-            ...(params?.["X-Forwarded-Access-Token"] != null && {
-                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
-            }),
-            ...options?.headers
-        },
-        body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-        const body = await res.text();
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(body);
-        } catch  {
-            parsed = body;
-        }
-        throw new ApiError(res.status, res.statusText, parsed);
-    }
-    return {
-        data: await res.json()
-    };
-};
-export function useGrantSpaceAccess(options?: {
-    mutation?: UseMutationOptions<{
-        data: Record<string, unknown>;
-    }, ApiError, {
-        params: GrantSpaceAccessParams;
-        data: SpaceAccessGrantRequest;
-    }>;
-}) {
-    return useMutation({
-        mutationFn: (vars)=>grantSpaceAccess(vars.data, vars.params),
-        ...options?.mutation
-    });
-}
-export interface RevokeSpaceAccessParams {
-    space_id: string;
-    "X-Forwarded-Host"?: string | null;
-    "X-Forwarded-Preferred-Username"?: string | null;
-    "X-Forwarded-User"?: string | null;
-    "X-Forwarded-Email"?: string | null;
-    "X-Request-Id"?: string | null;
-    "X-Forwarded-Access-Token"?: string | null;
-}
-export const revokeSpaceAccess = async (params: RevokeSpaceAccessParams, options?: RequestInit): Promise<{
-    data: Record<string, unknown>;
-}> =>{
-    const res = await fetch(`/api/genie/settings/space-access/${params.space_id}`, {
-        ...options,
-        method: "DELETE",
-        headers: {
-            ...(params?.["X-Forwarded-Host"] != null && {
-                "X-Forwarded-Host": params["X-Forwarded-Host"]
-            }),
-            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
-                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
-            }),
-            ...(params?.["X-Forwarded-User"] != null && {
-                "X-Forwarded-User": params["X-Forwarded-User"]
-            }),
-            ...(params?.["X-Forwarded-Email"] != null && {
-                "X-Forwarded-Email": params["X-Forwarded-Email"]
-            }),
-            ...(params?.["X-Request-Id"] != null && {
-                "X-Request-Id": params["X-Request-Id"]
-            }),
-            ...(params?.["X-Forwarded-Access-Token"] != null && {
-                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
-            }),
-            ...options?.headers
-        }
-    });
-    if (!res.ok) {
-        const body = await res.text();
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(body);
-        } catch  {
-            parsed = body;
-        }
-        throw new ApiError(res.status, res.statusText, parsed);
-    }
-    return {
-        data: await res.json()
-    };
-};
-export function useRevokeSpaceAccess(options?: {
-    mutation?: UseMutationOptions<{
-        data: Record<string, unknown>;
-    }, ApiError, {
-        params: RevokeSpaceAccessParams;
-    }>;
-}) {
-    return useMutation({
-        mutationFn: (vars)=>revokeSpaceAccess(vars.params),
-        ...options?.mutation
     });
 }
 export interface ListSpacesParams {

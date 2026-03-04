@@ -2,11 +2,6 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
-import {
   Search,
   Database,
   BarChart3,
@@ -34,6 +29,16 @@ import {
   ChevronDown,
   Flag,
   Upload,
+  FlaskConical,
+  Activity,
+  BookMarked,
+  Tag,
+  Box,
+  ClipboardList,
+  Gauge,
+  Award,
+  MessageCircle,
+  UserCheck,
   type LucideIcon,
 } from "lucide-react";
 
@@ -50,12 +55,19 @@ interface LeafDef {
   detail?: React.ComponentType;
 }
 
+interface MlflowFeature {
+  label: string;
+  api: string;
+  icon: LucideIcon;
+}
+
 interface StepDef {
   number: number;
   title: string;
   description: string;
   icon: LucideIcon;
   leaves: LeafDef[];
+  mlflow: MlflowFeature[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -95,29 +107,25 @@ const FAILURE_TO_LEVER = [
 
 function JudgesDetail() {
   return (
-    <div className="space-y-3 pt-2">
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+    <div className="space-y-4">
+      <div className="grid grid-cols-3 gap-3 sm:grid-cols-5 lg:grid-cols-5">
         {JUDGES.map((judge) => (
-          <div key={judge.name} className="flex items-start gap-2 rounded-lg border border-border/50 bg-muted/30 p-2">
-            <div className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${judge.type === "CODE" ? "bg-emerald-100 text-emerald-600" : "bg-violet-100 text-violet-600"}`}>
-              <judge.icon className="h-3 w-3" />
+          <div key={judge.name} className="flex flex-col items-center text-center rounded-xl border border-border/50 bg-background p-3">
+            <div className={`flex h-9 w-9 items-center justify-center rounded-lg ${judge.type === "CODE" ? "bg-emerald-100 text-emerald-600" : "bg-violet-100 text-violet-600"}`}>
+              <judge.icon className="h-4.5 w-4.5" />
             </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5">
-                <p className="text-[11px] font-semibold text-foreground truncate">{judge.label}</p>
-                <Badge variant="outline" className={`shrink-0 text-[8px] px-1 py-0 ${judge.type === "CODE" ? "border-emerald-300 text-emerald-700" : "border-violet-300 text-violet-700"}`}>{judge.type}</Badge>
-              </div>
-              <p className="text-[10px] text-muted-foreground leading-snug mt-0.5">{judge.description}</p>
-              {judge.threshold != null && (
-                <p className="text-[9px] text-muted-foreground mt-0.5">Threshold: <span className="font-medium text-foreground">{judge.threshold}%</span></p>
-              )}
-            </div>
+            <p className="mt-2 text-xs font-semibold text-foreground leading-tight">{judge.label}</p>
+            <Badge variant="outline" className={`mt-1 text-[9px] px-1.5 py-0 ${judge.type === "CODE" ? "border-emerald-300 text-emerald-700" : "border-violet-300 text-violet-700"}`}>{judge.type}</Badge>
+            <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">{judge.description}</p>
+            {judge.threshold != null && (
+              <p className="mt-1 text-[11px] text-muted-foreground">Threshold: <span className="font-semibold text-foreground">{judge.threshold}%</span></p>
+            )}
           </div>
         ))}
       </div>
-      <div className="rounded-md border border-blue-200 bg-blue-50/50 p-2">
-        <p className="text-[11px] text-blue-800">
-          <span className="font-semibold">Overall accuracy</span> is the weighted average across all judges. Each scores every question as <code className="rounded bg-blue-100 px-1 text-[9px]">yes</code>/<code className="rounded bg-blue-100 px-1 text-[9px]">no</code>.
+      <div className="rounded-lg border border-blue-200 bg-blue-50/50 p-3">
+        <p className="text-xs text-blue-800">
+          <span className="font-semibold">Overall accuracy</span> is the weighted average across all judges. Each scores every question as <code className="rounded bg-blue-100 px-1 text-[10px]">yes</code>/<code className="rounded bg-blue-100 px-1 text-[10px]">no</code>.
         </p>
       </div>
     </div>
@@ -126,37 +134,35 @@ function JudgesDetail() {
 
 function StrategistDetail() {
   return (
-    <div className="space-y-3 pt-2">
-      <div className="flex flex-col items-center gap-2 sm:flex-row sm:items-stretch sm:gap-2">
-        <div className="flex-1 rounded-lg border-2 border-amber-200 bg-amber-50/50 p-2.5 text-center">
-          <div className="mx-auto mb-1.5 flex h-8 w-8 items-center justify-center rounded-full bg-amber-100">
-            <Brain className="h-4 w-4 text-amber-700" />
-          </div>
-          <p className="text-xs font-semibold text-amber-900">Phase 1: Triage</p>
-          <p className="mt-0.5 text-[10px] text-amber-800 leading-snug">Clusters failures by root cause, outputs action group skeletons with needed levers.</p>
+    <div className="flex flex-col items-center gap-3 sm:flex-row sm:items-stretch sm:gap-4">
+      <div className="flex-1 rounded-xl border-2 border-amber-200 bg-amber-50/50 p-4 text-center">
+        <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-amber-100">
+          <Brain className="h-5 w-5 text-amber-700" />
         </div>
-        <div className="flex items-center justify-center">
-          <ArrowRight className="hidden h-4 w-4 text-muted-foreground/40 sm:block" />
-          <ArrowDown className="block h-4 w-4 text-muted-foreground/40 sm:hidden" />
+        <p className="text-sm font-semibold text-amber-900">Phase 1: Triage</p>
+        <p className="mt-1 text-xs text-amber-800 leading-snug">Clusters failures by root cause, outputs action group skeletons with needed levers.</p>
+      </div>
+      <div className="flex items-center justify-center">
+        <ArrowRight className="hidden h-5 w-5 text-muted-foreground/40 sm:block" />
+        <ArrowDown className="block h-5 w-5 text-muted-foreground/40 sm:hidden" />
+      </div>
+      <div className="flex-1 rounded-xl border-2 border-blue-200 bg-blue-50/50 p-4 text-center">
+        <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-blue-100">
+          <Layers className="h-5 w-5 text-blue-700" />
         </div>
-        <div className="flex-1 rounded-lg border-2 border-blue-200 bg-blue-50/50 p-2.5 text-center">
-          <div className="mx-auto mb-1.5 flex h-8 w-8 items-center justify-center rounded-full bg-blue-100">
-            <Layers className="h-4 w-4 text-blue-700" />
-          </div>
-          <p className="text-xs font-semibold text-blue-900">Phase 2: Detail</p>
-          <p className="mt-0.5 text-[10px] text-blue-800 leading-snug">Produces concrete lever directives with specific tables, columns, and patches.</p>
+        <p className="text-sm font-semibold text-blue-900">Phase 2: Detail</p>
+        <p className="mt-1 text-xs text-blue-800 leading-snug">Produces concrete lever directives with specific tables, columns, and patches.</p>
+      </div>
+      <div className="flex items-center justify-center">
+        <ArrowRight className="hidden h-5 w-5 text-muted-foreground/40 sm:block" />
+        <ArrowDown className="block h-5 w-5 text-muted-foreground/40 sm:hidden" />
+      </div>
+      <div className="flex-1 rounded-xl border-2 border-green-200 bg-green-50/50 p-4 text-center">
+        <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-green-100">
+          <Sparkles className="h-5 w-5 text-green-700" />
         </div>
-        <div className="flex items-center justify-center">
-          <ArrowRight className="hidden h-4 w-4 text-muted-foreground/40 sm:block" />
-          <ArrowDown className="block h-4 w-4 text-muted-foreground/40 sm:hidden" />
-        </div>
-        <div className="flex-1 rounded-lg border-2 border-green-200 bg-green-50/50 p-2.5 text-center">
-          <div className="mx-auto mb-1.5 flex h-8 w-8 items-center justify-center rounded-full bg-green-100">
-            <Sparkles className="h-4 w-4 text-green-700" />
-          </div>
-          <p className="text-xs font-semibold text-green-900">Action Groups</p>
-          <p className="mt-0.5 text-[10px] text-green-800 leading-snug">Coordinated lever changes for one root cause, applied in priority order.</p>
-        </div>
+        <p className="text-sm font-semibold text-green-900">Action Groups</p>
+        <p className="mt-1 text-xs text-green-800 leading-snug">Coordinated lever changes for one root cause, applied in priority order.</p>
       </div>
     </div>
   );
@@ -164,42 +170,36 @@ function StrategistDetail() {
 
 function LeversDetail() {
   return (
-    <div className="space-y-3 pt-2">
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-5">
-        {LEVERS.map((lever) => (
-          <div key={lever.number} className="rounded-lg border border-border/50 bg-muted/30 p-2">
-            <div className="flex items-center gap-1.5 mb-1">
-              <div className="flex h-5 w-5 items-center justify-center rounded bg-blue-100 text-blue-600">
-                <lever.icon className="h-3 w-3" />
-              </div>
-              <Badge variant="outline" className="text-[8px] px-1 py-0">L{lever.number}</Badge>
-            </div>
-            <p className="text-[11px] font-semibold text-foreground leading-tight">{lever.name}</p>
-            <p className="text-[9px] text-muted-foreground mt-0.5 leading-snug">{lever.description}</p>
-            <div className="mt-1 flex flex-wrap gap-0.5">
-              {lever.examples.map((ex) => (
-                <code key={ex} className="rounded bg-muted px-1 py-0.5 text-[8px] font-mono text-muted-foreground">{ex}</code>
-              ))}
-            </div>
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      {LEVERS.map((lever) => (
+        <div key={lever.number} className="flex flex-col items-center text-center rounded-xl border border-border/50 bg-background p-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-100 text-blue-600">
+            <lever.icon className="h-4.5 w-4.5" />
           </div>
-        ))}
-      </div>
+          <Badge variant="outline" className="mt-1.5 text-[9px] px-1.5 py-0">L{lever.number}</Badge>
+          <p className="mt-1.5 text-xs font-semibold text-foreground leading-tight">{lever.name}</p>
+          <p className="mt-1 text-[11px] text-muted-foreground leading-snug">{lever.description}</p>
+          <div className="mt-2 flex flex-wrap gap-1 justify-center">
+            {lever.examples.map((ex) => (
+              <code key={ex} className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-mono text-muted-foreground">{ex}</code>
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
 
 function FailureRoutingDetail() {
   return (
-    <div className="pt-2">
-      <div className="flex flex-wrap gap-1">
-        {FAILURE_TO_LEVER.map((f) => (
-          <span key={f.failure} className="inline-flex items-center gap-1 rounded-full border border-border/50 bg-muted/30 px-1.5 py-0.5 text-[9px]">
-            <code className="font-mono text-muted-foreground">{f.failure}</code>
-            <ArrowRight className="h-2 w-2 text-muted-foreground/50" />
-            <span className="font-semibold text-blue-600">L{f.lever}</span>
-          </span>
-        ))}
-      </div>
+    <div className="flex flex-wrap gap-2">
+      {FAILURE_TO_LEVER.map((f) => (
+        <div key={f.failure} className="inline-flex items-center gap-1.5 rounded-lg border border-border/50 bg-background px-3 py-2 text-xs">
+          <code className="font-mono text-muted-foreground">{f.failure}</code>
+          <ArrowRight className="h-3 w-3 text-muted-foreground/50" />
+          <span className="font-bold text-blue-600">L{f.lever}</span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -217,31 +217,31 @@ function ThreeGateDetail() {
   };
 
   return (
-    <div className="space-y-2 pt-2">
-      <div className="flex flex-col items-center gap-1.5 sm:flex-row sm:items-stretch sm:gap-2">
+    <div className="space-y-3">
+      <div className="flex flex-col items-center gap-3 sm:flex-row sm:items-stretch sm:gap-4">
         {gates.map((gate, idx) => {
           const c = colorMap[gate.color];
           return (
             <React.Fragment key={gate.name}>
-              <div className={`flex-1 rounded-lg border-2 ${c.border} ${c.bg} p-2 text-center`}>
-                <div className={`mx-auto mb-1 flex h-7 w-7 items-center justify-center rounded-full ${c.circle}`}>
-                  <gate.icon className={`h-4 w-4 ${c.iconColor}`} />
+              <div className={`flex-1 rounded-xl border-2 ${c.border} ${c.bg} p-4 text-center`}>
+                <div className={`mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full ${c.circle}`}>
+                  <gate.icon className={`h-5 w-5 ${c.iconColor}`} />
                 </div>
-                <p className={`text-[11px] font-semibold ${c.title}`}>Gate {idx + 1}: {gate.name}</p>
-                <p className={`mt-0.5 text-[10px] leading-snug ${c.text}`}>{gate.desc}</p>
+                <p className={`text-sm font-semibold ${c.title}`}>Gate {idx + 1}: {gate.name}</p>
+                <p className={`mt-1 text-xs leading-snug ${c.text}`}>{gate.desc}</p>
               </div>
               {idx < gates.length - 1 && (
                 <div className="flex items-center justify-center">
-                  <ArrowRight className="hidden h-4 w-4 text-muted-foreground/40 sm:block" />
-                  <ArrowDown className="block h-4 w-4 text-muted-foreground/40 sm:hidden" />
+                  <ArrowRight className="hidden h-5 w-5 text-muted-foreground/40 sm:block" />
+                  <ArrowDown className="block h-5 w-5 text-muted-foreground/40 sm:hidden" />
                 </div>
               )}
             </React.Fragment>
           );
         })}
       </div>
-      <div className="rounded-md border border-green-200 bg-green-50/50 p-2">
-        <p className="text-[10px] text-green-800">
+      <div className="rounded-lg border border-green-200 bg-green-50/50 p-3">
+        <p className="text-xs text-green-800">
           <span className="font-semibold">Rollback protection:</span> Regressions on any gate cause automatic rollback of that action group.
         </p>
       </div>
@@ -267,6 +267,15 @@ const STEPS: StepDef[] = [
       { id: "s1-joins", title: "Join Specifications", description: "Map existing join specifications between tables", icon: Link2 },
       { id: "s1-coverage", title: "Description Coverage", description: "Measure how many columns and tables have descriptions", icon: Filter },
     ],
+    mlflow: [
+      { label: "Experiment Creation", api: "mlflow.set_experiment()", icon: FlaskConical },
+      { label: "Experiment Tags", api: "mlflow.set_experiment_tags()", icon: Tag },
+      { label: "Evaluation Dataset", api: "mlflow.genai.datasets.create_dataset()", icon: ClipboardList },
+      { label: "Prompt Registry", api: "mlflow.genai.register_prompt()", icon: BookMarked },
+      { label: "LoggedModel Init", api: "mlflow.initialize_logged_model()", icon: Box },
+      { label: "Label Schemas", api: "mlflow.genai.label_schemas.create_label_schema()", icon: UserCheck },
+      { label: "Feedback Ingestion", api: "mlflow.genai.labeling.get_labeling_sessions()", icon: MessageCircle },
+    ],
   },
   {
     number: 2,
@@ -282,6 +291,9 @@ const STEPS: StepDef[] = [
       { id: "s2-enrich", title: "Description Enrichment", description: "Find columns where both Genie description and UC comment are blank, generate structured descriptions (definition, values, join hints) via Databricks LLM.", icon: Sparkles, variant: "proactive" },
       { id: "s2-joindisco", title: "Join Discovery", description: "Parse JOINs from baseline SQL results, merge with UC FK constraints, validate type compatibility, and patch new join specifications into the Genie Space.", icon: Sparkles, variant: "proactive" },
     ],
+    mlflow: [
+      { label: "Instruction Versioning", api: "mlflow.genai.register_prompt()", icon: BookMarked },
+    ],
   },
   {
     number: 3,
@@ -291,6 +303,13 @@ const STEPS: StepDef[] = [
     leaves: [
       { id: "s3-judges", title: "9 Evaluation Judges", description: "3 deterministic code judges and 6 LLM reasoning judges score every question independently", icon: Scale, detail: JudgesDetail },
       { id: "s3-arbiter", title: "Arbiter Corrections", description: "When 3+ benchmark questions have arbiter verdict 'genie_correct', the benchmark dataset is updated with Genie's SQL as the new ground truth before the strategist runs.", icon: ShieldCheck, variant: "proactive" },
+    ],
+    mlflow: [
+      { label: "MLflow Run", api: "mlflow.start_run()", icon: FlaskConical },
+      { label: "GenAI Evaluate", api: "mlflow.genai.evaluate()", icon: Scale },
+      { label: "Tracing", api: "@mlflow.trace", icon: Activity },
+      { label: "Params & Metrics", api: "mlflow.log_params() / log_metric()", icon: Gauge },
+      { label: "LoggedModel Linking", api: "mlflow.set_active_model()", icon: Box },
     ],
   },
   {
@@ -303,6 +322,10 @@ const STEPS: StepDef[] = [
       { id: "s4-levers", title: "5 Optimization Levers", description: "Tables & Columns, Metric Views, TVFs, Join Specs, and Instructions — each lever is an executor that generates patch proposals", icon: Wrench, detail: LeversDetail },
       { id: "s4-routing", title: "Failure-to-Lever Routing", description: "Judge failure types are automatically mapped to the appropriate optimization lever", icon: GitBranch, detail: FailureRoutingDetail },
     ],
+    mlflow: [
+      { label: "Tracing Spans", api: "mlflow.start_span()", icon: Activity },
+      { label: "LoggedModel per Iteration", api: "mlflow.initialize_logged_model()", icon: Box },
+    ],
   },
   {
     number: 5,
@@ -313,6 +336,13 @@ const STEPS: StepDef[] = [
       { id: "s5-gates", title: "3-Gate Evaluation", description: "Slice Eval, P0 Eval, and Full Eval — progressively broader checks to catch regressions early", icon: ShieldCheck, detail: ThreeGateDetail },
       { id: "s5-rollback", title: "Rollback Protection", description: "Regressions on any gate cause automatic rollback of the action group's patches to the previous known-good state", icon: Repeat },
       { id: "s5-convergence", title: "Convergence", description: "Pipeline stops when all thresholds are met, no further improvement is possible, or the maximum iteration count is reached", icon: Target },
+    ],
+    mlflow: [
+      { label: "3-Gate Evaluations", api: "mlflow.genai.evaluate()", icon: Scale },
+      { label: "Gate Feedback", api: "mlflow.log_feedback()", icon: MessageCircle },
+      { label: "ASI Feedback", api: "mlflow.log_feedback()", icon: MessageCircle },
+      { label: "Instruction Versioning", api: "mlflow.genai.register_prompt()", icon: BookMarked },
+      { label: "LoggedModel per Iteration", api: "mlflow.initialize_logged_model()", icon: Box },
     ],
   },
   {
@@ -325,6 +355,11 @@ const STEPS: StepDef[] = [
       { id: "s6-publish", title: "Benchmark Publishing", description: "Push updated benchmark questions and ground-truth SQL back to the Genie Space for future evaluations", icon: Upload },
       { id: "s6-uc", title: "UC Write-backs", description: "When apply_mode includes uc_artifact, column and table descriptions are written back to Unity Catalog via ALTER TABLE ... COMMENT. Executes under the user's OBO identity, only replays non-rolled-back patches.", icon: Database, variant: "optional" },
     ],
+    mlflow: [
+      { label: "Repeatability Evaluation", api: "mlflow.genai.evaluate()", icon: Scale },
+      { label: "Champion Promotion", api: 'mlflow.set_logged_model_alias("champion")', icon: Award },
+      { label: "Review Session", api: "mlflow.genai.labeling.create_labeling_session()", icon: UserCheck },
+    ],
   },
 ];
 
@@ -332,57 +367,84 @@ const TOTAL_STEPS = STEPS.length;
 const AUTO_PLAY_INTERVAL = 5000;
 
 /* ------------------------------------------------------------------ */
+/*  MLflow Gen AI strip                                                */
+/* ------------------------------------------------------------------ */
+
+function MlflowStrip({ features }: { features: MlflowFeature[] }) {
+  if (features.length === 0) return null;
+
+  return (
+    <div className="border-t border-teal-200/60 bg-gradient-to-r from-teal-50/60 via-indigo-50/40 to-teal-50/60 px-5 py-3">
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="flex items-center gap-1.5 shrink-0">
+          <div className="flex h-5 w-5 items-center justify-center rounded bg-teal-600 text-white">
+            <FlaskConical className="h-3 w-3" />
+          </div>
+          <span className="text-[11px] font-bold text-teal-800 tracking-wide uppercase">MLflow Gen AI</span>
+        </div>
+        <div className="h-4 w-px bg-teal-300/60 shrink-0" />
+        {features.map((f) => (
+          <div key={f.label} className="group relative inline-flex items-center gap-1.5 rounded-lg border border-teal-200/80 bg-white/80 px-2.5 py-1.5 transition-colors hover:border-teal-400 hover:bg-teal-50/50">
+            <f.icon className="h-3.5 w-3.5 text-teal-600 shrink-0" />
+            <span className="text-[11px] font-medium text-teal-900">{f.label}</span>
+            <div className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 hidden group-hover:block z-20">
+              <div className="rounded-md bg-gray-900 px-2.5 py-1.5 shadow-lg">
+                <code className="text-[10px] font-mono text-teal-300 whitespace-nowrap">{f.api}</code>
+              </div>
+              <div className="mx-auto h-1.5 w-1.5 -mt-0.5 rotate-45 bg-gray-900" />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Leaf node component                                                */
 /* ------------------------------------------------------------------ */
 
 function LeafNode({ leaf, isExpanded, onToggle }: { leaf: LeafDef; isExpanded: boolean; onToggle: () => void }) {
   const hasDetail = !!leaf.detail;
-  const DetailComp = leaf.detail;
   const variantBadge = leaf.variant === "proactive"
     ? <Badge variant="outline" className="text-[8px] px-1 py-0 border-purple-300 text-purple-700 bg-purple-50">Proactive</Badge>
     : leaf.variant === "optional"
       ? <Badge variant="outline" className="text-[8px] px-1 py-0 border-amber-300 text-amber-700 bg-amber-50">Optional</Badge>
       : null;
 
-  const header = (
-    <div className="flex flex-col items-center text-center p-3">
-      <div className={`flex h-9 w-9 items-center justify-center rounded-lg ${leaf.variant === "proactive" ? "bg-purple-100 text-purple-600" : "bg-blue-100 text-blue-600"}`}>
-        <leaf.icon className="h-4.5 w-4.5" />
+  const card = (
+    <div className="flex flex-col items-center text-center p-4">
+      <div className={`flex h-10 w-10 items-center justify-center rounded-lg ${leaf.variant === "proactive" ? "bg-purple-100 text-purple-600" : "bg-blue-100 text-blue-600"}`}>
+        <leaf.icon className="h-5 w-5" />
       </div>
-      <div className="mt-2 flex items-center gap-1 flex-wrap justify-center">
-        <p className="text-xs font-semibold text-foreground leading-tight">{leaf.title}</p>
+      <div className="mt-2.5 flex items-center gap-1 flex-wrap justify-center">
+        <p className="text-sm font-semibold text-foreground leading-tight">{leaf.title}</p>
         {variantBadge}
       </div>
-      <p className="text-[10px] text-muted-foreground leading-snug mt-1">{leaf.description}</p>
+      <p className="text-xs text-muted-foreground leading-snug mt-1.5">{leaf.description}</p>
       {hasDetail && (
-        <ChevronDown className={`mt-1.5 h-3.5 w-3.5 text-muted-foreground/60 transition-transform duration-200 ${isExpanded ? "rotate-0" : "-rotate-90"}`} />
+        <ChevronDown className={`mt-2 h-4 w-4 text-muted-foreground/60 transition-transform duration-200 ${isExpanded ? "rotate-0" : "-rotate-90"}`} />
       )}
     </div>
   );
 
+  const borderColor = isExpanded ? "border-blue-300 shadow-sm shadow-blue-100" : "border-border/40";
+
   if (!hasDetail) {
     return (
-      <div className="rounded-lg border border-border/40 bg-muted/20">
-        {header}
+      <div className={`rounded-xl border ${borderColor} bg-background`}>
+        {card}
       </div>
     );
   }
 
   return (
-    <div className="rounded-lg border border-border/40 bg-muted/20 overflow-hidden">
-      <Collapsible open={isExpanded} onOpenChange={onToggle}>
-        <CollapsibleTrigger asChild>
-          <button className="w-full cursor-pointer hover:bg-muted/30 transition-colors">
-            {header}
-          </button>
-        </CollapsibleTrigger>
-        <CollapsibleContent className="overflow-hidden data-[state=open]:animate-in data-[state=open]:fade-in data-[state=open]:slide-in-from-top-1 data-[state=closed]:animate-out data-[state=closed]:fade-out data-[state=closed]:slide-out-to-top-1 duration-300">
-          <div className="border-t border-border/30 px-3 pb-3">
-            {DetailComp && <DetailComp />}
-          </div>
-        </CollapsibleContent>
-      </Collapsible>
-    </div>
+    <button
+      onClick={onToggle}
+      className={`rounded-xl border ${borderColor} bg-background cursor-pointer hover:border-blue-200 hover:shadow-sm transition-all text-left`}
+    >
+      {card}
+    </button>
   );
 }
 
@@ -467,7 +529,7 @@ export function ProcessFlow() {
       </div>
 
       {/* Horizontal spine */}
-      <div className="flex items-start justify-center gap-0 px-2 overflow-x-auto">
+      <div className="flex items-start justify-center gap-0 px-2 pt-3 overflow-x-auto">
         {STEPS.map((step, idx) => {
           const isActive = step.number === activeStep;
           const isPast = step.number < activeStep;
@@ -477,7 +539,7 @@ export function ProcessFlow() {
             <div key={step.number} className="flex items-center">
               <button
                 onClick={() => handleStepClick(step.number)}
-                className="group relative flex flex-col items-center gap-1.5 focus:outline-none"
+                className="group relative flex flex-col items-center gap-1.5 overflow-visible focus:outline-none"
               >
                 <div
                   className={`
@@ -558,7 +620,8 @@ export function ProcessFlow() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 px-5 py-4">
+        {/* Layer 2: Leaf cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4 px-5 py-4">
           {current.leaves.map((leaf) => (
             <LeafNode
               key={leaf.id}
@@ -568,6 +631,34 @@ export function ProcessFlow() {
             />
           ))}
         </div>
+
+        {/* MLflow Gen AI strip */}
+        <MlflowStrip features={current.mlflow} />
+
+        {/* Layer 3: Expanded detail panels (full width) */}
+        {current.leaves
+          .filter((leaf) => leaf.detail && expandedLeaves.has(leaf.id))
+          .map((leaf) => {
+            const DetailComp = leaf.detail!;
+            return (
+              <div key={leaf.id} className="border-t border-border/30 px-5 py-4 animate-in fade-in slide-in-from-top-2 duration-300">
+                <div className="flex items-center gap-2 mb-3">
+                  <div className="flex h-7 w-7 items-center justify-center rounded-md bg-blue-100 text-blue-600">
+                    <leaf.icon className="h-4 w-4" />
+                  </div>
+                  <h4 className="text-sm font-semibold text-foreground">{leaf.title}</h4>
+                  <div className="h-px flex-1 bg-border/40" />
+                  <button
+                    onClick={() => handleToggleLeaf(leaf.id)}
+                    className="text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                  >
+                    Collapse
+                  </button>
+                </div>
+                <DetailComp />
+              </div>
+            );
+          })}
 
         {/* Progress bar */}
         <div className="h-1 bg-muted">

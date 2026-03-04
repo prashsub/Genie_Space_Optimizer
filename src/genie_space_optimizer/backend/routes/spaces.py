@@ -471,10 +471,15 @@ def get_space_detail(
     ws: Dependencies.UserClient,
     sp_ws: Dependencies.Client,
     config: Dependencies.Config,
+    headers: Dependencies.Headers,
 ):
     """Full space config with UC metadata and optimization history."""
-    from genie_space_optimizer.common.genie_client import fetch_space_config
+    from genie_space_optimizer.common.genie_client import fetch_space_config, user_can_edit_space
     from genie_space_optimizer.optimization.state import load_runs_for_space
+
+    caller_email = (headers.user_email or headers.user_name or "").lower()
+    if not user_can_edit_space(ws, space_id, user_email=caller_email, acl_client=sp_ws):
+        raise HTTPException(status_code=403, detail="You need CAN_EDIT or CAN_MANAGE on this space.")
 
     client = _genie_client(ws, sp_ws)
     try:
@@ -822,6 +827,10 @@ def do_start_optimization(
             if exp_val and str(exp_val) not in ("", "None", "nan"):
                 prev_experiment = str(exp_val)
 
+    if prev_experiment and not prev_experiment.startswith("/Shared/"):
+        logger.warning("Ignoring legacy experiment path %s, using /Shared/ template", prev_experiment)
+        prev_experiment = None
+
     run_id = str(uuid.uuid4())
 
     space_snapshot: dict = {}
@@ -974,7 +983,7 @@ def do_start_optimization(
             domain=domain,
             catalog=config.catalog,
             schema=config.schema_name,
-            apply_mode=_PIPELINE_APPLY_MODE,
+            apply_mode=requested_apply_mode,
             triggered_by=current_user,
             experiment_name=experiment_name or "",
         )

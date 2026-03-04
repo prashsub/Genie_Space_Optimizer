@@ -1126,9 +1126,12 @@ databricks apps logs genie-space-optimizer -p <profile>
 ### Job Execution (check each task)
 
 - [ ] Preflight completes: config fetched, benchmarks generated, experiment created, experiment-level tags set
-- [ ] Preflight labeling: schemas ensured, human feedback ingested from prior session (if available)
+- [ ] Preflight returns `human_corrections` from prior labeling session (if available)
+- [ ] Preflight `_validate_write_access()`: fails fast if `apply_mode=both/uc_artifact` and MODIFY missing
 - [ ] Baseline eval completes: scores recorded in `genie_opt_iterations` with iteration=0
+- [ ] Baseline labeling session auto-created for failure trace IDs
 - [ ] Baseline traces tagged with `genie.optimization_run_id`, `genie.iteration`, `genie.eval_scope`
+- [ ] Lever loop applies human benchmark corrections from prior labeling session (if any)
 - [ ] Lever loop Stage 2.5: prompt matching auto-config applied (format assistance + entity matching)
 - [ ] Lever loop Stage 2.75: proactive description enrichment for insufficient columns (< 10 chars)
 - [ ] Lever loop Stage 2.75: table description enrichment for tables with no/insufficient descriptions
@@ -1171,17 +1174,15 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Run status updated to DISCARDED in Delta
 - [ ] Genie Space config in workspace reverted to original
 
-### Settings & Permission Dashboard
+### Settings & Permission Dashboard (Advisor-Only)
 
-- [ ] `GET /api/genie/settings/data-access` returns 200 with grants and detected schemas
-- [ ] `GET /api/genie/settings/permissions` returns 200 with schema read/write permissions and space access
-- [ ] Service principal ID is displayed
-- [ ] Data Access tab: Grant a new schema → grant appears in table
-- [ ] Data Access tab: Revoke an existing grant → grant removed
-- [ ] Space Access tab: Grant SP edit access to a Genie Space → appears in list
-- [ ] Space Access tab: Revoke SP access → removed from list
-- [ ] Schema permissions show read/write status per schema
-- [ ] OBO permissions enforced (user needs MANAGE on schema)
+- [ ] `GET /api/genie/settings/permissions` returns 200 with schema read/write, space ACLs, and copyable grant commands
+- [ ] Service principal ID and display name shown
+- [ ] `workspaceHost` and `jobUrl` fields populated
+- [ ] Schema permissions show read/write status per schema with `readGrantCommand`/`writeGrantCommand`
+- [ ] Space permissions show `spHasManage` status and `spGrantInstructions`
+- [ ] No GRANT/REVOKE buttons — advisor model provides copyable SQL and sharing instructions only
+- [ ] Activity feed filtered: only shows runs for spaces user has CAN_MANAGE or CAN_EDIT on
 
 ### Programmatic Trigger API
 

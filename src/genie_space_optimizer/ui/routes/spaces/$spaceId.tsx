@@ -83,7 +83,7 @@ function SpaceDetail() {
     ...selector(),
   });
   const triggerOpt = useTriggerOptimization();
-  const { data: permData } = useGetPermissionDashboard();
+  const { data: permData, isLoading: permsLoading } = useGetPermissionDashboard();
   const [applyMode, setApplyMode] = useState<"genie_config" | "both">(
     "genie_config",
   );
@@ -93,7 +93,7 @@ function SpaceDetail() {
   const hasActiveRun = space?.hasActiveRun ?? false;
 
   const spacePerms: SpacePermissions | undefined = (
-    (permData as any)?.spaces ?? []
+    (permData as any)?.data?.spaces ?? (permData as any)?.spaces ?? []
   ).find((s: SpacePermissions) => s.spaceId === spaceId);
   const hasSpaceAccess = spacePerms?.spHasManage ?? false;
   const allReadGranted =
@@ -250,13 +250,18 @@ function SpaceDetail() {
                   : "Start Optimization"}
             </Button>
           </div>
-          {!canStartOptimization && (
+          {!canStartOptimization && !permsLoading && (
             <p className="text-xs text-amber-600">
               Missing permissions.{" "}
               <Link to="/settings" className="underline hover:text-amber-800">
                 Go to Settings
               </Link>{" "}
               to grant access.
+            </p>
+          )}
+          {permsLoading && (
+            <p className="text-xs text-muted-foreground">
+              Checking permissions…
             </p>
           )}
           {canStartOptimization &&

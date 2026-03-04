@@ -44,6 +44,102 @@ def list_spaces(w: WorkspaceClient) -> list[dict[str, str]]:
 EDITABLE_PERMISSIONS = {"CAN_MANAGE", "CAN_EDIT"}
 
 
+# ── REST-based permission helpers ───────────────────────────────────────
+
+
+def get_space_permissions_rest(w: WorkspaceClient, space_id: str) -> dict | None:
+    """Fetch Genie Space ACL via REST API.
+
+    Returns the raw JSON response dict, or ``None`` on failure.
+    Prefer this over ``permissions.get()`` SDK which requires specific
+    OAuth scopes that OBO tokens may lack.
+    """
+    try:
+        return w.api_client.do("GET", f"/api/2.0/permissions/genie/{space_id}")
+    except Exception:
+        return None
+
+
+def _check_user_edit_from_rest_acl(
+    acl_response: dict, user_email: str, user_groups: set[str],
+) -> bool:
+    """Return True if *user_email* has CAN_MANAGE or CAN_EDIT in a REST ACL response."""
+    for entry in acl_response.get("access_control_list", []):
+        principal = (
+            entry.get("user_name") or entry.get("group_name") or ""
+        ).lower()
+        is_me = (
+            principal == user_email
+            or principal in user_groups
+            or entry.get("group_name") == "admins"
+        )
+        if not is_me:
+            continue
+        for p in entry.get("all_permissions", []):
+            level = str(p.get("permission_level", ""))
+            if level in EDITABLE_PERMISSIONS:
+                return True
+    return False
+
+
+def _check_sp_manage_from_rest_acl(
+    acl_response: dict, sp_aliases: set[str],
+) -> bool:
+    """Return True if any SP alias has CAN_MANAGE in a REST ACL response."""
+    sp_aliases_lower = {a.lower() for a in sp_aliases}
+    for entry in acl_response.get("access_control_list", []):
+        principal = (
+            entry.get("user_name") or entry.get("group_name")
+            or entry.get("service_principal_name") or ""
+        ).lower()
+        if principal not in sp_aliases_lower:
+            continue
+        for p in entry.get("all_permissions", []):
+            if str(p.get("permission_level", "")) == "CAN_MANAGE":
+                return True
+    return False
+
+
+def _check_user_manage_from_rest_acl(
+    acl_response: dict, user_email: str, user_groups: set[str],
+) -> bool:
+    """Return True if *user_email* has CAN_MANAGE (not just CAN_EDIT) in a REST ACL."""
+    for entry in acl_response.get("access_control_list", []):
+        principal = (
+            entry.get("user_name") or entry.get("group_name") or ""
+        ).lower()
+        is_me = (
+            principal == user_email
+            or principal in user_groups
+            or entry.get("group_name") == "admins"
+        )
+        if not is_me:
+            continue
+        for p in entry.get("all_permissions", []):
+            if str(p.get("permission_level", "")) == "CAN_MANAGE":
+                return True
+    return False
+
+
+def _check_user_edit_from_perms(
+    perms, user_email: str, user_groups: set[str],
+) -> bool:
+    """Return True if *user_email* has CAN_MANAGE or CAN_EDIT in SDK *perms*."""
+    for acl in getattr(perms, "access_control_list", None) or []:
+        principal = (acl.user_name or acl.group_name or "").lower()
+        is_me = (
+            principal == user_email
+            or principal in user_groups
+            or acl.group_name == "admins"
+        )
+        if not is_me:
+            continue
+        for p in acl.all_permissions or []:
+            if str(p.permission_level).replace("PermissionLevel.", "") in EDITABLE_PERMISSIONS:
+                return True
+    return False
+
+
 def user_can_edit_space(
     w: WorkspaceClient,
     space_id: str,
@@ -51,23 +147,13 @@ def user_can_edit_space(
     user_email: str | None = None,
     user_groups: set[str] | None = None,
     acl_client: WorkspaceClient | None = None,
+    cached_perms: dict | object | None = None,
 ) -> bool:
     """Check whether a user has CAN_MANAGE or CAN_EDIT on a Genie space.
 
-    Parameters
-    ----------
-    w:
-        Client used to resolve the user identity via ``current_user.me()``
-        when *user_email* is not provided.
-    space_id:
-        The Genie Space to check.
-    user_email:
-        Pre-resolved user email (avoids the ``current_user.me()`` call).
-    user_groups:
-        Pre-resolved lowercase group names the user belongs to.
-    acl_client:
-        Client used to read the ACL (``permissions.get``).  Defaults to *w*.
-        Pass the SP client here when the OBO token lacks the Permissions scope.
+    Uses REST API ``GET /api/2.0/permissions/genie/{id}`` via the OBO
+    client first, then falls back to the SP client.  The ``cached_perms``
+    parameter accepts either a raw REST dict or an SDK ``ObjectPermissions``.
     """
     try:
         if not user_email:
@@ -79,20 +165,17 @@ def user_can_edit_space(
             user_email = user_email.lower()
         user_groups = user_groups or set()
 
-        perm_client = acl_client or w
-        perms = perm_client.permissions.get("genie", space_id)
-        for acl in perms.access_control_list or []:
-            principal = (acl.user_name or acl.group_name or "").lower()
-            is_me = (
-                principal == user_email
-                or principal in user_groups
-                or acl.group_name == "admins"
-            )
-            if not is_me:
-                continue
-            for p in acl.all_permissions or []:
-                if str(p.permission_level).replace("PermissionLevel.", "") in EDITABLE_PERMISSIONS:
-                    return True
+        if cached_perms is not None:
+            if isinstance(cached_perms, dict):
+                return _check_user_edit_from_rest_acl(cached_perms, user_email, user_groups)
+            return _check_user_edit_from_perms(cached_perms, user_email, user_groups)
+
+        # OBO REST first, SP REST fallback
+        for client in [w, acl_client] if acl_client else [w]:
+            acl_resp = get_space_permissions_rest(client, space_id)
+            if acl_resp is not None:
+                return _check_user_edit_from_rest_acl(acl_resp, user_email, user_groups)
+
         return False
     except Exception:
         logger.warning("Could not check permissions for space %s — hiding", space_id)
@@ -101,23 +184,17 @@ def user_can_edit_space(
 
 def sp_can_manage_space(
     w: WorkspaceClient, space_id: str, sp_aliases: set[str],
+    cached_perms: dict | None = None,
 ) -> bool:
-    """Check whether a service principal has CAN_MANAGE on a Genie space."""
-    try:
-        perms = w.permissions.get("genie", space_id)
-        for acl in perms.access_control_list or []:
-            principal = (acl.user_name or acl.group_name or "").lower()
-            sn = getattr(acl, "service_principal_name", "") or ""
-            if principal not in sp_aliases and sn.lower() not in sp_aliases:
-                continue
-            for p in acl.all_permissions or []:
-                level = str(p.permission_level).replace("PermissionLevel.", "")
-                if level == "CAN_MANAGE":
-                    return True
+    """Check whether a service principal has CAN_MANAGE on a Genie space.
+
+    Uses REST API ``GET /api/2.0/permissions/genie/{id}``.
+    Accepts a pre-fetched REST dict via ``cached_perms``.
+    """
+    acl_resp = cached_perms or get_space_permissions_rest(w, space_id)
+    if acl_resp is None:
         return False
-    except Exception:
-        logger.debug("Could not check SP permissions for space %s", space_id)
-        return False
+    return _check_sp_manage_from_rest_acl(acl_resp, sp_aliases)
 
 
 def fetch_space_config(w: WorkspaceClient, space_id: str) -> dict:

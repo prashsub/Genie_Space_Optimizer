@@ -503,3 +503,22 @@ def submit_optimization(
         job_run_id,
     )
     return job_run_id, job_id
+
+
+def get_job_url(ws: WorkspaceClient) -> str | None:
+    """Resolve the URL to the persistent optimization job, if it exists."""
+    job_id = _cached_job_id
+    if job_id is None:
+        try:
+            for job in ws.jobs.list(name=_PERSISTENT_JOB_NAME, limit=1):
+                if job.job_id is not None:
+                    job_id = int(job.job_id)
+                    break
+        except Exception:
+            return None
+    if job_id is None:
+        return None
+    host = (ws.config.host or "").rstrip("/")
+    if not host:
+        return None
+    return f"{host}/jobs/{job_id}"

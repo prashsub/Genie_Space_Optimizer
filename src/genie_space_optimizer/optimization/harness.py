@@ -283,15 +283,17 @@ def _run_preflight(
     schema: str,
     domain: str,
     experiment_name: str | None = None,
+    apply_mode: str = "genie_config",
 ) -> dict:
     """Stage 1: Fetch config, UC metadata, generate/load benchmarks, create experiment.
 
     Returns a dict of task values to pass downstream.
     """
-    config, benchmarks, model_id, exp_name = _safe_stage(
+    config, benchmarks, model_id, exp_name, human_corrections = _safe_stage(
         spark, run_id, "PREFLIGHT", run_preflight,
         catalog, schema,
         w, spark, run_id, space_id, catalog, schema, domain, experiment_name,
+        apply_mode,
     )
 
     import mlflow
@@ -311,6 +313,7 @@ def _run_preflight(
         "model_id": model_id,
         "experiment_name": exp_name,
         "experiment_id": experiment_id,
+        "human_corrections": human_corrections,
     }
 
 
@@ -388,12 +391,35 @@ def _run_baseline(
             catalog=catalog, schema=schema,
         )
 
+        _bl_trace_map = eval_result.get("trace_map", {})
+        _bl_failures = set(eval_result.get("failure_question_ids", []))
+        _bl_fail_tids = [tid for qid, tid in _bl_trace_map.items() if qid in _bl_failures]
+        _bl_session_name = ""
+        if _bl_fail_tids:
+            try:
+                from genie_space_optimizer.optimization.labeling import create_review_session
+                _bl_session_info = create_review_session(
+                    run_id=run_id, domain=domain, experiment_name=exp_name,
+                    uc_schema=f"{catalog}.{schema}",
+                    failure_trace_ids=_bl_fail_tids, regression_trace_ids=[],
+                )
+                _bl_session_name = _bl_session_info.get("session_name", "")
+                if _bl_session_name:
+                    update_run_status(
+                        spark, run_id, catalog, schema,
+                        labeling_session_name=_bl_session_name,
+                    )
+                    print(f"\n[MLflow Review] Baseline labeling session: {_bl_session_name}")
+            except Exception:
+                logger.warning("Failed to create baseline labeling session", exc_info=True)
+
         return {
             "scores": scores,
             "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
             "thresholds_met": thresholds_met,
             "model_id": model_id,
             "eval_result": eval_result,
+            "baseline_session_name": _bl_session_name,
         }
     except Exception as exc:
         err_msg = f"{type(exc).__name__}: {exc}"
@@ -1760,7 +1786,7 @@ def _run_gate_checks(
                 )
             except Exception:
                 logger.debug("Failed to log gate feedback", exc_info=True)
-            return {"passed": False, "rollback_reason": f"slice_gate: {slice_drops[0]['judge']}"}
+            return {"passed": False, "rollback_reason": f"slice_gate: {slice_drops[0]['judge']}", "failed_eval_result": slice_result}
         else:
             _sc = ", ".join(
                 f"{j} {best_scores.get(j, 0):.1f}->{slice_scores.get(j, 0):.1f}"
@@ -1795,7 +1821,7 @@ def _run_gate_checks(
                 + _kv("Action", "ROLLBACK") + "\n"
                 + _bar("-")
             )
-            return {"passed": False, "rollback_reason": f"p0_gate: {len(p0_failures)} failures"}
+            return {"passed": False, "rollback_reason": f"p0_gate: {len(p0_failures)} failures", "failed_eval_result": p0_result}
         else:
             print(
                 _section(f"P0 GATE [{ag_id}]: PASS", "-") + "\n"
@@ -1887,7 +1913,7 @@ def _run_gate_checks(
             )
         except Exception:
             logger.debug("Failed to log full eval gate feedback", exc_info=True)
-        return {"passed": False, "rollback_reason": f"full_eval: {regressions[0]['judge']}"}
+        return {"passed": False, "rollback_reason": f"full_eval: {regressions[0]['judge']}", "failed_eval_result": full_result, "regressions": regressions}
 
     # ── PASSED ────────────────────────────────────────────────────────
     _score_delta = ", ".join(
@@ -1943,6 +1969,7 @@ def _run_lever_loop(
     thresholds: dict[str, float] | None = None,
     apply_mode: str = APPLY_MODE,
     triggered_by: str = "",
+    human_corrections: list[dict] | None = None,
 ) -> dict:
     """Stage 3: Iterate levers with convergence checking.
 
@@ -1981,6 +2008,22 @@ def _run_lever_loop(
     lever_changes: list[dict] = []
     all_failure_trace_ids: list[str] = []
     all_regression_trace_ids: list[str] = []
+
+    _human_sql_fixes = [
+        {"question": c.get("question", ""), "new_expected_sql": c["corrected_sql"], "verdict": "genie_correct"}
+        for c in (human_corrections or [])
+        if c.get("type") == "benchmark_correction" and c.get("corrected_sql")
+    ]
+    if _human_sql_fixes:
+        try:
+            from genie_space_optimizer.optimization.benchmarks import apply_benchmark_corrections
+            _hfix = apply_benchmark_corrections(_human_sql_fixes, spark, f"{catalog}.{schema}", domain)
+            print(
+                f"\n[Human Feedback] Applied {_hfix['applied']} benchmark corrections "
+                f"from prior review (skipped {_hfix['skipped']})"
+            )
+        except Exception:
+            logger.warning("Failed to apply human benchmark corrections", exc_info=True)
 
     _ensure_sql_context(spark, catalog, schema)
     from genie_space_optimizer.optimization.evaluation import build_metric_view_measures
@@ -2386,6 +2429,14 @@ def _run_lever_loop(
                 detail={"reason": reason},
                 catalog=catalog, schema=schema,
             )
+            _failed_eval = gate_result.get("failed_eval_result", {})
+            _fail_tmap = _failed_eval.get("trace_map", {})
+            _fail_qids = set(_failed_eval.get("failure_question_ids", []))
+            for qid, tid in _fail_tmap.items():
+                if qid in _fail_qids:
+                    all_failure_trace_ids.append(tid)
+                elif "regressions" in gate_result:
+                    all_regression_trace_ids.append(tid)
             continue
 
         # ── Accept action group ──────────────────────────────────────
@@ -2499,7 +2550,7 @@ def _run_lever_loop(
                     labeling_session_run_id=_srun,
                 )
         except Exception:
-            logger.debug("Failed to create labeling session", exc_info=True)
+            logger.warning("Failed to create labeling session", exc_info=True)
 
     # ── End-of-Run Summary ─────────────────────────────────────────
     _summary = [_section("OPTIMIZATION RUN SUMMARY", "=")]
@@ -3176,6 +3227,7 @@ def optimize_genie_space(
         config = cast(dict[str, Any], preflight_out["config"])
         benchmarks = cast(list[dict], preflight_out["benchmarks"])
         model_id = str(preflight_out["model_id"])
+        human_corrections = cast(list[dict], preflight_out.get("human_corrections", []))
         exp_name = str(preflight_out["experiment_name"])
         result.experiment_name = exp_name
         result.experiment_id = str(preflight_out.get("experiment_id", ""))
@@ -3212,6 +3264,7 @@ def optimize_genie_space(
                 prev_scores, prev_accuracy, model_id, config,
                 catalog, schema, levers, max_iterations, thresholds, apply_mode,
                 triggered_by=triggered_by or "",
+                human_corrections=human_corrections,
             )
             result.levers_attempted = cast(list[int], loop_out["levers_attempted"])
             result.levers_accepted = cast(list[int], loop_out["levers_accepted"])

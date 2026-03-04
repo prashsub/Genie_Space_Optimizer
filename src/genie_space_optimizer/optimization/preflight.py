@@ -144,6 +144,42 @@ def _validate_core_access(spark: SparkSession, genie_table_refs: list) -> None:
         )
 
 
+def _validate_write_access(spark: SparkSession, genie_table_refs: list) -> None:
+    """Fail-fast if the runtime identity lacks MODIFY on schemas required for UC writes."""
+    schemas: set[tuple[str, str]] = set()
+    for ref in genie_table_refs:
+        cat = ref[0] if isinstance(ref, (list, tuple)) else ""
+        sch = ref[1] if isinstance(ref, (list, tuple)) and len(ref) > 1 else ""
+        if cat and sch:
+            schemas.add((cat, sch))
+
+    if not schemas:
+        return
+
+    missing: list[str] = []
+    for cat, sch in sorted(schemas):
+        try:
+            rows = spark.sql(
+                f"SHOW GRANTS ON SCHEMA `{cat}`.`{sch}`"
+            ).collect()
+            has_modify = any(
+                "MODIFY" in str(r.asDict().get("privilege", "")).upper()
+                for r in rows
+            )
+            if not has_modify:
+                missing.append(f"`{cat}`.`{sch}`")
+        except Exception as exc:
+            logger.warning("MODIFY check failed for %s.%s: %s", cat, sch, exc)
+            missing.append(f"`{cat}`.`{sch}`")
+
+    if missing:
+        raise RuntimeError(
+            f"UC write access (MODIFY) missing on: {', '.join(missing)}. "
+            "The apply_mode requires MODIFY permission on these schemas. "
+            "Grant write access from the Settings page, or choose 'Config only' mode."
+        )
+
+
 def run_preflight(
     w: WorkspaceClient,
     spark: SparkSession,
@@ -153,6 +189,7 @@ def run_preflight(
     schema: str,
     domain: str,
     experiment_name: str | None = None,
+    apply_mode: str = "genie_config",
 ) -> tuple[dict, list[dict], str, str]:
     """Execute the full preflight sequence (Stage 1).
 
@@ -254,6 +291,9 @@ def run_preflight(
         )
 
     _validate_core_access(spark, genie_table_refs)
+
+    if apply_mode in ("both", "uc_artifact"):
+        _validate_write_access(spark, genie_table_refs)
 
     _pf = prefetched if isinstance(prefetched, dict) else {}
     _actual_source: dict[str, str] = {}
@@ -671,7 +711,7 @@ def run_preflight(
                     len(_human_corrections), _prior_session_name,
                 )
     except Exception:
-        logger.debug("Human feedback ingestion skipped (no prior session or module unavailable)", exc_info=True)
+        logger.warning("Human feedback ingestion skipped (no prior session or module unavailable)", exc_info=True)
 
     prompt_registrations = register_judge_prompts(uc_schema, domain, experiment_name)
 
@@ -721,7 +761,7 @@ def run_preflight(
         catalog=catalog, schema=schema,
     )
 
-    return config, benchmarks, model_id, experiment_name
+    return config, benchmarks, model_id, experiment_name, _human_corrections
 
 
 def _load_or_generate_benchmarks(

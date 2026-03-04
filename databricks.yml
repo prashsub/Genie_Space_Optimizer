@@ -30,6 +30,10 @@ resources:
       source_code_path: ./.build
       user_api_scopes:
         - "dashboards.genie"
+        - "files.files"
+        - "catalog.catalogs:read"
+        - "catalog.schemas:read"
+        - "catalog.tables:read"
         - "sql"
       config:
         env:

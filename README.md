@@ -114,8 +114,8 @@ Genie_Space_Optimizer/
 │   │   └── routes/
 │   │       ├── spaces.py             # GET /spaces, GET /spaces/{id}, POST /spaces/{id}/optimize
 │   │       ├── runs.py               # GET /runs/{id}, comparison, iterations, ASI, provenance, apply/discard
-│   │       ├── activity.py           # GET /activity (recent runs feed)
-│   │       ├── settings.py           # Permission dashboard: data-access, space-access, schema permissions
+│   │       ├── activity.py           # GET /activity (permission-filtered recent runs)
+│   │       ├── settings.py           # Advisor-only permission dashboard (read-only, copyable grants)
 │   │       └── trigger.py            # POST /trigger, GET /trigger/status (programmatic API)
 │   │
 │   ├── ui/                           # React + Vite frontend
@@ -123,7 +123,7 @@ Genie_Space_Optimizer/
 │   │   ├── routes/                   # File-based TanStack Router pages
 │   │   │   ├── __root.tsx            # Root layout (navbar, theme)
 │   │   │   ├── index.tsx             # Dashboard (spaces grid, activity, stats)
-│   │   │   ├── settings.tsx          # Settings page (data access management)
+│   │   │   ├── settings.tsx          # Advisor-only settings (read permissions, copyable grants)
 │   │   │   ├── spaces/$spaceId.tsx   # Space detail & optimization trigger
 │   │   │   ├── runs/$runId.tsx       # Run monitoring (pipeline steps, levers)
 │   │   │   └── runs/$runId/comparison.tsx  # Side-by-side config diff
@@ -202,13 +202,8 @@ All endpoints are prefixed with `/api/genie`.
 | `GET` | `/runs/{run_id}/comparison` | `getComparison` | Side-by-side original vs optimized config |
 | `POST` | `/runs/{run_id}/apply` | `applyOptimization` | Confirm and keep optimized config |
 | `POST` | `/runs/{run_id}/discard` | `discardOptimization` | Rollback to original config |
-| `GET` | `/activity` | `listActivity` | Recent optimization runs feed |
-| `GET` | `/settings/data-access` | `getDataAccess` | List UC data-access grants and auto-detected schemas |
-| `POST` | `/settings/data-access` | `grantDataAccess` | Grant app service principal access to a UC schema |
-| `DELETE` | `/settings/data-access/{grant_id}` | `revokeDataAccess` | Revoke a UC data-access grant |
-| `GET` | `/settings/permissions` | `getPermissionDashboard` | Permission dashboard: schema read/write, space access |
-| `POST` | `/settings/space-access` | `grantSpaceAccess` | Grant app SP edit access to a Genie Space |
-| `DELETE` | `/settings/space-access/{space_id}` | `revokeSpaceAccess` | Revoke app SP access from a Genie Space |
+| `GET` | `/activity` | `getActivity` | Recent optimization runs (permission-filtered to user's spaces) |
+| `GET` | `/settings/permissions` | `getPermissionDashboard` | Advisor-only dashboard: schema read/write, space ACLs, copyable grant commands |
 | `POST` | `/trigger` | `triggerOptimization` | Trigger optimization programmatically (headless API) |
 | `GET` | `/trigger/status/{run_id}` | `getTriggerStatus` | Poll status of a triggered optimization run |
 | `GET` | `/runs/{run_id}/iterations` | `getIterations` | Per-iteration scores for iteration chart |
@@ -240,14 +235,18 @@ Run statuses: `QUEUED` → `IN_PROGRESS` → `CONVERGED` | `STALLED` | `MAX_ITER
 
 The `databricks.yml` bundle provisions:
 
-- **Databricks App** -- Serves the full-stack web application with OBO (on-behalf-of) user authentication
+- **Databricks App** -- Serves the full-stack web application with OBO (on-behalf-of) user authentication. The app operates as an **advisor**: it reads permissions and shows copyable grant commands but never executes GRANT/REVOKE on the user's behalf
 - **PostgreSQL Database** (Lakebase) -- `CU_1` capacity instance
 - **SQL Warehouse** -- For statement execution and UC metadata queries
 - **Optimization Job** -- Triggered on-demand via UI or `/trigger` API; runs preflight → baseline → lever loop → finalize pipeline
 
-### Required API Scopes
+### Required OBO API Scopes
 
 - `dashboards.genie` -- Read/write Genie Space configurations
+- `files.files` -- File operations (workspace artifacts)
+- `catalog.catalogs:read` -- List Unity Catalog catalogs
+- `catalog.schemas:read` -- List UC schemas
+- `catalog.tables:read` -- Read UC table/column metadata via REST
 - `sql` -- Execute SQL statements
 - `iam.access-control:read` -- Check space permissions
 - `iam.current-user:read` -- Identify the authenticated user

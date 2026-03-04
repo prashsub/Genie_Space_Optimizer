@@ -1,4 +1,9 @@
-"""Activity endpoint: recent optimization runs for the Dashboard."""
+"""Activity endpoint: recent optimization runs for the Dashboard.
+
+Permission filtering: results are restricted to Genie Spaces where the
+calling user has CAN_MANAGE or CAN_EDIT.  This prevents leaking run
+history for spaces the user cannot access.
+"""
 
 from __future__ import annotations
 
@@ -13,20 +18,62 @@ router = create_router()
 logger = logging.getLogger(__name__)
 
 
+def _get_accessible_space_ids(
+    ws, sp_ws, caller_email: str,
+) -> set[str] | None:
+    """Return space IDs the user can manage/edit, or None to skip filtering."""
+    from genie_space_optimizer.common.genie_client import (
+        list_spaces,
+        user_can_edit_space,
+    )
+
+    try:
+        all_spaces: list[dict] = []
+        for client in [ws, sp_ws]:
+            try:
+                all_spaces = list_spaces(client)
+                break
+            except Exception:
+                continue
+        if not all_spaces:
+            return set()
+        return {
+            s["id"]
+            for s in all_spaces
+            if user_can_edit_space(ws, s["id"], user_email=caller_email, acl_client=sp_ws)
+        }
+    except Exception:
+        logger.warning("Could not resolve accessible spaces for activity filter", exc_info=True)
+        return None
+
+
 @router.get("/activity", response_model=list[ActivityItem], operation_id="getActivity")
 def get_activity(
     config: Dependencies.Config,
+    ws: Dependencies.UserClient,
+    sp_ws: Dependencies.Client,
+    headers: Dependencies.Headers,
     space_id: str | None = None,
     limit: int = 20,
 ):
-    """Recent optimization runs for the Dashboard activity table."""
+    """Recent optimization runs for the Dashboard activity table.
+
+    Results are filtered to only include spaces where the calling user
+    has CAN_MANAGE or CAN_EDIT permission.
+    """
     from genie_space_optimizer.optimization.state import load_recent_activity
+
+    caller_email = (headers.user_email or headers.user_name or "").lower()
+    accessible_ids = _get_accessible_space_ids(ws, sp_ws, caller_email)
+
+    if space_id and accessible_ids is not None and space_id not in accessible_ids:
+        return []
 
     try:
         spark = get_spark()
         df = load_recent_activity(
             spark, config.catalog, config.schema_name,
-            space_id=space_id, limit=limit,
+            space_id=space_id, limit=limit * 3 if accessible_ids is not None else limit,
         )
     except Exception:
         logger.debug("Delta tables not yet available, returning empty activity")
@@ -38,11 +85,14 @@ def get_activity(
             spark, list(df["run_id"]), config.catalog, config.schema_name,
         )
         for _, row in df.iterrows():
+            row_space_id = row.get("space_id", "")
+            if accessible_ids is not None and row_space_id not in accessible_ids:
+                continue
             run_id_val = row.get("run_id", "")
             items.append(
                 ActivityItem(
                     runId=run_id_val,
-                    spaceId=row.get("space_id", ""),
+                    spaceId=row_space_id,
                     spaceName=row.get("domain", ""),
                     status=row.get("status", ""),
                     initiatedBy=row.get("triggered_by") or "system",
@@ -51,6 +101,8 @@ def get_activity(
                     timestamp=ensure_utc_iso(row.get("started_at")) or "",
                 )
             )
+            if len(items) >= limit:
+                break
     return items
 
 

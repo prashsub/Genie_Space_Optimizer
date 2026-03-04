@@ -218,57 +218,7 @@ class ActivityItem(SafeModel):
     timestamp: str
 
 
-# ── Data Access Grant Models ───────────────────────────────────────────
-
-
-class DataAccessGrant(BaseModel):
-    id: str
-    catalog: str
-    schema_name: str = ""
-    grantedBy: str
-    grantedAt: str
-    status: str = "active"
-    source: str = "app"
-    grantType: str = "read"
-
-
-class DataAccessGrantRequest(BaseModel):
-    catalog: str
-    schema_name: str
-    grant_type: str = "read"
-
-
-class DetectedSchema(BaseModel):
-    catalog: str
-    schema_name: str
-    spaceCount: int
-    granted: bool
-    canGrant: bool = False
-    writeGranted: bool = False
-    canGrantWrite: bool = False
-
-
-class DataAccessOverview(BaseModel):
-    grants: list[DataAccessGrant]
-    detectedSchemas: list[DetectedSchema]
-    spPrincipalId: str
-    spPrincipalDisplayName: str | None = None
-
-
-class MissingGrantDetail(BaseModel):
-    catalog: str
-    schema_name: str
-    grantCommand: str
-
-
-# ── Genie Space SP Access Models ──────────────────────────────────────
-
-
-class SpaceAccessGrantRequest(BaseModel):
-    space_id: str
-
-
-# ── Permission Dashboard Models ──────────────────────────────────────
+# ── Permission Dashboard Models (advisor-only) ───────────────────────
 
 
 class SchemaPermission(BaseModel):
@@ -276,19 +226,17 @@ class SchemaPermission(BaseModel):
     schema_name: str
     readGranted: bool
     writeGranted: bool
-    canGrantRead: bool
-    canGrantWrite: bool
-    readGrantId: str | None = None
-    writeGrantId: str | None = None
+    readGrantCommand: str | None = None
+    writeGrantCommand: str | None = None
 
 
 class SpacePermissions(BaseModel):
     spaceId: str
     title: str
     spHasManage: bool
-    userCanGrantManage: bool
     schemas: list[SchemaPermission]
     status: str
+    spGrantInstructions: str | None = None
 
 
 class PermissionDashboard(BaseModel):
@@ -299,6 +247,8 @@ class PermissionDashboard(BaseModel):
     frameworkSchema: str
     experimentBasePath: str
     jobName: str
+    workspaceHost: str | None = None
+    jobUrl: str | None = None
 
 
 # ── ASI (Judge Feedback) Models ───────────────────────────────────────

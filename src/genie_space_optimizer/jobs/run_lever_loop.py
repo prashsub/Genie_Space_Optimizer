@@ -174,6 +174,7 @@ levers = json.loads(dbutils.jobs.taskValues.get(taskKey="preflight", key="levers
 apply_mode = dbutils.jobs.taskValues.get(taskKey="preflight", key="apply_mode")
 
 triggered_by = dbutils.jobs.taskValues.get(taskKey="preflight", key="triggered_by", default="")
+human_corrections = json.loads(dbutils.jobs.taskValues.get(taskKey="preflight", key="human_corrections", default="[]"))
 
 scores_json = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="scores")
 prev_scores = json.loads(scores_json)
@@ -292,6 +293,7 @@ try:
         catalog, schema, levers, max_iterations,
         apply_mode=apply_mode,
         triggered_by=triggered_by,
+        human_corrections=human_corrections,
     )
     _log(
         "Lever loop finished",
