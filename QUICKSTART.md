@@ -128,9 +128,12 @@ Or navigate to **Apps** in the Databricks workspace sidebar and click **genie-sp
 
 ## 6. Optimize Your First Genie Space
 
-### Step 0: Configure Data Access (First Time Only)
+### Step 0: Configure Permissions (First Time Only)
 
-Navigate to the **Settings** page (gear icon in the navbar). The app auto-detects available schemas and shows the service principal's current permissions. Click **Grant Access** for each schema your Genie Spaces depend on.
+Navigate to the **Settings** page (gear icon in the navbar). The page is organized into two tabs:
+
+- **Data Access** — auto-detects available schemas and shows the service principal's current read/write privileges. Click **Grant Access** for each schema your Genie Spaces depend on.
+- **Space Access** — grant the app's service principal **CAN EDIT** on each Genie Space you want to optimize, so patches can be applied directly.
 
 ### Step 1: Browse Your Spaces
 
@@ -309,6 +312,7 @@ MAX_ITERATIONS = 5            # Max lever loop iterations
 REGRESSION_THRESHOLD = 10.0   # % drop that triggers rollback
 SLICE_GATE_TOLERANCE = 15.0   # % tolerance for per-dimension slice gate
 PLATEAU_ITERATIONS = 2        # Consecutive no-improvement before stopping
+MAX_NOISE_FLOOR = 3.0         # Min score improvement to accept (below = cosmetic noise)
 ```
 
 ### Benchmark Generation

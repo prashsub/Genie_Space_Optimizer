@@ -44,21 +44,48 @@ def list_spaces(w: WorkspaceClient) -> list[dict[str, str]]:
 EDITABLE_PERMISSIONS = {"CAN_MANAGE", "CAN_EDIT"}
 
 
-def user_can_edit_space(w: WorkspaceClient, space_id: str) -> bool:
-    """Check whether the calling user has CAN_MANAGE or CAN_EDIT on a Genie space."""
-    try:
-        me = w.current_user.me()
-        my_email = (me.user_name or "").lower()
-        my_groups: set[str] = set()
-        if me.groups:
-            my_groups = {g.display.lower() for g in me.groups if g.display}
+def user_can_edit_space(
+    w: WorkspaceClient,
+    space_id: str,
+    *,
+    user_email: str | None = None,
+    user_groups: set[str] | None = None,
+    acl_client: WorkspaceClient | None = None,
+) -> bool:
+    """Check whether a user has CAN_MANAGE or CAN_EDIT on a Genie space.
 
-        perms = w.permissions.get("genie", space_id)
+    Parameters
+    ----------
+    w:
+        Client used to resolve the user identity via ``current_user.me()``
+        when *user_email* is not provided.
+    space_id:
+        The Genie Space to check.
+    user_email:
+        Pre-resolved user email (avoids the ``current_user.me()`` call).
+    user_groups:
+        Pre-resolved lowercase group names the user belongs to.
+    acl_client:
+        Client used to read the ACL (``permissions.get``).  Defaults to *w*.
+        Pass the SP client here when the OBO token lacks the Permissions scope.
+    """
+    try:
+        if not user_email:
+            me = w.current_user.me()
+            user_email = (me.user_name or "").lower()
+            if user_groups is None and me.groups:
+                user_groups = {g.display.lower() for g in me.groups if g.display}
+        else:
+            user_email = user_email.lower()
+        user_groups = user_groups or set()
+
+        perm_client = acl_client or w
+        perms = perm_client.permissions.get("genie", space_id)
         for acl in perms.access_control_list or []:
             principal = (acl.user_name or acl.group_name or "").lower()
             is_me = (
-                principal == my_email
-                or principal in my_groups
+                principal == user_email
+                or principal in user_groups
                 or acl.group_name == "admins"
             )
             if not is_me:
@@ -68,8 +95,29 @@ def user_can_edit_space(w: WorkspaceClient, space_id: str) -> bool:
                     return True
         return False
     except Exception:
-        logger.warning("Could not check permissions for space %s", space_id)
-        return True
+        logger.warning("Could not check permissions for space %s — hiding", space_id)
+        return False
+
+
+def sp_can_manage_space(
+    w: WorkspaceClient, space_id: str, sp_aliases: set[str],
+) -> bool:
+    """Check whether a service principal has CAN_MANAGE on a Genie space."""
+    try:
+        perms = w.permissions.get("genie", space_id)
+        for acl in perms.access_control_list or []:
+            principal = (acl.user_name or acl.group_name or "").lower()
+            sn = getattr(acl, "service_principal_name", "") or ""
+            if principal not in sp_aliases and sn.lower() not in sp_aliases:
+                continue
+            for p in acl.all_permissions or []:
+                level = str(p.permission_level).replace("PermissionLevel.", "")
+                if level == "CAN_MANAGE":
+                    return True
+        return False
+    except Exception:
+        logger.debug("Could not check SP permissions for space %s", space_id)
+        return False
 
 
 def fetch_space_config(w: WorkspaceClient, space_id: str) -> dict:

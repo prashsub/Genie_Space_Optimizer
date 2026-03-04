@@ -78,12 +78,21 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
   const [open, setOpen] = useState(false);
 
   const chartData = stageEvents
-    .filter((e) => e.durationSeconds != null && e.durationSeconds > 0)
-    .map((e) => ({
-      ...e,
-      shortStage: e.stage ? shortenStageName(e.stage) : "Unknown",
-      durationSeconds: e.durationSeconds ?? 0,
-    }));
+    .map((e) => {
+      let duration = e.durationSeconds;
+      if ((duration == null || duration <= 0) && e.startedAt && e.completedAt) {
+        duration =
+          (new Date(e.completedAt).getTime() -
+            new Date(e.startedAt).getTime()) /
+          1000;
+      }
+      return {
+        ...e,
+        shortStage: e.stage ? shortenStageName(e.stage) : "Unknown",
+        durationSeconds: duration ?? 0,
+      };
+    })
+    .filter((e) => e.durationSeconds > 0);
 
   const hasData = chartData.length > 0;
 

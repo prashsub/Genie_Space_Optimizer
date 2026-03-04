@@ -33,6 +33,7 @@ type ChartPoint = {
 function buildChartData(iterations: IterationSummary[]): ChartPoint[] {
   const full = iterations
     .filter((it) => it.evalScope === "full")
+    .filter((it) => it.iteration === 0 || it.overallAccuracy > 0)
     .sort((a, b) => a.iteration - b.iteration);
 
   return full.map((it) => ({
@@ -41,7 +42,7 @@ function buildChartData(iterations: IterationSummary[]): ChartPoint[] {
     leverLabel:
       it.iteration === 0
         ? "Baseline"
-        : it.lever != null
+        : it.lever != null && it.lever > 0
           ? `Lever ${it.lever}`
           : `Iteration ${it.iteration}`,
     accuracy: it.overallAccuracy <= 1 ? it.overallAccuracy * 100 : it.overallAccuracy,

@@ -1,7 +1,9 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import {
   useGetSpaceDetailSuspense,
   useTriggerOptimization,
+  useGetPermissionDashboard,
+  type SpacePermissions,
 } from "@/lib/api";
 import selector from "@/lib/selector";
 import { Button } from "@/components/ui/button";
@@ -18,6 +20,16 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Suspense, useState } from "react";
 import {
   ArrowLeft,
@@ -71,11 +83,25 @@ function SpaceDetail() {
     ...selector(),
   });
   const triggerOpt = useTriggerOptimization();
+  const { data: permData } = useGetPermissionDashboard();
   const [applyMode, setApplyMode] = useState<"genie_config" | "both">(
     "genie_config",
   );
+  const [ucConfirmOpen, setUcConfirmOpen] = useState(false);
+  const [ucAcknowledged, setUcAcknowledged] = useState(false);
 
   const hasActiveRun = space?.hasActiveRun ?? false;
+
+  const spacePerms: SpacePermissions | undefined = (
+    (permData as any)?.spaces ?? []
+  ).find((s: SpacePermissions) => s.spaceId === spaceId);
+  const hasSpaceAccess = spacePerms?.spHasManage ?? false;
+  const allReadGranted =
+    spacePerms?.schemas?.every((s) => s.readGranted) ?? false;
+  const allWriteGranted =
+    spacePerms?.schemas?.every((s) => s.writeGranted) ?? false;
+  const canStartOptimization = hasSpaceAccess && allReadGranted;
+  const canStartWithWrites = canStartOptimization && allWriteGranted;
   const benchmarkQuestions = (
     (space as { benchmarkQuestions?: string[] })?.benchmarkQuestions ?? []
   );
@@ -104,7 +130,7 @@ function SpaceDetail() {
     ["QUEUED", "IN_PROGRESS", "RUNNING"].includes((run.status || "").toUpperCase()),
   )?.runId;
 
-  function handleOptimize() {
+  function doStartOptimization() {
     triggerOpt.mutate(
       {
         params: {},
@@ -149,6 +175,15 @@ function SpaceDetail() {
     );
   }
 
+  function handleOptimize() {
+    if (applyMode === "both") {
+      setUcAcknowledged(false);
+      setUcConfirmOpen(true);
+    } else {
+      doStartOptimization();
+    }
+  }
+
   if (!space) return null;
 
   return (
@@ -179,16 +214,33 @@ function SpaceDetail() {
               size="sm"
               variant={applyMode === "both" ? "default" : "ghost"}
               onClick={() => setApplyMode("both")}
+              disabled={!canStartWithWrites && !canStartOptimization}
+              title={
+                !canStartWithWrites
+                  ? "Write (MODIFY) permissions required — grant them in Settings"
+                  : undefined
+              }
             >
-              Config + Deferred UC
+              Config + UC Write Backs
             </Button>
           </div>
           <div>
             <Button
               onClick={handleOptimize}
-              disabled={triggerOpt.isPending || hasActiveRun}
+              disabled={
+                triggerOpt.isPending ||
+                hasActiveRun ||
+                !canStartOptimization ||
+                (applyMode === "both" && !canStartWithWrites)
+              }
               className="bg-db-red hover:bg-db-red/90"
-              title={hasActiveRun ? "An optimization run is already in progress" : undefined}
+              title={
+                hasActiveRun
+                  ? "An optimization run is already in progress"
+                  : !canStartOptimization
+                    ? "Required permissions are missing"
+                    : undefined
+              }
             >
               <Rocket className="mr-2 h-4 w-4" />
               {triggerOpt.isPending
@@ -198,6 +250,28 @@ function SpaceDetail() {
                   : "Start Optimization"}
             </Button>
           </div>
+          {!canStartOptimization && (
+            <p className="text-xs text-amber-600">
+              Missing permissions.{" "}
+              <Link to="/settings" className="underline hover:text-amber-800">
+                Go to Settings
+              </Link>{" "}
+              to grant access.
+            </p>
+          )}
+          {canStartOptimization &&
+            !canStartWithWrites &&
+            applyMode === "both" && (
+              <p className="text-xs text-amber-600">
+                Write (MODIFY) access missing for some schemas.{" "}
+                <Link
+                  to="/settings"
+                  className="underline hover:text-amber-800"
+                >
+                  Grant in Settings
+                </Link>
+              </p>
+            )}
           {hasActiveRun && activeRunId && (
             <div>
               <Button
@@ -212,6 +286,62 @@ function SpaceDetail() {
           )}
         </div>
       </div>
+
+      <AlertDialog open={ucConfirmOpen} onOpenChange={setUcConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Confirm UC Writes</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3">
+                <p>
+                  This optimization will write changes directly to Unity Catalog
+                  assets, including column descriptions, table descriptions, and
+                  TVF definitions.
+                </p>
+                {space.tables && space.tables.length > 0 && (
+                  <div className="rounded border p-2 text-xs">
+                    <p className="mb-1 font-medium">Affected schemas:</p>
+                    <ul className="list-inside list-disc">
+                      {[
+                        ...new Set(
+                          space.tables.map(
+                            (t: { catalog?: string; schema?: string }) =>
+                              `${t.catalog ?? "?"}.${t.schema ?? "?"}`,
+                          ),
+                        ),
+                      ].map((s) => (
+                        <li key={String(s)}>{String(s)}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={ucAcknowledged}
+                    onChange={(e) => setUcAcknowledged(e.target.checked)}
+                    className="mt-0.5"
+                  />
+                  I understand these changes will modify Unity Catalog assets
+                  directly and cannot be automatically reverted.
+                </label>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={!ucAcknowledged}
+              onClick={() => {
+                setUcConfirmOpen(false);
+                doStartOptimization();
+              }}
+            >
+              Confirm &amp; Start
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <Tabs defaultValue="description" className="space-y-4">
         <TabsList className="h-auto w-full justify-start overflow-x-auto">

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
+
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -379,6 +379,7 @@ def list_spaces(
     ws: Dependencies.UserClient,
     sp_ws: Dependencies.Client,
     config: Dependencies.Config,
+    headers: Dependencies.Headers,
 ):
     """List Genie Spaces enriched with latest optimization metadata from Delta.
 
@@ -398,10 +399,11 @@ def list_spaces(
         logger.error("Genie list_spaces failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail=f"Could not fetch Genie spaces: {exc}") from exc
 
-    if client is ws:
-        spaces = [s for s in all_spaces if user_can_edit_space(ws, s["id"])]
-    else:
-        spaces = all_spaces
+    caller_email = headers.user_email or headers.user_name or ""
+    spaces = [
+        s for s in all_spaces
+        if user_can_edit_space(ws, s["id"], user_email=caller_email, acl_client=sp_ws)
+    ]
 
     score_by_space: dict[str, float] = {}
     try:
@@ -503,7 +505,11 @@ def get_space_detail(
             )
         )
 
-    joins_raw = ds.get("join_specs", []) if isinstance(ds, dict) else []
+    instr = ss.get("instructions", {}) if isinstance(ss, dict) else {}
+
+    joins_raw = (instr.get("join_specs", []) if isinstance(instr, dict) else []) or (
+        ds.get("join_specs", []) if isinstance(ds, dict) else []
+    )
     joins: list[JoinInfo] = []
     for join in joins_raw:
         if not isinstance(join, dict):
@@ -547,8 +553,6 @@ def get_space_detail(
                 joinColumns=join_columns,
             )
         )
-
-    instr = ss.get("instructions", {}) if isinstance(ss, dict) else {}
     text_instr = instr.get("text_instructions", []) if isinstance(instr, dict) else []
     instructions_str = ""
     if text_instr and isinstance(text_instr, list):
@@ -639,12 +643,16 @@ def get_space_detail(
         ):
             runs_df = load_runs_for_space(spark, space_id, config.catalog, config.schema_name)
         if not runs_df.empty:
+            baseline_scores = _load_baseline_scores(
+                spark, [r for r in runs_df["run_id"]], config.catalog, config.schema_name,
+            )
             for _, row in runs_df.iterrows():
+                run_id_val = row.get("run_id", "")
                 history.append(
                     RunSummary(
-                        runId=row.get("run_id", ""),
+                        runId=run_id_val,
                         status=row.get("status", ""),
-                        baselineScore=_safe_float(row.get("best_accuracy")),
+                        baselineScore=_safe_float(baseline_scores.get(run_id_val)),
                         optimizedScore=_safe_float(row.get("best_accuracy")),
                         timestamp=ensure_utc_iso(row.get("started_at")) or "",
                     )
@@ -693,6 +701,31 @@ def _check_sp_data_access(
 
     missing = sorted(needed - granted)
     return missing
+
+
+def _check_sp_write_access(
+    spark, catalog: str, schema_name: str, genie_refs: list, sp_ws: WorkspaceClient,
+) -> list[tuple[str, str]]:
+    """Return (catalog, schema) pairs where the SP lacks MODIFY (write) grant."""
+    from .settings import _load_grants
+
+    needed: set[tuple[str, str]] = set()
+    for ref in genie_refs:
+        cat = ref[0] if isinstance(ref, (list, tuple)) else ""
+        sch = ref[1] if isinstance(ref, (list, tuple)) and len(ref) > 1 else ""
+        if cat and sch:
+            needed.add((cat.lower(), sch.lower()))
+
+    if not needed:
+        return []
+
+    grants = _load_grants(spark, catalog, schema_name)
+    write_granted = {
+        (str(g.get("target_catalog", "")).lower(), str(g.get("target_schema", "")).lower())
+        for g in grants if g.get("grant_type") == "write"
+    }
+
+    return sorted(needed - write_granted)
 
 
 def do_start_optimization(
@@ -848,31 +881,51 @@ def do_start_optimization(
     except Exception:
         logger.warning("OBO UC metadata prefetch failed for run %s", run_id, exc_info=True)
 
+    from genie_space_optimizer.common.genie_client import sp_can_manage_space
+    from .settings import _get_sp_principal_aliases
+
+    sp_aliases = _get_sp_principal_aliases(sp_ws)
+    if not sp_can_manage_space(sp_ws, space_id, sp_aliases):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"The service principal does not have CAN_MANAGE on Genie Space {space_id}. "
+                "Please grant access from the Settings page before starting optimization."
+            ),
+        )
+
     try:
         if use_warehouse_fallback:
             missing = []
         else:
             missing = _check_sp_data_access(spark, config.catalog, config.schema_name, genie_refs, sp_ws)
         if missing:
-            sp_id = get_sp_principal(sp_ws)
-            lines = []
-            for cat, sch in missing:
-                lines.append(
-                    f"GRANT USE CATALOG ON CATALOG `{cat}` TO `{sp_id}`;\n"
-                    f"GRANT USE SCHEMA ON SCHEMA `{cat}`.`{sch}` TO `{sp_id}`;\n"
-                    f"GRANT SELECT ON SCHEMA `{cat}`.`{sch}` TO `{sp_id}`;\n"
-                    f"GRANT EXECUTE ON SCHEMA `{cat}`.`{sch}` TO `{sp_id}`;"
-                )
             schemas_str = ", ".join(f"`{c}`.`{s}`" for c, s in missing)
-            logger.warning(
-                "SP missing grants on %s for run %s — the job will rely on "
-                "prefetched OBO metadata or Spark fallback. To fix, run:\n%s",
-                schemas_str, run_id, "\n\n".join(lines),
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"The service principal is missing read access on: {schemas_str}. "
+                    "Please grant data access from the Settings page before starting optimization."
+                ),
             )
     except HTTPException:
         raise
     except Exception:
         logger.warning("SP data-access check failed for run %s", run_id, exc_info=True)
+
+    if requested_apply_mode in ("both", "uc_artifact"):
+        write_missing = _check_sp_write_access(
+            spark, config.catalog, config.schema_name, genie_refs, sp_ws,
+        )
+        if write_missing:
+            schemas_str = ", ".join(f"`{c}`.`{s}`" for c, s in write_missing)
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"UC write mode requires MODIFY on: {schemas_str}. "
+                    "Please grant write access from the Settings page."
+                ),
+            )
 
     current_user = headers.user_email or headers.user_name or ""
     if not current_user:
@@ -885,56 +938,10 @@ def do_start_optimization(
             ),
         )
 
-    # Pre-create MLflow experiment using OBO so the serverless job
-    # (running as SP) doesn't need to create it under the user's path.
-    experiment_name = prev_experiment
-    if not experiment_name:
-        from genie_space_optimizer.common.config import EXPERIMENT_PATH_TEMPLATE, format_mlflow_template
-        experiment_name = format_mlflow_template(
-            EXPERIMENT_PATH_TEMPLATE, user_email=current_user, domain=domain,
-        )
-    try:
-        import mlflow
-        obo_host = (ws.config.host or "").rstrip("/")
-        obo_token = ws.config.token
-        if obo_host and obo_token:
-            mlflow.set_tracking_uri("databricks")
-            os.environ["DATABRICKS_HOST"] = obo_host
-            os.environ["DATABRICKS_TOKEN"] = obo_token
-        try:
-            ws.workspace.mkdirs(str(__import__("pathlib").PurePosixPath(experiment_name).parent))
-        except Exception:
-            pass
-        mlflow.set_experiment(experiment_name)
-        logger.info("Pre-created MLflow experiment %s via OBO", experiment_name)
-
-        exp = mlflow.get_experiment_by_name(experiment_name)  # type: ignore[possibly-missing-attribute]
-        if exp:
-            sp_id = get_sp_principal(sp_ws)
-            try:
-                ws.api_client.do(
-                    "PUT",
-                    f"/api/2.0/permissions/experiments/{exp.experiment_id}",
-                    body={
-                        "access_control_list": [{
-                            "service_principal_name": sp_id,
-                            "all_permissions": [{"permission_level": "CAN_MANAGE"}],
-                        }]
-                    },
-                )
-                logger.info(
-                    "Granted SP %s CAN_MANAGE on experiment %s",
-                    sp_id, exp.experiment_id,
-                )
-            except Exception as perm_err:
-                logger.warning(
-                    "Failed to grant SP experiment permission: %s", perm_err,
-                )
-    except Exception as _mlflow_err:
-        logger.warning(
-            "OBO experiment pre-creation failed for %s: %s — job will create it",
-            experiment_name, _mlflow_err,
-        )
+    from genie_space_optimizer.common.config import EXPERIMENT_PATH_TEMPLATE, format_mlflow_template
+    experiment_name = prev_experiment or format_mlflow_template(
+        EXPERIMENT_PATH_TEMPLATE, space_id=space_id, domain=domain,
+    )
 
     if use_warehouse_fallback:
         _wh_create_run(
@@ -1036,6 +1043,32 @@ def _infer_domain(w, space_id: str) -> str:
         return re.sub(r"[^a-z0-9_]+", "_", raw).strip("_") or "default"
     except Exception:
         return "default"
+
+
+def _load_baseline_scores(
+    spark: Any, run_ids: list[str], catalog: str, schema: str,
+) -> dict[str, float | None]:
+    """Bulk-fetch baseline accuracy (iteration 0, full eval) for a list of runs."""
+    from genie_space_optimizer.common.config import TABLE_ITERATIONS
+    from genie_space_optimizer.common.delta_helpers import _fqn, run_query
+
+    if not run_ids:
+        return {}
+    fqn = _fqn(catalog, schema, TABLE_ITERATIONS)
+    ids_csv = ", ".join(f"'{rid}'" for rid in run_ids)
+    try:
+        df = run_query(
+            spark,
+            f"SELECT run_id, overall_accuracy FROM {fqn} "
+            f"WHERE run_id IN ({ids_csv}) AND iteration = 0 AND eval_scope = 'full'",
+        )
+    except Exception:
+        return {}
+    result: dict[str, float | None] = {}
+    if not df.empty:
+        for _, row in df.iterrows():
+            result[row.get("run_id", "")] = safe_float(row.get("overall_accuracy"))
+    return result
 
 
 _safe_float = safe_float

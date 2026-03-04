@@ -3,17 +3,29 @@
 from __future__ import annotations
 
 import copy
+import re
 
 import pytest
 
 from genie_space_optimizer.optimization.optimizer import (
+    _JOIN_FQN_RE,
+    _MIN_DESCRIPTION_LENGTH,
+    _SQL_FROM_TABLE_RE,
     _collect_blank_columns,
+    _collect_insufficient_tables,
+    _convert_fk_to_candidates,
     _detect_instruction_content_in_description,
+    _extract_equijoin_predicates,
+    _extract_proven_joins,
+    _filter_no_op_proposals,
     _format_enrichment_context,
-    _is_description_blank,
+    _format_table_enrichment_context,
+    _is_description_insufficient,
     _is_fuzzy_match,
     _map_to_lever,
+    _mine_benchmark_example_sqls,
     _resolve_lever5_llm_result,
+    _sanitize_join_sql,
     _types_compatible,
     _validate_lever5_proposals,
     cluster_failures,
@@ -21,6 +33,7 @@ from genie_space_optimizer.optimization.optimizer import (
     detect_regressions,
     discover_join_candidates,
     enrich_metadata_with_uc_types,
+    generate_proposals_from_strategy,
     validate_join_spec_types,
     validate_patch_set,
 )
@@ -756,30 +769,45 @@ class TestDetectInstructionContentInDescription:
 # ---------------------------------------------------------------------------
 
 
-class TestIsDescriptionBlank:
-    def test_none_is_blank(self):
-        assert _is_description_blank(None) is True
+class TestIsDescriptionInsufficient:
+    def test_none_is_insufficient(self):
+        assert _is_description_insufficient(None) is True
 
-    def test_empty_string_is_blank(self):
-        assert _is_description_blank("") is True
+    def test_empty_string_is_insufficient(self):
+        assert _is_description_insufficient("") is True
 
-    def test_empty_list_is_blank(self):
-        assert _is_description_blank([]) is True
+    def test_empty_list_is_insufficient(self):
+        assert _is_description_insufficient([]) is True
 
-    def test_list_with_empty_string_is_blank(self):
-        assert _is_description_blank([""]) is True
+    def test_list_with_empty_string_is_insufficient(self):
+        assert _is_description_insufficient([""]) is True
 
-    def test_list_with_whitespace_is_blank(self):
-        assert _is_description_blank(["  ", ""]) is True
+    def test_list_with_whitespace_is_insufficient(self):
+        assert _is_description_insufficient(["  ", ""]) is True
 
-    def test_nonempty_string_is_not_blank(self):
-        assert _is_description_blank("Primary key") is False
+    def test_long_string_is_sufficient(self):
+        assert _is_description_insufficient("Primary key for orders") is False
 
-    def test_nonempty_list_is_not_blank(self):
-        assert _is_description_blank(["Primary key"]) is False
+    def test_long_list_is_sufficient(self):
+        assert _is_description_insufficient(["Primary key"]) is False
 
-    def test_whitespace_only_string_is_blank(self):
-        assert _is_description_blank("   ") is True
+    def test_whitespace_only_string_is_insufficient(self):
+        assert _is_description_insufficient("   ") is True
+
+    def test_short_string_under_threshold_is_insufficient(self):
+        assert _is_description_insufficient("abc") is True
+
+    def test_string_at_threshold_is_sufficient(self):
+        assert _is_description_insufficient("a" * _MIN_DESCRIPTION_LENGTH) is False
+
+    def test_string_just_under_threshold_is_insufficient(self):
+        assert _is_description_insufficient("a" * (_MIN_DESCRIPTION_LENGTH - 1)) is True
+
+    def test_short_list_elements_combined_sufficient(self):
+        assert _is_description_insufficient(["hello", "world"]) is False
+
+    def test_short_list_elements_combined_insufficient(self):
+        assert _is_description_insufficient(["ab", "cd"]) is True
 
 
 class TestCollectBlankColumns:
@@ -853,8 +881,8 @@ class TestCollectBlankColumns:
                 "description": ["Order data"],
                 "column_configs": [
                     {"column_name": "order_id", "description": None, "data_type": "BIGINT"},
-                    {"column_name": "amount", "description": ["Order amount"], "data_type": "DOUBLE"},
-                    {"column_name": "status", "description": ["Status"], "data_type": "STRING"},
+                    {"column_name": "amount", "description": ["Order amount in USD"], "data_type": "DOUBLE"},
+                    {"column_name": "status", "description": ["Current fulfillment status"], "data_type": "STRING"},
                 ],
             }
         ])
@@ -884,7 +912,7 @@ class TestCollectBlankColumns:
                 "description": [],
                 "column_configs": [
                     {"column_name": "a", "description": None, "data_type": "INT"},
-                    {"column_name": "b", "description": ["desc"], "data_type": "INT"},
+                    {"column_name": "b", "description": ["A longer column description"], "data_type": "INT"},
                 ],
             },
             {
@@ -899,6 +927,35 @@ class TestCollectBlankColumns:
         assert len(result) == 2
         tables = {r["table"] for r in result}
         assert tables == {"cat.sch.t1", "cat.sch.t2"}
+
+    def test_short_description_under_threshold_is_insufficient(self):
+        """Descriptions shorter than _MIN_DESCRIPTION_LENGTH are treated as insufficient."""
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t1",
+                "description": [],
+                "column_configs": [
+                    {"column_name": "a", "description": ["col"], "data_type": "INT"},
+                ],
+            }
+        ])
+        result = _collect_blank_columns(snap)
+        assert len(result) == 1
+        assert result[0]["column"] == "a"
+
+    def test_short_uc_comment_does_not_exclude(self):
+        """UC comments shorter than threshold don't prevent enrichment."""
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t1",
+                "description": [],
+                "column_configs": [
+                    {"column_name": "a", "description": None, "data_type": "INT", "uc_comment": "col"},
+                ],
+            }
+        ])
+        result = _collect_blank_columns(snap)
+        assert len(result) == 1
 
 
 class TestFormatEnrichmentContext:
@@ -937,3 +994,733 @@ class TestFormatEnrichmentContext:
         assert len(sibling_line) == 1
         assert "col_b" in sibling_line[0]
         assert "col_a" not in sibling_line[0].split("Sibling columns")[1]
+
+
+# ---------------------------------------------------------------------------
+# Proactive Table Description Enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestCollectInsufficientTables:
+    def _make_snapshot(self, tables, metric_views=None):
+        ds = {"tables": tables}
+        if metric_views:
+            ds["metric_views"] = metric_views
+        return {"data_sources": ds}
+
+    def test_no_tables_need_enrichment(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.orders",
+                "description": "Transactional order data with one row per order",
+                "column_configs": [
+                    {"column_name": "order_id", "data_type": "BIGINT"},
+                ],
+            }
+        ])
+        assert _collect_insufficient_tables(snap) == []
+
+    def test_empty_description_is_insufficient(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.orders",
+                "description": "",
+                "column_configs": [
+                    {"column_name": "order_id", "data_type": "BIGINT"},
+                    {"column_name": "amount", "data_type": "DOUBLE"},
+                ],
+            }
+        ])
+        result = _collect_insufficient_tables(snap)
+        assert len(result) == 1
+        assert result[0]["table"] == "cat.sch.orders"
+        assert "order_id" in result[0]["column_names"]
+        assert "amount" in result[0]["column_names"]
+        assert result[0]["is_metric_view"] is False
+
+    def test_short_description_is_insufficient(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t1",
+                "description": "table1",
+                "column_configs": [
+                    {"column_name": "a", "data_type": "INT"},
+                ],
+            }
+        ])
+        result = _collect_insufficient_tables(snap)
+        assert len(result) == 1
+        assert result[0]["current_description"] == "table1"
+
+    def test_none_description_is_insufficient(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t1",
+                "description": None,
+                "column_configs": [],
+            }
+        ])
+        result = _collect_insufficient_tables(snap)
+        assert len(result) == 1
+
+    def test_list_description_below_threshold(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t1",
+                "description": ["ab", "cd"],
+                "column_configs": [],
+            }
+        ])
+        result = _collect_insufficient_tables(snap)
+        assert len(result) == 1
+
+    def test_list_description_above_threshold(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t1",
+                "description": ["A long enough description for the table"],
+                "column_configs": [],
+            }
+        ])
+        assert _collect_insufficient_tables(snap) == []
+
+    def test_metric_view_flagged(self):
+        snap = self._make_snapshot(
+            tables=[],
+            metric_views=[
+                {
+                    "identifier": "cat.sch.mv1",
+                    "description": "",
+                    "column_configs": [
+                        {"column_name": "metric_a", "data_type": "DOUBLE"},
+                    ],
+                }
+            ],
+        )
+        result = _collect_insufficient_tables(snap)
+        assert len(result) == 1
+        assert result[0]["is_metric_view"] is True
+
+    def test_column_types_populated(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.t1",
+                "description": "",
+                "column_configs": [
+                    {"column_name": "id", "data_type": "BIGINT"},
+                    {"column_name": "name", "data_type": "STRING"},
+                ],
+            }
+        ])
+        result = _collect_insufficient_tables(snap)
+        assert result[0]["column_types"] == {"id": "BIGINT", "name": "STRING"}
+
+    def test_mixed_sufficient_and_insufficient(self):
+        snap = self._make_snapshot([
+            {
+                "identifier": "cat.sch.good",
+                "description": "A table with a proper long description",
+                "column_configs": [],
+            },
+            {
+                "identifier": "cat.sch.bad",
+                "description": "short",
+                "column_configs": [],
+            },
+        ])
+        result = _collect_insufficient_tables(snap)
+        assert len(result) == 1
+        assert result[0]["table"] == "cat.sch.bad"
+
+
+class TestFormatTableEnrichmentContext:
+    def test_basic_formatting(self):
+        tables = [
+            {
+                "table": "cat.sch.orders",
+                "current_description": "",
+                "column_names": ["order_id", "amount", "status"],
+                "column_types": {"order_id": "BIGINT", "amount": "DOUBLE", "status": "STRING"},
+                "is_metric_view": False,
+            },
+        ]
+        ctx = _format_table_enrichment_context(tables)
+        assert "cat.sch.orders" in ctx
+        assert "order_id (BIGINT)" in ctx
+        assert "amount (DOUBLE)" in ctx
+        assert "(none)" in ctx
+
+    def test_existing_short_description_shown(self):
+        tables = [
+            {
+                "table": "cat.sch.t1",
+                "current_description": "short",
+                "column_names": ["a"],
+                "column_types": {"a": "INT"},
+                "is_metric_view": False,
+            },
+        ]
+        ctx = _format_table_enrichment_context(tables)
+        assert "(short)" in ctx
+
+    def test_metric_view_type_shown(self):
+        tables = [
+            {
+                "table": "cat.sch.mv1",
+                "current_description": "",
+                "column_names": [],
+                "column_types": {},
+                "is_metric_view": True,
+            },
+        ]
+        ctx = _format_table_enrichment_context(tables)
+        assert "Metric View" in ctx
+
+
+# ---------------------------------------------------------------------------
+# Regex Relaxation Tests
+# ---------------------------------------------------------------------------
+
+
+class TestJoinRegexRelaxation:
+    """Verify _JOIN_FQN_RE and _SQL_FROM_TABLE_RE match 2-part names."""
+
+    def test_from_three_part_unquoted(self):
+        sql = "SELECT * FROM catalog.schema.orders"
+        m = _SQL_FROM_TABLE_RE.search(sql)
+        assert m is not None
+        assert m.group(1) == "catalog.schema.orders"
+
+    def test_from_two_part_unquoted(self):
+        sql = "SELECT * FROM schema.orders"
+        m = _SQL_FROM_TABLE_RE.search(sql)
+        assert m is not None
+        assert m.group(1) == "schema.orders"
+
+    def test_from_three_part_backticked(self):
+        sql = "SELECT * FROM `catalog`.`schema`.`orders`"
+        m = _SQL_FROM_TABLE_RE.search(sql)
+        assert m is not None
+
+    def test_from_two_part_backticked(self):
+        sql = "SELECT * FROM `schema`.`orders`"
+        m = _SQL_FROM_TABLE_RE.search(sql)
+        assert m is not None
+
+    def test_join_three_part_with_on(self):
+        sql = (
+            "SELECT * FROM catalog.schema.fact_sales f "
+            "JOIN catalog.schema.dim_product p ON f.product_key = p.product_key"
+        )
+        matches = list(_JOIN_FQN_RE.finditer(sql))
+        assert len(matches) == 1
+        assert "dim_product" in matches[0].group(1)
+
+    def test_join_two_part_with_on(self):
+        sql = (
+            "SELECT * FROM schema.fact_sales f "
+            "JOIN schema.dim_product p ON f.product_key = p.product_key"
+        )
+        matches = list(_JOIN_FQN_RE.finditer(sql))
+        assert len(matches) == 1
+        assert "dim_product" in matches[0].group(1)
+
+    def test_join_captures_alias(self):
+        sql = "SELECT * FROM a.b.c JOIN a.b.d AS dim ON c.id = dim.id"
+        matches = list(_JOIN_FQN_RE.finditer(sql))
+        assert len(matches) == 1
+        assert matches[0].group(2) == "dim"
+
+    def test_join_without_alias(self):
+        sql = "SELECT * FROM a.b.c JOIN a.b.d ON c.id = d.id"
+        matches = list(_JOIN_FQN_RE.finditer(sql))
+        assert len(matches) == 1
+        assert matches[0].group(2) is None or matches[0].group(2) == ""
+
+
+# ---------------------------------------------------------------------------
+# Equijoin Extraction Tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractEquijoinPredicates:
+    def test_simple_equijoin(self):
+        result = _extract_equijoin_predicates("a.id = b.id")
+        assert result == "a.id = b.id"
+
+    def test_multiple_equijoins(self):
+        result = _extract_equijoin_predicates(
+            "a.id = b.id AND a.key = b.key"
+        )
+        assert "a.id = b.id" in result
+        assert "a.key = b.key" in result
+
+    def test_filters_non_equijoin_predicate(self):
+        sql = "fact.product_key = dim.product_key AND dim.is_current = true"
+        result = _extract_equijoin_predicates(sql)
+        assert "product_key" in result
+        assert "is_current" not in result
+
+    def test_backtick_equijoin(self):
+        result = _extract_equijoin_predicates("`a`.`id` = `b`.`id`")
+        assert "id" in result
+
+    def test_empty_returns_empty(self):
+        assert _extract_equijoin_predicates("") == ""
+
+    def test_no_equijoin_returns_empty(self):
+        assert _extract_equijoin_predicates("1 = 1") == ""
+
+    def test_sanitize_join_sql_strips_filter(self):
+        sql = "fact.key = dim.key AND dim.is_active = true"
+        result = _sanitize_join_sql(sql)
+        assert "key" in result
+        assert "is_active" not in result
+
+    def test_sanitize_join_sql_strips_prose(self):
+        sql = "fact.key = dim.key, MANY_TO_ONE. Use this join for lookups"
+        result = _sanitize_join_sql(sql)
+        assert "key" in result
+        assert "MANY_TO_ONE" not in result
+        assert "lookups" not in result
+
+
+# ---------------------------------------------------------------------------
+# Extract Proven Joins Tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractProvenJoins:
+    """Tests for _extract_proven_joins with expanded verdicts and regex."""
+
+    def _make_metadata(self, tables):
+        return {
+            "data_sources": {
+                "tables": [
+                    {"identifier": t, "column_configs": []}
+                    for t in tables
+                ],
+                "metric_views": [],
+            }
+        }
+
+    def test_both_correct_extracted(self):
+        snap = self._make_metadata(["cat.sch.orders", "cat.sch.customers"])
+        rows = [
+            {
+                "arbiter/value": "both_correct",
+                "inputs/question_id": "q1",
+                "request": {"expected_sql": "SELECT * FROM cat.sch.orders o JOIN cat.sch.customers c ON o.cust_id = c.id"},
+                "response": {"response": "SELECT * FROM cat.sch.orders o JOIN cat.sch.customers c ON o.cust_id = c.id"},
+            }
+        ]
+        result = _extract_proven_joins(rows, snap)
+        assert len(result) >= 1
+        tables = {(r["left_table"], r["right_table"]) for r in result}
+        flat = set()
+        for pair in tables:
+            flat.update(pair)
+        assert "cat.sch.orders" in flat
+        assert "cat.sch.customers" in flat
+
+    def test_ground_truth_correct_extracted(self):
+        snap = self._make_metadata(["cat.sch.orders", "cat.sch.products"])
+        rows = [
+            {
+                "arbiter/value": "ground_truth_correct",
+                "inputs/question_id": "q2",
+                "request": {"expected_sql": "SELECT * FROM cat.sch.orders o JOIN cat.sch.products p ON o.prod_id = p.id"},
+                "response": {"response": ""},
+            }
+        ]
+        result = _extract_proven_joins(rows, snap)
+        assert len(result) >= 1
+
+    def test_negative_verdict_skipped(self):
+        snap = self._make_metadata(["cat.sch.orders", "cat.sch.products"])
+        rows = [
+            {
+                "arbiter/value": "both_wrong",
+                "inputs/question_id": "q3",
+                "request": {"expected_sql": "SELECT * FROM cat.sch.orders o JOIN cat.sch.products p ON o.id = p.id"},
+                "response": {"response": ""},
+            }
+        ]
+        result = _extract_proven_joins(rows, snap)
+        assert len(result) == 0
+
+    def test_two_part_names_resolved(self):
+        snap = self._make_metadata(["cat.sch.orders", "cat.sch.items"])
+        rows = [
+            {
+                "arbiter/value": "genie_correct",
+                "inputs/question_id": "q4",
+                "request": {"expected_sql": "SELECT * FROM sch.orders o JOIN sch.items i ON o.id = i.order_id"},
+                "response": {"response": ""},
+            }
+        ]
+        result = _extract_proven_joins(rows, snap)
+        assert len(result) >= 1
+
+
+# ---------------------------------------------------------------------------
+# FK Candidate Conversion Tests
+# ---------------------------------------------------------------------------
+
+
+class TestConvertFkToCandidates:
+    def test_basic_conversion(self):
+        fk_rows = [
+            {
+                "child_table": "cat.sch.orders",
+                "child_columns": ["customer_id"],
+                "parent_table": "cat.sch.customers",
+                "parent_columns": ["id"],
+                "constraint_name": "fk_orders_customer",
+            }
+        ]
+        result = _convert_fk_to_candidates(fk_rows)
+        assert len(result) == 1
+        c = result[0]
+        assert c["fk_constraint"] is True
+        assert "customer_id" in c["on_condition"]
+        assert c["frequency"] == 0
+
+    def test_deduplicates_same_pair(self):
+        fk_rows = [
+            {
+                "child_table": "cat.sch.a",
+                "child_columns": ["id"],
+                "parent_table": "cat.sch.b",
+                "parent_columns": ["id"],
+                "constraint_name": "fk1",
+            },
+            {
+                "child_table": "cat.sch.b",
+                "child_columns": ["id"],
+                "parent_table": "cat.sch.a",
+                "parent_columns": ["id"],
+                "constraint_name": "fk2",
+            },
+        ]
+        result = _convert_fk_to_candidates(fk_rows)
+        assert len(result) == 1
+
+    def test_skips_incomplete_rows(self):
+        fk_rows = [
+            {"child_table": "cat.sch.a", "child_columns": [], "parent_table": "cat.sch.b", "parent_columns": ["id"]},
+        ]
+        result = _convert_fk_to_candidates(fk_rows)
+        assert len(result) == 0
+
+    def test_composite_key(self):
+        fk_rows = [
+            {
+                "child_table": "cat.sch.line_items",
+                "child_columns": ["order_id", "product_id"],
+                "parent_table": "cat.sch.order_products",
+                "parent_columns": ["order_id", "product_id"],
+                "constraint_name": "fk_composite",
+            }
+        ]
+        result = _convert_fk_to_candidates(fk_rows)
+        assert len(result) == 1
+        assert "AND" in result[0]["on_condition"]
+
+
+# ---------------------------------------------------------------------------
+# Multi-catalog Ambiguity Tests
+# ---------------------------------------------------------------------------
+
+
+class TestMultiCatalogAmbiguity:
+    """Verify short-name collisions across catalogs don't produce wrong joins."""
+
+    def test_ambiguous_short_name_skipped(self):
+        snap = {
+            "data_sources": {
+                "tables": [
+                    {"identifier": "cat1.sch.orders", "column_configs": []},
+                    {"identifier": "cat2.sch.orders", "column_configs": []},
+                    {"identifier": "cat1.sch.customers", "column_configs": []},
+                ],
+                "metric_views": [],
+            }
+        }
+        rows = [
+            {
+                "arbiter/value": "both_correct",
+                "inputs/question_id": "q1",
+                "request": {"expected_sql": "SELECT * FROM sch.orders o JOIN sch.customers c ON o.id = c.id"},
+                "response": {"response": ""},
+            }
+        ]
+        result = _extract_proven_joins(rows, snap)
+        for cand in result:
+            assert cand["left_table"] != cand["right_table"]
+
+    def test_fqn_resolves_despite_ambiguous_short(self):
+        snap = {
+            "data_sources": {
+                "tables": [
+                    {"identifier": "cat1.sch.orders", "column_configs": []},
+                    {"identifier": "cat2.sch.orders", "column_configs": []},
+                    {"identifier": "cat1.sch.customers", "column_configs": []},
+                ],
+                "metric_views": [],
+            }
+        }
+        rows = [
+            {
+                "arbiter/value": "both_correct",
+                "inputs/question_id": "q1",
+                "request": {"expected_sql": "SELECT * FROM cat1.sch.orders o JOIN cat1.sch.customers c ON o.id = c.id"},
+                "response": {"response": ""},
+            }
+        ]
+        result = _extract_proven_joins(rows, snap)
+        assert len(result) >= 1
+        flat_tables = set()
+        for cand in result:
+            flat_tables.add(cand["left_table"])
+            flat_tables.add(cand["right_table"])
+        assert "cat1.sch.orders" in flat_tables
+        assert "cat1.sch.customers" in flat_tables
+
+
+# ── Example SQL Array Parsing ──────────────────────────────────────────
+
+
+class TestExampleSqlArrayParsing:
+    """Test that generate_proposals_from_strategy handles both array and legacy formats."""
+
+    _METADATA = {
+        "tables": [{"name": "cat.sch.orders", "columns": []}],
+        "functions": [],
+        "metric_views": [],
+        "config": {},
+    }
+
+    _STRATEGY_BASE = {
+        "global_instruction_rewrite": "",
+        "action_groups": [{"id": "AG1", "root_cause_summary": "test", "source_cluster_ids": ["C1"]}],
+    }
+
+    def _make_ag(self, lever5_dir):
+        return {
+            "id": "AG1",
+            "root_cause_summary": "test routing",
+            "source_cluster_ids": ["C1"],
+            "affected_questions": ["q1"],
+            "lever_directives": {"5": lever5_dir},
+            "coordination_notes": "",
+        }
+
+    def test_legacy_single_example_sql(self):
+        ag = self._make_ag({
+            "instruction_guidance": "",
+            "example_sql": {
+                "question": "How many orders?",
+                "sql_sketch": "SELECT COUNT(*) FROM cat.sch.orders",
+            },
+        })
+        proposals = generate_proposals_from_strategy(
+            strategy=self._STRATEGY_BASE,
+            action_group=ag,
+            metadata_snapshot=self._METADATA,
+            target_lever=5,
+        )
+        ex_proposals = [p for p in proposals if p.get("patch_type") == "add_example_sql"]
+        assert len(ex_proposals) == 1
+        assert ex_proposals[0]["example_question"] == "How many orders?"
+
+    def test_new_array_example_sqls(self):
+        ag = self._make_ag({
+            "instruction_guidance": "",
+            "example_sqls": [
+                {"question": "Q1?", "sql_sketch": "SELECT 1"},
+                {"question": "Q2?", "sql_sketch": "SELECT 2"},
+                {"question": "Q3?", "sql_sketch": "SELECT 3"},
+            ],
+        })
+        proposals = generate_proposals_from_strategy(
+            strategy=self._STRATEGY_BASE,
+            action_group=ag,
+            metadata_snapshot=self._METADATA,
+            target_lever=5,
+        )
+        ex_proposals = [p for p in proposals if p.get("patch_type") == "add_example_sql"]
+        assert len(ex_proposals) == 3
+        questions = {p["example_question"] for p in ex_proposals}
+        assert questions == {"Q1?", "Q2?", "Q3?"}
+
+    def test_array_overrides_legacy(self):
+        ag = self._make_ag({
+            "instruction_guidance": "",
+            "example_sql": {"question": "Legacy?", "sql_sketch": "SELECT 0"},
+            "example_sqls": [
+                {"question": "Array1?", "sql_sketch": "SELECT 1"},
+            ],
+        })
+        proposals = generate_proposals_from_strategy(
+            strategy=self._STRATEGY_BASE,
+            action_group=ag,
+            metadata_snapshot=self._METADATA,
+            target_lever=5,
+        )
+        ex_proposals = [p for p in proposals if p.get("patch_type") == "add_example_sql"]
+        assert len(ex_proposals) == 1
+        assert ex_proposals[0]["example_question"] == "Array1?"
+
+    def test_example_sql_from_non_lever5_array(self):
+        ag = {
+            "id": "AG1",
+            "root_cause_summary": "test",
+            "source_cluster_ids": ["C1"],
+            "affected_questions": ["q1"],
+            "lever_directives": {
+                "1": {
+                    "tables": [],
+                    "columns": [],
+                    "example_sqls": [
+                        {"question": "Cross-lever Q?", "sql_sketch": "SELECT 1"},
+                    ],
+                },
+            },
+            "coordination_notes": "",
+        }
+        proposals = generate_proposals_from_strategy(
+            strategy=self._STRATEGY_BASE,
+            action_group=ag,
+            metadata_snapshot=self._METADATA,
+            target_lever=1,
+        )
+        ex_proposals = [p for p in proposals if p.get("patch_type") == "add_example_sql"]
+        assert len(ex_proposals) == 1
+        assert ex_proposals[0]["example_question"] == "Cross-lever Q?"
+
+
+# ── Example SQL Dedup Against Existing Config ──────────────────────────
+
+
+class TestExampleSqlDedup:
+    """Test that _validate_lever5_proposals rejects duplicates against existing config."""
+
+    _METADATA = {
+        "tables": [{"name": "cat.sch.orders", "columns": []}],
+        "functions": [],
+        "metric_views": [],
+        "config": {
+            "example_question_sqls": [
+                {"question": ["How many orders are there?"], "sql": "SELECT COUNT(*) FROM orders"},
+            ],
+        },
+    }
+
+    def test_rejects_duplicate_of_existing(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "How many orders are there?",
+                "example_sql": "SELECT COUNT(*) FROM cat.sch.orders",
+                "parameters": [],
+            },
+        ]
+        result = _validate_lever5_proposals(proposals, self._METADATA)
+        assert len(result) == 0
+
+    def test_accepts_novel_question(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "What is the average order value?",
+                "example_sql": "SELECT AVG(amount) FROM cat.sch.orders",
+                "parameters": [],
+            },
+        ]
+        result = _validate_lever5_proposals(proposals, self._METADATA)
+        assert len(result) == 1
+
+    def test_dedup_within_batch(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "Unique question?",
+                "example_sql": "SELECT 1",
+                "parameters": [],
+            },
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "Unique question?",
+                "example_sql": "SELECT 2",
+                "parameters": [],
+            },
+        ]
+        result = _validate_lever5_proposals(proposals, self._METADATA)
+        ex_results = [p for p in result if p.get("patch_type") == "add_example_sql"]
+        assert len(ex_results) == 1
+
+    def test_filter_no_op_rejects_existing(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "How many orders are there?",
+                "example_sql": "SELECT COUNT(*) FROM cat.sch.orders",
+            },
+        ]
+        result = _filter_no_op_proposals(proposals, self._METADATA)
+        assert len(result) == 0
+
+
+# ── Benchmark Mining ───────────────────────────────────────────────────
+
+
+class TestMineBenchmarkExampleSqls:
+    """Test _mine_benchmark_example_sqls helper."""
+
+    _METADATA = {
+        "tables": [{"name": "cat.sch.orders", "columns": []}],
+        "functions": [],
+        "metric_views": [],
+        "config": {
+            "example_question_sqls": [
+                {"question": ["Existing question?"], "sql": "SELECT 1"},
+            ],
+        },
+    }
+
+    def test_produces_proposals_from_benchmarks(self):
+        benchmarks = [
+            {"question": "How many orders?", "expected_sql": "SELECT COUNT(*) FROM cat.sch.orders"},
+            {"question": "Total revenue?", "expected_sql": "SELECT SUM(amount) FROM cat.sch.orders"},
+        ]
+        result = _mine_benchmark_example_sqls(benchmarks, self._METADATA)
+        assert len(result) == 2
+        for p in result:
+            assert p["patch_type"] == "add_example_sql"
+            assert p["example_question"]
+            assert p["example_sql"]
+            assert p["confidence"] == 0.95
+
+    def test_skips_benchmarks_without_sql(self):
+        benchmarks = [
+            {"question": "No SQL here", "expected_sql": ""},
+            {"question": "Also missing"},
+        ]
+        result = _mine_benchmark_example_sqls(benchmarks, self._METADATA)
+        assert len(result) == 0
+
+    def test_skips_duplicate_of_existing(self):
+        benchmarks = [
+            {"question": "Existing question?", "expected_sql": "SELECT 1"},
+        ]
+        result = _mine_benchmark_example_sqls(benchmarks, self._METADATA)
+        assert len(result) == 0
+
+    def test_dedup_within_benchmarks(self):
+        benchmarks = [
+            {"question": "Same question?", "expected_sql": "SELECT 1"},
+            {"question": "Same question?", "expected_sql": "SELECT 2"},
+        ]
+        result = _mine_benchmark_example_sqls(benchmarks, self._METADATA)
+        assert len(result) == 1

@@ -40,6 +40,7 @@ from genie_space_optimizer.common.config import (
     INLINE_EVAL_DELAY,
     LEVER_NAMES,
     MAX_ITERATIONS,
+    MAX_NOISE_FLOOR,
     PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS,
     PROPAGATION_WAIT_SECONDS,
     REGRESSION_THRESHOLD,
@@ -71,7 +72,9 @@ from genie_space_optimizer.optimization.models import (
 )
 from genie_space_optimizer.optimization.optimizer import (
     _enrich_blank_descriptions,
+    _enrich_table_descriptions,
     _generate_holistic_strategy,
+    _mine_benchmark_example_sqls,
     cluster_failures,
     detect_regressions,
     enrich_metadata_with_uc_types,
@@ -125,6 +128,67 @@ def _kv(key: str, value: object, indent: int = 2) -> str:
 
 def _bar(char: str = "-") -> str:
     return char * _W
+
+
+_PATCH_TYPE_LABELS: dict[str, str] = {
+    "add_instruction": "Add Instruction",
+    "update_instruction": "Update Instruction",
+    "remove_instruction": "Remove Instruction",
+    "rewrite_instruction": "Rewrite Instruction",
+    "add_example_sql": "Add Example SQL",
+    "update_example_sql": "Update Example SQL",
+    "remove_example_sql": "Remove Example SQL",
+    "add_description": "Add Table Description",
+    "update_description": "Update Table Description",
+    "add_column_description": "Add Column Description",
+    "update_column_description": "Update Column Description",
+    "add_column_synonym": "Add Column Synonym",
+    "add_join_spec": "Add Join Spec",
+    "update_join_spec": "Update Join Spec",
+    "remove_join_spec": "Remove Join Spec",
+    "update_tvf_sql": "Update TVF SQL",
+}
+
+
+def _fmt_patch(idx: int, patch: dict, action: dict) -> str:
+    """Format a single applied patch into a readable multi-line string."""
+    ptype = patch.get("type", action.get("action_type", "?"))
+    label = _PATCH_TYPE_LABELS.get(ptype, ptype)
+    table = patch.get("table") or patch.get("target") or ""
+    column = patch.get("column", "")
+    target = f"{table}.{column}" if column else table
+    short_target = target.rsplit(".", 1)[-1] if "." in target else target
+
+    lines = [f"|  [{idx}] {label}"]
+    if target:
+        lines.append(f"|      Target: {target}")
+
+    struct = patch.get("structured_sections") or {}
+    if struct and isinstance(struct, dict):
+        for sk, sv in struct.items():
+            sv_flat = str(sv).replace("\n", " ")[:100]
+            lines.append(f"|      {sk}: {sv_flat}")
+    else:
+        new_text = patch.get("new_text", "")
+        if new_text:
+            lines.append(f"|      Value: {new_text.replace(chr(10), ' ')[:120]}")
+
+    eq = patch.get("example_question", "")
+    esql = patch.get("example_sql", "")
+    if eq:
+        lines.append(f"|      Question: {eq[:100]}")
+    if esql:
+        lines.append(f"|      SQL: {esql[:100]}")
+
+    js = patch.get("join_spec")
+    if js and isinstance(js, dict):
+        left = js.get("left", {}).get("identifier", "?")
+        right = js.get("right", {}).get("identifier", "?")
+        sql_cond = (js.get("sql") or ["?"])[0][:80]
+        lines.append(f"|      Join: {left} <-> {right}")
+        lines.append(f"|        ON {sql_cond}")
+
+    return "\n".join(lines)
 
 
 def _scorecard(scores: dict[str, float], prefix: str = "|  ") -> str:
@@ -409,16 +473,15 @@ def _run_prompt_matching_setup(
             refreshed = fetch_space_config(w, space_id)
             config["_parsed_space"] = refreshed.get("_parsed_space", refreshed)
 
-        print(
-            f"\n-- PROMPT MATCHING APPLIED " + "-" * 26 + "\n"
-            f"  Total changes: {len(applied)}\n"
-            f"    Format assistance (enable_format_assistance): {fa_count} columns\n"
-            f"    Entity matching (enable_entity_matching): {em_count} columns\n"
-            f"  Tables patched: {apply_log.get('patched_objects', [])}\n"
-            f"  Genie Space API PATCH sent: {'YES' if applied else 'NO'}\n"
-            f"  Config refreshed: {'YES' if applied else 'N/A'}\n"
-            + "-" * 52
-        )
+        _pm_lines = [_section("PROMPT MATCHING", "-")]
+        _pm_lines.append(_kv("Total changes", len(applied)))
+        _pm_lines.append(_kv("Format assistance", f"{fa_count} columns"))
+        _pm_lines.append(_kv("Entity matching", f"{em_count} columns"))
+        _pm_lines.append(_kv("Tables patched", apply_log.get('patched_objects', [])))
+        _pm_lines.append(_kv("Genie API PATCH sent", "YES" if applied else "NO"))
+        _pm_lines.append(_kv("Config refreshed", "YES" if applied else "N/A"))
+        _pm_lines.append(_bar("-"))
+        print("\n".join(_pm_lines))
 
         write_stage(
             spark, run_id, "PROMPT_MATCHING_SETUP", "COMPLETE",
@@ -463,14 +526,14 @@ def _run_description_enrichment(
     catalog: str,
     schema: str,
 ) -> dict:
-    """Stage 2.75: Generate structured descriptions for blank columns.
+    """Stage 2.75: Generate structured descriptions for columns and tables.
 
-    Runs after UC type enrichment and before the strategist.  Targets only
-    columns that have NO description in both the Genie Space and Unity Catalog.
+    Runs after UC type enrichment and before the strategist.  Targets
+    columns and tables whose descriptions are insufficient (< 10 chars)
+    in both the Genie Space and Unity Catalog.
     Applies patches via update_sections with lever=0 (pre-optimization).
 
-    Returns summary dict with ``total_eligible``, ``total_enriched``, and
-    ``total_skipped``.
+    Returns summary dict with column and table enrichment counts.
     """
     from genie_space_optimizer.common.genie_client import (
         fetch_space_config,
@@ -486,25 +549,15 @@ def _run_description_enrichment(
         task_key="description_enrichment", catalog=catalog, schema=schema,
     )
 
-    result = {"total_eligible": 0, "total_enriched": 0, "total_skipped": 0}
+    result = {
+        "total_eligible": 0, "total_enriched": 0, "total_skipped": 0,
+        "tables_eligible": 0, "tables_enriched": 0, "tables_skipped": 0,
+    }
 
     try:
-        patches = _enrich_blank_descriptions(metadata_snapshot, w)
-        result["total_eligible"] = len(patches)
-
-        if not patches:
-            print(
-                f"\n-- DESCRIPTION ENRICHMENT " + "-" * 27 + "\n"
-                f"  Eligible columns: 0\n"
-                f"  No columns need proactive descriptions.\n"
-                + "-" * 52
-            )
-            write_stage(
-                spark, run_id, "DESCRIPTION_ENRICHMENT", "COMPLETE",
-                task_key="description_enrichment",
-                detail=result, catalog=catalog, schema=schema,
-            )
-            return result
+        # ── Column description enrichment ────────────────────────────
+        col_patches = _enrich_blank_descriptions(metadata_snapshot, w)
+        result["total_eligible"] = len(col_patches)
 
         ds = metadata_snapshot.get("data_sources", {})
         if not isinstance(ds, dict):
@@ -518,10 +571,11 @@ def _run_description_enrichment(
                 ident = tbl.get("identifier", "") or tbl.get("name", "")
                 tbl_lookup[ident] = tbl
 
-        enriched = 0
-        skipped = 0
+        col_enriched = 0
+        col_skipped = 0
+        col_enriched_items: list[dict] = []
 
-        for patch in patches:
+        for patch in col_patches:
             tbl_id = patch["table"]
             col_name = patch["column"]
             sections = patch.get("structured_sections", {})
@@ -530,7 +584,7 @@ def _run_description_enrichment(
             tbl = tbl_lookup.get(tbl_id)
             if not tbl:
                 logger.warning("Description enrichment: table %s not found — skipping", tbl_id)
-                skipped += 1
+                col_skipped += 1
                 continue
 
             cols = tbl.get("column_configs", tbl.get("columns", []))
@@ -544,7 +598,7 @@ def _run_description_enrichment(
                 logger.warning(
                     "Description enrichment: column %s.%s not found — skipping", tbl_id, col_name,
                 )
-                skipped += 1
+                col_skipped += 1
                 continue
 
             if not etype:
@@ -559,24 +613,67 @@ def _run_description_enrichment(
                     entity_type=etype,
                 )
                 cc["description"] = new_desc
-                enriched += 1
+                col_enriched += 1
+                col_enriched_items.append(patch)
             except Exception:
                 logger.warning(
                     "Description enrichment: failed to apply sections for %s.%s",
                     tbl_id, col_name, exc_info=True,
                 )
-                skipped += 1
+                col_skipped += 1
 
-        result["total_enriched"] = enriched
-        result["total_skipped"] = skipped
+        result["total_enriched"] = col_enriched
+        result["total_skipped"] = col_skipped
 
-        if enriched > 0:
+        # ── Table description enrichment ─────────────────────────────
+        tbl_patches = _enrich_table_descriptions(metadata_snapshot, w)
+        result["tables_eligible"] = len(tbl_patches)
+
+        tbl_enriched = 0
+        tbl_skipped = 0
+        tbl_enriched_items: list[dict] = []
+
+        for patch in tbl_patches:
+            tbl_id = patch["table"]
+            sections = patch.get("structured_sections", {})
+            entity_type = patch.get("table_entity_type", "table")
+
+            tbl = tbl_lookup.get(tbl_id)
+            if not tbl:
+                logger.warning("Table description enrichment: table %s not found — skipping", tbl_id)
+                tbl_skipped += 1
+                continue
+
+            try:
+                new_desc = update_sections(
+                    tbl.get("description"),
+                    sections,
+                    lever=0,
+                    entity_type=entity_type,
+                )
+                tbl["description"] = new_desc
+                tbl_enriched += 1
+                tbl_enriched_items.append(patch)
+            except Exception:
+                logger.warning(
+                    "Table description enrichment: failed to apply sections for %s",
+                    tbl_id, exc_info=True,
+                )
+                tbl_skipped += 1
+
+        result["tables_enriched"] = tbl_enriched
+        result["tables_skipped"] = tbl_skipped
+
+        # ── PATCH the Genie Space if anything changed ────────────────
+        anything_enriched = col_enriched > 0 or tbl_enriched > 0
+        if anything_enriched:
             parsed = config.get("_parsed_space", config)
             patch_space_config(w, space_id, parsed)
 
-            for idx, patch in enumerate(patches[:enriched]):
+            patch_idx = 0
+            for patch in col_enriched_items:
                 write_patch(
-                    spark, run_id, 0, 0, idx,
+                    spark, run_id, 0, 0, patch_idx,
                     {
                         "patch_type": "proactive_description_enrichment",
                         "scope": "genie_config",
@@ -589,15 +686,54 @@ def _run_description_enrichment(
                     },
                     catalog, schema,
                 )
+                patch_idx += 1
+            for patch in tbl_enriched_items:
+                write_patch(
+                    spark, run_id, 0, 0, patch_idx,
+                    {
+                        "patch_type": "proactive_table_description_enrichment",
+                        "scope": "genie_config",
+                        "risk_level": "low",
+                        "target_object": patch["table"],
+                        "patch": patch,
+                        "command": None,
+                        "rollback": None,
+                        "proposal_id": "table_description_enrichment",
+                    },
+                    catalog, schema,
+                )
+                patch_idx += 1
 
-        print(
-            f"\n-- DESCRIPTION ENRICHMENT " + "-" * 27 + "\n"
-            f"  Eligible columns: {len(patches)}\n"
-            f"  Enriched: {enriched}\n"
-            f"  Skipped: {skipped}\n"
-            f"  Genie Space API PATCH sent: {'YES' if enriched > 0 else 'NO'}\n"
-            + "-" * 52
-        )
+        # ── Logging ──────────────────────────────────────────────────
+        _de_lines = [_section("DESCRIPTION ENRICHMENT", "-")]
+        _de_lines.append(_kv("Eligible columns", len(col_patches)))
+        _de_lines.append(_kv("Columns enriched", col_enriched))
+        _de_lines.append(_kv("Columns skipped", col_skipped))
+        if col_enriched_items:
+            _de_lines.append("|")
+            for ei, ep in enumerate(col_enriched_items, 1):
+                _tbl_short = ep["table"].rsplit(".", 1)[-1]
+                _col = ep["column"]
+                _sects = ep.get("structured_sections", {})
+                _defn = _sects.get("definition", "")[:80]
+                _de_lines.append(f"|  [{ei}] {_tbl_short}.{_col}")
+                if _defn:
+                    _de_lines.append(f"|      definition: {_defn}")
+        _de_lines.append(_kv("Eligible tables", len(tbl_patches)))
+        _de_lines.append(_kv("Tables enriched", tbl_enriched))
+        _de_lines.append(_kv("Tables skipped", tbl_skipped))
+        if tbl_enriched_items:
+            _de_lines.append("|")
+            for ei, ep in enumerate(tbl_enriched_items, 1):
+                _tbl_short = ep["table"].rsplit(".", 1)[-1]
+                _sects = ep.get("structured_sections", {})
+                _purpose = _sects.get("purpose", "")[:80]
+                _de_lines.append(f"|  [{ei}] {_tbl_short}")
+                if _purpose:
+                    _de_lines.append(f"|      purpose: {_purpose}")
+        _de_lines.append(_kv("Genie API PATCH sent", "YES" if anything_enriched else "NO"))
+        _de_lines.append(_bar("-"))
+        print("\n".join(_de_lines))
 
         write_stage(
             spark, run_id, "DESCRIPTION_ENRICHMENT", "COMPLETE",
@@ -724,7 +860,8 @@ def _run_proactive_join_discovery(
             lt = left_obj.get("identifier", "") if isinstance(left_obj, dict) else ""
             rt = right_obj.get("identifier", "") if isinstance(right_obj, dict) else ""
             if lt and rt:
-                existing_pairs.add(tuple(sorted((lt, rt))))
+                _a, _b = sorted((lt, rt))
+                existing_pairs.add((_a, _b))
 
         # 3a. Tier 0: FK constraint candidates (authoritative)
         fk_rows = config.get("_uc_foreign_keys") or []
@@ -781,17 +918,16 @@ def _run_proactive_join_discovery(
 
         # 7. Gate: nothing to apply
         if not new_specs:
-            print(
-                f"\n-- JOIN DISCOVERY " + "-" * 34 + "\n"
-                f"  Existing join specs: {result['existing_specs']}\n"
-                f"  FK constraint candidates: {result['fk_candidates']}\n"
-                f"  Execution-proven candidates: {result['execution_candidates']}\n"
-                f"  Merged candidates: {result['candidates_found']}\n"
-                f"  Already defined: {result['already_defined']}\n"
-                f"  Type-incompatible: {result['type_incompatible']}\n"
-                f"  New joins to apply: 0\n"
-                + "-" * 52
-            )
+            _jd_lines = [_section("JOIN DISCOVERY", "-")]
+            _jd_lines.append(_kv("Existing join specs", result['existing_specs']))
+            _jd_lines.append(_kv("FK constraint candidates", result['fk_candidates']))
+            _jd_lines.append(_kv("Execution-proven candidates", result['execution_candidates']))
+            _jd_lines.append(_kv("Merged candidates", result['candidates_found']))
+            _jd_lines.append(_kv("Already defined", result['already_defined']))
+            _jd_lines.append(_kv("Type-incompatible", result['type_incompatible']))
+            _jd_lines.append(_kv("New joins to apply", 0))
+            _jd_lines.append(_bar("-"))
+            print("\n".join(_jd_lines))
             write_stage(
                 spark, run_id, "JOIN_DISCOVERY", "COMPLETE",
                 task_key="join_discovery", detail=result,
@@ -842,19 +978,20 @@ def _run_proactive_join_discovery(
             )
 
         # 11. Summary
-        print(
-            f"\n-- JOIN DISCOVERY " + "-" * 34 + "\n"
-            f"  Existing join specs: {result['existing_specs']}\n"
-            f"  FK constraint candidates: {result['fk_candidates']}\n"
-            f"  Execution-proven candidates: {result['execution_candidates']}\n"
-            f"  Merged candidates: {result['candidates_found']}\n"
-            f"  Already defined: {result['already_defined']}\n"
-            f"  Type-incompatible: {result['type_incompatible']}\n"
-            f"  New joins applied: {result['total_applied']}\n"
-            + "\n".join(applied_lines) + "\n"
-            f"  Genie Space API PATCH sent: YES\n"
-            + "-" * 52
-        )
+        _jd_lines = [_section("JOIN DISCOVERY", "-")]
+        _jd_lines.append(_kv("Existing join specs", result['existing_specs']))
+        _jd_lines.append(_kv("FK constraint candidates", result['fk_candidates']))
+        _jd_lines.append(_kv("Execution-proven candidates", result['execution_candidates']))
+        _jd_lines.append(_kv("Merged candidates", result['candidates_found']))
+        _jd_lines.append(_kv("Already defined", result['already_defined']))
+        _jd_lines.append(_kv("Type-incompatible", result['type_incompatible']))
+        _jd_lines.append(_kv("New joins applied", result['total_applied']))
+        if applied_lines:
+            _jd_lines.append("|")
+            _jd_lines.extend(f"|  {al.strip()}" for al in applied_lines)
+        _jd_lines.append(_kv("Genie API PATCH sent", "YES"))
+        _jd_lines.append(_bar("-"))
+        print("\n".join(_jd_lines))
 
         write_stage(
             spark, run_id, "JOIN_DISCOVERY", "COMPLETE",
@@ -902,7 +1039,9 @@ def _run_space_metadata_enrichment(
         _generate_space_description,
     )
 
-    needs_description = not (config.get("description") or "").strip()
+    from genie_space_optimizer.optimization.optimizer import _MIN_DESCRIPTION_LENGTH
+    _desc_text = (config.get("description") or "").strip()
+    needs_description = len(_desc_text) < _MIN_DESCRIPTION_LENGTH
     parsed = config.get("_parsed_space", config)
     existing_sqs = (parsed.get("config") or {}).get("sample_questions")
     needs_questions = not existing_sqs
@@ -914,13 +1053,12 @@ def _run_space_metadata_enrichment(
     }
 
     if not needs_description and not needs_questions:
-        print(
-            f"\n-- SPACE METADATA ENRICHMENT " + "-" * 24 + "\n"
-            f"  Description: already present\n"
-            f"  Sample questions: already present ({len(existing_sqs or [])})\n"
-            f"  No enrichment needed.\n"
-            + "-" * 52
-        )
+        _sm_lines = [_section("SPACE METADATA ENRICHMENT", "-")]
+        _sm_lines.append(_kv("Description", "already present"))
+        _sm_lines.append(_kv("Sample questions", f"already present ({len(existing_sqs or [])})"))
+        _sm_lines.append(_kv("Status", "No enrichment needed"))
+        _sm_lines.append(_bar("-"))
+        print("\n".join(_sm_lines))
         return result
 
     write_stage(
@@ -990,12 +1128,28 @@ def _run_space_metadata_enrichment(
                         exc_info=True,
                     )
 
-        print(
-            f"\n-- SPACE METADATA ENRICHMENT " + "-" * 24 + "\n"
-            f"  Description: {'generated (' + str(len(desc_text)) + ' chars)' if result['description_generated'] else ('already present' if not needs_description else 'generation failed')}\n"
-            f"  Sample questions: {'generated (' + str(len(new_sqs)) + ')' if result['questions_generated'] else ('already present' if not needs_questions else 'generation failed')}\n"
-            + "-" * 52
+        _desc_status = (
+            f"generated ({len(desc_text)} chars)"
+            if result['description_generated']
+            else ("already present" if not needs_description else "FAILED")
         )
+        _sq_status = (
+            f"generated ({len(new_sqs)} questions)"
+            if result['questions_generated']
+            else ("already present" if not needs_questions else "FAILED")
+        )
+        _sm_lines = [_section("SPACE METADATA ENRICHMENT", "-")]
+        _sm_lines.append(_kv("Description", _desc_status))
+        if result['description_generated'] and desc_text:
+            _sm_lines.append(f"|      {desc_text[:120]}...")
+        _sm_lines.append(_kv("Sample questions", _sq_status))
+        if result['questions_generated'] and new_sqs:
+            for sq in new_sqs:
+                q_text = sq.get("question", [""])[0] if sq.get("question") else ""
+                if q_text:
+                    _sm_lines.append(f"|      - {q_text[:100]}")
+        _sm_lines.append(_bar("-"))
+        print("\n".join(_sm_lines))
 
         write_stage(
             spark, run_id, "SPACE_METADATA_ENRICHMENT", "COMPLETE",
@@ -1697,7 +1851,7 @@ def _run_gate_checks(
 
     accuracy_drop = best_accuracy - full_accuracy
     accuracy_threshold = max(effective_regression_tol / 2, noise_floor)
-    if accuracy_drop > accuracy_threshold:
+    if accuracy_drop >= accuracy_threshold:
         regressions.append({
             "judge": "overall_accuracy",
             "previous": best_accuracy,
@@ -1815,6 +1969,7 @@ def _run_lever_loop(
     if resume_state.get("prev_accuracy"):
         prev_accuracy = resume_state["prev_accuracy"]
 
+    baseline_accuracy = prev_accuracy
     best_scores = dict(prev_scores)
     best_accuracy = prev_accuracy
     best_model_id = prev_model_id
@@ -1848,7 +2003,7 @@ def _run_lever_loop(
     enrichment_result = _run_description_enrichment(
         w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
     )
-    if enrichment_result.get("total_enriched", 0) > 0:
+    if enrichment_result.get("total_enriched", 0) > 0 or enrichment_result.get("tables_enriched", 0) > 0:
         from genie_space_optimizer.common.genie_client import fetch_space_config
         config = fetch_space_config(w, space_id)
         config["_uc_columns"] = uc_columns
@@ -1979,7 +2134,7 @@ def _run_lever_loop(
     ags_attempted: list[str] = []
     ags_accepted: list[str] = []
     ags_rolled_back: list[str] = []
-    noise_floor = 100.0 / max(len(benchmarks), 1)
+    noise_floor = min(100.0 / max(len(benchmarks), 1), MAX_NOISE_FLOOR)
     global_rewrite_applied = False
 
     for ag in action_groups:
@@ -2049,6 +2204,19 @@ def _run_lever_loop(
                 )
                 all_proposals.extend(l5_proposals)
                 global_rewrite_applied = True
+
+        # ── Mine benchmarks for example SQLs ──────────────────────────
+        if "5" in lever_keys or (ag == action_groups[-1]):
+            mined_proposals = _mine_benchmark_example_sqls(
+                benchmarks, metadata_snapshot,
+                spark=spark, catalog=catalog, gold_schema=schema,
+            )
+            if mined_proposals:
+                logger.info(
+                    "Benchmark mining added %d example SQL proposals to AG %s",
+                    len(mined_proposals), ag_id,
+                )
+                all_proposals.extend(mined_proposals)
 
         # ── Log proposals ────────────────────────────────────────────
         _n_valid = 0
@@ -2168,39 +2336,12 @@ def _run_lever_loop(
         # ── Applied Patches Detail ───────────────────────────────────
         _applied = apply_log.get("applied", [])
         if _applied:
-            _ap_lines = [_section(f"[{ag_id}] Applied Patches ({len(_applied)})", "-")]
+            _ap_lines = [_section(f"[{ag_id}] Applied {len(_applied)} Patch(es)", "=")]
             for ai, aentry in enumerate(_applied, 1):
                 _ap = aentry.get("patch", {})
                 _aa = aentry.get("action", {})
-                _ap_type = _ap.get("type", _aa.get("action_type", "?"))
-                _ap_table = _ap.get("table", "")
-                _ap_column = _ap.get("column", "")
-                _ap_new_text = _ap.get("new_text", "")
-                _ap_join_spec = _ap.get("join_spec")
-                _ap_example_q = _ap.get("example_question", "")
-                _ap_example_sql = _ap.get("example_sql", "")
-                _ap_lines.append(f"|  Patch {ai}: {_ap_type}")
-                if _ap_table:
-                    _ap_lines.append(f"|    Table: {_ap_table}")
-                if _ap_column:
-                    _ap_lines.append(f"|    Column: {_ap_column}")
-                _ap_struct = _ap.get("structured_sections") or {}
-                if _ap_struct and isinstance(_ap_struct, dict):
-                    for _sk, _sv in _ap_struct.items():
-                        _ap_lines.append(f"|    **{_sk}:** {str(_sv).replace(chr(10), ' ')[:120]}")
-                elif _ap_new_text:
-                    _ap_lines.append(f"|    Value: {_ap_new_text.replace(chr(10), ' ')[:200]}")
-                _tbl_struct = _ap.get("table_sections") if not _ap_struct else None
-                if _tbl_struct and isinstance(_tbl_struct, dict):
-                    for _sk, _sv in _tbl_struct.items():
-                        _ap_lines.append(f"|    **{_sk}:** {str(_sv).replace(chr(10), ' ')[:120]}")
-                if _ap_example_q:
-                    _ap_lines.append(f"|    Example Q: {_ap_example_q[:120]}")
-                if _ap_example_sql:
-                    _ap_lines.append(f"|    Example SQL: {_ap_example_sql[:120]}")
-                if _ap_join_spec:
-                    _ap_lines.append(f"|    Join: {json.dumps(_ap_join_spec)[:200]}")
-            _ap_lines.append(_bar("-"))
+                _ap_lines.append(_fmt_patch(ai, _ap, _aa))
+            _ap_lines.append(_bar("="))
             print("\n".join(_ap_lines))
 
         # ── Gate checks (slice → P0 → full eval) ────────────────────
@@ -2359,6 +2500,58 @@ def _run_lever_loop(
                 )
         except Exception:
             logger.debug("Failed to create labeling session", exc_info=True)
+
+    # ── End-of-Run Summary ─────────────────────────────────────────
+    _summary = [_section("OPTIMIZATION RUN SUMMARY", "=")]
+    _summary.append(_kv("Space ID", space_id))
+    _summary.append(_kv("Run ID", run_id))
+    _summary.append(_kv("Baseline accuracy", f"{baseline_accuracy:.1f}%"))
+    _summary.append(_kv("Final accuracy", f"{best_accuracy:.1f}%"))
+    _delta = best_accuracy - baseline_accuracy
+    _summary.append(_kv("Net improvement", f"{'+' if _delta >= 0 else ''}{_delta:.1f}%"))
+    _summary.append(_kv("Iterations", iteration_counter))
+    _summary.append(_kv("Best iteration", best_iteration))
+    _summary.append("|")
+
+    # Proactive changes
+    _summary.append("|  --- Proactive Changes (pre-lever-loop) ---")
+    _desc_enriched = enrichment_result.get("total_enriched", 0)
+    _tbl_desc_enriched = enrichment_result.get("tables_enriched", 0)
+    _joins_applied = join_result.get("total_applied", 0)
+    _desc_gen = meta_result.get("description_generated", False)
+    _sq_gen = meta_result.get("questions_generated", False)
+    _sq_count = meta_result.get("questions_count", 0)
+    _summary.append(_kv("Column descriptions added", _desc_enriched))
+    _summary.append(_kv("Table descriptions added", _tbl_desc_enriched))
+    _summary.append(_kv("Join specs discovered", _joins_applied))
+    _summary.append(_kv("Space description", "generated" if _desc_gen else "unchanged"))
+    _summary.append(_kv("Sample questions", f"generated ({_sq_count})" if _sq_gen else "unchanged"))
+    _summary.append("|")
+
+    # Lever loop changes
+    _summary.append("|  --- Lever Loop Changes ---")
+    _summary.append(_kv("Action groups attempted", len(levers_attempted)))
+    _summary.append(_kv("Action groups accepted", len(ags_accepted)))
+    _summary.append(_kv("Action groups rolled back", len(ags_rolled_back)))
+    if lever_changes:
+        _summary.append("|")
+        for lc in lever_changes:
+            _delta_str = f"{lc['accuracy_delta']:+.1f}%"
+            _summary.append(f"|  {lc['lever_name']}")
+            _summary.append(f"|      Accuracy delta: {_delta_str}")
+            for p in lc.get("patches", []):
+                _ptype = _PATCH_TYPE_LABELS.get(p.get("patch_type", ""), p.get("patch_type", ""))
+                _change = p.get("change", "")[:80]
+                _summary.append(f"|      - {_ptype}: {_change}")
+    elif not ags_accepted:
+        _summary.append(_kv("Status", "No lever loop changes were accepted"))
+
+    _summary.append("|")
+    _summary.append("|  --- Final Scores ---")
+    for sname, sval in sorted(best_scores.items()):
+        _summary.append(f"|  {sname + ':':<28s} {sval:.1f}")
+    _summary.append(_bar("="))
+    print("\n".join(_summary))
 
     return {
         "scores": best_scores,

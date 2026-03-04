@@ -229,11 +229,13 @@ class DataAccessGrant(BaseModel):
     grantedAt: str
     status: str = "active"
     source: str = "app"
+    grantType: str = "read"
 
 
 class DataAccessGrantRequest(BaseModel):
     catalog: str
     schema_name: str
+    grant_type: str = "read"
 
 
 class DetectedSchema(BaseModel):
@@ -242,6 +244,8 @@ class DetectedSchema(BaseModel):
     spaceCount: int
     granted: bool
     canGrant: bool = False
+    writeGranted: bool = False
+    canGrantWrite: bool = False
 
 
 class DataAccessOverview(BaseModel):
@@ -255,6 +259,46 @@ class MissingGrantDetail(BaseModel):
     catalog: str
     schema_name: str
     grantCommand: str
+
+
+# ── Genie Space SP Access Models ──────────────────────────────────────
+
+
+class SpaceAccessGrantRequest(BaseModel):
+    space_id: str
+
+
+# ── Permission Dashboard Models ──────────────────────────────────────
+
+
+class SchemaPermission(BaseModel):
+    catalog: str
+    schema_name: str
+    readGranted: bool
+    writeGranted: bool
+    canGrantRead: bool
+    canGrantWrite: bool
+    readGrantId: str | None = None
+    writeGrantId: str | None = None
+
+
+class SpacePermissions(BaseModel):
+    spaceId: str
+    title: str
+    spHasManage: bool
+    userCanGrantManage: bool
+    schemas: list[SchemaPermission]
+    status: str
+
+
+class PermissionDashboard(BaseModel):
+    spaces: list[SpacePermissions]
+    spPrincipalId: str
+    spPrincipalDisplayName: str | None = None
+    frameworkCatalog: str
+    frameworkSchema: str
+    experimentBasePath: str
+    jobName: str
 
 
 # ── ASI (Judge Feedback) Models ───────────────────────────────────────

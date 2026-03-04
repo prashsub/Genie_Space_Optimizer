@@ -514,6 +514,34 @@ class TestValidateExampleSqlEntry:
         config = {"data_sources": {"tables": [{"identifier": "cat.sch.dim_property"}]}}
         assert _validate_example_sql_entry(entry, config=config) is False
 
+    def test_metric_view_sql_accepted(self):
+        entry = {
+            "question": ["What is total revenue?"],
+            "sql": ["SELECT MEASURE(total_revenue) FROM cat.sch.mv_bookings"],
+            "id": "x",
+        }
+        config = {
+            "data_sources": {
+                "tables": [{"identifier": "cat.sch.dim_property"}],
+                "metric_views": [{"identifier": "cat.sch.mv_bookings"}],
+            }
+        }
+        assert _validate_example_sql_entry(entry, config=config) is True
+
+    def test_metric_view_fqn_accepted(self):
+        entry = {
+            "question": ["Revenue by month?"],
+            "sql": ["SELECT MEASURE(revenue) FROM prashanth_catalog.my_schema.mv_sales"],
+            "id": "x",
+        }
+        config = {
+            "data_sources": {
+                "tables": [],
+                "metric_views": [{"identifier": "prashanth_catalog.my_schema.mv_sales"}],
+            }
+        }
+        assert _validate_example_sql_entry(entry, config=config) is True
+
     def test_no_config_skips_asset_check(self):
         entry = {"question": ["Q"], "sql": ["SELECT * FROM anything"], "id": "x"}
         assert _validate_example_sql_entry(entry, config=None) is True

@@ -86,31 +86,13 @@ def _collect_or_empty(fetch_fn: Any, label: str) -> tuple[list[dict], str | None
         return [], f"{type(exc).__name__}: {exc}"
 
 
-def _resolve_experiment_path(
-    *,
-    run_data: dict,
-    domain: str,
-    ws: WorkspaceClient,
-) -> str:
-    """Pick a stable MLflow experiment path for this run.
+def _resolve_experiment_path(*, space_id: str, domain: str) -> str:
+    """Return a stable, app-owned experiment path for this Genie Space.
 
-    With OBO-first execution the job runs as the triggering user, so we
-    always prefer ``/Users/<user_email>/genie-optimization/<domain>``.
-    ``/Shared/`` is a last-resort fallback when identity cannot be resolved.
+    Experiments live under ``/Shared/genie-space-optimizer/<space_id>/<domain>``
+    so the SP can create them without OBO and each space gets its own experiment.
     """
-    triggered_by = str(run_data.get("triggered_by") or "").strip()
-    if "@" in triggered_by:
-        return format_mlflow_template(EXPERIMENT_PATH_TEMPLATE, user_email=triggered_by, domain=domain)
-
-    try:
-        current_user = str(ws.current_user.me().user_name or "").strip()
-    except Exception:
-        current_user = ""
-
-    if "@" in current_user:
-        return format_mlflow_template(EXPERIMENT_PATH_TEMPLATE, user_email=current_user, domain=domain)
-
-    return f"/Shared/genie-optimization/{domain}"
+    return format_mlflow_template(EXPERIMENT_PATH_TEMPLATE, space_id=space_id, domain=domain)
 
 
 def _ensure_experiment_parent_dir(ws: WorkspaceClient, experiment_path: str) -> bool:
@@ -131,10 +113,35 @@ def _ensure_experiment_parent_dir(ws: WorkspaceClient, experiment_path: str) -> 
         return False
 
 
-def _has_non_email_user_home(path: str) -> bool:
-    """Detect /Users/<principal>/... paths where principal is not an email."""
-    parts = PurePosixPath(path).parts
-    return len(parts) > 2 and parts[0] == "/" and parts[1] == "Users" and "@" not in parts[2]
+def _validate_core_access(spark: SparkSession, genie_table_refs: list) -> None:
+    """Early-fail if the runtime identity cannot read information_schema for the primary schemas."""
+    schemas: set[tuple[str, str]] = set()
+    for ref in genie_table_refs:
+        cat = ref[0] if isinstance(ref, (list, tuple)) else ""
+        sch = ref[1] if isinstance(ref, (list, tuple)) and len(ref) > 1 else ""
+        if cat and sch:
+            schemas.add((cat, sch))
+
+    if not schemas:
+        return
+
+    failed: list[str] = []
+    for cat, sch in sorted(schemas):
+        try:
+            spark.sql(
+                f"SELECT 1 FROM `{cat}`.`information_schema`.`columns` "
+                f"WHERE table_schema = '{sch}' LIMIT 1"
+            ).collect()
+        except Exception as exc:
+            logger.warning("Core access check failed for %s.%s: %s", cat, sch, exc)
+            failed.append(f"`{cat}`.`{sch}`")
+
+    if failed:
+        raise RuntimeError(
+            f"Cannot read information_schema for: {', '.join(failed)}. "
+            "The service principal or runtime identity is missing required "
+            "read permissions. Grant access from the Settings page."
+        )
 
 
 def run_preflight(
@@ -245,6 +252,8 @@ def run_preflight(
             len(genie_table_refs),
             sorted({f"{c}.{s}" for c, s, _ in genie_table_refs if c and s}),
         )
+
+    _validate_core_access(spark, genie_table_refs)
 
     _pf = prefetched if isinstance(prefetched, dict) else {}
     _actual_source: dict[str, str] = {}
@@ -466,29 +475,15 @@ def run_preflight(
 
     uc_schema = f"{catalog}.{schema}"
     if experiment_name is None:
-        experiment_name = _resolve_experiment_path(run_data=run_data, domain=domain, ws=w)
-    elif _has_non_email_user_home(experiment_name):
-        experiment_name = _resolve_experiment_path(run_data=run_data, domain=domain, ws=w)
-    def _try_set_experiment(path: str) -> bool:
-        """Attempt to set an MLflow experiment, returning True on success."""
-        _ensure_experiment_parent_dir(w, path)
-        try:
-            mlflow.set_experiment(path)
-            return True
-        except Exception as exc:
-            logger.warning("mlflow.set_experiment(%s) failed: %s", path, exc)
-            return False
+        experiment_name = _resolve_experiment_path(space_id=space_id, domain=domain)
 
-    if not _try_set_experiment(experiment_name):
-        shared_fallback = f"/Shared/genie-optimization/{domain}"
-        logger.warning(
-            "Falling back to %s for experiment", shared_fallback,
-        )
-        if not _try_set_experiment(shared_fallback):
-            raise RuntimeError(
-                f"Cannot create MLflow experiment at {experiment_name} or {shared_fallback}"
-            )
-        experiment_name = shared_fallback
+    _ensure_experiment_parent_dir(w, experiment_name)
+    try:
+        mlflow.set_experiment(experiment_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot create MLflow experiment at {experiment_name}: {exc}"
+        ) from exc
     exp = mlflow.get_experiment_by_name(experiment_name)
     experiment_id = exp.experiment_id if exp else ""
     logger.info("Experiment: %s (id=%s)", experiment_name, experiment_id)

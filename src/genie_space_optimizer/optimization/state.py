@@ -196,10 +196,11 @@ CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_data_access_grants (
     granted_by          STRING        NOT NULL COMMENT 'User who performed the grant',
     granted_at          TIMESTAMP     NOT NULL COMMENT 'When the grant was applied',
     revoked_at          TIMESTAMP              COMMENT 'When the grant was revoked (null if active)',
-    status              STRING        NOT NULL COMMENT 'active|revoked'
+    status              STRING        NOT NULL COMMENT 'active|revoked',
+    grant_type          STRING        NOT NULL DEFAULT 'read' COMMENT 'read|write — read grants SELECT/EXECUTE, write adds MODIFY'
 )
 USING DELTA
-COMMENT 'Tracks UC privileges granted to the app SP for reading Genie space assets'
+COMMENT 'Tracks UC privileges granted to the app SP for accessing Genie space assets'
 TBLPROPERTIES (
     'delta.autoOptimize.optimizeWrite' = 'true',
     'delta.autoOptimize.autoCompact' = 'true'
@@ -272,6 +273,7 @@ def _migrate_add_columns(spark: SparkSession, catalog: str, schema: str) -> None
         (TABLE_ASI, "mlflow_run_id", "STRING COMMENT 'MLflow run ID from the evaluation that produced this ASI row'"),
         (TABLE_RUNS, "labeling_session_name", "STRING COMMENT 'MLflow labeling session name for human review'"),
         (TABLE_RUNS, "labeling_session_run_id", "STRING COMMENT 'MLflow run ID associated with the labeling session'"),
+        (TABLE_DATA_ACCESS_GRANTS, "grant_type", "STRING DEFAULT 'read' COMMENT 'read|write — read grants SELECT/EXECUTE, write adds MODIFY'"),
     ]
     for table, col, col_def in migrations:
         fqn = _fqn(catalog, schema, table)

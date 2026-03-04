@@ -84,13 +84,31 @@ def get_trigger_status(
     if status == "IN_PROGRESS":
         status = "RUNNING"
 
+    from genie_space_optimizer.optimization.state import load_iterations
+
+    baseline_score: float | None = None
+    try:
+        iters_df = load_iterations(spark, run_id, config.catalog, config.schema_name)
+        if not iters_df.empty:
+            iters_rows = iters_df.to_dict("records")
+            baseline_row = next(
+                (r for r in iters_rows
+                 if int(r.get("iteration", -1)) == 0
+                 and str(r.get("eval_scope", "")).lower() == "full"),
+                None,
+            )
+            if baseline_row:
+                baseline_score = safe_float(baseline_row.get("overall_accuracy"))
+    except Exception:
+        pass
+
     return RunStatusResponse(
         runId=run_id,
         status=status,
         spaceId=run_data.get("space_id", ""),
         startedAt=ensure_utc_iso(run_data.get("started_at")),
         completedAt=ensure_utc_iso(run_data.get("completed_at")),
-        baselineScore=safe_float(run_data.get("best_accuracy")),
+        baselineScore=baseline_score,
         optimizedScore=safe_float(run_data.get("best_accuracy")),
         convergenceReason=run_data.get("convergence_reason"),
     )

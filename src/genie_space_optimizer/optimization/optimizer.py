@@ -58,6 +58,34 @@ from genie_space_optimizer.common.genie_schema import ensure_join_spec_fields
 
 logger = logging.getLogger(__name__)
 
+_LLM_TIMEOUT_SECONDS = 600
+
+
+def _ws_with_timeout(
+    w: WorkspaceClient | None,
+    timeout: int = _LLM_TIMEOUT_SECONDS,
+) -> WorkspaceClient:
+    """Return a **new** workspace client whose HTTP session uses *timeout*.
+
+    The Databricks SDK bakes ``http_timeout_seconds`` into the
+    ``requests.Session`` at construction time, so mutating the config
+    after the fact has no effect.  We therefore always create a fresh
+    client.  In a Databricks job the env-var auth (``DATABRICKS_HOST``,
+    ``DATABRICKS_TOKEN``, etc.) is inherited automatically.
+    """
+    from databricks.sdk import client as _sdk_client
+
+    cfg_kwargs: dict[str, Any] = {"http_timeout_seconds": timeout}
+    if w is not None:
+        for attr in ("host", "token", "azure_workspace_resource_id",
+                      "azure_client_id", "azure_client_secret", "azure_tenant_id",
+                      "client_id", "client_secret"):
+            val = getattr(w.config, attr, None)
+            if val:
+                cfg_kwargs[attr] = val
+
+    return WorkspaceClient(config=_sdk_client.Config(**cfg_kwargs))
+
 
 def _estimate_tokens(text: str) -> int:
     """Conservative token estimate (~4 chars per token)."""
@@ -857,21 +885,27 @@ def enrich_metadata_with_uc_types(
 # ---------------------------------------------------------------------------
 
 _ENRICHMENT_BATCH_THRESHOLD = 30
+_MIN_DESCRIPTION_LENGTH = 10
 
 
-def _is_description_blank(desc: Any) -> bool:
-    """Return True when a column_config description is effectively empty."""
+def _is_description_insufficient(desc: Any) -> bool:
+    """Return True when a description is too short to be useful (< 10 chars)."""
     if desc is None:
         return True
     if isinstance(desc, list):
-        return all(not str(d).strip() for d in desc)
-    return not str(desc).strip()
+        text = " ".join(str(d).strip() for d in desc)
+    else:
+        text = str(desc).strip()
+    return len(text) < _MIN_DESCRIPTION_LENGTH
 
 
 def _collect_blank_columns(
     metadata_snapshot: dict,
 ) -> list[dict]:
-    """Scan metadata_snapshot for columns missing descriptions in both UC and Genie Space.
+    """Scan metadata_snapshot for columns with insufficient descriptions.
+
+    A column is eligible when both the Genie Space description and the UC
+    comment are shorter than ``_MIN_DESCRIPTION_LENGTH`` characters.
 
     Returns a list of dicts with keys: table, column, data_type, entity_type,
     table_description, sibling_columns.
@@ -914,9 +948,9 @@ def _collect_blank_columns(
             desc = cc.get("description")
             uc_comment = cc.get("uc_comment", "")
 
-            if not _is_description_blank(desc):
+            if not _is_description_insufficient(desc):
                 continue
-            if uc_comment:
+            if uc_comment and len(str(uc_comment).strip()) >= _MIN_DESCRIPTION_LENGTH:
                 continue
 
             data_type = cc.get("data_type", "")
@@ -973,7 +1007,6 @@ def _enrich_blank_descriptions(
     Only targets columns where BOTH the Genie Space description AND the UC
     comment are empty and the column is not hidden.
     """
-    from databricks.sdk import WorkspaceClient as _WC
     from genie_space_optimizer.optimization.evaluation import _extract_json
 
     blanks = _collect_blank_columns(metadata_snapshot)
@@ -1013,9 +1046,8 @@ def _enrich_blank_descriptions(
         prompt = format_mlflow_template(DESCRIPTION_ENRICHMENT_PROMPT, **format_kwargs)
 
         try:
-            if w is None:
-                w = _WC()
-            response = w.serving_endpoints.query(
+            wc = _ws_with_timeout(w)
+            response = wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
                 messages=[
                     ChatMessage(
@@ -1079,6 +1111,194 @@ def _enrich_blank_descriptions(
     return all_patches
 
 
+# ---------------------------------------------------------------------------
+# Proactive Table Description Enrichment
+# ---------------------------------------------------------------------------
+
+
+def _collect_insufficient_tables(
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Scan metadata_snapshot for tables with insufficient top-level descriptions.
+
+    A table is eligible when its description is shorter than
+    ``_MIN_DESCRIPTION_LENGTH`` characters.
+
+    Returns a list of dicts with keys: table, current_description,
+    column_names, column_types, is_metric_view.
+    """
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = metadata_snapshot.get("tables", []) or ds.get("tables", [])
+    mvs = metadata_snapshot.get("metric_views", []) or ds.get("metric_views", [])
+
+    insufficient: list[dict] = []
+
+    for tbl_list, is_mv in [(tables, False), (mvs, True)]:
+        for tbl in tbl_list:
+            if not isinstance(tbl, dict):
+                continue
+            identifier = tbl.get("identifier", "") or tbl.get("name", "")
+            raw_desc = tbl.get("description", "")
+            if isinstance(raw_desc, list):
+                desc_text = "\n".join(str(d) for d in raw_desc).strip()
+            else:
+                desc_text = str(raw_desc or "").strip()
+
+            if len(desc_text) >= _MIN_DESCRIPTION_LENGTH:
+                continue
+
+            cols = tbl.get("column_configs", tbl.get("columns", []))
+            col_info = []
+            for cc in cols:
+                if not isinstance(cc, dict):
+                    continue
+                col_info.append({
+                    "name": cc.get("column_name", cc.get("name", "")),
+                    "data_type": cc.get("data_type", ""),
+                })
+
+            insufficient.append({
+                "table": identifier,
+                "current_description": desc_text,
+                "column_names": [c["name"] for c in col_info],
+                "column_types": {c["name"]: c["data_type"] for c in col_info},
+                "is_metric_view": is_mv,
+            })
+
+    return insufficient
+
+
+def _format_table_enrichment_context(tables: list[dict]) -> str:
+    """Format insufficient tables into a context string for the LLM prompt."""
+    lines: list[str] = []
+    for t in tables:
+        cur = t.get("current_description", "")
+        desc_label = f"({cur[:80]})" if cur else "(none)"
+        lines.append(f"Table: {t['table']}")
+        lines.append(f"  Current description: {desc_label}")
+        col_parts = []
+        for cname in t.get("column_names", [])[:30]:
+            ctype = t.get("column_types", {}).get(cname, "")
+            col_parts.append(f"{cname} ({ctype})" if ctype else cname)
+        if col_parts:
+            lines.append(f"  Columns: {', '.join(col_parts)}")
+            remaining = len(t.get("column_names", [])) - 30
+            if remaining > 0:
+                lines.append(f"  (+{remaining} more columns)")
+        if t.get("is_metric_view"):
+            lines.append("  Type: Metric View")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _enrich_table_descriptions(
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> list[dict]:
+    """Generate structured descriptions for tables that have insufficient descriptions.
+
+    Returns a list of patch dicts compatible with ``update_description``
+    proposals (lever 0, scope ``genie_config``).
+    """
+    from genie_space_optimizer.common.config import TABLE_DESCRIPTION_ENRICHMENT_PROMPT
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+
+    tables = _collect_insufficient_tables(metadata_snapshot)
+    if not tables:
+        logger.info("Table description enrichment: 0 tables need enrichment — skipping")
+        return []
+
+    logger.info(
+        "Table description enrichment: %d tables with insufficient descriptions",
+        len(tables),
+    )
+
+    allowlist = _build_identifier_allowlist(metadata_snapshot)
+    allowlist_str = _format_identifier_allowlist(allowlist)
+
+    if len(tables) <= _ENRICHMENT_BATCH_THRESHOLD:
+        batches = [tables]
+    else:
+        batches = [[t] for t in tables]
+
+    all_patches: list[dict] = []
+
+    for batch in batches:
+        context_str = _format_table_enrichment_context(batch)
+        format_kwargs: dict[str, Any] = {
+            "tables_context": context_str,
+            "identifier_allowlist": allowlist_str,
+        }
+        format_kwargs = _truncate_to_budget(
+            format_kwargs, TABLE_DESCRIPTION_ENRICHMENT_PROMPT,
+            priority_keys=["tables_context"],
+        )
+        prompt = format_mlflow_template(TABLE_DESCRIPTION_ENRICHMENT_PROMPT, **format_kwargs)
+
+        try:
+            wc = _ws_with_timeout(w)
+            response = wc.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[
+                    ChatMessage(
+                        role=ChatMessageRole.SYSTEM,
+                        content="You generate structured table descriptions for a Databricks Genie Space.",
+                    ),
+                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                ],
+                temperature=LLM_TEMPERATURE,
+                max_tokens=4096,
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                logger.warning("Table description enrichment: empty LLM response for batch of %d tables", len(batch))
+                continue
+            message = choices[0].message if hasattr(choices[0], "message") else choices[0]
+            content = getattr(message, "content", None)
+            if not content:
+                logger.warning("Table description enrichment: LLM content is empty")
+                continue
+            text = str(content).strip()
+            result = _extract_json(text)
+        except Exception:
+            logger.warning("Table description enrichment: LLM call failed for batch", exc_info=True)
+            continue
+
+        batch_lookup = {t["table"]: t for t in batch}
+
+        for change in result.get("changes", []):
+            tbl = change.get("table", "")
+            sections = change.get("sections", {})
+
+            if not tbl or not sections:
+                continue
+            if tbl not in batch_lookup:
+                logger.debug(
+                    "Table description enrichment: skipping %s — not in eligible set", tbl,
+                )
+                continue
+
+            entity_type = "mv_table" if batch_lookup[tbl].get("is_metric_view") else "table"
+
+            all_patches.append({
+                "type": "update_description",
+                "table": tbl,
+                "structured_sections": sections,
+                "table_entity_type": entity_type,
+                "lever": 0,
+                "risk_level": "low",
+                "source": "proactive_enrichment",
+            })
+
+    logger.info(
+        "Table description enrichment: generated %d patches for %d insufficient tables",
+        len(all_patches), len(tables),
+    )
+    return all_patches
+
+
 # ── Proactive Space Metadata Generation ──────────────────────────────
 
 
@@ -1090,12 +1310,17 @@ def _build_space_schema_context(metadata_snapshot: dict) -> dict[str, str]:
     tables = ds.get("tables", [])
     mvs = ds.get("metric_views", [])
 
+    def _str_field(val: object) -> str:
+        if isinstance(val, list):
+            return " ".join(str(s) for s in val)
+        return str(val) if val else ""
+
     table_lines: list[str] = []
     for tbl in tables:
         if not isinstance(tbl, dict):
             continue
         ident = tbl.get("identifier", "")
-        desc = tbl.get("description", "")
+        desc = _str_field(tbl.get("description", ""))
         cols = tbl.get("column_configs", tbl.get("columns", []))
         col_names = [
             c.get("column_name", c.get("name", ""))
@@ -1115,7 +1340,7 @@ def _build_space_schema_context(metadata_snapshot: dict) -> dict[str, str]:
         if not isinstance(mv, dict):
             continue
         ident = mv.get("identifier", "")
-        desc = mv.get("description", "")
+        desc = _str_field(mv.get("description", ""))
         cols = mv.get("column_configs", mv.get("columns", []))
         col_names = [
             c.get("column_name", c.get("name", ""))
@@ -1130,9 +1355,16 @@ def _build_space_schema_context(metadata_snapshot: dict) -> dict[str, str]:
 
     instr = metadata_snapshot.get("instructions", {})
     ti_list = instr.get("text_instructions", []) if isinstance(instr, dict) else []
-    instr_text = "\n".join(
-        ti.get("content", "")[:200] for ti in ti_list if isinstance(ti, dict) and ti.get("content")
-    ) or "(none)"
+    instr_parts: list[str] = []
+    for ti in ti_list:
+        if not isinstance(ti, dict):
+            continue
+        raw = ti.get("content", "")
+        if isinstance(raw, list):
+            raw = "\n".join(str(s) for s in raw)
+        if raw:
+            instr_parts.append(str(raw)[:200])
+    instr_text = "\n".join(instr_parts) or "(none)"
 
     return {
         "tables_context": "\n".join(table_lines) or "(none)",
@@ -1149,8 +1381,6 @@ def _generate_space_description(
 
     Returns the description text, or ``""`` on failure.
     """
-    from databricks.sdk import WorkspaceClient as _WC
-
     ctx = _build_space_schema_context(metadata_snapshot)
     format_kwargs = _truncate_to_budget(
         ctx, SPACE_DESCRIPTION_PROMPT,
@@ -1159,9 +1389,8 @@ def _generate_space_description(
     prompt = format_mlflow_template(SPACE_DESCRIPTION_PROMPT, **format_kwargs)
 
     try:
-        if w is None:
-            w = _WC()
-        response = w.serving_endpoints.query(
+        wc = _ws_with_timeout(w)
+        response = wc.serving_endpoints.query(
             name=LLM_ENDPOINT,
             messages=[
                 ChatMessage(
@@ -1204,7 +1433,6 @@ def _generate_sample_questions(
     Returns a list of ``{"id": "<hex>", "question": ["<text>"]}`` dicts,
     or ``[]`` on failure.
     """
-    from databricks.sdk import WorkspaceClient as _WC
     from genie_space_optimizer.common.genie_schema import generate_genie_id
     from genie_space_optimizer.optimization.evaluation import _extract_json
 
@@ -1217,9 +1445,8 @@ def _generate_sample_questions(
     prompt = format_mlflow_template(SAMPLE_QUESTIONS_PROMPT, **format_kwargs)
 
     try:
-        if w is None:
-            w = _WC()
-        response = w.serving_endpoints.query(
+        wc = _ws_with_timeout(w)
+        response = wc.serving_endpoints.query(
             name=LLM_ENDPOINT,
             messages=[
                 ChatMessage(
@@ -1563,17 +1790,17 @@ _FACT_PREFIXES = ("fact_", "fct_")
 
 _JOIN_FQN_RE = re.compile(
     r"\bJOIN\s+"
-    r"((?:`[^`]+`\.`[^`]+`\.`[^`]+`)"
-    r"|(?:[A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*))"
-    r"\s+(?:AS\s+)?(\w+)?"
+    r"((?:`[^`]+`(?:\.`[^`]+`){1,2})"              # backtick-quoted 2- or 3-part
+    r"|(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,2}))"    # unquoted 2- or 3-part
+    r"(?:\s+(?:AS\s+)?(\w+))?"
     r"\s*ON\s+(.+?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|;|\Z)",
     re.I | re.S,
 )
 
 _SQL_FROM_TABLE_RE = re.compile(
     r"\bFROM\s+"
-    r"((?:`[^`]+`\.`[^`]+`\.`[^`]+`)"
-    r"|(?:[A-Za-z_]\w*\.[A-Za-z_]\w*\.[A-Za-z_]\w*))",
+    r"((?:`[^`]+`(?:\.`[^`]+`){1,2})"              # backtick-quoted 2- or 3-part
+    r"|(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,2}))",   # unquoted 2- or 3-part
     re.I,
 )
 
@@ -1614,7 +1841,8 @@ def _convert_fk_to_candidates(
         ]
         on_condition = " AND ".join(on_parts)
 
-        pair_key = tuple(sorted((child_fqn, parent_fqn)))
+        _pk_a, _pk_b = sorted((child_fqn, parent_fqn))
+        pair_key = (_pk_a, _pk_b)
         if pair_key in seen_pairs:
             continue
         seen_pairs.add(pair_key)
@@ -1643,12 +1871,12 @@ def _extract_proven_joins(
 ) -> list[dict]:
     """Extract execution-validated join paths from baseline eval rows.
 
-    Only considers rows where the arbiter verdict is ``both_correct`` or
-    ``genie_correct``.  Parses JOIN…ON clauses from both Genie SQL and
-    ground-truth SQL, resolves short table names to FQN identifiers, and
-    returns deduplicated candidates sorted by frequency.
+    Considers rows where the arbiter verdict is positive (``both_correct``,
+    ``genie_correct``, or ``ground_truth_correct``).  Parses JOIN…ON clauses
+    from both Genie SQL and ground-truth SQL, resolves short table names to
+    FQN identifiers, and returns deduplicated candidates sorted by frequency.
     """
-    _POSITIVE_VERDICTS = {"both_correct", "genie_correct"}
+    _POSITIVE_VERDICTS = {"both_correct", "genie_correct", "ground_truth_correct"}
 
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
@@ -1670,7 +1898,16 @@ def _extract_proven_joins(
             fqn_lower = ident.lower().strip("`")
             short_to_fqn[fqn_lower] = ident
 
+    logger.info(
+        "Join extraction: short_to_fqn has %d entries, %d ambiguous shorts",
+        len(short_to_fqn), len(_ambiguous_shorts),
+    )
+
     candidates: dict[tuple[str, str], dict] = {}
+    _diag_positive = 0
+    _diag_has_join = 0
+    _diag_no_from = 0
+    _diag_no_resolve = 0
 
     for row in rows:
         arbiter = (
@@ -1682,6 +1919,7 @@ def _extract_proven_joins(
         if str(arbiter).lower() not in _POSITIVE_VERDICTS:
             continue
 
+        _diag_positive += 1
         qid = _row_qid(row)
 
         _req = row.get("request") or {}
@@ -1712,6 +1950,12 @@ def _extract_proven_joins(
             if not sql:
                 continue
 
+            join_matches = list(_JOIN_FQN_RE.finditer(sql))
+            if not join_matches:
+                continue
+
+            _diag_has_join += 1
+
             from_m = _SQL_FROM_TABLE_RE.search(sql)
             from_table_raw = from_m.group(1).replace("`", "").lower() if from_m else ""
             from_fqn = ""
@@ -1724,7 +1968,16 @@ def _extract_proven_joins(
                     elif "." in from_table_raw and from_table_raw.count(".") >= 2:
                         from_fqn = from_table_raw
 
-            for m in _JOIN_FQN_RE.finditer(sql):
+            if not from_fqn:
+                _diag_no_from += 1
+                logger.debug(
+                    "Join extraction [%s/%s]: no FROM table resolved "
+                    "(raw=%r), skipping %d JOINs",
+                    qid, source_label, from_table_raw, len(join_matches),
+                )
+                continue
+
+            for m in join_matches:
                 joined_table_raw = m.group(1).replace("`", "").lower()
                 alias = (m.group(2) or "").lower()
                 on_clause = m.group(3).strip()
@@ -1741,13 +1994,16 @@ def _extract_proven_joins(
                     if "." in joined_table_raw and joined_table_raw.count(".") >= 2:
                         joined_fqn = joined_table_raw
                     else:
+                        _diag_no_resolve += 1
+                        logger.debug(
+                            "Join extraction [%s/%s]: cannot resolve "
+                            "joined table %r to FQN",
+                            qid, source_label, joined_table_raw,
+                        )
                         continue
 
-                left_fqn = from_fqn or ""
-                if not left_fqn:
-                    continue
-
-                pair_key = tuple(sorted((left_fqn, joined_fqn)))
+                _pk_l, _pk_r = sorted((from_fqn, joined_fqn))
+                pair_key = (_pk_l, _pk_r)
                 if pair_key[0] == pair_key[1]:
                     continue
 
@@ -1790,9 +2046,20 @@ def _extract_proven_joins(
     result.sort(key=lambda x: (-int(x.get("agreed", False)), -x["frequency"]))
 
     logger.info(
-        "Proactive join discovery: %d execution-proven candidates from %d rows",
+        "Proactive join discovery: %d candidates from %d rows "
+        "(positive_verdicts=%d, sql_with_join=%d, "
+        "no_from_resolved=%d, no_joined_resolved=%d)",
         len(result), len(rows),
+        _diag_positive, _diag_has_join,
+        _diag_no_from, _diag_no_resolve,
     )
+    for cand in result:
+        logger.info(
+            "  candidate: %s <-> %s  freq=%d agreed=%s on=%s",
+            cand["left_table"], cand["right_table"],
+            cand["frequency"], cand["agreed"],
+            cand.get("on_condition", "")[:80],
+        )
     return result
 
 
@@ -1909,6 +2176,9 @@ def _build_join_specs_from_proven(
 
         sql_parts = []
         if on_condition:
+            equijoin_only = _extract_equijoin_predicates(on_condition)
+            if equijoin_only:
+                on_condition = equijoin_only
             normalized = re.sub(
                 r"`?\w+`?\.",
                 lambda m: m.group(0),
@@ -2263,8 +2533,8 @@ def _build_identifier_allowlist(
     if not isinstance(ds, dict):
         ds = {}
     tables_list = ds.get("tables", []) or metadata_snapshot.get("tables", [])
-    funcs_list = metadata_snapshot.get("functions", []) or []
-    mvs_list = metadata_snapshot.get("metric_views", []) or []
+    funcs_list = metadata_snapshot.get("functions", []) or ds.get("functions", []) or []
+    mvs_list = ds.get("metric_views", []) or metadata_snapshot.get("metric_views", []) or []
 
     table_ids: list[str] = []
     tables_short: set[str] = set()
@@ -2399,6 +2669,11 @@ def _validate_sql_identifiers(
     tables_full = {t.lower() for t in (allowlist.get("tables") or [])}
     tables_short = {s.lower() for s in (allowlist.get("tables_short") or set())}
     cols_flat = {c.lower() for c in (allowlist.get("columns_flat") or set())}
+
+    for mv in allowlist.get("metric_views") or []:
+        mv_lower = mv.lower()
+        tables_full.add(mv_lower)
+        tables_short.add(mv_lower.rsplit(".", 1)[-1])
 
     for m in _SQL_TABLE_REF_RE.finditer(sql):
         ref = m.group(1).replace("`", "").strip()
@@ -3209,14 +3484,13 @@ def _call_llm_for_proposal(
 
     import time
 
-    from databricks.sdk import WorkspaceClient as _WC
     from genie_space_optimizer.optimization.evaluation import _extract_json
 
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            w = _WC()
-            response = w.serving_endpoints.query(
+            _wc = _ws_with_timeout(None)
+            response = _wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
                 messages=[
                     ChatMessage(
@@ -3311,16 +3585,39 @@ _JOIN_PROSE_SPLIT_RE = re.compile(
 _SENTENCE_BOUNDARY_RE = re.compile(r"\.\s+[A-Z]")
 
 
+_EQUIJOIN_PREDICATE_RE = re.compile(
+    r"`?[\w.]+`?\s*\.\s*`?\w+`?\s*=\s*`?[\w.]+`?\s*\.\s*`?\w+`?",
+)
+
+
+def _extract_equijoin_predicates(sql_str: str) -> str:
+    """Keep only ``table.col = table.col`` predicates from a join SQL string.
+
+    The Genie API ``join_specs[].sql`` field only accepts equijoin predicates
+    (column equality between two tables).  LLMs and execution-proven SQL
+    sometimes include filter predicates such as
+    ``AND dim_property.is_current = true`` which the API rejects.
+
+    This function extracts all ``a.x = b.y`` predicates and returns them
+    joined by `` AND ``, discarding everything else.
+    """
+    predicates = _EQUIJOIN_PREDICATE_RE.findall(sql_str)
+    return " AND ".join(predicates)
+
+
 def _sanitize_join_sql(sql_str: str) -> str:
-    """Strip prose and cardinality labels from a join condition SQL string.
+    """Strip prose, cardinality labels, and non-equijoin predicates.
 
     LLMs sometimes embed descriptive text like ``MANY_TO_ONE. Use this join
     to connect...`` after the actual ON-clause expression.  This function
-    keeps only the SQL portion.
+    first strips prose, then extracts only equijoin predicates that the
+    Genie API accepts.
     """
     cleaned = _JOIN_PROSE_SPLIT_RE.split(sql_str, maxsplit=1)[0]
     cleaned = _SENTENCE_BOUNDARY_RE.split(cleaned, maxsplit=1)[0]
-    return cleaned.strip().rstrip(",").rstrip(".")
+    cleaned = cleaned.strip().rstrip(",").rstrip(".")
+    equijoin_only = _extract_equijoin_predicates(cleaned)
+    return equijoin_only if equijoin_only else cleaned
 
 
 def _call_llm_for_join_discovery(
@@ -3389,8 +3686,6 @@ def _call_llm_for_join_discovery(
 
     import time
 
-    from databricks.sdk import WorkspaceClient as _WC
-
     system_msg = (
         "You are a JSON API. You MUST respond with ONLY a valid JSON object. "
         "Do NOT include any explanation, analysis, or markdown outside the JSON. "
@@ -3400,7 +3695,7 @@ def _call_llm_for_join_discovery(
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            wc = w or _WC()
+            wc = _ws_with_timeout(w)
             response = wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
                 messages=[
@@ -3732,8 +4027,6 @@ def _call_llm_for_holistic_instructions(
 
     import time
 
-    from databricks.sdk import WorkspaceClient as _WC
-
     from genie_space_optimizer.optimization.evaluation import _extract_json
 
     holistic_system_msg = (
@@ -3746,7 +4039,7 @@ def _call_llm_for_holistic_instructions(
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            wc = w or _WC()
+            wc = _ws_with_timeout(w)
             response = wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
                 messages=[
@@ -4013,8 +4306,6 @@ def _call_llm_for_strategy(
 
     import time
 
-    from databricks.sdk import WorkspaceClient as _WC
-
     system_msg = (
         "You are a JSON API. You MUST respond with ONLY a valid JSON object. "
         "Do NOT include any explanation, analysis, or markdown outside the JSON. "
@@ -4022,19 +4313,10 @@ def _call_llm_for_strategy(
         "The JSON must contain an 'action_groups' array."
     )
 
-    from databricks.sdk import client as _sdk_client
-
-    _STRATEGIST_TIMEOUT_SECONDS = 600
-
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            if w:
-                wc = w
-            else:
-                wc = _WC(config=_sdk_client.Config(
-                    http_timeout_seconds=_STRATEGIST_TIMEOUT_SECONDS,
-                ))
+            wc = _ws_with_timeout(w)
             response = wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
                 messages=[
@@ -4188,10 +4470,6 @@ def _call_llm_for_triage(
     _link_prompt_to_trace("strategist_triage")
 
     import time
-    from databricks.sdk import WorkspaceClient as _WC
-    from databricks.sdk import client as _sdk_client
-
-    _TRIAGE_TIMEOUT = 600
 
     system_msg = (
         "You are a JSON API. Respond with ONLY a valid JSON object. "
@@ -4202,10 +4480,7 @@ def _call_llm_for_triage(
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            if w:
-                wc = w
-            else:
-                wc = _WC(config=_sdk_client.Config(http_timeout_seconds=_TRIAGE_TIMEOUT))
+            wc = _ws_with_timeout(w)
             response = wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
                 messages=[
@@ -4359,10 +4634,6 @@ def _call_llm_for_ag_detail(
     _link_prompt_to_trace("strategist_detail")
 
     import time
-    from databricks.sdk import WorkspaceClient as _WC
-    from databricks.sdk import client as _sdk_client
-
-    _DETAIL_TIMEOUT = 600
 
     system_msg = (
         "You are a JSON API. Respond with ONLY a valid JSON object. "
@@ -4373,10 +4644,7 @@ def _call_llm_for_ag_detail(
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            if w:
-                wc = w
-            else:
-                wc = _WC(config=_sdk_client.Config(http_timeout_seconds=_DETAIL_TIMEOUT))
+            wc = _ws_with_timeout(w)
             response = wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
                 messages=[
@@ -4824,6 +5092,23 @@ def _validate_lever5_proposals(
 
     id_allowlist = _build_identifier_allowlist(metadata_snapshot)
 
+    existing_eqs_raw = (
+        (metadata_snapshot.get("config") or metadata_snapshot).get("example_question_sqls")
+        or metadata_snapshot.get("example_question_sqls")
+        or []
+    )
+    existing_questions: set[str] = set()
+    for e in existing_eqs_raw:
+        if isinstance(e, dict):
+            q = e.get("question", "")
+            if isinstance(q, list):
+                q = " ".join(q)
+            q = q.lower().strip()
+            if q:
+                existing_questions.add(q)
+
+    seen_new_questions: set[str] = set()
+
     valid: list[dict] = []
     for p in proposals:
         ptype = p.get("patch_type", "")
@@ -4889,6 +5174,15 @@ def _validate_lever5_proposals(
                 logger.info("Rejecting empty add_example_sql proposal")
                 continue
 
+            eq_norm = eq.lower().strip()
+            if eq_norm in existing_questions:
+                logger.info("Rejecting add_example_sql duplicate of existing config: %.80s", eq)
+                continue
+            if eq_norm in seen_new_questions:
+                logger.info("Rejecting add_example_sql duplicate within batch: %.80s", eq)
+                continue
+            seen_new_questions.add(eq_norm)
+
             sql_ok, violations = _validate_sql_identifiers(es, id_allowlist)
             if not sql_ok:
                 logger.warning(
@@ -4902,15 +5196,17 @@ def _validate_lever5_proposals(
                     from genie_space_optimizer.optimization.benchmarks import validate_ground_truth_sql
                     is_valid, err = validate_ground_truth_sql(
                         es, spark, catalog=catalog, gold_schema=gold_schema,
+                        execute=True,
+                        parameters=p.get("parameters"),
                     )
                     if not is_valid:
                         logger.warning(
-                            "Rejecting add_example_sql that failed EXPLAIN: %s — %.120s",
+                            "Rejecting add_example_sql that failed validation: %s — %.120s",
                             err, es,
                         )
                         continue
                 except Exception:
-                    logger.debug("EXPLAIN validation skipped (error)", exc_info=True)
+                    logger.debug("Example SQL execution validation skipped (error)", exc_info=True)
 
         valid.append(p)
 
@@ -4920,6 +5216,117 @@ def _validate_lever5_proposals(
             "Lever 5 proposal validation: %d rejected, %d kept", rejected, len(valid)
         )
     return valid
+
+
+def _mine_benchmark_example_sqls(
+    benchmarks: list[dict],
+    metadata_snapshot: dict,
+    *,
+    spark: Any = None,
+    catalog: str = "",
+    gold_schema: str = "",
+) -> list[dict]:
+    """Mine benchmarks with ``expected_sql`` as ready-made example SQL proposals.
+
+    Skips benchmarks whose question already exists in the config's
+    ``example_question_sqls``.  Validates each via
+    ``validate_ground_truth_sql(..., execute=True)`` so only SQL that
+    actually runs and returns rows is proposed.
+    """
+    existing_eqs_raw = (
+        (metadata_snapshot.get("config") or metadata_snapshot).get("example_question_sqls")
+        or metadata_snapshot.get("example_question_sqls")
+        or []
+    )
+    existing_questions: set[str] = set()
+    for e in existing_eqs_raw:
+        if isinstance(e, dict):
+            q = e.get("question", "")
+            if isinstance(q, list):
+                q = " ".join(q)
+            q = q.lower().strip()
+            if q:
+                existing_questions.add(q)
+
+    proposals: list[dict] = []
+    skipped_no_sql = 0
+    skipped_dup = 0
+    skipped_invalid = 0
+
+    for b in benchmarks:
+        sql = (b.get("expected_sql") or "").strip()
+        question = (b.get("question") or "").strip()
+        if not sql or not question:
+            skipped_no_sql += 1
+            continue
+
+        q_norm = question.lower().strip()
+        if q_norm in existing_questions:
+            skipped_dup += 1
+            continue
+        existing_questions.add(q_norm)
+
+        if spark is not None:
+            try:
+                from genie_space_optimizer.optimization.benchmarks import validate_ground_truth_sql
+                is_valid, err = validate_ground_truth_sql(
+                    sql, spark, catalog=catalog, gold_schema=gold_schema,
+                    execute=True,
+                    parameters=b.get("parameters"),
+                )
+                if not is_valid:
+                    logger.info(
+                        "Benchmark mining: skipping invalid SQL for '%.60s': %s",
+                        question, err,
+                    )
+                    skipped_invalid += 1
+                    continue
+            except Exception:
+                logger.debug("Benchmark mining: validation error, skipping", exc_info=True)
+                skipped_invalid += 1
+                continue
+
+        proposals.append({
+            "proposal_id": f"P_BM_{len(proposals) + 1:03d}",
+            "cluster_id": f"BENCHMARK_EX_{len(proposals) + 1:03d}",
+            "lever": 5,
+            "scope": "genie_config",
+            "patch_type": "add_example_sql",
+            "change_description": f"Benchmark-mined example SQL: {question[:80]}",
+            "proposed_value": question,
+            "example_question": question,
+            "example_sql": sql,
+            "parameters": b.get("parameters", []) or [],
+            "usage_guidance": f"Mined from benchmark ground truth for: {question[:100]}",
+            "rationale": "Pre-validated benchmark SQL mined as example SQL",
+            "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+            "confidence": 0.95,
+            "questions_fixed": 1,
+            "questions_at_risk": 0,
+            "net_impact": 0.95,
+            "asi": {
+                "failure_type": "asset_routing_error",
+                "blame_set": [],
+                "severity": "minor",
+                "counterfactual_fixes": [],
+                "ambiguity_detected": False,
+            },
+            "provenance": {
+                "cluster_id": f"BENCHMARK_EX_{len(proposals):03d}",
+                "root_cause": "benchmark_mining",
+                "originating_questions": [question],
+                "lever": 5,
+                "lever_name": "Benchmark Example SQL Mining",
+                "patch_type": "add_example_sql",
+            },
+        })
+
+    logger.info(
+        "Benchmark mining: %d proposals, %d skipped (no sql=%d, dup=%d, invalid=%d)",
+        len(proposals), skipped_no_sql + skipped_dup + skipped_invalid,
+        skipped_no_sql, skipped_dup, skipped_invalid,
+    )
+    return proposals
 
 
 def _ngram_similarity(a: str, b: str, n: int = 3) -> float:
@@ -4960,6 +5367,21 @@ def _filter_no_op_proposals(proposals: list[dict], metadata_snapshot: dict) -> l
                 existing_descs[(tbl_name, col_name)] = desc
                 existing_descs[(short_name, col_name)] = desc
 
+    existing_eqs_raw = (
+        (metadata_snapshot.get("config") or metadata_snapshot).get("example_question_sqls")
+        or metadata_snapshot.get("example_question_sqls")
+        or []
+    )
+    existing_eq_questions: set[str] = set()
+    for e in existing_eqs_raw:
+        if isinstance(e, dict):
+            q = e.get("question", "")
+            if isinstance(q, list):
+                q = " ".join(q)
+            q = q.lower().strip()
+            if q:
+                existing_eq_questions.add(q)
+
     kept: list[dict] = []
     dropped = 0
     for p in proposals:
@@ -4971,6 +5393,12 @@ def _filter_no_op_proposals(proposals: list[dict], metadata_snapshot: dict) -> l
             short_tbl = tbl.rsplit(".", 1)[-1] if "." in tbl else tbl
             current = existing_descs.get((tbl, col)) or existing_descs.get((short_tbl, col)) or ""
             if current and proposed and _ngram_similarity(current, proposed) > 0.97:
+                dropped += 1
+                continue
+        if ptype == "add_example_sql":
+            eq = (p.get("example_question") or "").lower().strip()
+            if eq and eq in existing_eq_questions:
+                logger.info("Filtering no-op add_example_sql already in config: %.80s", eq)
                 dropped += 1
                 continue
         kept.append(p)
@@ -5377,7 +5805,14 @@ def generate_proposals_from_strategy(
             global_rewrite = strategy.get("global_instruction_rewrite", "")
             l5_dir = lever_dir or {}
             instruction_guidance = l5_dir.get("instruction_guidance", "")
-            example_sql_dir = l5_dir.get("example_sql")
+
+            example_sqls_list = l5_dir.get("example_sqls", [])
+            if not example_sqls_list:
+                legacy = l5_dir.get("example_sql")
+                if isinstance(legacy, dict):
+                    example_sqls_list = [legacy]
+            if not isinstance(example_sqls_list, list):
+                example_sqls_list = [example_sqls_list] if isinstance(example_sqls_list, dict) else []
 
             if global_rewrite:
                 from genie_space_optimizer.optimization.applier import _get_general_instructions
@@ -5410,17 +5845,19 @@ def generate_proposals_from_strategy(
                     "provenance": {**provenance_base, "patch_type": "rewrite_instruction"},
                 })
 
-            if isinstance(example_sql_dir, dict):
+            for ex_idx, example_sql_dir in enumerate(example_sqls_list):
+                if not isinstance(example_sql_dir, dict):
+                    continue
                 eq = (example_sql_dir.get("question") or "").strip()
                 es = (example_sql_dir.get("sql_sketch") or "").strip()
                 if eq and es:
                     proposals.append({
                         "proposal_id": f"P{len(proposals) + 1:03d}",
-                        "cluster_id": f"{ag_id}_EX",
+                        "cluster_id": f"{ag_id}_EX{ex_idx + 1}",
                         "lever": 5,
                         "scope": "genie_config",
                         "patch_type": "add_example_sql",
-                        "change_description": f"[{ag_id}] Example SQL: {eq[:80]}",
+                        "change_description": f"[{ag_id}] Example SQL {ex_idx + 1}: {eq[:80]}",
                         "proposed_value": eq,
                         "example_question": eq,
                         "example_sql": es,
@@ -5444,18 +5881,26 @@ def generate_proposals_from_strategy(
 
         # ── Example SQL from any lever ────────────────────────────────────
         if target_lever != 5 and isinstance(lever_dir, dict):
-            ex_sql = lever_dir.get("example_sql")
-            if isinstance(ex_sql, dict):
+            ex_sqls = lever_dir.get("example_sqls", [])
+            if not ex_sqls:
+                legacy_ex = lever_dir.get("example_sql")
+                if isinstance(legacy_ex, dict):
+                    ex_sqls = [legacy_ex]
+            if not isinstance(ex_sqls, list):
+                ex_sqls = [ex_sqls] if isinstance(ex_sqls, dict) else []
+            for ex_idx, ex_sql in enumerate(ex_sqls):
+                if not isinstance(ex_sql, dict):
+                    continue
                 eq = (ex_sql.get("question") or "").strip()
                 es = (ex_sql.get("sql_sketch") or "").strip()
                 if eq and es:
                     proposals.append({
                         "proposal_id": f"P{len(proposals) + 1:03d}",
-                        "cluster_id": f"{ag_id}_L{target_lever}_EX",
+                        "cluster_id": f"{ag_id}_L{target_lever}_EX{ex_idx + 1}",
                         "lever": 5,
                         "scope": "genie_config",
                         "patch_type": "add_example_sql",
-                        "change_description": f"[{ag_id}] Lever {target_lever} example SQL: {eq[:80]}",
+                        "change_description": f"[{ag_id}] Lever {target_lever} example SQL {ex_idx + 1}: {eq[:80]}",
                         "proposed_value": eq,
                         "example_question": eq,
                         "example_sql": es,
@@ -5506,6 +5951,7 @@ def generate_metadata_proposals(
     spark: Any = None,
     catalog: str = "",
     gold_schema: str = "",
+    benchmarks: list[dict] | None = None,
 ) -> list[dict]:
     """Generate metadata change proposals from failure clusters.
 
@@ -5637,6 +6083,15 @@ def generate_metadata_proposals(
                     "ambiguity_detected": False,
                 },
             })
+
+        if benchmarks:
+            mined = _mine_benchmark_example_sqls(
+                benchmarks, metadata_snapshot,
+                spark=spark, catalog=catalog, gold_schema=gold_schema,
+            )
+            if mined:
+                logger.info("Benchmark mining added %d example SQL proposals", len(mined))
+                proposals.extend(mined)
 
         proposals = _validate_lever5_proposals(
             proposals, metadata_snapshot,

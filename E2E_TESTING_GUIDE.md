@@ -1130,7 +1130,10 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Baseline eval completes: scores recorded in `genie_opt_iterations` with iteration=0
 - [ ] Baseline traces tagged with `genie.optimization_run_id`, `genie.iteration`, `genie.eval_scope`
 - [ ] Lever loop Stage 2.5: prompt matching auto-config applied (format assistance + entity matching)
-- [ ] Lever loop Stage 2.75: proactive description enrichment for blank columns (if any eligible)
+- [ ] Lever loop Stage 2.75: proactive description enrichment for insufficient columns (< 10 chars)
+- [ ] Lever loop Stage 2.75: table description enrichment for tables with no/insufficient descriptions
+- [ ] Lever loop Stage 2.75: example SQL mining from high-scoring benchmark questions
+- [ ] Lever loop noise floor: score improvements < 3.0 pts rejected as cosmetic noise
 - [ ] Lever loop strategist: holistic strategy generated triaging all failures to levers
 - [ ] Lever loop arbiter corrections: applied if ≥3 `genie_correct` verdicts in baseline
 - [ ] Lever loop arbiter filter: `both_correct` AND `genie_correct` excluded from hard failure rows
@@ -1168,12 +1171,16 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Run status updated to DISCARDED in Delta
 - [ ] Genie Space config in workspace reverted to original
 
-### Settings & Data Access
+### Settings & Permission Dashboard
 
 - [ ] `GET /api/genie/settings/data-access` returns 200 with grants and detected schemas
+- [ ] `GET /api/genie/settings/permissions` returns 200 with schema read/write permissions and space access
 - [ ] Service principal ID is displayed
-- [ ] Grant a new schema → grant appears in table
-- [ ] Revoke an existing grant → grant removed
+- [ ] Data Access tab: Grant a new schema → grant appears in table
+- [ ] Data Access tab: Revoke an existing grant → grant removed
+- [ ] Space Access tab: Grant SP edit access to a Genie Space → appears in list
+- [ ] Space Access tab: Revoke SP access → removed from list
+- [ ] Schema permissions show read/write status per schema
 - [ ] OBO permissions enforced (user needs MANAGE on schema)
 
 ### Programmatic Trigger API

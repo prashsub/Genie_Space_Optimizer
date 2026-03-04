@@ -30,14 +30,14 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 1. **Configuration Analysis** -- Scans the Genie Space config, counts tables/instructions/sample questions, and validates structure.
 2. **Metadata Collection** -- Queries Unity Catalog via REST API (with Spark SQL fallback) for columns, data types, tags, routines, and table descriptions.
 3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges. All evaluation traces are tagged with `genie.optimization_run_id`, `genie.iteration`, and `genie.lever` for end-to-end traceability. The arbiter judge identifies `genie_correct` verdicts for benchmark correction and tiered soft signals for best-practice guidance.
-4. **Configuration Generation (Lever Loop)** -- Stage 2.5 applies deterministic prompt matching (format assistance + entity matching). Stage 2.75 proactively enriches blank column descriptions using UC metadata. Arbiter benchmark corrections rewrite stale gold SQL. A holistic strategist then triages all failures and generates a unified optimization strategy. Iterates through 5 optimization levers (up to 5 iterations), applying targeted patches with tiered failure analysis (hard failures + soft signals). Each patch is evaluated via a 3-gate system (slice, P0, full); regressions trigger automatic rollback.
+4. **Configuration Generation (Lever Loop)** -- Stage 2.5 applies deterministic prompt matching (format assistance + entity matching). Stage 2.75 proactively enriches insufficient column *and table* descriptions using UC metadata, and mines proven example SQLs from high-scoring benchmark questions. Arbiter benchmark corrections rewrite stale gold SQL. A holistic strategist then triages all failures and generates a unified optimization strategy. Iterates through 5 optimization levers (up to 5 iterations), applying targeted patches with tiered failure analysis (hard failures + soft signals). Each patch is evaluated via a 3-gate system (slice, P0, full); regressions trigger automatic rollback. Score improvements below the noise floor (3 pts) are treated as cosmetic and rejected.
 5. **Optimized Evaluation & Repeatability** -- Final evaluation of the optimized config, including repeatability testing to ensure consistent results.
 
 ### Optimization Levers
 
 Before the main lever loop, four preparatory stages run:
 - **Stage 2.5 (Prompt Matching)** -- Deterministic format assistance (`get_example_values`) and entity matching (`build_value_dictionary`) on prioritized columns. No LLM involved.
-- **Stage 2.75 (Description Enrichment)** -- LLM-generated structured descriptions for columns with no description in both Genie Space and Unity Catalog. Also generates space descriptions and sample questions for spaces that lack them.
+- **Stage 2.75 (Description Enrichment)** -- LLM-generated structured descriptions for columns *and tables* with insufficient descriptions (< 10 chars). Also generates space descriptions and sample questions for spaces that lack them, and mines proven example SQLs from high-scoring benchmark questions.
 - **Stage 2.85 (Proactive Join Discovery)** -- Parses JOIN clauses from successful baseline queries, corroborates with UC foreign key constraints, and codifies execution-proven joins as Genie Space join specifications.
 - **Strategist** -- Holistic triage of all failures into a unified optimization strategy with per-lever action plans.
 
@@ -115,7 +115,7 @@ Genie_Space_Optimizer/
 │   │       ├── spaces.py             # GET /spaces, GET /spaces/{id}, POST /spaces/{id}/optimize
 │   │       ├── runs.py               # GET /runs/{id}, comparison, iterations, ASI, provenance, apply/discard
 │   │       ├── activity.py           # GET /activity (recent runs feed)
-│   │       ├── settings.py           # GET/POST/DELETE /settings/data-access (UC permissions)
+│   │       ├── settings.py           # Permission dashboard: data-access, space-access, schema permissions
 │   │       └── trigger.py            # POST /trigger, GET /trigger/status (programmatic API)
 │   │
 │   ├── ui/                           # React + Vite frontend
@@ -139,21 +139,22 @@ Genie_Space_Optimizer/
 │   │   │   ├── ProvenancePanel.tsx   # Judge → cluster → patch provenance viewer
 │   │   │   ├── StageTimeline.tsx     # Pipeline stage timeline visualization
 │   │   │   ├── CrossRunChart.tsx     # Cross-run score comparison chart
-│   │   │   └── ui/                   # shadcn/ui components (incl. chart)
+│   │   │   ├── ProcessFlow.tsx       # Pipeline process flow visualization
+│   │   │   └── ui/                   # shadcn/ui components (incl. chart, accordion, alert-dialog)
 │   │   └── lib/
 │   │       ├── api.ts                # Auto-generated OpenAPI client (DO NOT edit)
 │   │       ├── transparency-api.ts   # Transparency API hooks (iterations, ASI, provenance)
 │   │       └── selector.ts           # Query selector helper
 │   │
 │   ├── common/                       # Shared utilities
-│   │   ├── config.py                 # All constants (thresholds, prompts, taxonomy)
+│   │   ├── config.py                 # All constants (thresholds, prompts, taxonomy, noise floor)
 │   │   ├── genie_client.py           # Genie Space API wrapper (list, fetch, patch, query, result DFs)
 │   │   ├── genie_schema.py           # Genie Space config schema validation (lenient + strict modes)
 │   │   ├── uc_metadata.py            # Unity Catalog introspection (REST API + Spark SQL fallback + FK extraction)
 │   │   └── delta_helpers.py          # Delta table read/write operations
 │   │
 │   ├── optimization/                 # Core optimization engine
-│   │   ├── optimizer.py              # Strategist, failure analysis, proposal generation, description enrichment
+│   │   ├── optimizer.py              # Strategist, failure analysis, proposal generation, table/column enrichment, example SQL mining
 │   │   ├── evaluation.py             # Benchmark generation, temporal date resolution, 9-judge scoring, MLflow tracking
 │   │   ├── applier.py                # Patch application & rollback
 │   │   ├── harness.py                # Full pipeline orchestration
@@ -205,6 +206,9 @@ All endpoints are prefixed with `/api/genie`.
 | `GET` | `/settings/data-access` | `getDataAccess` | List UC data-access grants and auto-detected schemas |
 | `POST` | `/settings/data-access` | `grantDataAccess` | Grant app service principal access to a UC schema |
 | `DELETE` | `/settings/data-access/{grant_id}` | `revokeDataAccess` | Revoke a UC data-access grant |
+| `GET` | `/settings/permissions` | `getPermissionDashboard` | Permission dashboard: schema read/write, space access |
+| `POST` | `/settings/space-access` | `grantSpaceAccess` | Grant app SP edit access to a Genie Space |
+| `DELETE` | `/settings/space-access/{space_id}` | `revokeSpaceAccess` | Revoke app SP access from a Genie Space |
 | `POST` | `/trigger` | `triggerOptimization` | Trigger optimization programmatically (headless API) |
 | `GET` | `/trigger/status/{run_id}` | `getTriggerStatus` | Poll status of a triggered optimization run |
 | `GET` | `/runs/{run_id}/iterations` | `getIterations` | Per-iteration scores for iteration chart |

@@ -6,6 +6,33 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Permission Dashboard, Table Enrichment, Example SQL Mining, Noise Floor
+- **Permission dashboard** (`settings.py`, `settings.tsx`): overhauled settings page
+  with tabbed layout (Data Access, Space Access); read/write privilege probing;
+  `PermissionDashboard`, `SchemaPermission`, `SpacePermissions` models; grant/revoke
+  space access endpoints; accordion-based schema permission viewer
+- **Table description enrichment** (`optimizer.py`, `config.py`): new
+  `TABLE_DESCRIPTION_ENRICHMENT_PROMPT` and `_enrich_table_descriptions()` for tables
+  with no/insufficient descriptions (< 10 chars); integrated into description enrichment stage
+- **Example SQL mining** (`optimizer.py`, `harness.py`): `_mine_benchmark_example_sqls()`
+  extracts proven SQL patterns from high-scoring benchmark questions and proposes them
+  as `add_example_sql` patches for Genie Space sample queries
+- **Noise floor threshold** (`config.py`, `harness.py`): `MAX_NOISE_FLOOR = 3.0` —
+  score improvements below this threshold are treated as noise, preventing
+  cosmetic-only patches from being accepted
+- **LLM timeout management** (`optimizer.py`): `_ws_with_timeout()` creates workspace
+  clients with configurable HTTP timeout (600s default) for long-running LLM calls
+- **Stable experiment paths** (`preflight.py`): experiments now live under
+  `/Shared/genie-space-optimizer/<space_id>/<domain>` — SP can create without OBO
+- **Insufficient description detection** (`optimizer.py`): `_is_description_insufficient()`
+  replaces `_is_description_blank()` — columns with < 10 char descriptions are now eligible
+  for enrichment
+- **ProcessFlow UI component**: new pipeline process flow visualization
+- **Settings UI overhaul**: tabs, accordion, alert dialogs for confirmation flows
+- Expanded tests: +829 optimizer, +28 applier lines
+
+---
+
 ### Added — Proactive Join Discovery, Space Metadata Generation, Scorer Accuracy Fixes
 - **Stage 2.85: Proactive join discovery** (`harness.py`, `optimizer.py`): parses JOIN
   clauses from successful baseline eval queries (arbiter `both_correct`/`genie_correct`),

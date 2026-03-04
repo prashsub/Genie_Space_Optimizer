@@ -125,58 +125,6 @@ def get_foreign_keys_for_tables_rest(
     w: "WorkspaceClient",
     refs: list[tuple[str, str, str]],
 ) -> list[dict]:
-    """Fetch foreign key constraints via the Unity Catalog REST API.
-
-    Calls ``w.tables.get()`` per table and extracts FK constraints from
-    ``TableInfo.table_constraints``.  Each returned dict describes one FK
-    relationship with fully-qualified table names:
-
-    ``child_table``, ``child_columns``, ``parent_table``, ``parent_columns``,
-    ``constraint_name``.
-    """
-    rows: list[dict] = []
-    failed: list[str] = []
-    for cat, sch, tbl in refs:
-        if not (cat and sch and tbl):
-            continue
-        full_name = f"{cat}.{sch}.{tbl}"
-        try:
-            table_info = w.tables.get(full_name=full_name)
-        except Exception as exc:
-            failed.append(f"{full_name}: {type(exc).__name__}: {exc}")
-            continue
-        if not table_info.table_constraints:
-            continue
-        for tc in table_info.table_constraints:
-            fk = getattr(tc, "foreign_key_constraint", None)
-            if not fk:
-                continue
-            parent_table = getattr(fk, "parent_table", "") or ""
-            child_cols = list(getattr(fk, "child_columns", []) or [])
-            parent_cols = list(getattr(fk, "parent_columns", []) or [])
-            if parent_table and child_cols and parent_cols:
-                rows.append({
-                    "child_table": full_name,
-                    "child_columns": child_cols,
-                    "parent_table": parent_table,
-                    "parent_columns": parent_cols,
-                    "constraint_name": getattr(fk, "name", "") or "",
-                })
-    summary = (
-        f"[UC_METADATA] REST get_foreign_keys_for_tables_rest: "
-        f"{len(refs)} refs, {len(refs) - len(failed)} succeeded, {len(rows)} FK rows"
-    )
-    print(summary, flush=True)
-    if failed:
-        for f in failed:
-            print(f"[UC_METADATA]   FAILED: {f}", flush=True)
-    return rows
-
-
-def get_foreign_keys_for_tables_rest(
-    w: "WorkspaceClient",
-    refs: list[tuple[str, str, str]],
-) -> list[dict]:
     """Fetch FK constraint metadata via the Unity Catalog REST API.
 
     Calls ``w.tables.get()`` per table and extracts ``ForeignKeyConstraint``

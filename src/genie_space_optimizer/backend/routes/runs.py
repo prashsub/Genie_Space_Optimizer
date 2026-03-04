@@ -265,7 +265,7 @@ _STEP_DEFINITIONS: list[_StepDefinition] = [
     {
         "stepNumber": 4,
         "name": "Configuration Generation",
-        "stage_prefixes": ["LEVER_"],
+        "stage_prefixes": ["LEVER_", "AG_"],
         "summary_template": "Applied {patches} optimizations across {levers} categories. Score improved from {before}% to {after}%",
     },
     {
@@ -626,6 +626,15 @@ def _build_step_io(
         )
 
     if step_num == 4:
+        patches_applied = detail.get("patches_applied")
+        if patches_applied is None:
+            patches_applied = detail.get("patches_count")
+        iteration_counter = detail.get("iteration_counter")
+        if iteration_counter is None:
+            iteration_counter = run_data.get("best_iteration")
+        levers_accepted = detail.get("levers_accepted", [])
+        levers_rolled_back = detail.get("levers_rolled_back", [])
+
         return (
             {
                 "leverCountConfigured": len(run_data.get("levers", []))
@@ -634,10 +643,12 @@ def _build_step_io(
                 "maxIterations": run_data.get("max_iterations"),
             },
             {
-                "patchesApplied": detail.get("patches_applied"),
-                "leversAccepted": detail.get("levers_accepted"),
-                "leversRolledBack": detail.get("levers_rolled_back"),
-                "iterationCounter": detail.get("iteration_counter"),
+                "patchesApplied": patches_applied,
+                "leversAccepted": levers_accepted,
+                "leversRolledBack": levers_rolled_back,
+                "iterationCounter": iteration_counter,
+                "baselineAccuracy": run_data.get("baseline_accuracy"),
+                "bestAccuracy": _safe_float(run_data.get("best_accuracy")),
                 "stageEvents": timeline,
             },
         )

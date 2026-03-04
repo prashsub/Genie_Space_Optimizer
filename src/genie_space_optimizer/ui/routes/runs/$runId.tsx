@@ -603,6 +603,37 @@ function StepInsights({
   const outputs = step.outputs ?? {};
   if (!Object.keys(outputs).length) return null;
 
+  if (step.stepNumber === 1) {
+    const tableCount = outputs.tableCount as number | undefined;
+    const tables = (outputs.tables as string[] | undefined) ?? [];
+    const functionCount = outputs.functionCount as number | undefined;
+    const instructionCount = outputs.instructionCount as number | undefined;
+    const sampleQuestionCount = outputs.sampleQuestionCount as number | undefined;
+    const sampleQuestionsPreview = (outputs.sampleQuestionsPreview as string[] | undefined) ?? [];
+
+    return (
+      <div className="space-y-2 text-xs">
+        <div className="flex flex-wrap gap-2">
+          {tableCount != null && <Badge variant="secondary">Tables: {tableCount}</Badge>}
+          {functionCount != null && <Badge variant="secondary">Functions: {functionCount}</Badge>}
+          {instructionCount != null && <Badge variant="secondary">Instructions: {instructionCount}</Badge>}
+          {sampleQuestionCount != null && <Badge variant="secondary">Sample questions: {sampleQuestionCount}</Badge>}
+        </div>
+        {tables.length > 0 && (
+          <p className="text-muted-foreground">Tables: {tables.slice(0, 8).join(", ")}</p>
+        )}
+        {sampleQuestionsPreview.length > 0 && (
+          <div className="space-y-1">
+            <p className="font-medium text-muted-foreground">Sample questions</p>
+            {sampleQuestionsPreview.slice(0, 3).map((q, i) => (
+              <p key={i} className="text-muted-foreground truncate">{q}</p>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   if (step.stepNumber === 2) {
     const columnsCollected = outputs.columnsCollected as number | undefined;
     const tagsCollected = outputs.tagsCollected as number | undefined;
@@ -727,6 +758,50 @@ function StepInsights({
             </a>
           </Button>
         )}
+      </div>
+    );
+  }
+
+  if (step.stepNumber === 4) {
+    const patchesApplied = outputs.patchesApplied as number | undefined;
+    const leversAccepted = (outputs.leversAccepted as unknown[] | undefined) ?? [];
+    const leversRolledBack = (outputs.leversRolledBack as unknown[] | undefined) ?? [];
+    const iterationCounter = outputs.iterationCounter as number | undefined;
+    const baselineAccuracy = outputs.baselineAccuracy as number | undefined;
+    const bestAccuracy = outputs.bestAccuracy as number | undefined;
+
+    return (
+      <div className="space-y-2 text-xs">
+        <div className="flex flex-wrap gap-2">
+          {patchesApplied != null && <Badge variant="secondary">Patches applied: {patchesApplied}</Badge>}
+          <Badge variant="secondary">Levers accepted: {leversAccepted.length}</Badge>
+          <Badge variant="secondary">Levers rolled back: {leversRolledBack.length}</Badge>
+          {iterationCounter != null && <Badge variant="secondary">Iterations: {iterationCounter}</Badge>}
+        </div>
+        {baselineAccuracy != null && bestAccuracy != null && (
+          <p className="text-muted-foreground">
+            Score: {baselineAccuracy.toFixed(1)}% → {bestAccuracy.toFixed(1)}%
+            <span className={bestAccuracy > baselineAccuracy ? "ml-1 text-green-600" : "ml-1"}>
+              ({bestAccuracy > baselineAccuracy ? "+" : ""}{(bestAccuracy - baselineAccuracy).toFixed(1)}%)
+            </span>
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  if (step.stepNumber === 5) {
+    const bestAccuracy = outputs.bestAccuracy as number | undefined;
+    const repeatability = outputs.repeatability as number | undefined;
+    const convergenceReason = outputs.convergenceReason as string | undefined;
+
+    return (
+      <div className="space-y-2 text-xs">
+        <div className="flex flex-wrap gap-2">
+          {bestAccuracy != null && <Badge variant="secondary">Best accuracy: {bestAccuracy.toFixed(1)}%</Badge>}
+          {repeatability != null && <Badge variant="secondary">Repeatability: {repeatability.toFixed(1)}%</Badge>}
+          {convergenceReason && <Badge variant="secondary">Convergence: {convergenceReason}</Badge>}
+        </div>
       </div>
     );
   }

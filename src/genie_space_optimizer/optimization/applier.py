@@ -115,10 +115,15 @@ def _validate_example_sql_entry(
         sql_lower = (" ".join(raw_sql) if isinstance(raw_sql, list) else str(raw_sql)).lower()
         if sql_lower:
             known: set[str] = set()
-            for tbl in (config.get("data_sources") or {}).get("tables", []):
-                ident = (tbl.get("identifier") or tbl.get("name") or "").lower()
-                known.add(ident)
-                known.add(ident.rsplit(".", 1)[-1])
+            ds = config.get("data_sources") or {}
+            for source_key in ("tables", "metric_views"):
+                for tbl in ds.get(source_key) or []:
+                    ident = (tbl.get("identifier") or tbl.get("name") or "").lower()
+                    known.add(ident)
+                    parts = ident.split(".")
+                    if len(parts) >= 2:
+                        known.add(".".join(parts[-2:]))
+                    known.add(parts[-1])
             known.discard("")
             if known and not any(a in sql_lower for a in known):
                 logger.warning(
