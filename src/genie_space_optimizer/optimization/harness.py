@@ -432,7 +432,8 @@ def _run_baseline(
                     print(f"\n[MLflow Review] Baseline labeling session: {_bl_session_name}")
                     if _bl_session_url:
                         print(f"  URL: {_bl_session_url}")
-            except Exception:
+            except Exception as exc:
+                print(f"[Labeling] Failed to create baseline labeling session: {exc}")
                 logger.warning("Failed to create baseline labeling session", exc_info=True)
 
         return {
@@ -3795,7 +3796,8 @@ def _run_lever_loop(
                     labeling_session_run_id=_srun,
                     labeling_session_url=_surl,
                 )
-        except Exception:
+        except Exception as exc:
+            print(f"[Labeling] Failed to create labeling session: {exc}")
             logger.warning("Failed to create labeling session", exc_info=True)
 
     # ── End-of-Run Summary ─────────────────────────────────────────

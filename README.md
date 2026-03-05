@@ -158,7 +158,7 @@ Genie_Space_Optimizer/
 │   │   ├── applier.py                # Patch application & rollback
 │   │   ├── harness.py                # Full pipeline orchestration
 │   │   ├── preflight.py              # Pre-flight validation
-│   │   ├── labeling.py               # MLflow labeling sessions (human-in-the-loop review, eval-run-based trace population)
+│   │   ├── labeling.py               # MLflow labeling sessions (overwrite-based schema creation, batched trace population, console diagnostics)
 │   │   ├── state.py                  # Delta-backed state machine (6 tables + provenance)
 │   │   ├── benchmarks.py             # Benchmark question definitions
 │   │   ├── repeatability.py          # Repeatability testing & variance classification

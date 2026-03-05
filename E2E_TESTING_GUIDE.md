@@ -1173,6 +1173,10 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] `GET /pending-reviews/{space_id}` returns flagged questions, queued patches, labeling session URL
 - [ ] Pending review badge shown on run detail page and space card
 - [ ] Reflection entries track `affected_question_ids`, `fixed_questions`, `still_failing`, `new_regressions`
+- [ ] Label schemas created with `overwrite=True` (no defensive existence-check needed)
+- [ ] Console `print()` diagnostics visible for schema creation, session creation, and trace population steps
+- [ ] Labeling session created with `mlflow.set_experiment()` called before session creation
+- [ ] Trace population uses batched `add_traces()` — priority traces first, then backfill (not single concat)
 - [ ] Labeling session created with eval-run-based trace population (flagged trace IDs prioritized)
 - [ ] Labeling session URL persisted to `genie_opt_runs.labeling_session_url`
 - [ ] Labeling session URL surfaced as "Human Review" link in run detail UI

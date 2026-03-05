@@ -6,6 +6,25 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Changed — Labeling Module Simplification, Console Diagnostics
+- **Simplified label schema creation** (`labeling.py`): removed the defensive
+  `_create_or_reuse_schema()` helper; schemas are now defined in a data-driven list
+  and created with `overwrite=True` in a simple loop, eliminating the complex
+  existence-checking and error-signal parsing logic.
+- **Console-visible diagnostics** (`labeling.py`, `harness.py`): added `print()`
+  messages throughout the labeling pipeline — schema creation failures, session
+  creation progress, trace search fallbacks, experiment-not-found, and per-batch
+  trace counts are now visible in the job notebook console output.
+- **Batched trace population** (`labeling.py`): `_populate_session_traces()` now
+  calls `session.add_traces()` in two separate batches (priority traces first,
+  then backfill) instead of concatenating into a single DataFrame, improving
+  memory efficiency and providing per-batch progress logging.
+- **Explicit experiment context** (`labeling.py`): `create_review_session()` now
+  calls `mlflow.set_experiment()` before session creation to ensure the correct
+  experiment context is active.
+
+---
+
 ### Added — Per-Question Failure Persistence, Escalation Framework, Pending Reviews
 - **Cross-iteration verdict history** (`harness.py`): `_build_verdict_history()` builds
   per-question arbiter verdict history across all full-scope evaluations.

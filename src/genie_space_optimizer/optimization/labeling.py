@@ -35,46 +35,6 @@ ALL_SCHEMA_NAMES = [
 ]
 
 
-def _create_or_reuse_schema(schemas_mod: Any, **kwargs: Any) -> bool:
-    """Create a label schema if it doesn't exist; reuse it if it does.
-
-    MLflow's ``create_label_schema`` internally deletes-then-recreates when
-    a schema with the same name exists, which fails when a labeling session
-    references the schema.  We check existence first via ``get_label_schema``
-    and treat "referenced by labeling sessions" errors as proof the schema
-    already exists.
-    """
-    name = kwargs["name"]
-    kwargs.pop("overwrite", None)
-    try:
-        existing = schemas_mod.get_label_schema(name)
-        if existing is not None:
-            logger.info("Label schema '%s' already exists — reusing", name)
-            return True
-    except Exception:
-        pass
-
-    try:
-        schemas_mod.create_label_schema(**kwargs, overwrite=False)
-        logger.info("Created label schema '%s'", name)
-        return True
-    except Exception as exc:
-        err_lower = str(exc).lower()
-        _exists_signals = [
-            "already exists",
-            "referenced by",
-            "cannot rename or remove",
-            "labeling sessions",
-        ]
-        if any(s in err_lower for s in _exists_signals):
-            logger.info(
-                "Label schema '%s' already exists (confirmed by error) — reusing", name,
-            )
-            return True
-        logger.warning("Failed to create label schema '%s': %s", name, exc)
-        return False
-
-
 def ensure_labeling_schemas() -> list[str]:
     """Create or reuse custom labeling schemas for Genie optimization review.
 
@@ -89,71 +49,70 @@ def ensure_labeling_schemas() -> list[str]:
             InputTextList,
         )
     except ImportError:
-        logger.warning("mlflow.genai.label_schemas not available — skipping schema creation")
+        print("[Labeling] mlflow.genai.label_schemas not available — skipping")
         return []
 
     available: list[str] = []
+    _schema_defs: list[dict] = [
+        {
+            "name": SCHEMA_JUDGE_VERDICT,
+            "type": "feedback",
+            "title": "Is the judge's verdict correct for this question?",
+            "input": InputCategorical(options=[
+                "Correct - judge is right",
+                "Wrong - Genie answer is actually fine",
+                "Wrong - both answers are wrong",
+                "Ambiguous - question is unclear",
+            ]),
+            "instruction": (
+                "Review the benchmark question, expected SQL, Genie-generated SQL, "
+                "and each judge's rationale. Was the overall verdict correct?"
+            ),
+            "enable_comment": True,
+        },
+        {
+            "name": SCHEMA_CORRECTED_SQL,
+            "type": "expectation",
+            "title": "Provide the correct expected SQL (if benchmark is wrong)",
+            "input": InputText(),
+            "instruction": (
+                "If the benchmark's expected SQL is incorrect or suboptimal, "
+                "provide the corrected SQL. Leave blank if the benchmark is correct."
+            ),
+        },
+        {
+            "name": SCHEMA_PATCH_APPROVAL,
+            "type": "feedback",
+            "title": "Should the proposed optimization patch be applied?",
+            "input": InputCategorical(options=["Approve", "Reject", "Modify"]),
+            "instruction": (
+                "Review the proposed metadata change (column description, instruction, "
+                "join condition, etc.). Approve it, reject it, or suggest modifications."
+            ),
+            "enable_comment": True,
+        },
+        {
+            "name": SCHEMA_IMPROVEMENTS,
+            "type": "expectation",
+            "title": "Suggest improvements for this Genie Space",
+            "input": InputTextList(max_count=5, max_length_each=500),
+            "instruction": (
+                "Provide specific, actionable improvements: better column descriptions, "
+                "missing join conditions, instruction changes, or table-level fixes."
+            ),
+        },
+    ]
 
-    if _create_or_reuse_schema(
-        schemas,
-        name=SCHEMA_JUDGE_VERDICT,
-        type="feedback",
-        title="Is the judge's verdict correct for this question?",
-        input=InputCategorical(options=[
-            "Correct - judge is right",
-            "Wrong - Genie answer is actually fine",
-            "Wrong - both answers are wrong",
-            "Ambiguous - question is unclear",
-        ]),
-        instruction=(
-            "Review the benchmark question, expected SQL, Genie-generated SQL, "
-            "and each judge's rationale. Was the overall verdict correct?"
-        ),
-        enable_comment=True,
-    ):
-        available.append(SCHEMA_JUDGE_VERDICT)
+    for defn in _schema_defs:
+        name = defn["name"]
+        try:
+            schemas.create_label_schema(**defn, overwrite=True)
+            available.append(name)
+        except Exception as exc:
+            print(f"[Labeling] Failed to create schema '{name}': {exc}")
+            logger.warning("Failed to create label schema '%s': %s", name, exc)
 
-    if _create_or_reuse_schema(
-        schemas,
-        name=SCHEMA_CORRECTED_SQL,
-        type="expectation",
-        title="Provide the correct expected SQL (if benchmark is wrong)",
-        input=InputText(),
-        instruction=(
-            "If the benchmark's expected SQL is incorrect or suboptimal, "
-            "provide the corrected SQL. Leave blank if the benchmark is correct."
-        ),
-    ):
-        available.append(SCHEMA_CORRECTED_SQL)
-
-    if _create_or_reuse_schema(
-        schemas,
-        name=SCHEMA_PATCH_APPROVAL,
-        type="feedback",
-        title="Should the proposed optimization patch be applied?",
-        input=InputCategorical(options=["Approve", "Reject", "Modify"]),
-        instruction=(
-            "Review the proposed metadata change (column description, instruction, "
-            "join condition, etc.). Approve it, reject it, or suggest modifications."
-        ),
-        enable_comment=True,
-    ):
-        available.append(SCHEMA_PATCH_APPROVAL)
-
-    if _create_or_reuse_schema(
-        schemas,
-        name=SCHEMA_IMPROVEMENTS,
-        type="expectation",
-        title="Suggest improvements for this Genie Space",
-        input=InputTextList(max_count=5, max_length_each=500),
-        instruction=(
-            "Provide specific, actionable improvements: better column descriptions, "
-            "missing join conditions, instruction changes, or table-level fixes."
-        ),
-    ):
-        available.append(SCHEMA_IMPROVEMENTS)
-
-    logger.info("Ensured %d labeling schemas: %s", len(available), ", ".join(available))
+    print(f"[Labeling] Ensured {len(available)}/{len(_schema_defs)} schemas: {', '.join(available)}")
     return available
 
 
@@ -183,21 +142,23 @@ def create_review_session(
     try:
         import mlflow.genai.labeling as labeling
     except ImportError:
-        logger.warning("mlflow.genai.labeling not available — skipping session creation")
+        print("[Labeling] mlflow.genai.labeling not available — skipping session creation")
         return {}
 
     schema_names = ensure_labeling_schemas()
     if not schema_names:
-        logger.warning("No labeling schemas created; skipping session")
+        print("[Labeling] No schemas available — cannot create labeling session")
         return {}
+
+    mlflow.set_experiment(experiment_name)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_name = f"genie_opt_review_{domain}_{run_id[:8]}_{ts}"
 
-    logger.info(
-        "Creating labeling session %s — %d failure tids, %d regression tids, %d eval run ids",
-        session_name, len(failure_trace_ids), len(regression_trace_ids),
-        len(eval_mlflow_run_ids or []),
+    print(
+        f"[Labeling] Creating session '{session_name}' in experiment '{experiment_name}' "
+        f"({len(failure_trace_ids)} failures, {len(regression_trace_ids)} regressions, "
+        f"{len(eval_mlflow_run_ids or [])} eval runs)"
     )
 
     try:
@@ -206,7 +167,8 @@ def create_review_session(
             label_schemas=schema_names,
             assigned_users=reviewers or [],
         )
-    except Exception:
+    except Exception as exc:
+        print(f"[Labeling] Failed to create session: {exc}")
         logger.exception("Failed to create labeling session")
         return {}
 
@@ -220,7 +182,8 @@ def create_review_session(
             regression_trace_ids=regression_trace_ids,
             eval_mlflow_run_ids=eval_mlflow_run_ids or [],
         )
-    except Exception:
+    except Exception as exc:
+        print(f"[Labeling] Failed to add traces to session: {exc}")
         logger.exception("Failed to add traces to labeling session")
 
     session_run_id = getattr(session, "mlflow_run_id", "")
@@ -279,7 +242,8 @@ def _populate_session_traces(
                 if run_traces is not None and len(run_traces) > 0:
                     logger.info("Found %d traces in eval run %s", len(run_traces), rid)
                     frames.append(run_traces)
-            except Exception:
+            except Exception as exc:
+                print(f"[Labeling] Failed to search traces for eval run {rid}: {exc}")
                 logger.warning("Failed to search traces for eval run %s", rid, exc_info=True)
         if frames:
             all_traces = pd.concat(frames, ignore_index=True)
@@ -290,9 +254,10 @@ def _populate_session_traces(
             )
 
     if all_traces is None or len(all_traces) == 0:
-        logger.info("Falling back to experiment-wide trace search for session %s", session_name)
+        print(f"[Labeling] Falling back to experiment-wide trace search for session {session_name}")
         exp = mlflow.get_experiment_by_name(experiment_name)
         if not exp:
+            print(f"[Labeling] Experiment '{experiment_name}' not found — session will be empty")
             logger.warning("Experiment '%s' not found — session will be empty", experiment_name)
             return 0
         all_traces = mlflow.search_traces(
@@ -300,6 +265,7 @@ def _populate_session_traces(
             max_results=500,
         )
         if all_traces is None or len(all_traces) == 0:
+            print(f"[Labeling] No traces found for experiment '{experiment_name}'")
             logger.warning("No traces found for experiment '%s'", experiment_name)
             return 0
 
@@ -316,24 +282,33 @@ def _populate_session_traces(
         priority_traces = pd.DataFrame()
         other_traces = all_traces
 
-    remaining = _MAX_SESSION_TRACES - len(priority_traces)
+    traces_added = 0
+
+    if len(priority_traces) > 0:
+        batch = priority_traces.head(_MAX_SESSION_TRACES)
+        session.add_traces(batch)
+        traces_added += len(batch)
+        print(f"[Labeling] Added {len(batch)} priority traces to session {session_name}")
+
+    remaining = _MAX_SESSION_TRACES - traces_added
     if remaining > 0 and len(other_traces) > 0:
         backfill = other_traces.head(remaining)
-        combined = pd.concat([priority_traces, backfill], ignore_index=True)
-    else:
-        combined = priority_traces.head(_MAX_SESSION_TRACES)
+        session.add_traces(backfill)
+        traces_added += len(backfill)
+        print(f"[Labeling] Added {len(backfill)} backfill traces to session {session_name}")
 
-    if len(combined) == 0:
+    if traces_added == 0:
+        print(f"[Labeling] No traces to add to labeling session {session_name}")
         logger.warning("No traces to add to labeling session %s", session_name)
         return 0
 
-    session.add_traces(combined)
     logger.info(
         "Added %d traces to labeling session %s (%d priority + %d backfill)",
-        len(combined), session_name,
-        len(priority_traces), len(combined) - len(priority_traces),
+        traces_added, session_name,
+        min(len(priority_traces), _MAX_SESSION_TRACES),
+        traces_added - min(len(priority_traces), _MAX_SESSION_TRACES),
     )
-    return len(combined)
+    return traces_added
 
 
 def _find_session_by_name(session_name: str) -> Any | None:
