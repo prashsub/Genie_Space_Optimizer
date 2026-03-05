@@ -1163,7 +1163,17 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Gate Feedback logged on MLflow traces (`gate_{type}` entries with pass/fail + regression details)
 - [ ] Expected SQL logged as `Expectation` assessments on evaluation traces (baseline + each accepted iteration)
 - [ ] Instruction slot budget enforced: proposals capped at remaining budget, post-apply trim, strict validation
-- [ ] Labeling session created with eval-run-based trace population (not experiment-wide search)
+- [ ] Cross-iteration verdict history: per-question arbiter verdicts tracked across all full-scope evaluations
+- [ ] Question persistence summary: INTERMITTENT / PERSISTENT / ADDITIVE_LEVERS_EXHAUSTED classification
+- [ ] Escalation: `remove_tvf` triggers TVF schema overlap analysis and confidence tiering
+- [ ] Escalation: `gt_repair` triggers LLM-assisted ground-truth SQL correction for `neither_correct`
+- [ ] Escalation: `flag_for_review` writes to `genie_opt_flagged_questions` Delta table
+- [ ] Quarantined questions excluded from accuracy denominator after repeated `neither_correct` + failed GT repair
+- [ ] Queued patches written to `genie_opt_queued_patches` for high-risk patches pending human approval
+- [ ] `GET /pending-reviews/{space_id}` returns flagged questions, queued patches, labeling session URL
+- [ ] Pending review badge shown on run detail page and space card
+- [ ] Reflection entries track `affected_question_ids`, `fixed_questions`, `still_failing`, `new_regressions`
+- [ ] Labeling session created with eval-run-based trace population (flagged trace IDs prioritized)
 - [ ] Labeling session URL persisted to `genie_opt_runs.labeling_session_url`
 - [ ] Labeling session URL surfaced as "Human Review" link in run detail UI
 - [ ] Baseline labeling session also captures and persists session URL

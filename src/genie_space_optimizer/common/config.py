@@ -80,7 +80,16 @@ SLICE_GATE_TOLERANCE = 15.0
 REGRESSION_THRESHOLD = 5.0
 MAX_NOISE_FLOOR = 5.0
 PLATEAU_ITERATIONS = 2
-ARBITER_CORRECTION_TRIGGER = 3
+ARBITER_CORRECTION_TRIGGER = 3  # deprecated — use per-question thresholds below
+GENIE_CORRECT_CONFIRMATION_THRESHOLD = 2
+"""Minimum independent evaluations where a question must receive ``genie_correct``
+before the benchmark's expected SQL is auto-corrected with Genie's SQL."""
+NEITHER_CORRECT_REPAIR_THRESHOLD = 2
+"""After this many ``neither_correct`` verdicts across iterations for a single
+question, attempt LLM-assisted ground-truth repair."""
+NEITHER_CORRECT_QUARANTINE_THRESHOLD = 3
+"""Quarantine a question (exclude from accuracy denominator) after this many
+consecutive ``neither_correct`` verdicts AND at least one failed GT repair."""
 REPEATABILITY_EXTRA_QUERIES = 2
 DIMINISHING_RETURNS_EPSILON = 2.0
 """Stop the lever loop when the last DIMINISHING_RETURNS_LOOKBACK accepted
@@ -89,6 +98,18 @@ DIMINISHING_RETURNS_LOOKBACK = 2
 REFLECTION_WINDOW_FULL = 3
 """Number of most-recent reflection entries shown in full detail inside the
 adaptive strategist prompt.  Older entries are compressed to one line."""
+
+PERSISTENCE_MIN_FAILURES = 2
+"""Minimum non-passing evaluations across iterations before a question
+appears in the per-question persistence summary shown to the strategist."""
+
+TVF_REMOVAL_MIN_ITERATIONS = 2
+"""Minimum consecutive failing iterations (each with 2 evals) before TVF
+removal is considered.  Effectively requires >= 4 consecutive eval failures."""
+
+TVF_REMOVAL_BLAME_THRESHOLD = 2
+"""Minimum distinct iterations where the TVF was blamed in ASI provenance
+for high-confidence auto-removal."""
 
 # ── 4. LLM Configuration ──────────────────────────────────────────────
 
@@ -1682,6 +1703,22 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '## Identifier Allowlist\n'
     'ONLY reference identifiers from this allowlist:\n'
     '{{ identifier_allowlist }}\n'
+    '\n'
+    '## Escalation for Persistent Failures\n'
+    'Check the Persistent Question Failures section.  If a question is marked '
+    'ADDITIVE_LEVERS_EXHAUSTED, do NOT propose more add_instruction or add_example_sql '
+    'patches for it — those have already been tried multiple times without effect.\n'
+    'Instead, set the optional "escalation" field in your output:\n'
+    '- "remove_tvf": The root cause is a misleading TVF that overrides routing.  '
+    'Only TVFs may be removed — NEVER tables or metric views.  Include the TVF identifier '
+    'in lever 3.  The system will assess removal confidence and either auto-apply, '
+    'flag for review, or escalate to human.\n'
+    '- "gt_repair": The ground-truth SQL appears incorrect (neither_correct pattern).  '
+    'The system will attempt LLM-assisted GT correction.\n'
+    '- "flag_for_review": No automated fix is viable.  The question will be flagged '
+    'for human review in the labeling session.\n'
+    'If INTERMITTENT, the question may be non-deterministic — monitor but do not '
+    'escalate unless it becomes PERSISTENT.\n'
     '</instructions>\n'
     '\n'
     '<context>\n'
@@ -1696,6 +1733,9 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     '## Reflection History\n'
     '{{ reflection_buffer }}\n'
+    '\n'
+    '## Persistent Question Failures\n'
+    '{{ question_persistence_summary }}\n'
     '\n'
     '## Schema Context\n'
     '{{ full_schema_context }}\n'
@@ -1747,7 +1787,8 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '"parameters": [{"name": "...", "type_hint": "STRING", "default_value": "..."}], '
     '"usage_guidance": "<when to match>"}]}\n'
     '      },\n'
-    '      "coordination_notes": "<how levers reference each other>"\n'
+    '      "coordination_notes": "<how levers reference each other>",\n'
+    '      "escalation": "<optional: remove_tvf | gt_repair | flag_for_review>"\n'
     '    }\n'
     '  ],\n'
     '  "global_instruction_rewrite": "PURPOSE:\\nOne paragraph...\\n\\n'

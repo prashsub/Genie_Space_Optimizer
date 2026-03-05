@@ -809,6 +809,8 @@ _ARBITER_CORRECT_VERDICTS = frozenset({"genie_correct", "both_correct"})
 
 def _compute_arbiter_adjusted_accuracy(
     rows: list[dict],
+    *,
+    quarantined_qids: set[str] | None = None,
 ) -> tuple[float, int, list[str], int]:
     """Compute overall accuracy that accounts for arbiter overrides.
 
@@ -818,13 +820,15 @@ def _compute_arbiter_adjusted_accuracy(
         ``genie_correct`` or ``both_correct``
 
     Rows where ``result_correctness`` == "excluded" (GT-side infrastructure
-    failures) are removed from the denominator entirely.
+    failures) or whose question is quarantined are removed from the
+    denominator entirely.
 
     Returns ``(accuracy_pct, correct_count, failure_ids, excluded_count)``.
     """
     if not rows:
         return 0.0, 0, [], 0
 
+    _quarantined = quarantined_qids or set()
     total = 0
     correct = 0
     excluded = 0
@@ -835,6 +839,26 @@ def _compute_arbiter_adjusted_accuracy(
         ).lower()
 
         if rc == "excluded":
+            excluded += 1
+            continue
+
+        _rq = row.get("request") or {}
+        if isinstance(_rq, str):
+            try:
+                _rq = json.loads(_rq)
+            except (json.JSONDecodeError, TypeError):
+                _rq = {}
+        _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
+        qid = str(
+            row.get("inputs/question_id")
+            or (row.get("inputs") or {}).get("question_id", "")
+            or row.get("question_id")
+            or _rqk.get("question_id")
+            or (_rq.get("question_id") if isinstance(_rq, dict) else None)
+            or ""
+        )
+
+        if qid and qid in _quarantined:
             excluded += 1
             continue
 
@@ -850,21 +874,6 @@ def _compute_arbiter_adjusted_accuracy(
         if is_correct:
             correct += 1
         else:
-            _rq = row.get("request") or {}
-            if isinstance(_rq, str):
-                try:
-                    _rq = json.loads(_rq)
-                except (json.JSONDecodeError, TypeError):
-                    _rq = {}
-            _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
-            qid = (
-                row.get("inputs/question_id")
-                or (row.get("inputs") or {}).get("question_id", "")
-                or row.get("question_id")
-                or _rqk.get("question_id")
-                or (_rq.get("question_id") if isinstance(_rq, dict) else None)
-                or ""
-            )
             if qid:
                 failure_ids.append(str(qid))
 
@@ -2487,6 +2496,8 @@ def create_evaluation_dataset(
                 "validation_reason_code": b.get("validation_reason_code", ""),
                 "validation_error": b.get("validation_error", ""),
                 "correction_source": b.get("correction_source", ""),
+                "required_tables": b.get("required_tables", []),
+                "required_columns": b.get("required_columns", []),
             }
             expectations = {k: v for k, v in expectations.items() if v is not None}
             records.append(

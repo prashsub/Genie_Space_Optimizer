@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useGetRun } from "@/lib/api";
+import { useGetRun, useGetPendingReviews } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
@@ -23,6 +23,7 @@ import {
   Zap,
   TrendingUp,
   ExternalLink,
+  UserCheck,
 } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
 
@@ -178,6 +179,54 @@ function StatusBanner({
   }
 
   return null;
+}
+
+function ReviewBanner({ spaceId }: { spaceId: string }) {
+  const { data } = useGetPendingReviews({
+    params: { space_id: spaceId },
+    query: { enabled: !!spaceId },
+  });
+
+  const reviews = data?.data;
+  if (!reviews || !reviews.totalPending) return null;
+
+  const parts: string[] = [];
+  if (reviews.flaggedQuestions)
+    parts.push(`${reviews.flaggedQuestions} flagged question${reviews.flaggedQuestions > 1 ? "s" : ""}`);
+  if (reviews.queuedPatches)
+    parts.push(`${reviews.queuedPatches} queued patch${reviews.queuedPatches > 1 ? "es" : ""}`);
+
+  return (
+    <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+      <div className="flex items-start gap-3">
+        <UserCheck className="mt-0.5 h-5 w-5 text-amber-600" />
+        <div className="flex-1">
+          <h3 className="text-sm font-semibold text-amber-900">
+            {reviews.totalPending} item{reviews.totalPending > 1 ? "s" : ""} need
+            your review
+          </h3>
+          <p className="mt-0.5 text-xs text-amber-700">{parts.join(", ")}</p>
+        </div>
+        {reviews.labelingSessionUrl && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0 border-amber-300 text-amber-700 hover:bg-amber-100"
+            asChild
+          >
+            <a
+              href={reviews.labelingSessionUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open Review Session
+              <ExternalLink className="ml-1.5 h-3.5 w-3.5" />
+            </a>
+          </Button>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function PipelineView() {
@@ -382,6 +431,9 @@ function PipelineView() {
         elapsed={elapsed}
         completedSteps={completedSteps}
       />
+
+      {/* Review Banner (only for terminal runs) */}
+      {(isCompleted || isFailed) && <ReviewBanner spaceId={run.spaceId} />}
 
       {/* Progress */}
       <div className="space-y-2">

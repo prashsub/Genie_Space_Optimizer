@@ -488,6 +488,9 @@ def build_eval_records(benchmarks: list[dict]) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+_CORRECTABLE_VERDICTS = {"genie_correct", "arbiter_repair"}
+
+
 def apply_benchmark_corrections(
     corrections: list[dict],
     spark: Any,
@@ -499,7 +502,7 @@ def apply_benchmark_corrections(
     Each correction dict should have:
     - ``question``: the benchmark question to correct
     - ``new_expected_sql``: the corrected SQL
-    - ``verdict``: arbiter verdict (``genie_correct``, etc.)
+    - ``verdict``: ``genie_correct`` or ``arbiter_repair``
 
     Returns ``{applied: int, skipped: int, errors: list[str]}``.
     """
@@ -513,7 +516,7 @@ def apply_benchmark_corrections(
         new_sql = c.get("new_expected_sql", "")
         verdict = c.get("verdict", "")
 
-        if verdict != "genie_correct":
+        if verdict not in _CORRECTABLE_VERDICTS:
             skipped += 1
             continue
 
@@ -522,7 +525,7 @@ def apply_benchmark_corrections(
             skipped += 1
             continue
 
-        is_valid, val_err = validate_ground_truth_sql(new_sql, spark)
+        is_valid, val_err = validate_ground_truth_sql(new_sql, spark, execute=True)
         if not is_valid:
             errors.append(
                 f"Correction SQL invalid for '{question[:50]}': {val_err[:200]}"
@@ -552,3 +555,63 @@ def apply_benchmark_corrections(
             skipped += 1
 
     return {"applied": applied, "skipped": skipped, "errors": errors}
+
+
+def quarantine_benchmark_question(
+    spark: Any,
+    uc_schema: str,
+    domain: str,
+    question: str,
+    *,
+    reason: str = "",
+) -> bool:
+    """Quarantine a benchmark question by setting ``quarantined_at`` and ``quarantine_reason``.
+
+    Quarantined questions are excluded from the accuracy denominator so the
+    optimizer stops wasting lever budget on questions with broken ground truth.
+
+    The columns are added dynamically if they don't exist yet (safe for
+    existing tables that predate this feature).
+
+    Returns ``True`` if the row was updated, ``False`` otherwise.
+    """
+    table_name = f"{uc_schema}.genie_benchmarks_{domain}"
+
+    for col, dtype in [("quarantined_at", "TIMESTAMP"), ("quarantine_reason", "STRING")]:
+        try:
+            spark.sql(f"ALTER TABLE {table_name} ADD COLUMN {col} {dtype}")
+        except Exception:
+            pass
+
+    escaped_q = question.replace("'", "\\'")
+    escaped_reason = reason.replace("'", "\\'")
+    try:
+        spark.sql(
+            f"""
+            UPDATE {table_name}
+            SET quarantined_at = CURRENT_TIMESTAMP(),
+                quarantine_reason = '{escaped_reason}'
+            WHERE question = '{escaped_q}'
+              AND quarantined_at IS NULL
+            """
+        )
+        return True
+    except Exception as e:
+        logger.warning("Failed to quarantine question '%s': %s", question[:60], e)
+        return False
+
+
+def get_quarantined_questions(
+    spark: Any,
+    uc_schema: str,
+    domain: str,
+) -> set[str]:
+    """Return the set of question IDs that are currently quarantined."""
+    table_name = f"{uc_schema}.genie_benchmarks_{domain}"
+    try:
+        df = spark.sql(
+            f"SELECT question_id FROM {table_name} WHERE quarantined_at IS NOT NULL"
+        ).toPandas()
+        return set(df["question_id"].dropna().astype(str).tolist())
+    except Exception:
+        return set()

@@ -252,6 +252,7 @@ def _populate_session_traces(
     failure_trace_ids: list[str],
     regression_trace_ids: list[str],
     eval_mlflow_run_ids: list[str],
+    flagged_trace_ids: list[str] | None = None,
 ) -> int:
     """Collect traces from eval runs and add them to the labeling session.
 
@@ -302,8 +303,9 @@ def _populate_session_traces(
             logger.warning("No traces found for experiment '%s'", experiment_name)
             return 0
 
+    _flagged = flagged_trace_ids or []
     priority_set = set(
-        dict.fromkeys(regression_trace_ids + failure_trace_ids)
+        dict.fromkeys(_flagged + regression_trace_ids + failure_trace_ids)
     )
 
     if priority_set and "trace_id" in all_traces.columns:
@@ -461,3 +463,121 @@ def sync_corrections_to_dataset(
     except Exception:
         logger.exception("Failed to sync session '%s' to dataset %s", session_name, dataset_name)
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Flag for Human Review
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def flag_for_human_review(
+    spark: Any,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    domain: str,
+    items: list[dict],
+) -> int:
+    """Flag questions or patches for human review.
+
+    Each item in *items* should have:
+        - ``question_id``: str
+        - ``question_text``: str
+        - ``reason``: str (e.g. "ADDITIVE_LEVERS_EXHAUSTED", "low-confidence TVF removal")
+        - ``iterations_failed``: int
+        - ``patches_tried``: str (summary)
+
+    Writes to ``genie_opt_flagged_questions`` Delta table.
+    Returns the number of items flagged.
+    """
+    if not items:
+        return 0
+
+    from genie_space_optimizer.optimization.state import run_query
+
+    fqn = f"{catalog}.{schema}.genie_opt_flagged_questions"
+
+    try:
+        spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {fqn} (
+                run_id              STRING      NOT NULL,
+                domain              STRING      NOT NULL,
+                question_id         STRING      NOT NULL,
+                question_text       STRING,
+                flag_reason         STRING,
+                iterations_failed   INT,
+                patches_tried       STRING,
+                status              STRING      NOT NULL  DEFAULT 'pending',
+                flagged_at          TIMESTAMP   NOT NULL,
+                resolved_at         TIMESTAMP
+            ) USING DELTA
+        """)
+    except Exception:
+        logger.debug("Flagged questions table already exists or creation failed", exc_info=True)
+
+    flagged = 0
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+
+    for item in items:
+        qid = item.get("question_id", "")
+        if not qid:
+            continue
+        q_text = (item.get("question_text") or "")[:500]
+        reason = (item.get("reason") or "")[:500]
+        iters = item.get("iterations_failed", 0)
+        patches = (item.get("patches_tried") or "")[:1000]
+
+        try:
+            _q_text_esc = q_text.replace("'", "''")
+            _reason_esc = reason.replace("'", "''")
+            _patches_esc = patches.replace("'", "''")
+            spark.sql(f"""
+                MERGE INTO {fqn} AS t
+                USING (SELECT '{run_id}' AS run_id, '{domain}' AS domain,
+                              '{qid}' AS question_id) AS s
+                ON t.question_id = s.question_id AND t.domain = s.domain
+                   AND t.status = 'pending'
+                WHEN MATCHED THEN UPDATE SET
+                    t.run_id = s.run_id,
+                    t.flag_reason = '{_reason_esc}',
+                    t.iterations_failed = {iters},
+                    t.patches_tried = '{_patches_esc}',
+                    t.flagged_at = '{now}'
+                WHEN NOT MATCHED THEN INSERT (
+                    run_id, domain, question_id, question_text, flag_reason,
+                    iterations_failed, patches_tried, status, flagged_at
+                ) VALUES (
+                    s.run_id, s.domain, s.question_id, '{_q_text_esc}',
+                    '{_reason_esc}', {iters}, '{_patches_esc}', 'pending', '{now}'
+                )
+            """)
+            flagged += 1
+        except Exception:
+            logger.warning("Failed to flag question %s", qid, exc_info=True)
+
+    logger.info("Flagged %d questions for human review (run=%s)", flagged, run_id)
+    return flagged
+
+
+def get_flagged_questions(
+    spark: Any,
+    catalog: str,
+    schema: str,
+    domain: str,
+    *,
+    status: str = "pending",
+) -> list[dict]:
+    """Return flagged questions for a domain with the given status."""
+    from genie_space_optimizer.optimization.state import run_query
+
+    fqn = f"{catalog}.{schema}.genie_opt_flagged_questions"
+    try:
+        df = run_query(
+            spark,
+            f"SELECT * FROM {fqn} WHERE domain = '{domain}' AND status = '{status}'",
+        )
+        return df.to_dict("records") if not df.empty else []
+    except Exception:
+        logger.debug("Could not read flagged questions table", exc_info=True)
+        return []

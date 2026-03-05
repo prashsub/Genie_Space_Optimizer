@@ -149,7 +149,7 @@ Genie_Space_Optimizer/
 │   │   ├── config.py                 # All constants (thresholds, prompts, taxonomy, noise floor)
 │   │   ├── genie_client.py           # Genie Space API wrapper (list, fetch, patch, query, result DFs)
 │   │   ├── genie_schema.py           # Genie Space config schema validation (lenient + strict), instruction slot budget (100 max)
-│   │   ├── uc_metadata.py            # Unity Catalog introspection (REST API + Spark SQL fallback + FK extraction)
+│   │   ├── uc_metadata.py            # Unity Catalog introspection (REST API + Spark SQL fallback + FK extraction + TVF overlap analysis)
 │   │   └── delta_helpers.py          # Delta table read/write operations
 │   │
 │   ├── optimization/                 # Core optimization engine
@@ -208,6 +208,7 @@ All endpoints are prefixed with `/api/genie`.
 | `GET` | `/runs/{run_id}/iterations` | `getIterations` | Per-iteration scores for iteration chart |
 | `GET` | `/runs/{run_id}/asi` | `getAsiResults` | ASI failure analysis breakdown |
 | `GET` | `/runs/{run_id}/provenance` | `getProvenance` | End-to-end provenance (judge → cluster → patch → gate) |
+| `GET` | `/pending-reviews/{space_id}` | `getPendingReviews` | Flagged questions, queued patches, labeling session URL |
 | `GET` | `/version` | `getVersion` | App version |
 | `GET` | `/current-user` | `getCurrentUser` | Authenticated user info |
 
@@ -215,7 +216,7 @@ All endpoints are prefixed with `/api/genie`.
 
 ## State Management
 
-The optimizer maintains state across 6 Delta tables (partitioned by `run_id` or `space_id`):
+The optimizer maintains state across 8 Delta tables (partitioned by `run_id` or `space_id`):
 
 | Table | Purpose |
 |-------|---------|
@@ -225,6 +226,8 @@ The optimizer maintains state across 6 Delta tables (partitioned by `run_id` or 
 | `genie_opt_patches` | Individual patches: type, lever, old/new values, applied/rolled-back, provenance chain |
 | `genie_eval_asi_results` | Failure assessments: type, severity, blame set, counterfactual fixes, MLflow run ID for trace linking |
 | `genie_opt_provenance` | End-to-end provenance: links every patch to originating judge verdicts, clusters, and gate outcomes |
+| `genie_opt_queued_patches` | High-risk patches (e.g. TVF removal) pending human approval, with confidence tier and coverage analysis |
+| `genie_opt_flagged_questions` | Questions flagged for human review after exhausting automated approaches |
 
 Run statuses: `QUEUED` → `IN_PROGRESS` → `CONVERGED` | `STALLED` | `MAX_ITERATIONS` | `FAILED` → `APPLIED` | `DISCARDED`
 

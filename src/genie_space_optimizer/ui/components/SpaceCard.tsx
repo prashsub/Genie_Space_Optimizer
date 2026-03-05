@@ -7,6 +7,7 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Database, Clock } from "lucide-react";
+import { useGetPendingReviews } from "@/lib/api";
 
 interface SpaceCardProps {
   id: string;
@@ -52,6 +53,7 @@ function relativeTime(iso: string): string {
 }
 
 export function SpaceCard({
+  id,
   name,
   description,
   tableCount,
@@ -59,6 +61,12 @@ export function SpaceCard({
   qualityScore,
   onClick,
 }: SpaceCardProps) {
+  const { data: reviewsData } = useGetPendingReviews({
+    params: { space_id: id },
+    query: { enabled: !!id },
+  });
+  const pendingCount = reviewsData?.data?.totalPending ?? 0;
+
   return (
     <Card
       className="cursor-pointer border border-db-gray-border bg-white transition-shadow hover:shadow-md"
@@ -77,7 +85,14 @@ export function SpaceCard({
           <CardTitle className="line-clamp-1 text-base font-semibold text-foreground">
             {name}
           </CardTitle>
-          {scoreBadge(qualityScore)}
+          <div className="flex items-center gap-1.5">
+            {pendingCount > 0 && (
+              <Badge variant="outline" className="border-amber-300 text-amber-700">
+                {pendingCount} review{pendingCount > 1 ? "s" : ""}
+              </Badge>
+            )}
+            {scoreBadge(qualityScore)}
+          </div>
         </div>
         <CardDescription className="line-clamp-2 text-sm">
           {description || "No description"}

@@ -1843,3 +1843,80 @@ def _extract_space_configuration(ss: dict) -> SpaceConfiguration:
 _safe_float = safe_float
 _safe_int = safe_int
 _finite = safe_finite
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Pending Reviews
+# ═══════════════════════════════════════════════════════════════════════
+
+from ..models import PendingReviewItem, PendingReviewsOut
+
+
+@router.get(
+    "/pending-reviews/{space_id}",
+    response_model=PendingReviewsOut,
+    operation_id="getPendingReviews",
+)
+def get_pending_reviews(space_id: str, config: Dependencies.Config) -> PendingReviewsOut:
+    """Return counts and details of items awaiting human review for a space."""
+    spark = get_spark()
+    if not spark:
+        return PendingReviewsOut()
+
+    catalog = config.catalog
+    schema = config.schema_name
+
+    items: list[PendingReviewItem] = []
+    flagged_count = 0
+    queued_count = 0
+    labeling_url: str | None = None
+
+    try:
+        from genie_space_optimizer.optimization.labeling import get_flagged_questions
+        flagged = get_flagged_questions(spark, catalog, schema, space_id)
+        flagged_count = len(flagged)
+        for f in flagged[:5]:
+            items.append(PendingReviewItem(
+                questionId=f.get("question_id", ""),
+                questionText=f.get("question_text", "")[:200],
+                reason=f.get("flag_reason", ""),
+                itemType="flagged_question",
+            ))
+    except Exception:
+        logger.debug("Could not load flagged questions", exc_info=True)
+
+    try:
+        from genie_space_optimizer.optimization.state import get_queued_patches
+        queued = get_queued_patches(spark, catalog, schema)
+        queued_count = len(queued)
+        for q in queued[:5 - len(items)]:
+            items.append(PendingReviewItem(
+                questionId=q.get("target_identifier", ""),
+                reason=f"Queued {q.get('patch_type', '')}",
+                confidenceTier=q.get("confidence_tier", ""),
+                itemType="queued_patch",
+            ))
+    except Exception:
+        logger.debug("Could not load queued patches", exc_info=True)
+
+    try:
+        from genie_space_optimizer.optimization.state import run_query
+        fqn = f"{catalog}.{schema}.genie_opt_runs"
+        df = run_query(
+            spark,
+            f"SELECT labeling_session_url FROM {fqn} "
+            f"WHERE space_id = '{space_id}' AND labeling_session_url IS NOT NULL "
+            f"ORDER BY started_at DESC LIMIT 1",
+        )
+        if not df.empty:
+            labeling_url = df.iloc[0].get("labeling_session_url")
+    except Exception:
+        logger.debug("Could not load labeling session URL", exc_info=True)
+
+    return PendingReviewsOut(
+        flaggedQuestions=flagged_count,
+        queuedPatches=queued_count,
+        totalPending=flagged_count + queued_count,
+        labelingSessionUrl=labeling_url,
+        items=items,
+    )

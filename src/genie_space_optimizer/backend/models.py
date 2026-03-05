@@ -324,3 +324,22 @@ class IterationSummary(SafeModel):
     repeatabilityPct: float | None = None
     thresholdsMet: bool
     judgeScores: dict[str, float | None] = {}
+
+
+# ── Pending Reviews Models ───────────────────────────────────────────
+
+
+class PendingReviewItem(BaseModel):
+    questionId: str
+    questionText: str = ""
+    reason: str = ""
+    confidenceTier: str = ""
+    itemType: str = "flagged_question"
+
+
+class PendingReviewsOut(BaseModel):
+    flaggedQuestions: int = 0
+    queuedPatches: int = 0
+    totalPending: int = 0
+    labelingSessionUrl: str | None = None
+    items: list[PendingReviewItem] = []

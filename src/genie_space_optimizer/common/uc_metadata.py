@@ -461,3 +461,136 @@ def get_metric_views(spark: SparkSession, catalog: str, schema: str) -> DataFram
         f"FROM {catalog}.information_schema.views "
         f"WHERE table_schema = '{schema}' AND table_name LIKE 'mv\\_%'"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TVF Schema Overlap Analysis
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def describe_tvf_output_columns(
+    spark: Any,
+    tvf_identifier: str,
+) -> list[str]:
+    """Return the output column names of a TVF via ``DESCRIBE FUNCTION EXTENDED``.
+
+    Falls back to parsing the ``routine_definition`` SQL if DESCRIBE does not
+    produce a parseable return-type table.  Returns an empty list on failure.
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE FUNCTION EXTENDED {tvf_identifier}").collect()
+    except Exception:
+        logger.warning("DESCRIBE FUNCTION EXTENDED failed for %s", tvf_identifier, exc_info=True)
+        return []
+
+    columns: list[str] = []
+    in_return_section = False
+    for row in rows:
+        line = str(row[0]) if row else ""
+        lower = line.strip().lower()
+        if "return" in lower and "type" in lower:
+            in_return_section = True
+            continue
+        if in_return_section:
+            if not line.strip() or line.startswith("--"):
+                break
+            parts = line.strip().split()
+            if parts:
+                col_name = parts[0].strip("`").strip('"').strip()
+                if col_name and not col_name.startswith("("):
+                    columns.append(col_name.lower())
+
+    if not columns:
+        try:
+            cat, sch, func_name = parse_table_identifier(tvf_identifier)
+            rdf = spark.sql(
+                f"SELECT routine_definition FROM {cat}.information_schema.routines "
+                f"WHERE routine_schema = '{sch}' AND routine_name = '{func_name}'"
+            ).collect()
+            if rdf:
+                defn = str(rdf[0][0] or "")
+                import re
+                select_match = re.search(r"RETURNS\s+TABLE\s*\(([^)]+)\)", defn, re.IGNORECASE)
+                if select_match:
+                    for col_def in select_match.group(1).split(","):
+                        col_name = col_def.strip().split()[0].strip("`").strip('"')
+                        if col_name:
+                            columns.append(col_name.lower())
+        except Exception:
+            logger.debug("Fallback column extraction failed for %s", tvf_identifier, exc_info=True)
+
+    return columns
+
+
+def check_tvf_schema_overlap(
+    spark: Any,
+    tvf_identifier: str,
+    metadata_snapshot: dict,
+) -> dict:
+    """Check schema overlap between a TVF and other assets in the Genie Space.
+
+    Returns::
+
+        {
+            "tvf_columns": ["col1", "col2"],
+            "covered_columns": {"col1": "table_a", "col2": "mv_b"},
+            "uncovered_columns": ["col3"],
+            "coverage_ratio": 0.67,
+            "full_coverage": False,
+        }
+    """
+    tvf_cols = describe_tvf_output_columns(spark, tvf_identifier)
+    if not tvf_cols:
+        return {
+            "tvf_columns": [],
+            "covered_columns": {},
+            "uncovered_columns": [],
+            "coverage_ratio": 0.0,
+            "full_coverage": False,
+        }
+
+    space_columns: set[str] = set()
+    column_source: dict[str, str] = {}
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+
+    for tbl in ds.get("tables", []):
+        tbl_name = tbl.get("identifier", tbl.get("name", ""))
+        for cc in tbl.get("column_configs", []):
+            col = (cc.get("column_name") or cc.get("name") or "").lower()
+            if col and col not in column_source:
+                space_columns.add(col)
+                column_source[col] = tbl_name
+
+    for mv in ds.get("metric_views", []):
+        mv_name = mv.get("identifier", mv.get("name", ""))
+        for m in mv.get("measures", []):
+            col = (m.get("name") or "").lower()
+            if col and col not in column_source:
+                space_columns.add(col)
+                column_source[col] = mv_name
+        for d in mv.get("dimensions", []):
+            col = (d.get("name") or "").lower()
+            if col and col not in column_source:
+                space_columns.add(col)
+                column_source[col] = mv_name
+
+    covered: dict[str, str] = {}
+    uncovered: list[str] = []
+    for col in tvf_cols:
+        if col in column_source:
+            covered[col] = column_source[col]
+        else:
+            uncovered.append(col)
+
+    ratio = len(covered) / len(tvf_cols) if tvf_cols else 0.0
+
+    return {
+        "tvf_columns": tvf_cols,
+        "covered_columns": covered,
+        "uncovered_columns": uncovered,
+        "coverage_ratio": ratio,
+        "full_coverage": len(uncovered) == 0 and len(tvf_cols) > 0,
+    }

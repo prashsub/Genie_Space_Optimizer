@@ -4603,6 +4603,7 @@ def _call_llm_for_adaptive_strategy(
     *,
     total_benchmarks: int = 0,
     passing_benchmarks: int = 0,
+    verdict_history: dict | None = None,
 ) -> dict:
     """Single-call strategist that produces exactly ONE action group.
 
@@ -4648,11 +4649,20 @@ def _call_llm_for_adaptive_strategy(
     # ── Build reflection text ────────────────────────────────────────
     reflection_text = format_reflection_buffer(reflection_buffer)
 
+    # ── Build per-question persistence summary ────────────────────────
+    from genie_space_optimizer.optimization.harness import (
+        _build_question_persistence_summary,
+    )
+    persistence_text = _build_question_persistence_summary(
+        verdict_history or {}, reflection_buffer,
+    )
+
     # ── Assemble prompt kwargs ───────────────────────────────────────
     format_kwargs: dict[str, Any] = {
         "success_summary": success_summary,
         "priority_ranking": ranking_text,
         "reflection_buffer": reflection_text,
+        "question_persistence_summary": persistence_text,
         "full_schema_context": _format_full_schema_context(metadata_snapshot),
         "cluster_briefs": _format_cluster_briefs(clusters),
         "soft_signal_summary": _format_soft_signal_summary(soft_signal_clusters),

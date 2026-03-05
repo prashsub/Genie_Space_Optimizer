@@ -39,10 +39,13 @@ from genie_space_optimizer.common.config import (
     DIMINISHING_RETURNS_EPSILON,
     DIMINISHING_RETURNS_LOOKBACK,
     ENABLE_PROMPT_MATCHING_AUTO_APPLY,
+    GENIE_CORRECT_CONFIRMATION_THRESHOLD,
     INLINE_EVAL_DELAY,
     LEVER_NAMES,
     MAX_ITERATIONS,
     MAX_NOISE_FLOOR,
+    NEITHER_CORRECT_QUARANTINE_THRESHOLD,
+    NEITHER_CORRECT_REPAIR_THRESHOLD,
     PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS,
     PROPAGATION_WAIT_SECONDS,
     REGRESSION_THRESHOLD,
@@ -93,6 +96,7 @@ from genie_space_optimizer.optimization.scorers import make_all_scorers
 from genie_space_optimizer.optimization.state import (
     create_run,
     ensure_optimization_tables,
+    load_all_full_iterations,
     load_latest_full_iteration,
     load_run,
     load_stages,
@@ -1548,6 +1552,10 @@ def _build_reflection_entry(
     new_scores: dict[str, float],
     rollback_reason: str | None,
     patches: list[dict],
+    *,
+    affected_question_ids: list[str] | None = None,
+    prev_failure_qids: set[str] | None = None,
+    new_failure_qids: set[str] | None = None,
 ) -> dict:
     """Build a structured reflection dict for the adaptive loop memory."""
     score_deltas = {
@@ -1576,6 +1584,9 @@ def _build_reflection_entry(
             new_failure_parts.append(f"{k} {delta:+.1f}%")
     new_failures = ", ".join(new_failure_parts) if new_failure_parts else None
 
+    _prev = prev_failure_qids or set()
+    _new = new_failure_qids or set()
+
     return {
         "iteration": iteration,
         "ag_id": ag_id,
@@ -1588,6 +1599,10 @@ def _build_reflection_entry(
         "new_failures": new_failures,
         "rollback_reason": rollback_reason,
         "do_not_retry": do_not_retry,
+        "affected_question_ids": affected_question_ids or [],
+        "fixed_questions": sorted(_prev - _new),
+        "still_failing": sorted(_prev & _new),
+        "new_regressions": sorted(_new - _prev),
     }
 
 
@@ -1682,6 +1697,768 @@ def _extract_arbiter_actions_from_baseline(
     return actions
 
 
+# ── Cross-Iteration Verdict History ────────────────────────────────────
+
+
+def _get_arbiter_verdict(row: dict) -> str:
+    """Extract the arbiter verdict string from an evaluation row."""
+    return str(
+        row.get("arbiter/value")
+        or row.get("feedback/arbiter/value")
+        or (row.get("arbiter") if isinstance(row.get("arbiter"), str) else "")
+        or "skipped"
+    ).lower()
+
+
+def _get_question_id(row: dict) -> str:
+    """Extract the question ID from an evaluation row."""
+    _rq = row.get("request") or {}
+    if isinstance(_rq, str):
+        try:
+            _rq = json.loads(_rq)
+        except (json.JSONDecodeError, TypeError):
+            _rq = {}
+    _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
+    return str(
+        row.get("inputs/question_id")
+        or (row.get("inputs") or {}).get("question_id", "")
+        or row.get("question_id")
+        or _rqk.get("question_id")
+        or (_rq.get("question_id") if isinstance(_rq, dict) else None)
+        or "?"
+    )
+
+
+def _get_question_text(row: dict) -> str:
+    """Extract the question text from an evaluation row."""
+    return str(
+        row.get("inputs/question")
+        or (row.get("inputs") or {}).get("question", "")
+    )
+
+
+def _get_genie_sql(row: dict) -> str:
+    """Extract Genie's generated SQL from an evaluation row."""
+    return str(
+        row.get("outputs/response")
+        or (row.get("outputs") or {}).get("response", "")
+    )
+
+
+def _get_expected_sql(row: dict) -> str:
+    """Extract the expected (ground truth) SQL from an evaluation row."""
+    return str(
+        row.get("inputs/expected_response")
+        or (row.get("inputs") or {}).get("expected_response", "")
+        or row.get("expected_response/value")
+    )
+
+
+def _get_arbiter_rationale(row: dict) -> str:
+    """Extract the arbiter rationale from an evaluation row."""
+    return str(
+        row.get("arbiter/rationale")
+        or row.get("feedback/arbiter/rationale")
+        or ""
+    )
+
+
+@dataclass
+class VerdictEntry:
+    """A single arbiter observation for a question in one evaluation."""
+    iteration: int
+    verdict: str
+    genie_sql: str
+    expected_sql: str
+    question_text: str
+    rationale: str
+
+
+def _build_verdict_history(
+    spark: Any,
+    run_id: str,
+    catalog: str,
+    schema: str,
+) -> dict[str, list[VerdictEntry]]:
+    """Build per-question verdict history across all full-scope evaluations.
+
+    Returns ``{question_id: [VerdictEntry, ...]}``, ordered by iteration.
+    """
+    all_iters = load_all_full_iterations(spark, run_id, catalog, schema)
+    history: dict[str, list[VerdictEntry]] = {}
+
+    for iteration_row in all_iters:
+        iteration_num = int(iteration_row.get("iteration", 0))
+        rows_json = iteration_row.get("rows_json")
+        if isinstance(rows_json, str):
+            try:
+                rows_json = json.loads(rows_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if not isinstance(rows_json, list):
+            continue
+
+        for row in rows_json:
+            qid = _get_question_id(row)
+            if qid == "?":
+                continue
+            entry = VerdictEntry(
+                iteration=iteration_num,
+                verdict=_get_arbiter_verdict(row),
+                genie_sql=_get_genie_sql(row),
+                expected_sql=_get_expected_sql(row),
+                question_text=_get_question_text(row),
+                rationale=_get_arbiter_rationale(row),
+            )
+            history.setdefault(qid, []).append(entry)
+
+    return history
+
+
+def _build_question_persistence_summary(
+    verdict_history: dict[str, list["VerdictEntry"]],
+    reflection_buffer: list[dict],
+    *,
+    min_failures: int | None = None,
+) -> str:
+    """Render a per-question failure persistence summary for the strategist.
+
+    Only includes questions that failed in >= *min_failures* iterations.
+    For each, shows the question text, consecutive failure count, verdict
+    breakdown, patches previously tried for that question, and an
+    exhaustion classification.
+    """
+    from genie_space_optimizer.common.config import PERSISTENCE_MIN_FAILURES
+
+    if min_failures is None:
+        min_failures = PERSISTENCE_MIN_FAILURES
+    if not verdict_history:
+        return "(No cross-iteration verdict data available yet.)"
+
+    _PASSING = {"both_correct"}
+    _ADDITIVE_PATCH_TYPES = {"add_instruction", "add_example_sql"}
+
+    q_patches: dict[str, list[tuple[int, str]]] = {}
+    for entry in reflection_buffer:
+        iter_n = entry.get("iteration", 0)
+        affected = entry.get("affected_question_ids", [])
+        patch_types = set()
+        for part in entry.get("action", "").split(", "):
+            pt = part.split(" on ")[0].strip() if " on " in part else ""
+            if pt:
+                patch_types.add(pt)
+        for qid in affected:
+            for pt in patch_types:
+                q_patches.setdefault(qid, []).append((iter_n, pt))
+
+    persistent: list[dict] = []
+    for qid, entries in verdict_history.items():
+        non_passing = [e for e in entries if e.verdict not in _PASSING]
+        if len(non_passing) < min_failures:
+            continue
+
+        consecutive = 0
+        max_consecutive = 0
+        for e in entries:
+            if e.verdict not in _PASSING:
+                consecutive += 1
+                max_consecutive = max(max_consecutive, consecutive)
+            else:
+                consecutive = 0
+
+        verdict_counts: dict[str, int] = {}
+        for e in non_passing:
+            verdict_counts[e.verdict] = verdict_counts.get(e.verdict, 0) + 1
+
+        q_text = non_passing[-1].question_text if non_passing else "?"
+        fail_iters = sorted({e.iteration for e in non_passing})
+
+        tried = q_patches.get(qid, [])
+        additive_counts: dict[str, int] = {}
+        for _, pt in tried:
+            if pt in _ADDITIVE_PATCH_TYPES:
+                additive_counts[pt] = additive_counts.get(pt, 0) + 1
+
+        exhausted = all(
+            additive_counts.get(pt, 0) >= 2 for pt in _ADDITIVE_PATCH_TYPES
+        )
+
+        if max_consecutive < 2:
+            classification = "INTERMITTENT"
+        elif exhausted:
+            classification = "ADDITIVE_LEVERS_EXHAUSTED"
+        else:
+            classification = "PERSISTENT"
+
+        persistent.append({
+            "qid": qid,
+            "question_text": q_text,
+            "fail_count": len(non_passing),
+            "total_evals": len(entries),
+            "max_consecutive": max_consecutive,
+            "verdict_counts": verdict_counts,
+            "fail_iterations": fail_iters,
+            "patches_tried": tried,
+            "classification": classification,
+        })
+
+    if not persistent:
+        return "(No persistent failures detected across iterations.)"
+
+    persistent.sort(key=lambda p: (-p["max_consecutive"], -p["fail_count"]))
+
+    lines: list[str] = [
+        "Questions failing across multiple iterations despite fix attempts:",
+        "",
+    ]
+    for p in persistent:
+        lines.append(f"### {p['qid']}: \"{p['question_text'][:120]}\"")
+        lines.append(
+            f"  Failed {p['fail_count']}/{p['total_evals']} evals "
+            f"({p['max_consecutive']} consecutive)"
+        )
+        vstr = ", ".join(f"{v}={c}" for v, c in sorted(p["verdict_counts"].items()))
+        lines.append(f"  Verdicts: {vstr}")
+        lines.append(f"  Failed in iterations: {p['fail_iterations']}")
+        if p["patches_tried"]:
+            patch_lines = []
+            for it, pt in p["patches_tried"]:
+                patch_lines.append(f"iter{it}: {pt}")
+            lines.append(f"  Patches tried: {'; '.join(patch_lines)}")
+        lines.append(f"  ASSESSMENT: {p['classification']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _score_tvf_removal_confidence(
+    tvf_identifier: str,
+    benchmarks: list[dict],
+    verdict_history: dict[str, list["VerdictEntry"]],
+    reflection_buffer: list[dict],
+    schema_overlap: dict,
+    asi_provenance: list[dict],
+    *,
+    min_iterations: int | None = None,
+) -> str | None:
+    """Tiered confidence model for TVF removal.
+
+    Returns ``"high"``, ``"medium"``, ``"low"``, or ``None`` if the
+    iteration gate has not been met yet (too early to consider removal).
+    """
+    from genie_space_optimizer.common.config import (
+        TVF_REMOVAL_BLAME_THRESHOLD,
+        TVF_REMOVAL_MIN_ITERATIONS,
+    )
+
+    if min_iterations is None:
+        min_iterations = TVF_REMOVAL_MIN_ITERATIONS
+
+    _PASSING = {"both_correct"}
+    tvf_lower = tvf_identifier.lower()
+
+    blamed_qids: set[str] = set()
+    for prov in asi_provenance:
+        blame = prov.get("blame_set")
+        if isinstance(blame, str):
+            try:
+                blame = json.loads(blame)
+            except (json.JSONDecodeError, TypeError):
+                blame = [blame]
+        if not isinstance(blame, list):
+            continue
+        for b in blame:
+            if tvf_lower in str(b).lower():
+                qid = prov.get("question_id", "")
+                if qid:
+                    blamed_qids.add(qid)
+
+    max_consecutive = 0
+    for qid in blamed_qids:
+        entries = verdict_history.get(qid, [])
+        consec = 0
+        for e in entries:
+            if e.verdict not in _PASSING:
+                consec += 1
+                max_consecutive = max(max_consecutive, consec)
+            else:
+                consec = 0
+
+    if max_consecutive < min_iterations:
+        return None
+
+    gt_refs = sum(
+        1 for b in benchmarks
+        if tvf_lower in (b.get("expected_asset") or "").lower()
+        or tvf_lower in (b.get("expected_sql") or "").lower()
+    )
+
+    if gt_refs > 0:
+        return "low"
+
+    blame_iterations: set[int] = set()
+    for prov in asi_provenance:
+        blame = prov.get("blame_set")
+        if isinstance(blame, str):
+            try:
+                blame = json.loads(blame)
+            except (json.JSONDecodeError, TypeError):
+                blame = [blame]
+        if not isinstance(blame, list):
+            continue
+        for b in blame:
+            if tvf_lower in str(b).lower():
+                it = prov.get("iteration")
+                if it is not None:
+                    blame_iterations.add(int(it))
+
+    full_coverage = schema_overlap.get("full_coverage", False)
+
+    if full_coverage and len(blame_iterations) >= TVF_REMOVAL_BLAME_THRESHOLD:
+        return "high"
+
+    uncovered = schema_overlap.get("uncovered_columns", [])
+    if schema_overlap.get("coverage_ratio", 0) > 0:
+        uncov_in_benchmarks = False
+        for col in uncovered:
+            for b in benchmarks:
+                if col.lower() in (b.get("expected_sql") or "").lower():
+                    uncov_in_benchmarks = True
+                    break
+            if uncov_in_benchmarks:
+                break
+        if not uncov_in_benchmarks:
+            return "medium"
+
+    return "low"
+
+
+def _handle_escalation(
+    escalation: str,
+    ag: dict,
+    *,
+    w: Any,
+    spark: Any,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    domain: str,
+    iteration: int,
+    benchmarks: list[dict],
+    verdict_history: dict[str, list["VerdictEntry"]],
+    reflection_buffer: list[dict],
+    metadata_snapshot: dict,
+) -> dict:
+    """Dispatch an escalation action from the strategist.
+
+    Returns ``{"handled": True/False, "action": "...", "detail": {...}}``.
+    """
+    from genie_space_optimizer.common.uc_metadata import check_tvf_schema_overlap
+    from genie_space_optimizer.optimization.labeling import flag_for_human_review
+    from genie_space_optimizer.optimization.state import (
+        load_provenance,
+        write_queued_patch,
+    )
+
+    affected = ag.get("affected_questions", [])
+    result: dict[str, Any] = {"handled": False, "action": escalation, "detail": {}}
+
+    if escalation == "remove_tvf":
+        lever3 = ag.get("lever_directives", {}).get("3", {})
+        funcs = lever3.get("functions", [])
+        tvf_id = ""
+        for f in funcs:
+            tvf_id = f.get("identifier") or f.get("function") or ""
+            if tvf_id:
+                break
+        if not tvf_id:
+            logger.warning("Escalation remove_tvf but no TVF identifier in lever 3")
+            result["detail"] = {"error": "no_tvf_identifier"}
+            return result
+
+        schema_overlap = check_tvf_schema_overlap(spark, tvf_id, metadata_snapshot)
+
+        prov_df = load_provenance(spark, run_id, catalog, schema)
+        prov_list = prov_df.to_dict("records") if not prov_df.empty else []
+
+        confidence = _score_tvf_removal_confidence(
+            tvf_id, benchmarks, verdict_history, reflection_buffer,
+            schema_overlap, prov_list,
+        )
+        result["detail"]["confidence"] = confidence
+        result["detail"]["tvf_identifier"] = tvf_id
+        result["detail"]["schema_overlap"] = schema_overlap
+
+        if confidence is None:
+            logger.info(
+                "TVF removal of %s: iteration gate not met — deferring",
+                tvf_id,
+            )
+            result["detail"]["deferred"] = True
+            return result
+
+        result["handled"] = True
+
+        if confidence == "low":
+            write_queued_patch(
+                spark, run_id, iteration, "remove_tvf", tvf_id,
+                catalog, schema,
+                confidence_tier="low",
+                coverage_analysis=schema_overlap,
+                blame_iterations=0,
+            )
+            flag_for_human_review(
+                spark, run_id, catalog, schema, domain,
+                [{
+                    "question_id": q,
+                    "question_text": "",
+                    "reason": f"Low-confidence TVF removal recommended: {tvf_id}",
+                    "iterations_failed": 0,
+                    "patches_tried": "remove_tvf",
+                } for q in (affected or [tvf_id])],
+            )
+            result["detail"]["tier_action"] = "flagged_only"
+
+        elif confidence == "medium":
+            result["detail"]["tier_action"] = "apply_and_flag"
+            flag_for_human_review(
+                spark, run_id, catalog, schema, domain,
+                [{
+                    "question_id": q,
+                    "question_text": "",
+                    "reason": f"Medium-confidence TVF removal applied: {tvf_id} — please verify",
+                    "iterations_failed": 0,
+                    "patches_tried": "remove_tvf",
+                } for q in (affected or [tvf_id])],
+            )
+
+        else:
+            result["detail"]["tier_action"] = "auto_apply"
+
+    elif escalation == "gt_repair":
+        logger.info(
+            "Escalation gt_repair for questions %s — handled by arbiter correction pipeline",
+            affected,
+        )
+        result["handled"] = True
+        result["detail"]["note"] = "Delegated to _run_arbiter_corrections"
+
+    elif escalation == "flag_for_review":
+        flag_for_human_review(
+            spark, run_id, catalog, schema, domain,
+            [{
+                "question_id": q,
+                "question_text": "",
+                "reason": ag.get("root_cause_summary", "Strategist flagged for review"),
+                "iterations_failed": 0,
+                "patches_tried": "",
+            } for q in affected],
+        )
+        result["handled"] = True
+        result["detail"]["flagged_count"] = len(affected)
+    else:
+        logger.warning("Unknown escalation type: %s", escalation)
+
+    return result
+
+
+def _extract_confirmed_corrections(
+    spark: Any,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    *,
+    already_corrected: set[str] | None = None,
+) -> list[dict]:
+    """Return benchmark corrections for questions with cross-iteration ``genie_correct`` confirmation.
+
+    A question qualifies when it received ``genie_correct`` in at least
+    ``GENIE_CORRECT_CONFIRMATION_THRESHOLD`` independent evaluations.
+    Uses the most recent Genie SQL as the corrected expected SQL.
+    """
+    history = _build_verdict_history(spark, run_id, catalog, schema)
+    corrected = already_corrected or set()
+    actions: list[dict] = []
+
+    for qid, entries in history.items():
+        if qid in corrected:
+            continue
+        gc_entries = [e for e in entries if e.verdict == "genie_correct"]
+        gc_iterations = {e.iteration for e in gc_entries}
+        if len(gc_iterations) < GENIE_CORRECT_CONFIRMATION_THRESHOLD:
+            continue
+        latest = max(gc_entries, key=lambda e: e.iteration)
+        if latest.genie_sql:
+            actions.append({
+                "question": latest.question_text,
+                "question_id": qid,
+                "new_expected_sql": latest.genie_sql,
+                "verdict": "genie_correct",
+                "confirmation_count": len(gc_iterations),
+            })
+    return actions
+
+
+def _extract_neither_correct_repair_candidates(
+    spark: Any,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    *,
+    already_repaired: set[str] | None = None,
+) -> list[dict]:
+    """Return questions that need GT repair due to repeated ``neither_correct`` verdicts.
+
+    A question qualifies when it received ``neither_correct`` in at least
+    ``NEITHER_CORRECT_REPAIR_THRESHOLD`` independent evaluations.
+    """
+    history = _build_verdict_history(spark, run_id, catalog, schema)
+    repaired = already_repaired or set()
+    candidates: list[dict] = []
+
+    for qid, entries in history.items():
+        if qid in repaired:
+            continue
+        nc_entries = [e for e in entries if e.verdict == "neither_correct"]
+        nc_iterations = {e.iteration for e in nc_entries}
+        if len(nc_iterations) < NEITHER_CORRECT_REPAIR_THRESHOLD:
+            continue
+
+        consecutive_nc = 0
+        for e in reversed(entries):
+            if e.verdict == "neither_correct":
+                consecutive_nc += 1
+            else:
+                break
+
+        latest = max(nc_entries, key=lambda e: e.iteration)
+        rationales = [e.rationale for e in nc_entries if e.rationale]
+
+        candidates.append({
+            "question": latest.question_text,
+            "question_id": qid,
+            "genie_sql": latest.genie_sql,
+            "expected_sql": latest.expected_sql,
+            "rationale": " | ".join(rationales[-3:]),
+            "nc_count": len(nc_iterations),
+            "consecutive_nc": consecutive_nc,
+        })
+    return candidates
+
+
+def _should_quarantine(candidate: dict) -> bool:
+    """Decide whether a ``neither_correct`` question should be quarantined."""
+    return candidate.get("consecutive_nc", 0) >= NEITHER_CORRECT_QUARANTINE_THRESHOLD
+
+
+_GT_REPAIR_PROMPT_TEMPLATE = """\
+You are a SQL expert reviewing a benchmark question where BOTH the ground-truth SQL \
+and Genie's generated SQL were judged incorrect by the arbiter.
+
+QUESTION: {question}
+
+GROUND TRUTH SQL (judged incorrect):
+{expected_sql}
+
+GENIE SQL (also judged incorrect):
+{genie_sql}
+
+ARBITER RATIONALE(S):
+{rationale}
+
+Your task: produce a CORRECTED ground-truth SQL that correctly answers the question.
+- Use proper Databricks SQL syntax
+- Respect temporal semantics (e.g. "this year" = DATE_TRUNC('year', CURRENT_DATE()), \
+"last 12 months" = ADD_MONTHS(CURRENT_DATE(), -12))
+- Use MEASURE() for metric view columns where appropriate
+- Return ONLY the corrected SQL, no explanation
+"""
+
+
+def _attempt_gt_repair(
+    w: WorkspaceClient,
+    candidate: dict,
+    spark: Any,
+) -> str | None:
+    """Use LLM to produce a corrected ground-truth SQL for a ``neither_correct`` question.
+
+    Returns the validated corrected SQL string, or ``None`` if repair fails.
+    """
+    from genie_space_optimizer.optimization.evaluation import _call_llm_for_scoring
+    from genie_space_optimizer.optimization.benchmarks import validate_ground_truth_sql
+
+    prompt = _GT_REPAIR_PROMPT_TEMPLATE.format(
+        question=candidate["question"],
+        expected_sql=candidate.get("expected_sql", ""),
+        genie_sql=candidate.get("genie_sql", ""),
+        rationale=candidate.get("rationale", "No rationale available"),
+    )
+
+    try:
+        result = _call_llm_for_scoring(w, prompt)
+        repaired_sql = ""
+        if isinstance(result, str):
+            repaired_sql = result.strip()
+        elif isinstance(result, dict):
+            repaired_sql = (
+                result.get("sql", "")
+                or result.get("corrected_sql", "")
+                or result.get("query", "")
+            ).strip()
+
+        if not repaired_sql:
+            logger.warning("GT repair returned empty SQL for: %s", candidate["question"][:60])
+            return None
+
+        is_valid, val_err = validate_ground_truth_sql(repaired_sql, spark, execute=True)
+        if not is_valid:
+            logger.warning(
+                "GT repair SQL failed validation for '%s': %s",
+                candidate["question"][:60], val_err[:200],
+            )
+            return None
+
+        return repaired_sql
+    except Exception:
+        logger.warning("GT repair LLM call failed for: %s", candidate["question"][:60], exc_info=True)
+        return None
+
+
+def _run_arbiter_corrections(
+    w: WorkspaceClient,
+    spark: Any,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    domain: str,
+    *,
+    already_corrected: set[str] | None = None,
+    already_repaired: set[str] | None = None,
+    quarantined_qids: set[str] | None = None,
+) -> dict:
+    """Run the full cross-iteration arbiter correction pipeline.
+
+    1. ``genie_correct`` confirmations → benchmark corrections
+    2. ``neither_correct`` repairs → LLM-assisted GT repair or quarantine
+
+    Returns ``{gc_applied, gc_skipped, nc_repaired, nc_quarantined, corrected_qids, quarantined_qids}``.
+    """
+    from genie_space_optimizer.optimization.benchmarks import (
+        apply_benchmark_corrections,
+        quarantine_benchmark_question,
+    )
+
+    uc_schema = f"{catalog}.{schema}"
+    corrected = set(already_corrected or set())
+    repaired = set(already_repaired or set())
+    quarantined = set(quarantined_qids or set())
+
+    gc_applied = 0
+    gc_skipped = 0
+    nc_repaired = 0
+    nc_quarantined = 0
+
+    # ── Phase 1: genie_correct confirmations ──────────────────────────
+    gc_actions = _extract_confirmed_corrections(
+        spark, run_id, catalog, schema,
+        already_corrected=corrected,
+    )
+
+    if gc_actions:
+        print(
+            f"\n-- PER-QUESTION ARBITER CORRECTIONS " + "-" * 16 + "\n"
+            f"  Confirmed genie_correct questions: {len(gc_actions)}"
+        )
+        for ac in gc_actions:
+            print(
+                f"    - [{ac.get('question_id', '?')}] "
+                f"\"{ac['question'][:60]}\" "
+                f"(confirmed in {ac.get('confirmation_count', '?')} evals)"
+            )
+
+        result = apply_benchmark_corrections(gc_actions, spark, uc_schema, domain)
+        gc_applied = result["applied"]
+        gc_skipped = result["skipped"]
+        print(
+            f"  Applied: {gc_applied}, Skipped: {gc_skipped}"
+        )
+        if result["errors"]:
+            print(f"  Errors: {result['errors'][:3]}")
+        print("-" * 52)
+
+        for ac in gc_actions:
+            qid = ac.get("question_id")
+            if qid:
+                corrected.add(qid)
+
+    # ── Phase 2: neither_correct repair / quarantine ──────────────────
+    nc_candidates = _extract_neither_correct_repair_candidates(
+        spark, run_id, catalog, schema,
+        already_repaired=repaired | quarantined,
+    )
+
+    if nc_candidates:
+        print(
+            f"\n-- NEITHER_CORRECT GT REPAIR " + "-" * 24 + "\n"
+            f"  Candidates: {len(nc_candidates)}"
+        )
+
+        for cand in nc_candidates:
+            qid = cand.get("question_id", "?")
+            if _should_quarantine(cand):
+                print(
+                    f"    - [{qid}] QUARANTINE: \"{cand['question'][:60]}\" "
+                    f"({cand['consecutive_nc']} consecutive neither_correct)"
+                )
+                try:
+                    quarantine_benchmark_question(
+                        spark, uc_schema, domain, cand["question"],
+                        reason=(
+                            f"Quarantined after {cand['consecutive_nc']} consecutive "
+                            f"neither_correct verdicts across {cand['nc_count']} evaluations"
+                        ),
+                    )
+                    quarantined.add(qid)
+                    nc_quarantined += 1
+                except Exception:
+                    logger.warning("Failed to quarantine %s", qid, exc_info=True)
+            else:
+                print(
+                    f"    - [{qid}] REPAIR ATTEMPT: \"{cand['question'][:60]}\" "
+                    f"(neither_correct in {cand['nc_count']} evals)"
+                )
+                repaired_sql = _attempt_gt_repair(w, cand, spark)
+                if repaired_sql:
+                    repair_actions = [{
+                        "question": cand["question"],
+                        "question_id": qid,
+                        "new_expected_sql": repaired_sql,
+                        "verdict": "arbiter_repair",
+                    }]
+                    repair_result = apply_benchmark_corrections(
+                        repair_actions, spark, uc_schema, domain,
+                    )
+                    if repair_result["applied"] > 0:
+                        print(f"      -> Repair succeeded: {repaired_sql[:80]}")
+                        repaired.add(qid)
+                        nc_repaired += 1
+                    else:
+                        print(f"      -> Repair SQL rejected: {repair_result['errors'][:2]}")
+                else:
+                    print(f"      -> Repair failed (LLM returned no valid SQL)")
+
+        print("-" * 52)
+
+    return {
+        "gc_applied": gc_applied,
+        "gc_skipped": gc_skipped,
+        "nc_repaired": nc_repaired,
+        "nc_quarantined": nc_quarantined,
+        "corrected_qids": corrected,
+        "quarantined_qids": quarantined,
+    }
+
+
 def _analyze_and_distribute(
     spark: Any,
     run_id: str,
@@ -1692,6 +2469,7 @@ def _analyze_and_distribute(
     lever_label: int,
     *,
     verbose: bool = True,
+    quarantined_qids: set[str] | None = None,
 ) -> dict:
     """Analyze failures once, cluster, and distribute clusters to levers.
 
@@ -1709,37 +2487,25 @@ def _analyze_and_distribute(
     )
 
     failure_rows = _get_failure_rows(spark, run_id, catalog, schema)
+    _quarantined = quarantined_qids or set()
 
     _NON_ACTIONABLE_VERDICTS = {"genie_correct", "both_correct"}
     arbiter_counts: dict[str, int] = {}
     arbiter_excluded: list[str] = []
+    quarantine_excluded: list[str] = []
     soft_signal_qids: list[str] = []
     filtered_failure_rows: list[dict] = []
     soft_signal_rows: list[dict] = []
     for row in failure_rows:
-        av = str(
-            row.get("arbiter/value")
-            or row.get("feedback/arbiter/value")
-            or (row.get("arbiter") if isinstance(row.get("arbiter"), str) else "")
-            or "skipped"
-        ).lower()
+        av = _get_arbiter_verdict(row)
+        qid = _get_question_id(row)
         arbiter_counts[av] = arbiter_counts.get(av, 0) + 1
+
+        if qid in _quarantined:
+            quarantine_excluded.append(qid)
+            continue
+
         if av in _NON_ACTIONABLE_VERDICTS:
-            _rq = row.get("request") or {}
-            if isinstance(_rq, str):
-                try:
-                    _rq = json.loads(_rq)
-                except (json.JSONDecodeError, TypeError):
-                    _rq = {}
-            _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
-            qid = str(
-                row.get("inputs/question_id")
-                or (row.get("inputs") or {}).get("question_id", "")
-                or row.get("question_id")
-                or _rqk.get("question_id")
-                or (_rq.get("question_id") if isinstance(_rq, dict) else None)
-                or "?"
-            )
             if _has_individual_judge_failure(row):
                 soft_signal_rows.append(row)
                 soft_signal_qids.append(qid)
@@ -1755,6 +2521,8 @@ def _analyze_and_distribute(
         _kv("Total rows loaded", len(failure_rows)),
         _kv("Arbiter verdicts", _arbiter_summary),
     ]
+    if quarantine_excluded:
+        _fa_lines.append(_kv("Quarantined (excluded)", f"{len(quarantine_excluded)} question(s): {', '.join(quarantine_excluded[:5])}"))
     if arbiter_excluded:
         _fa_lines.append(_kv("Excluded (fully correct)", f"{len(arbiter_excluded)} question(s)"))
     if soft_signal_rows:
@@ -1958,6 +2726,7 @@ def _run_gate_checks(
     schema: str,
     reference_sqls: dict[str, str],
     noise_floor: float,
+    affected_question_ids: set[str] | None = None,
 ) -> dict:
     """Run slice → P0 → full eval gate sequence for an action group.
 
@@ -2000,12 +2769,7 @@ def _run_gate_checks(
         mlflow.end_run()
     except Exception:
         pass
-    affected_qids: set[str] = set()
-    for p in proposals:
-        cid = p.get("cluster_id", "")
-        for c in clusters:
-            if c.get("cluster_id") == cid:
-                affected_qids.update(c.get("question_ids", []))
+    affected_qids: set[str] = affected_question_ids or set()
     slice_benchmarks = filter_benchmarks_by_scope(
         benchmarks, "slice", patched_objects,
         affected_question_ids=affected_qids,
@@ -2441,42 +3205,20 @@ def _run_lever_loop(
         len(reference_sqls),
     )
 
-    _arbiter_actions = _extract_arbiter_actions_from_baseline(
-        spark, run_id, catalog, schema,
+    # ── Per-question cross-iteration arbiter corrections ─────────────
+    _correction_state: dict[str, set[str]] = {
+        "corrected_qids": set(),
+        "repaired_qids": set(),
+        "quarantined_qids": set(),
+    }
+    _pre_loop_corr = _run_arbiter_corrections(
+        w, spark, run_id, catalog, schema, domain,
+        already_corrected=_correction_state["corrected_qids"],
+        already_repaired=_correction_state["repaired_qids"],
+        quarantined_qids=_correction_state["quarantined_qids"],
     )
-    _genie_correct_count = sum(
-        1 for a in _arbiter_actions if a.get("verdict") == "genie_correct"
-    )
-    if _genie_correct_count >= ARBITER_CORRECTION_TRIGGER and _arbiter_actions:
-        from genie_space_optimizer.optimization.benchmarks import apply_benchmark_corrections
-
-        print(
-            f"\n-- ARBITER BENCHMARK CORRECTIONS " + "-" * 19 + "\n"
-            f"  genie_correct count: {_genie_correct_count} "
-            f"(threshold: {ARBITER_CORRECTION_TRIGGER})\n"
-            f"  Corrections to apply: {len(_arbiter_actions)}"
-        )
-        for _ac in _arbiter_actions:
-            print(
-                f"    - \"{_ac['question'][:60]}\" -> {_ac['new_expected_sql'][:80]}"
-            )
-        print("-" * 52)
-
-        correction_result = apply_benchmark_corrections(
-            _arbiter_actions, spark, uc_schema, domain,
-        )
-        print(
-            f"  Applied: {correction_result['applied']}, "
-            f"Skipped: {correction_result['skipped']}"
-        )
-        if correction_result["errors"]:
-            print(f"  Errors: {correction_result['errors'][:3]}")
-        print("-" * 52)
-    elif _genie_correct_count > 0:
-        print(
-            f"\n-- ARBITER: {_genie_correct_count} genie_correct verdicts "
-            f"(below threshold {ARBITER_CORRECTION_TRIGGER}, no corrections applied)"
-        )
+    _correction_state["corrected_qids"] = _pre_loop_corr["corrected_qids"]
+    _correction_state["quarantined_qids"] = _pre_loop_corr["quarantined_qids"]
 
     # ── Mine benchmark examples once (proactive, before loop) ──────────
     mined_example_proposals = _mine_benchmark_example_sqls(
@@ -2507,6 +3249,7 @@ def _run_lever_loop(
 
     reflection_buffer: list[dict] = []
     tried_patches: set[tuple[str, str]] = set()
+    prev_failure_qids: set[str] = set()
 
     for _iter_num in range(1, max_iterations + 1):
         # ── Exit checks ──────────────────────────────────────────────
@@ -2519,10 +3262,21 @@ def _run_lever_loop(
 
         iteration_counter += 1
 
+        # ── 3B.1b: Per-iteration arbiter corrections ─────────────────
+        _iter_corr = _run_arbiter_corrections(
+            w, spark, run_id, catalog, schema, domain,
+            already_corrected=_correction_state["corrected_qids"],
+            already_repaired=_correction_state["repaired_qids"],
+            quarantined_qids=_correction_state["quarantined_qids"],
+        )
+        _correction_state["corrected_qids"] = _iter_corr["corrected_qids"]
+        _correction_state["quarantined_qids"] = _iter_corr["quarantined_qids"]
+
         # ── 3B.2: Re-cluster from latest eval ────────────────────────
         _analysis = _analyze_and_distribute(
             spark, run_id, catalog, schema, metadata_snapshot,
             iteration_counter - 1, lever_label=0,
+            quarantined_qids=_correction_state["quarantined_qids"],
         )
         clusters = _analysis["all_clusters"]
         soft_signal_clusters = _analysis["soft_signal_clusters"]
@@ -2547,6 +3301,8 @@ def _run_lever_loop(
         # ── 3B.4: Adaptive strategist (1 LLM call → 1 AG) ───────────
         print(_section(f"ADAPTIVE STRATEGIST — Iteration {iteration_counter}", "="))
 
+        _verdict_history = _build_verdict_history(spark, run_id, catalog, schema)
+
         _total_q = len(benchmarks)
         _passing_q = _total_q - sum(len(c.get("question_ids", [])) for c in clusters)
         strategy = _call_llm_for_adaptive_strategy(
@@ -2559,6 +3315,7 @@ def _run_lever_loop(
             w=w,
             total_benchmarks=_total_q,
             passing_benchmarks=max(0, _passing_q),
+            verdict_history=_verdict_history,
         )
         action_groups = strategy.get("action_groups", [])
         ag = action_groups[0] if action_groups else None
@@ -2604,6 +3361,56 @@ def _run_lever_loop(
             task_key="lever_loop", iteration=iteration_counter,
             catalog=catalog, schema=schema,
         )
+
+        # ── 3B.4b: Handle escalation if present ─────────────────────
+        _escalation = ag.get("escalation", "")
+        if _escalation:
+            print(
+                _section(f"ESCALATION: {_escalation}", "!") + "\n"
+                + _kv("Type", _escalation) + "\n"
+                + _kv("Affected questions", ag.get("affected_questions", [])) + "\n"
+                + _bar("!")
+            )
+            _esc_result = _handle_escalation(
+                _escalation, ag,
+                w=w, spark=spark, run_id=run_id,
+                catalog=catalog, schema=schema, domain=domain,
+                iteration=iteration_counter,
+                benchmarks=benchmarks,
+                verdict_history=_verdict_history,
+                reflection_buffer=reflection_buffer,
+                metadata_snapshot=metadata_snapshot,
+            )
+            logger.info("Escalation result: %s", _esc_result)
+            _esc_tier = _esc_result.get("detail", {}).get("tier_action", "")
+
+            if _escalation == "flag_for_review" or (
+                _escalation == "remove_tvf" and _esc_tier == "flagged_only"
+            ):
+                reflection_buffer.append(_build_reflection_entry(
+                    iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                    levers=[], target_objects=ag.get("affected_questions", []),
+                    prev_scores=best_scores, new_scores=best_scores,
+                    rollback_reason=f"escalation:{_escalation}",
+                    patches=[],
+                    affected_question_ids=ag.get("affected_questions", []),
+                    prev_failure_qids=prev_failure_qids,
+                    new_failure_qids=prev_failure_qids,
+                ))
+                continue
+
+            if _escalation == "gt_repair":
+                reflection_buffer.append(_build_reflection_entry(
+                    iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                    levers=[], target_objects=ag.get("affected_questions", []),
+                    prev_scores=best_scores, new_scores=best_scores,
+                    rollback_reason="escalation:gt_repair (delegated to arbiter)",
+                    patches=[],
+                    affected_question_ids=ag.get("affected_questions", []),
+                    prev_failure_qids=prev_failure_qids,
+                    new_failure_qids=prev_failure_qids,
+                ))
+                continue
 
         # ── 3B.5: Generate proposals + apply patches ─────────────────
         all_proposals: list[dict] = []
@@ -2711,6 +3518,9 @@ def _run_lever_loop(
                 iteration=iteration_counter, ag_id=ag_id, accepted=False,
                 levers=[], target_objects=[], prev_scores=best_scores,
                 new_scores=best_scores, rollback_reason="no_proposals", patches=[],
+                affected_question_ids=ag.get("affected_questions", []),
+                prev_failure_qids=prev_failure_qids,
+                new_failure_qids=prev_failure_qids,
             ))
             continue
 
@@ -2746,6 +3556,9 @@ def _run_lever_loop(
                 prev_scores=best_scores, new_scores=best_scores,
                 rollback_reason=f"patch_deploy_failed: {str(_pe)[:100]}",
                 patches=patches,
+                affected_question_ids=ag.get("affected_questions", []),
+                prev_failure_qids=prev_failure_qids,
+                new_failure_qids=prev_failure_qids,
             ))
             continue
 
@@ -2785,6 +3598,7 @@ def _run_lever_loop(
             schema=schema,
             reference_sqls=reference_sqls,
             noise_floor=noise_floor,
+            affected_question_ids=set(ag.get("affected_questions", [])),
         )
 
         # ── 3B.7: Accept or rollback ────────────────────────────────
@@ -2820,12 +3634,18 @@ def _run_lever_loop(
                 all_eval_mlflow_run_ids.append(_fail_run_id)
 
             _failed_scores = gate_result.get("full_scores", best_scores)
+            _rb_fail_qids = set(
+                gate_result.get("failed_eval_result", {}).get("failure_question_ids", [])
+            )
             reflection = _build_reflection_entry(
                 iteration=iteration_counter, ag_id=ag_id, accepted=False,
                 levers=[int(lk) for lk in lever_keys],
                 target_objects=_target_objects,
                 prev_scores=best_scores, new_scores=_failed_scores,
                 rollback_reason=reason, patches=patches,
+                affected_question_ids=ag.get("affected_questions", []),
+                prev_failure_qids=prev_failure_qids,
+                new_failure_qids=_rb_fail_qids or prev_failure_qids,
             )
             reflection_buffer.append(reflection)
             for p in patches:
@@ -2870,14 +3690,19 @@ def _run_lever_loop(
             "accuracy_delta": full_accuracy - best_accuracy,
         })
 
+        _accepted_fail_qids = set(full_result.get("failure_question_ids", []))
         reflection = _build_reflection_entry(
             iteration=iteration_counter, ag_id=ag_id, accepted=True,
             levers=[int(lk) for lk in lever_keys],
             target_objects=_target_objects,
             prev_scores=best_scores, new_scores=full_scores,
             rollback_reason=None, patches=patches,
+            affected_question_ids=ag.get("affected_questions", []),
+            prev_failure_qids=prev_failure_qids,
+            new_failure_qids=_accepted_fail_qids,
         )
         reflection_buffer.append(reflection)
+        prev_failure_qids = _accepted_fail_qids
 
         best_scores = full_scores
         best_accuracy = full_accuracy

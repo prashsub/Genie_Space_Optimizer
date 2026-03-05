@@ -166,7 +166,7 @@ Click **Optimize** to kick off the pipeline. This submits a multi-task Databrick
 
 **Total time: 20-60 minutes** depending on space complexity and number of tables.
 
-The lever loop now uses an **adaptive iteration cycle**: each iteration re-clusters failures, priority-scores them by impact, calls the adaptive strategist for a single targeted action group, applies patches, evaluates through 3 gates, and reflects on the outcome. A **100-instruction slot budget** is enforced (each example SQL = 1 slot, SQL function = 1, text instructions = 1) to stay within the Genie API limit. At the end of the loop, an MLflow labeling session is created for human review with a clickable URL link in the run detail page.
+The lever loop now uses an **adaptive iteration cycle**: each iteration re-clusters failures, priority-scores them by impact, calls the adaptive strategist for a single targeted action group, applies patches, evaluates through 3 gates, and reflects on the outcome. A **100-instruction slot budget** is enforced (each example SQL = 1 slot, SQL function = 1, text instructions = 1) to stay within the Genie API limit. **Per-question failure persistence** is tracked across iterations — questions classified as ADDITIVE_LEVERS_EXHAUSTED trigger escalation: TVF removal (with schema overlap confidence analysis), LLM-assisted ground-truth repair, or flagging for human review. High-risk patches are queued for approval in the pending reviews panel. At the end of the loop, an MLflow labeling session is created for human review with a clickable URL link in the run detail page.
 
 ### Step 4: Monitor Progress
 
@@ -317,6 +317,12 @@ PLATEAU_ITERATIONS = 2        # Consecutive no-improvement before stopping
 MAX_NOISE_FLOOR = 5.0         # Min score improvement to accept (below = cosmetic noise)
 DIMINISHING_RETURNS_EPSILON = 2.0  # Stop when last N accepted iters each < this %
 DIMINISHING_RETURNS_LOOKBACK = 2   # How many recent accepted iterations to check
+GENIE_CORRECT_CONFIRMATION_THRESHOLD = 2  # Evals confirming genie_correct before auto-correction
+NEITHER_CORRECT_REPAIR_THRESHOLD = 2      # neither_correct verdicts before GT repair attempt
+NEITHER_CORRECT_QUARANTINE_THRESHOLD = 3  # Consecutive neither_correct + failed repair → quarantine
+PERSISTENCE_MIN_FAILURES = 2              # Evals before question appears in persistence summary
+TVF_REMOVAL_MIN_ITERATIONS = 2            # Consecutive failing iterations before TVF removal considered
+TVF_REMOVAL_BLAME_THRESHOLD = 2           # Iterations TVF blamed in ASI for auto-removal
 ```
 
 ### Benchmark Generation

@@ -6,6 +6,44 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Per-Question Failure Persistence, Escalation Framework, Pending Reviews
+- **Cross-iteration verdict history** (`harness.py`): `_build_verdict_history()` builds
+  per-question arbiter verdict history across all full-scope evaluations.
+  `_build_question_persistence_summary()` classifies questions as INTERMITTENT, PERSISTENT,
+  or ADDITIVE_LEVERS_EXHAUSTED, and renders a strategist-ready summary.
+- **Escalation framework** (`harness.py`, `config.py`): the adaptive strategist can now
+  output an `escalation` field per action group: `remove_tvf` (auto-assess TVF removal
+  confidence), `gt_repair` (LLM-assisted ground-truth correction for `neither_correct`
+  patterns), or `flag_for_review` (human review in labeling session). Per-question
+  thresholds: `GENIE_CORRECT_CONFIRMATION_THRESHOLD=2`,
+  `NEITHER_CORRECT_REPAIR_THRESHOLD=2`, `NEITHER_CORRECT_QUARANTINE_THRESHOLD=3`.
+- **Quarantined questions** (`evaluation.py`): `_compute_arbiter_adjusted_accuracy()` now
+  accepts `quarantined_qids` — questions excluded from the accuracy denominator after
+  repeated `neither_correct` verdicts and failed GT repair.
+- **TVF schema overlap analysis** (`uc_metadata.py`): `describe_tvf_output_columns()` and
+  `analyze_tvf_table_overlap()` compare TVF output columns with underlying tables to
+  produce a coverage analysis and confidence tier for safe TVF removal.
+- **Queued patches table** (`state.py`): `genie_opt_queued_patches` Delta table for
+  high-risk patches pending human approval; `write_queued_patch()`, `get_queued_patches()`.
+- **Flagged questions** (`labeling.py`): `flag_for_human_review()` writes to
+  `genie_opt_flagged_questions` Delta table; `get_flagged_questions()` reads pending items.
+  Flagged trace IDs are prioritized in labeling session population.
+- **Pending reviews API** (`runs.py`, `models.py`): `GET /pending-reviews/{space_id}`
+  returns `PendingReviewsOut` with flagged question count, queued patch count, labeling
+  session URL, and top items. `PendingReviewItem` model for flagged questions and queued patches.
+- **Pending reviews UI** (`$runId.tsx`, `SpaceCard.tsx`, `api.ts`): run detail page shows
+  pending review badge with link to labeling session; space card shows pending review count.
+- **Reflection entry per-question tracking** (`harness.py`): `_build_reflection_entry()`
+  now tracks `affected_question_ids`, `fixed_questions`, `still_failing`, `new_regressions`.
+- **Adaptive strategist prompt enhancements** (`config.py`): new `{{ question_persistence_summary }}`
+  context block; escalation guidance for ADDITIVE_LEVERS_EXHAUSTED questions;
+  optional `"escalation"` field in action group output schema.
+- **Config thresholds** (`config.py`): `PERSISTENCE_MIN_FAILURES=2`,
+  `TVF_REMOVAL_MIN_ITERATIONS=2`, `TVF_REMOVAL_BLAME_THRESHOLD=2`.
+- **New test suites**: `test_arbiter_corrections.py`, `test_persistence_escalation.py`.
+
+---
+
 ### Added — Instruction Slot Budget, Labeling Session URLs, Expected SQL on Traces
 - **Instruction slot budget** (`genie_schema.py`, `optimizer.py`, `applier.py`):
   `count_instruction_slots()` counts consumed slots (example SQLs + SQL functions +

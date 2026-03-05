@@ -903,6 +903,35 @@ def load_latest_full_iteration(
     return row
 
 
+def load_all_full_iterations(
+    spark: SparkSession, run_id: str, catalog: str, schema: str
+) -> list[dict]:
+    """All iterations with ``eval_scope='full'``, ordered by ``iteration ASC``.
+
+    Each row's JSON columns are parsed into native Python objects.  Used for
+    cross-iteration verdict history (e.g. tracking ``genie_correct`` counts
+    per question across multiple evaluations).
+    """
+    fqn = _fqn(catalog, schema, TABLE_ITERATIONS)
+    df = run_query(
+        spark,
+        f"SELECT * FROM {fqn} WHERE run_id = '{run_id}' AND eval_scope = 'full' "
+        f"ORDER BY iteration ASC",
+    )
+    if df.empty:
+        return []
+    rows = df.to_dict("records")
+    for row in rows:
+        for col in ("scores_json", "failures_json", "remaining_failures",
+                     "arbiter_actions_json", "repeatability_json", "rows_json"):
+            if row.get(col) and isinstance(row[col], str):
+                try:
+                    row[col] = json.loads(row[col])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    return rows
+
+
 def load_runs_for_space(
     spark: SparkSession, space_id: str, catalog: str, schema: str
 ) -> pd.DataFrame:
@@ -973,3 +1002,77 @@ def load_provenance(
         spark,
         f"SELECT * FROM {fqn} {where} ORDER BY iteration, lever, question_id",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Queued Patches (high-risk, pending human review)
+# ═══════════════════════════════════════════════════════════════════════
+
+TABLE_QUEUED_PATCHES = "genie_opt_queued_patches"
+
+
+def _ensure_queued_patches_table(spark: Any, catalog: str, schema: str) -> None:
+    fqn = _fqn(catalog, schema, TABLE_QUEUED_PATCHES)
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {fqn} (
+            run_id              STRING      NOT NULL,
+            iteration           INT         NOT NULL,
+            patch_type          STRING      NOT NULL,
+            target_identifier   STRING      NOT NULL,
+            confidence_tier     STRING,
+            coverage_analysis   STRING      COMMENT 'JSON blob with schema overlap details',
+            blame_iterations    INT,
+            status              STRING      NOT NULL  DEFAULT 'pending',
+            created_at          TIMESTAMP   NOT NULL,
+            resolved_at         TIMESTAMP
+        ) USING DELTA
+    """)
+
+
+def write_queued_patch(
+    spark: Any,
+    run_id: str,
+    iteration: int,
+    patch_type: str,
+    target_identifier: str,
+    catalog: str,
+    schema: str,
+    *,
+    confidence_tier: str = "",
+    coverage_analysis: dict | None = None,
+    blame_iterations: int = 0,
+) -> None:
+    """Persist a high-risk patch that needs human approval."""
+    _ensure_queued_patches_table(spark, catalog, schema)
+    fqn = _fqn(catalog, schema, TABLE_QUEUED_PATCHES)
+    now = datetime.now(timezone.utc).isoformat()
+    cov_json = json.dumps(coverage_analysis or {}).replace("'", "''")
+    target_esc = target_identifier.replace("'", "''")
+    spark.sql(f"""
+        INSERT INTO {fqn} (run_id, iteration, patch_type, target_identifier,
+                           confidence_tier, coverage_analysis, blame_iterations,
+                           status, created_at)
+        VALUES ('{run_id}', {iteration}, '{patch_type}', '{target_esc}',
+                '{confidence_tier}', '{cov_json}', {blame_iterations},
+                'pending', '{now}')
+    """)
+
+
+def get_queued_patches(
+    spark: Any,
+    catalog: str,
+    schema: str,
+    *,
+    status: str = "pending",
+) -> list[dict]:
+    """Return all queued patches with the given status."""
+    fqn = _fqn(catalog, schema, TABLE_QUEUED_PATCHES)
+    try:
+        df = run_query(
+            spark,
+            f"SELECT * FROM {fqn} WHERE status = '{status}' ORDER BY created_at DESC",
+        )
+        return df.to_dict("records") if not df.empty else []
+    except Exception:
+        logger.debug("Could not read queued patches table", exc_info=True)
+        return []

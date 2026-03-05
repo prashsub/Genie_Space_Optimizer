@@ -49,6 +49,20 @@ export interface Name {
     family_name?: string | null;
     given_name?: string | null;
 }
+export interface PendingReviewItem {
+    confidenceTier?: string;
+    itemType?: string;
+    questionId: string;
+    questionText?: string;
+    reason?: string;
+}
+export interface PendingReviewsOut {
+    flaggedQuestions?: number;
+    items?: PendingReviewItem[];
+    labelingSessionUrl?: string | null;
+    queuedPatches?: number;
+    totalPending?: number;
+}
 export interface PermissionDashboard {
     experimentBasePath: string;
     frameworkCatalog: string;
@@ -328,6 +342,64 @@ export function useCurrentUserSuspense<TData = {
     return useSuspenseQuery({
         queryKey: currentUserKey(options?.params),
         queryFn: ()=>currentUser(options?.params),
+        ...options?.query
+    });
+}
+export interface GetPendingReviewsParams {
+    space_id: string;
+}
+export const getPendingReviews = async (params: GetPendingReviewsParams, options?: RequestInit): Promise<{
+    data: PendingReviewsOut;
+}> =>{
+    const res = await fetch(`/api/genie/pending-reviews/${params.space_id}`, {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const getPendingReviewsKey = (params?: GetPendingReviewsParams)=>{
+    return [
+        "/api/genie/pending-reviews/{space_id}",
+        params
+    ] as const;
+};
+export function useGetPendingReviews<TData = {
+    data: PendingReviewsOut;
+}>(options: {
+    params: GetPendingReviewsParams;
+    query?: Omit<UseQueryOptions<{
+        data: PendingReviewsOut;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: getPendingReviewsKey(options.params),
+        queryFn: ()=>getPendingReviews(options.params),
+        ...options?.query
+    });
+}
+export function useGetPendingReviewsSuspense<TData = {
+    data: PendingReviewsOut;
+}>(options: {
+    params: GetPendingReviewsParams;
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: PendingReviewsOut;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: getPendingReviewsKey(options.params),
+        queryFn: ()=>getPendingReviews(options.params),
         ...options?.query
     });
 }
