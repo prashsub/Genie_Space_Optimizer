@@ -922,6 +922,12 @@ def format_reflection_buffer(
             lines.append(f"  New failures: {new_failures}")
         if entry.get("rollback_reason"):
             lines.append(f"  Rollback reason: {entry['rollback_reason']}")
+        _ref_text = entry.get("reflection_text", "")
+        if _ref_text:
+            lines.append(f"  Reflection: {_ref_text}")
+        _ref_mode = entry.get("refinement_mode", "")
+        if _ref_mode and not entry.get("accepted"):
+            lines.append(f"  Refinement guidance: {_ref_mode}")
         if not entry.get("accepted"):
             do_not_retry.extend(entry.get("do_not_retry", []))
 
@@ -4604,6 +4610,7 @@ def _call_llm_for_adaptive_strategy(
     total_benchmarks: int = 0,
     passing_benchmarks: int = 0,
     verdict_history: dict | None = None,
+    skill_exemplars: list[dict] | None = None,
 ) -> dict:
     """Single-call strategist that produces exactly ONE action group.
 
@@ -4653,8 +4660,23 @@ def _call_llm_for_adaptive_strategy(
     from genie_space_optimizer.optimization.harness import (
         _build_question_persistence_summary,
     )
-    persistence_text = _build_question_persistence_summary(
+    persistence_text, _persistence_structured = _build_question_persistence_summary(
         verdict_history or {}, reflection_buffer,
+    )
+
+    # ── Build proven patterns text ────────────────────────────────────
+    _proven_lines: list[str] = []
+    for _ex in (skill_exemplars or []):
+        _proven_lines.append(
+            f"- Root cause: {_ex.get('root_cause', '?')[:80]} | "
+            f"Levers: {', '.join(str(l) for l in _ex.get('lever_pattern', []))} | "
+            f"Patches: {', '.join(_ex.get('patch_types', [])[:4])} | "
+            f"Gain: {_ex.get('accuracy_gain', 0):+.1f}%"
+        )
+    proven_patterns_text = (
+        "\n".join(_proven_lines)
+        if _proven_lines
+        else "(No accepted patterns yet. This is informed by prior successful iterations.)"
     )
 
     # ── Assemble prompt kwargs ───────────────────────────────────────
@@ -4663,6 +4685,7 @@ def _call_llm_for_adaptive_strategy(
         "priority_ranking": ranking_text,
         "reflection_buffer": reflection_text,
         "question_persistence_summary": persistence_text,
+        "proven_patterns": proven_patterns_text,
         "full_schema_context": _format_full_schema_context(metadata_snapshot),
         "cluster_briefs": _format_cluster_briefs(clusters),
         "soft_signal_summary": _format_soft_signal_summary(soft_signal_clusters),
@@ -4703,6 +4726,7 @@ def _call_llm_for_adaptive_strategy(
     prompt = format_mlflow_template(ADAPTIVE_STRATEGIST_PROMPT, **format_kwargs)
 
     _W = 78
+    _iter_label = len(reflection_buffer) + 1
     logger.info(
         "\n┌─── LLM Call [ADAPTIVE STRATEGIST] %s\n"
         "│ Clusters: %d hard, %d soft\n"
@@ -4716,14 +4740,38 @@ def _call_llm_for_adaptive_strategy(
         len(prompt),
         "─" * (_W - 1),
     )
-    print(
-        f"\n{'=' * _W}\n"
-        f"  ADAPTIVE STRATEGIST (iteration {len(reflection_buffer) + 1})\n"
-        f"  Clusters: {len(clusters)} hard, {len(soft_signal_clusters)} soft\n"
-        f"  Reflections: {len(reflection_buffer)}\n"
-        f"  Prompt: {len(prompt):,} chars\n"
-        f"{'=' * _W}"
-    )
+    _input_lines = [
+        f"\n{'=' * _W}",
+        f"  STRATEGIST INPUT (Iteration {_iter_label})",
+        f"{'=' * _W}",
+        f"|  {'Success Summary:':<28s} {success_summary}",
+        f"|  {'Clusters:':<28s} {len(clusters)} hard, {len(soft_signal_clusters)} soft",
+        f"|  {'Reflections:':<28s} {len(reflection_buffer)}",
+        f"|  {'Prompt:':<28s} {len(prompt):,} chars",
+    ]
+    _ranking_preview = ranking_text.split("\n")[:5]
+    if _ranking_preview:
+        _input_lines.append(f"|  {'Priority Ranking (top 5):':<28s}")
+        for _rp in _ranking_preview:
+            _input_lines.append(f"|    {_rp.strip()}")
+    _refl_preview = reflection_text[:500]
+    if _refl_preview and _refl_preview != "(No prior iterations. This is the first attempt after baseline evaluation.)":
+        _input_lines.append(f"|  {'Reflection Buffer:':<28s}")
+        for _rl in _refl_preview.split("\n")[:10]:
+            _input_lines.append(f"|    {_rl}")
+        if len(reflection_text) > 500:
+            _input_lines.append(f"|    ... ({len(reflection_text) - 500} more chars)")
+    _persist_preview = persistence_text[:500]
+    if _persist_preview and "No" not in _persist_preview[:30]:
+        _input_lines.append(f"|  {'Persistence Summary:':<28s}")
+        for _pl in _persist_preview.split("\n")[:8]:
+            _input_lines.append(f"|    {_pl}")
+    if _proven_lines:
+        _input_lines.append(f"|  {'Proven Patterns:':<28s} {len(_proven_lines)}")
+        for _pp in _proven_lines[:3]:
+            _input_lines.append(f"|    {_pp}")
+    _input_lines.append(f"{'=' * _W}")
+    print("\n".join(_input_lines))
 
     _link_prompt_to_trace("adaptive_strategist")
 
@@ -4781,16 +4829,28 @@ def _call_llm_for_adaptive_strategy(
                 len(global_rewrite),
                 str(rationale)[:300],
             )
+            _out_lines = [
+                f"\n{'=' * _W}",
+                f"  STRATEGIST OUTPUT (Iteration {_iter_label})",
+                f"{'=' * _W}",
+            ]
             if action_groups:
                 ag = action_groups[0]
                 levers = sorted(ag.get("lever_directives", {}).keys())
                 qs = ag.get("affected_questions", [])
-                print(
-                    f"  → AG: {ag.get('root_cause_summary', '?')[:100]}\n"
-                    f"    Levers: {levers} | Questions: {len(qs)}"
-                )
+                _out_lines.append(f"|  {'AG:':<28s} {ag.get('root_cause_summary', '?')[:100]}")
+                _out_lines.append(f"|  {'Levers:':<28s} {', '.join(levers)}")
+                _out_lines.append(f"|  {'Affected Questions:':<28s} {len(qs)} — {', '.join(qs[:5])}")
+                _out_lines.append(f"|  {'Escalation:':<28s} {ag.get('escalation', 'none') or 'none'}")
+                _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
+                if global_rewrite:
+                    _out_lines.append(f"|  {'Instruction Rewrite:':<28s} {global_rewrite[:200]}...")
             else:
-                print("  → No action group produced")
+                _out_lines.append("|  No action group produced")
+                if rationale:
+                    _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
+            _out_lines.append(f"{'=' * _W}")
+            print("\n".join(_out_lines))
 
             return {
                 "action_groups": action_groups[:1],

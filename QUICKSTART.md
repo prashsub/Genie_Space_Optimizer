@@ -2,6 +2,8 @@
 
 Get the Genie Space Optimizer running in your Databricks workspace in under 15 minutes.
 
+> **Detailed docs:** [Full Documentation](docs/genie-space-optimizer-design/00-index.md) | [Permissions Guide](docs/genie-space-optimizer-design/08-permissions-and-security.md) | [API Reference](docs/genie-space-optimizer-design/07-api-reference.md) | [Troubleshooting](docs/genie-space-optimizer-design/appendices/B-troubleshooting.md)
+
 ---
 
 ## 1. Prerequisites
@@ -106,11 +108,13 @@ Wait for the deployment to complete (~2-3 minutes).
 
 ### Grant Data Access
 
-After deployment, the app's service principal needs access to your Unity Catalog schemas. The app operates as an **advisor** — it shows you exactly what permissions are missing and provides **copyable SQL commands** on the Settings page. Run those commands in a SQL editor or use the grant script:
+After deployment, the app's service principal needs access to your Unity Catalog schemas. The app operates as an **advisor** -- it shows you exactly what permissions are missing and provides **copyable SQL commands** on the Settings page. Run those commands in a SQL editor or use the grant script:
 
 ```bash
 python resources/grant_app_uc_permissions.py --catalog your_catalog --schema your_schema
 ```
+
+See [08 -- Permissions and Security](docs/genie-space-optimizer-design/08-permissions-and-security.md) for the complete permissions model, including required OBO scopes, SP UC grants, and Genie Space CAN_MANAGE requirements.
 
 ---
 
@@ -231,7 +235,7 @@ curl -s "${APP_URL}/api/genie/trigger/status/<RUN_ID>" \
 
 ## 8. Programmatic API (Headless Trigger)
 
-You can trigger optimization runs programmatically without the UI, using the `/trigger` endpoint:
+You can trigger optimization runs programmatically without the UI, using the `/trigger` endpoint. See [07 -- API Reference](docs/genie-space-optimizer-design/07-api-reference.md) for the complete endpoint reference with request/response schemas and CI/CD integration patterns.
 
 ```bash
 # Trigger optimization
@@ -289,7 +293,7 @@ apx dev stop
 
 ## 10. Key Configuration Knobs
 
-All tunable parameters are in `src/genie_space_optimizer/common/config.py`:
+All tunable parameters are in `src/genie_space_optimizer/common/config.py`. See [Appendix A -- Configuration Reference](docs/genie-space-optimizer-design/appendices/A-configuration-reference.md) for the complete list with defaults, environment variable overrides, and tuning guidance.
 
 ### Quality Thresholds
 

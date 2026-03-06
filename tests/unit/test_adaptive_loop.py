@@ -185,6 +185,14 @@ class TestFormatReflectionBuffer:
         result = format_reflection_buffer([r], full_window=3)
         assert "schema_accuracy" in result
 
+    def test_reflection_text_and_refinement_mode_shown(self):
+        r = _make_reflection(iteration=1, accepted=False)
+        r["reflection_text"] = "Rollback: instructions caused regressions."
+        r["refinement_mode"] = "in_plan"
+        result = format_reflection_buffer([r], full_window=3)
+        assert "Reflection: Rollback: instructions caused regressions." in result
+        assert "Refinement guidance: in_plan" in result
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # _build_reflection_entry
@@ -247,11 +255,11 @@ class TestBuildReflectionEntry:
 
 
 class TestDiminishingReturns:
-    def test_not_enough_accepted_entries(self):
+    def test_not_enough_entries(self):
         buf = [_make_reflection(iteration=1, accepted=True, accuracy_delta=0.5)]
         assert _diminishing_returns(buf, epsilon=2.0, lookback=2) is False
 
-    def test_detects_diminishing_returns(self):
+    def test_detects_diminishing_returns_accepted(self):
         buf = [
             _make_reflection(
                 iteration=i,
@@ -276,13 +284,20 @@ class TestDiminishingReturns:
         ]
         assert _diminishing_returns(buf, epsilon=2.0, lookback=2) is False
 
-    def test_ignores_rolled_back_entries(self):
+    def test_rollbacks_count_as_no_improvement(self):
         buf = [
-            _make_reflection(iteration=1, accepted=True, score_deltas={"a": 0.5}),
+            _make_reflection(iteration=1, accepted=True, accuracy_delta=5.0, score_deltas={"a": 5.0}),
             _make_reflection(iteration=2, accepted=False, score_deltas={"a": -5.0}),
-            _make_reflection(iteration=3, accepted=True, score_deltas={"a": 0.5}),
+            _make_reflection(iteration=3, accepted=False, score_deltas={"a": -3.0}),
         ]
         assert _diminishing_returns(buf, epsilon=2.0, lookback=2) is True
+
+    def test_recent_accepted_with_gain_prevents_trigger(self):
+        buf = [
+            _make_reflection(iteration=1, accepted=False, score_deltas={"a": -5.0}),
+            _make_reflection(iteration=2, accepted=True, accuracy_delta=5.0, score_deltas={"a": 5.0}),
+        ]
+        assert _diminishing_returns(buf, epsilon=2.0, lookback=2) is False
 
     def test_empty_buffer(self):
         assert _diminishing_returns([], epsilon=2.0, lookback=2) is False

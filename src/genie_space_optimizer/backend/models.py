@@ -343,3 +343,74 @@ class PendingReviewsOut(BaseModel):
     totalPending: int = 0
     labelingSessionUrl: str | None = None
     items: list[PendingReviewItem] = []
+
+
+# ── Iteration Detail (Transparency) Models ───────────────────────────
+
+
+class QuestionResult(SafeModel):
+    questionId: str
+    question: str = ""
+    resultCorrectness: str | None = None
+    judgeVerdicts: dict[str, str] = {}
+    failureTypes: list[str] = []
+    matchType: str | None = None
+    expectedSql: str | None = None
+    generatedSql: str | None = None
+
+
+class GateResult(SafeModel):
+    gateName: str
+    accuracy: float | None = None
+    totalQuestions: int | None = None
+    passed: bool | None = None
+    mlflowRunId: str | None = None
+
+
+class ReflectionEntry(SafeModel):
+    iteration: int
+    agId: str
+    accepted: bool
+    action: str = ""
+    levers: list[int] = []
+    targetObjects: list[str] = []
+    scoreDeltas: dict[str, float] = {}
+    accuracyDelta: float = 0
+    newFailures: str | None = None
+    rollbackReason: str | None = None
+    doNotRetry: list[str] = []
+    affectedQuestionIds: list[str] = []
+    fixedQuestions: list[str] = []
+    stillFailing: list[str] = []
+    newRegressions: list[str] = []
+    reflectionText: str = ""
+    refinementMode: str = ""
+
+
+class IterationDetail(SafeModel):
+    iteration: int
+    agId: str | None = None
+    status: str
+    overallAccuracy: float
+    judgeScores: dict[str, float | None] = {}
+    totalQuestions: int = 0
+    correctCount: int = 0
+    mlflowRunId: str | None = None
+    modelId: str | None = None
+    gates: list[GateResult] = []
+    patches: list[dict] = []
+    reflection: ReflectionEntry | None = None
+    questions: list[QuestionResult] = []
+    clusterInfo: dict | None = None
+    timestamp: str | None = None
+
+
+class IterationDetailResponse(SafeModel):
+    runId: str
+    spaceId: str
+    baselineScore: float | None = None
+    optimizedScore: float | None = None
+    totalIterations: int
+    iterations: list[IterationDetail]
+    flaggedQuestions: list[dict] = []
+    labelingSessionUrl: str | None = None

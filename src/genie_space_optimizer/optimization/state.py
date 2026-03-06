@@ -583,6 +583,34 @@ def write_iteration(
     )
 
 
+def update_iteration_reflection(
+    spark: SparkSession,
+    run_id: str,
+    iteration: int,
+    reflection_json: dict,
+    *,
+    catalog: str,
+    schema: str,
+    eval_scope: str = "full",
+) -> None:
+    """Update ``reflection_json`` on an existing iteration row."""
+    fqn = _fqn(catalog, schema, TABLE_ITERATIONS)
+
+    def _esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("'", "''")
+
+    payload = _esc(json.dumps(reflection_json))
+    spark.sql(
+        f"UPDATE {fqn} SET reflection_json = '{payload}' "
+        f"WHERE run_id = '{run_id}' AND iteration = {iteration} "
+        f"AND eval_scope = '{eval_scope}'"
+    )
+    logger.info(
+        "Updated reflection_json for run %s iteration %d scope=%s",
+        run_id, iteration, eval_scope,
+    )
+
+
 def write_patch(
     spark: SparkSession,
     run_id: str,

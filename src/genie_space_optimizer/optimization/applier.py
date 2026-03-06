@@ -1506,15 +1506,28 @@ def apply_patch_set(
 
     slot_count = count_instruction_slots(config)
     if slot_count > MAX_INSTRUCTION_SLOTS:
-        logger.warning(
-            "Post-apply config exceeds instruction slot budget (%d/%d) — "
-            "trimming newest example_question_sqls",
-            slot_count, MAX_INSTRUCTION_SLOTS,
-        )
         excess = slot_count - MAX_INSTRUCTION_SLOTS
-        eqs = (config.get("instructions") or {}).get("example_question_sqls", [])
-        if len(eqs) > excess:
-            config["instructions"]["example_question_sqls"] = eqs[:-excess]
+        logger.warning(
+            "Post-apply config exceeds instruction slot budget (%d/%d, excess=%d) — "
+            "trimming example_question_sqls then sql_functions",
+            slot_count, MAX_INSTRUCTION_SLOTS, excess,
+        )
+        inst = config.get("instructions") or {}
+        eqs = inst.get("example_question_sqls", [])
+        if eqs and excess > 0:
+            trim_eq = min(len(eqs), excess)
+            config.setdefault("instructions", {})["example_question_sqls"] = eqs[:-trim_eq]
+            excess -= trim_eq
+        if excess > 0:
+            fns = (config.get("instructions") or {}).get("sql_functions", [])
+            if fns and excess > 0:
+                trim_fn = min(len(fns), excess)
+                logger.warning(
+                    "Still %d slots over budget after trimming examples — "
+                    "removing %d newest sql_functions entries",
+                    excess, trim_fn,
+                )
+                config["instructions"]["sql_functions"] = fns[:-trim_fn]
 
     config_ok, validation_errors = validate_serialized_space(config, strict=True)
     if not config_ok:

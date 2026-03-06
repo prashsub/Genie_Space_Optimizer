@@ -39,6 +39,7 @@ from genie_space_optimizer.common.uc_metadata import (
 from genie_space_optimizer.optimization.benchmarks import validate_benchmarks
 from genie_space_optimizer.optimization.applier import _get_general_instructions
 from genie_space_optimizer.optimization.evaluation import (
+    _drop_benchmark_table,
     create_evaluation_dataset,
     extract_genie_space_benchmarks,
     generate_benchmarks,
@@ -585,7 +586,7 @@ def run_preflight(
             domain=domain,
         )
 
-    benchmarks = _load_or_generate_benchmarks(
+    benchmarks, _benchmarks_regenerated = _load_or_generate_benchmarks(
         w, spark, config, uc_columns_dicts, uc_tags_dicts, uc_routines_dicts,
         domain, catalog, schema, uc_schema, run_id,
     )
@@ -677,6 +678,7 @@ def run_preflight(
             "Re-generating from scratch using Genie space assets.",
             len(benchmarks), MIN_VALID_BENCHMARKS,
         )
+        _benchmarks_regenerated = True
         genie_benchmarks_regen = extract_genie_space_benchmarks(
             config, spark, catalog=catalog, schema=schema,
         )
@@ -704,6 +706,14 @@ def run_preflight(
             f"Sample errors: {invalid_errors[:5]}. "
             "Check that the Genie space's referenced tables actually exist."
         )
+
+    _uc_table = f"{uc_schema}.genie_benchmarks_{domain}"
+    logger.info(
+        "Dropping benchmark table %s before persist to eliminate stale duplicates "
+        "(regenerated=%s, benchmarks=%d)",
+        _uc_table, _benchmarks_regenerated, len(benchmarks),
+    )
+    _drop_benchmark_table(spark, _uc_table)
 
     create_evaluation_dataset(
         spark, benchmarks, uc_schema, domain,
@@ -805,8 +815,13 @@ def _load_or_generate_benchmarks(
     schema: str,
     uc_schema: str,
     run_id: str,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """Load existing benchmarks or generate new ones from Genie space + LLM.
+
+    Returns:
+        A tuple of (benchmarks, regenerated) where *regenerated* is ``True``
+        when a full GENERATE or RE-GENERATE occurred (the caller should drop
+        the stale UC table before persisting) and ``False`` for REUSE / TOP-UP.
 
     Strategy:
       1. Extract curated benchmarks from the Genie Space config (example_question_sqls,
@@ -893,7 +908,7 @@ def _load_or_generate_benchmarks(
                         benchmark.setdefault("validation_reason_code", "ok")
                         benchmark.setdefault("validation_error", None)
                         benchmark.setdefault("correction_source", "")
-                    return valid_existing
+                    return valid_existing, False
                 else:
                     gap = TARGET_BENCHMARK_COUNT - len(valid_existing)
                     print(
@@ -933,7 +948,7 @@ def _load_or_generate_benchmarks(
                         },
                         catalog=catalog, schema=schema,
                     )
-                    return new_benchmarks
+                    return new_benchmarks, False
 
             print(
                 f"  Decision: RE-GENERATE (missing {len(missing_curated)} curated questions)\n"
@@ -989,4 +1004,4 @@ def _load_or_generate_benchmarks(
         },
         catalog=catalog, schema=schema,
     )
-    return benchmarks
+    return benchmarks, True

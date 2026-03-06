@@ -1,10 +1,10 @@
 # Genie Space Optimizer
 
-A full-stack Databricks App that automatically optimizes [Genie Spaces](https://docs.databricks.com/en/genie/index.html) through iterative, LLM-driven metadata improvement. It evaluates your Genie Space configuration against benchmark questions, identifies quality gaps across 7 dimensions, and applies targeted patches through 6 optimization levers -- all with full rollback support.
+A full-stack Databricks App that automatically optimizes [Genie Spaces](https://docs.databricks.com/en/genie/index.html) through iterative, LLM-driven metadata improvement. It evaluates your Genie Space configuration against benchmark questions, identifies quality gaps across 7 dimensions, and applies targeted patches through 5 optimization levers -- all with full rollback support.
 
 Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 
-> **Quick links:** [Quickstart Guide](QUICKSTART.md) | [E2E Testing Guide](E2E_TESTING_GUIDE.md) | [Code Review](CODE_REVIEW.md) | [Changelog](CHANGELOG.md)
+> **Quick links:** [Quickstart Guide](QUICKSTART.md) | [E2E Testing Guide](E2E_TESTING_GUIDE.md) | [Detailed Documentation](docs/genie-space-optimizer-design/00-index.md) | [Changelog](CHANGELOG.md)
 
 ---
 
@@ -27,30 +27,27 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 
 ### Optimization Pipeline (5 Steps)
 
-1. **Configuration Analysis** -- Scans the Genie Space config, counts tables/instructions/sample questions, and validates structure.
-2. **Metadata Collection** -- Queries Unity Catalog via REST API (with Spark SQL fallback) for columns, data types, tags, routines, and table descriptions.
-3. **Baseline Evaluation** -- Generates ~20 benchmark questions via LLM (with coverage gap fill for uncovered assets), auto-resolves temporal date references, runs them through Genie, and scores responses across 7 quality dimensions using 9 LLM judges. All evaluation traces are tagged with `genie.optimization_run_id`, `genie.iteration`, and `genie.lever` for end-to-end traceability. The arbiter judge identifies `genie_correct` verdicts for benchmark correction and tiered soft signals for best-practice guidance.
-4. **Configuration Generation (Adaptive Lever Loop)** -- Preparatory stages run first: Stage 2.5 (deterministic prompt matching), Stage 2.75 (description enrichment + proactive example SQL mining), Stage 2.85 (join discovery), Stage 2.95 (instruction seeding). Then an **adaptive loop** iterates: re-cluster failures from fresh evaluation → priority-score clusters by impact → adaptive strategist produces exactly 1 action group → apply patches → 3-gate evaluation (slice, P0, confirmation double-run) → accept/rollback → reflect. Each iteration sees the latest failure state with a reflection buffer (prior outcomes + DO NOT RETRY list). Stops on convergence, diminishing returns (< 2% improvement over 2 accepted iterations), or max iterations. Score improvements below the noise floor (5 pts) are treated as cosmetic and rejected.
-5. **Optimized Evaluation & Repeatability** -- Final evaluation of the optimized config, including repeatability testing to ensure consistent results.
+1. **Preflight** -- Validates config, collects UC metadata (REST API with Spark SQL fallback), generates/loads benchmark questions
+2. **Baseline Evaluation** -- Runs ~20 benchmarks through Genie, scores with 9 judges across 7 quality dimensions, establishes "before" score
+3. **Preparatory Stages + Adaptive Lever Loop** -- 4 preparatory stages (prompt matching, description enrichment, join discovery, instruction seeding), then an adaptive loop that re-clusters failures, targets the highest-impact root cause with one action group per iteration, and evaluates through a 3-gate quality check
+4. **Finalize** -- 2 repeatability evaluation passes, model promotion, report generation
+5. **Deploy** -- (Optional) Deploy optimized config to version control
+
+> **Deep dive:** See [03 -- Optimization Pipeline](docs/genie-space-optimizer-design/03-optimization-pipeline.md) for the complete end-to-end walkthrough of every stage.
 
 ### Optimization Levers
-
-Before the main lever loop, five preparatory stages run:
-- **Stage 2.5 (Prompt Matching)** -- Deterministic format assistance (`get_example_values`) and entity matching (`build_value_dictionary`) on prioritized columns. No LLM involved.
-- **Stage 2.75 (Description Enrichment)** -- LLM-generated structured descriptions for columns *and tables* with insufficient descriptions (< 10 chars). Also generates space descriptions and sample questions for spaces that lack them. Mines proven example SQLs from high-scoring benchmarks (with 0-row validation) and applies them proactively via the Genie API.
-- **Stage 2.85 (Proactive Join Discovery)** -- Parses JOIN clauses from successful baseline queries, corroborates with UC foreign key constraints, and codifies execution-proven joins as Genie Space join specifications.
-- **Stage 2.95 (Proactive Instruction Seeding)** -- Seeds conservative routing instructions for spaces with no/insufficient instructions (< 50 chars). Covers asset routing, temporal conventions, null handling, and common joins.
-After preparatory stages, the **adaptive lever loop** iterates (up to 5 times):
 
 | Lever | Name | What It Optimizes |
 |-------|------|-------------------|
 | 1 | Tables & Columns | Descriptions, visibility, column aliases |
 | 2 | Metric Views | Measures, dimensions, MV YAML definitions |
 | 3 | Table-Valued Functions | Parameters, TVF SQL, function signatures |
-| 4 | Join Specifications | Table relationships, join columns, cardinality (always runs discovery) |
+| 4 | Join Specifications | Table relationships, join columns, cardinality |
 | 5 | Genie Instructions | Holistic instruction rewrite (routing, disambiguation, best practices) |
 
-Each iteration: the **adaptive strategist** re-clusters failures from fresh evaluation, priority-scores them by `question_count × causal_weight × severity × fixability`, then produces exactly one action group targeting the highest-impact root cause. A **reflection buffer** tracks prior outcomes (accepted/rolled-back, score deltas, DO NOT RETRY list) so the strategist avoids repeating failed approaches. The loop stops on convergence, **diminishing returns** (last 2 accepted iterations each < 2% improvement), or max iterations.
+Each iteration, an **adaptive strategist** re-clusters failures, priority-scores them, and produces exactly one action group targeting the highest-impact root cause. A **reflection buffer** prevents repeating failed approaches. The loop stops on convergence, diminishing returns, or max iterations.
+
+> **Deep dive:** See [05 -- Optimization Levers](docs/genie-space-optimizer-design/05-optimization-levers.md) for detailed coverage of each lever and preparatory stage.
 
 ### 7 Quality Dimensions (9 Scorers)
 
@@ -188,9 +185,32 @@ Genie_Space_Optimizer/
 
 ---
 
+## Documentation
+
+Comprehensive documentation lives in [`docs/genie-space-optimizer-design/`](docs/genie-space-optimizer-design/00-index.md):
+
+| Document | Description |
+|----------|-------------|
+| [00 -- Index](docs/genie-space-optimizer-design/00-index.md) | Document index and quick navigation |
+| [01 -- Introduction](docs/genie-space-optimizer-design/01-introduction.md) | Purpose, audience, prerequisites |
+| [02 -- Architecture](docs/genie-space-optimizer-design/02-architecture-overview.md) | System architecture and data flows |
+| [03 -- Optimization Pipeline](docs/genie-space-optimizer-design/03-optimization-pipeline.md) | End-to-end optimizer deep dive |
+| [04 -- Evaluation and Scoring](docs/genie-space-optimizer-design/04-evaluation-and-scoring.md) | 9 judges, benchmarks, MLflow |
+| [05 -- Optimization Levers](docs/genie-space-optimizer-design/05-optimization-levers.md) | 5 levers and preparatory stages |
+| [06 -- State Management](docs/genie-space-optimizer-design/06-state-management.md) | Delta tables and run lifecycle |
+| [07 -- API Reference](docs/genie-space-optimizer-design/07-api-reference.md) | All endpoints, headless API, CI/CD |
+| [08 -- Permissions](docs/genie-space-optimizer-design/08-permissions-and-security.md) | OBO auth, UC grants, advisor model |
+| [09 -- Deployment](docs/genie-space-optimizer-design/09-deployment-guide.md) | Build, deploy, and configure |
+| [10 -- Operations](docs/genie-space-optimizer-design/10-operations-guide.md) | Monitoring, diagnostics, troubleshooting |
+| [Appendix A](docs/genie-space-optimizer-design/appendices/A-configuration-reference.md) | All tunable parameters |
+| [Appendix B](docs/genie-space-optimizer-design/appendices/B-troubleshooting.md) | Error-solution matrix |
+| [Appendix C](docs/genie-space-optimizer-design/appendices/C-references.md) | Glossary and external links |
+
+---
+
 ## API Reference
 
-All endpoints are prefixed with `/api/genie`.
+All endpoints are prefixed with `/api/genie`. For full request/response schemas, see [07 -- API Reference](docs/genie-space-optimizer-design/07-api-reference.md).
 
 | Method | Endpoint | Operation ID | Description |
 |--------|----------|-------------|-------------|
@@ -269,7 +289,11 @@ Environment variables (set via `databricks.yml`):
 | `GENIE_SPACE_OPTIMIZER_EVAL_DEBUG` | Enable verbose evaluation logging | `true` |
 | `GENIE_SPACE_OPTIMIZER_EVAL_MAX_ATTEMPTS` | Max retry attempts per evaluation query | `4` |
 
-All optimization parameters (thresholds, rate limits, iterations, LLM config) are centralized in `src/genie_space_optimizer/common/config.py` and can be tuned without code changes.
+All optimization parameters (thresholds, rate limits, iterations, LLM config) are centralized in `src/genie_space_optimizer/common/config.py` and can be tuned without code changes. See [Appendix A -- Configuration Reference](docs/genie-space-optimizer-design/appendices/A-configuration-reference.md) for the full parameter list.
+
+### Permissions
+
+The app requires OBO API scopes, UC grants for the service principal, and CAN_MANAGE on each Genie Space. The app operates as an **advisor** -- it shows what permissions are missing with copyable grant commands on the Settings page but never executes GRANT/REVOKE itself. See [08 -- Permissions and Security](docs/genie-space-optimizer-design/08-permissions-and-security.md) for the full permissions model.
 
 ---
 

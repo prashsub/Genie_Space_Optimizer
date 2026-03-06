@@ -452,10 +452,14 @@ def _check_string_lengths(obj: Any, path: str, errors: list[str]) -> None:
 def count_instruction_slots(config: dict) -> int:
     """Count the number of Genie API instruction slots consumed by *config*.
 
-    Per Databricks docs the limit is 100 slots total:
+    The Genie API enforces a limit of 100 slots total.  The API counts
+    **all** of the following toward that budget:
+
     - Each ``example_question_sqls`` entry = 1 slot
     - Each ``sql_functions`` entry = 1 slot
     - The entire ``text_instructions`` block = 1 slot (regardless of length)
+    - Each table in ``data_sources.tables`` with a non-empty ``description`` = 1 slot
+    - Each metric view in ``data_sources.metric_views`` with a non-empty ``description`` = 1 slot
 
     ``join_specs`` and ``sql_snippets`` do **not** count.
     """
@@ -463,7 +467,18 @@ def count_instruction_slots(config: dict) -> int:
     text_count = min(len(instructions.get("text_instructions") or []), 1)
     example_count = len(instructions.get("example_question_sqls") or [])
     function_count = len(instructions.get("sql_functions") or [])
-    return text_count + example_count + function_count
+
+    ds = config.get("data_sources") or {}
+    table_desc_count = sum(
+        1 for t in (ds.get("tables") or [])
+        if isinstance(t, dict) and t.get("description")
+    )
+    mv_desc_count = sum(
+        1 for m in (ds.get("metric_views") or [])
+        if isinstance(m, dict) and m.get("description")
+    )
+
+    return text_count + example_count + function_count + table_desc_count + mv_desc_count
 
 
 def _strict_validate(config: dict) -> list[str]:
@@ -630,10 +645,12 @@ def _strict_validate(config: dict) -> list[str]:
         _text_ct = min(len(ti_list), 1)
         _eq_ct = len(inst.get("example_question_sqls") or [])
         _fn_ct = len(inst.get("sql_functions") or [])
+        _tbl_ct = sum(1 for t in (ds.get("tables") or []) if isinstance(t, dict) and t.get("description"))
+        _mv_ct = sum(1 for m in (ds.get("metric_views") or []) if isinstance(m, dict) and m.get("description"))
         errors.append(
             f"Instruction slot budget exceeded: {slot_count}/{MAX_INSTRUCTION_SLOTS} "
             f"(example_sqls={_eq_ct}, sql_functions={_fn_ct}, "
-            f"text_instructions={_text_ct})"
+            f"text_instructions={_text_ct}, table_descs={_tbl_ct}, mv_descs={_mv_ct})"
         )
 
     # ── Table identifier format ──────────────────────────────────

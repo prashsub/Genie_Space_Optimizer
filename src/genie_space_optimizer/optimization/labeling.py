@@ -14,6 +14,7 @@ Uses the MLflow 3.x labeling API:
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any
@@ -109,8 +110,17 @@ def ensure_labeling_schemas() -> list[str]:
             schemas.create_label_schema(**defn, overwrite=True)
             available.append(name)
         except Exception as exc:
-            print(f"[Labeling] Failed to create schema '{name}': {exc}")
-            logger.warning("Failed to create label schema '%s': %s", name, exc)
+            try:
+                existing = schemas.get_label_schema(name)
+                if existing is not None:
+                    available.append(name)
+                    print(f"[Labeling] Schema '{name}' exists (referenced by session) — reusing")
+                else:
+                    print(f"[Labeling] Failed to create schema '{name}': {exc}")
+                    logger.warning("Failed to create label schema '%s': %s", name, exc)
+            except Exception:
+                print(f"[Labeling] Failed to create schema '{name}': {exc}")
+                logger.warning("Failed to create label schema '%s': %s", name, exc)
 
     print(f"[Labeling] Ensured {len(available)}/{len(_schema_defs)} schemas: {', '.join(available)}")
     return available
@@ -125,6 +135,7 @@ def create_review_session(
     regression_trace_ids: list[str],
     reviewers: list[str] | None = None,
     eval_mlflow_run_ids: list[str] | None = None,
+    failure_question_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a labeling session populated with evaluation traces for human review.
 
@@ -153,7 +164,12 @@ def create_review_session(
     mlflow.set_experiment(experiment_name)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_name = f"genie_opt_review_{domain}_{run_id[:8]}_{ts}"
+    suffix = f"_{run_id[:8]}_{ts}"
+    prefix = f"opt_{domain}"
+    max_prefix = 64 - len(suffix)
+    if len(prefix) > max_prefix:
+        prefix = prefix[:max_prefix]
+    session_name = f"{prefix}{suffix}"
 
     print(
         f"[Labeling] Creating session '{session_name}' in experiment '{experiment_name}' "
@@ -181,6 +197,7 @@ def create_review_session(
             failure_trace_ids=failure_trace_ids,
             regression_trace_ids=regression_trace_ids,
             eval_mlflow_run_ids=eval_mlflow_run_ids or [],
+            failure_question_ids=failure_question_ids,
         )
     except Exception as exc:
         print(f"[Labeling] Failed to add traces to session: {exc}")
@@ -207,6 +224,22 @@ def create_review_session(
 _MAX_SESSION_TRACES = 100
 
 
+def _extract_question_id(request_val: Any) -> str:
+    """Extract question_id from a trace's request field."""
+    if not request_val:
+        return ""
+    try:
+        req = json.loads(request_val) if isinstance(request_val, str) else request_val
+        if isinstance(req, dict):
+            return str(
+                req.get("question_id")
+                or req.get("kwargs", {}).get("question_id", "")
+            )
+    except Exception:
+        pass
+    return ""
+
+
 def _populate_session_traces(
     *,
     session: Any,
@@ -216,6 +249,7 @@ def _populate_session_traces(
     regression_trace_ids: list[str],
     eval_mlflow_run_ids: list[str],
     flagged_trace_ids: list[str] | None = None,
+    failure_question_ids: list[str] | None = None,
 ) -> int:
     """Collect traces from eval runs and add them to the labeling session.
 
@@ -226,8 +260,9 @@ def _populate_session_traces(
       2. Fall back to experiment-wide search (legacy path) when no run IDs
          are provided.
 
-    Within the collected traces, priority-filter by failure/regression
-    trace IDs, then backfill with passing traces for spot-checking.
+    When *failure_question_ids* is provided, only traces matching those
+    question IDs are included (no backfill with passing traces).  When not
+    provided, falls back to priority/backfill behavior.
     """
     import pandas as pd
 
@@ -269,6 +304,30 @@ def _populate_session_traces(
             logger.warning("No traces found for experiment '%s'", experiment_name)
             return 0
 
+    # --- Filter to failed questions only (when question IDs are provided) ---
+    if failure_question_ids and "request" in all_traces.columns:
+        fail_set = set(failure_question_ids)
+        total_before = len(all_traces)
+        qid_col = all_traces["request"].apply(_extract_question_id)
+        failed_mask = qid_col.isin(fail_set)
+        all_traces = all_traces[failed_mask]
+        print(
+            f"[Labeling] Filtered to {len(all_traces)} failed-question traces "
+            f"from {total_before} total ({len(fail_set)} failure question IDs)"
+        )
+
+        if all_traces.empty:
+            print(f"[Labeling] No traces matched failure question IDs — session will be empty")
+            logger.warning("No traces matched failure question IDs for session %s", session_name)
+            return 0
+
+        batch = all_traces.head(_MAX_SESSION_TRACES)
+        session.add_traces(batch)
+        traces_added = len(batch)
+        print(f"[Labeling] Added {traces_added} failed-question traces to session {session_name}")
+        return traces_added
+
+    # --- Fallback: priority/backfill when no question-level filtering ---
     _flagged = flagged_trace_ids or []
     priority_set = set(
         dict.fromkeys(_flagged + regression_trace_ids + failure_trace_ids)

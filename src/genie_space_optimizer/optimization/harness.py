@@ -34,11 +34,13 @@ from databricks.sdk import WorkspaceClient
 from genie_space_optimizer.common.config import (
     APPLY_MODE,
     ARBITER_CORRECTION_TRIGGER,
+    CONSECUTIVE_ROLLBACK_LIMIT,
     DEFAULT_LEVER_ORDER,
     DEFAULT_THRESHOLDS,
     DIMINISHING_RETURNS_EPSILON,
     DIMINISHING_RETURNS_LOOKBACK,
     ENABLE_PROMPT_MATCHING_AUTO_APPLY,
+    ENABLE_SLICE_GATE,
     GENIE_CORRECT_CONFIRMATION_THRESHOLD,
     INLINE_EVAL_DELAY,
     LEVER_NAMES,
@@ -49,6 +51,7 @@ from genie_space_optimizer.common.config import (
     PROPAGATION_WAIT_ENTITY_MATCHING_SECONDS,
     PROPAGATION_WAIT_SECONDS,
     REGRESSION_THRESHOLD,
+    SLICE_GATE_MIN_REDUCTION,
     SLICE_GATE_TOLERANCE,
 )
 from genie_space_optimizer.optimization.applier import (
@@ -101,6 +104,7 @@ from genie_space_optimizer.optimization.state import (
     load_run,
     load_stages,
     mark_patches_rolled_back,
+    update_iteration_reflection,
     update_provenance_gate,
     update_provenance_proposals,
     update_run_status,
@@ -412,7 +416,7 @@ def _run_baseline(
         _bl_eval_run_id = eval_result.get("mlflow_run_id") or eval_result.get("run_id", "")
         _bl_eval_run_ids = [_bl_eval_run_id] if _bl_eval_run_id else []
         _bl_session_name = ""
-        if _bl_fail_tids or _bl_eval_run_ids:
+        if _bl_fail_tids or _bl_eval_run_ids or _bl_failures:
             try:
                 from genie_space_optimizer.optimization.labeling import create_review_session
                 _bl_session_info = create_review_session(
@@ -420,6 +424,7 @@ def _run_baseline(
                     uc_schema=f"{catalog}.{schema}",
                     failure_trace_ids=_bl_fail_tids, regression_trace_ids=[],
                     eval_mlflow_run_ids=_bl_eval_run_ids,
+                    failure_question_ids=list(_bl_failures),
                 )
                 _bl_session_name = _bl_session_info.get("session_name", "")
                 _bl_session_url = _bl_session_info.get("session_url", "")
@@ -1557,8 +1562,18 @@ def _build_reflection_entry(
     affected_question_ids: list[str] | None = None,
     prev_failure_qids: set[str] | None = None,
     new_failure_qids: set[str] | None = None,
+    reflection_text: str = "",
+    refinement_mode: str = "",
 ) -> dict:
-    """Build a structured reflection dict for the adaptive loop memory."""
+    """Build a structured reflection dict for the adaptive loop memory.
+
+    *reflection_text* is a 2-3 sentence verbal explanation of why the
+    iteration succeeded or failed (Reflexion-style semantic gradient).
+
+    *refinement_mode* is ``"in_plan"`` when the lever direction was correct
+    but caused collateral regressions, or ``"out_of_plan"`` when the
+    approach fundamentally did not work (AdaPlanner-style classification).
+    """
     score_deltas = {
         k: new_scores.get(k, 0.0) - prev_scores.get(k, 0.0)
         for k in set(prev_scores) | set(new_scores)
@@ -1604,6 +1619,8 @@ def _build_reflection_entry(
         "fixed_questions": sorted(_prev - _new),
         "still_failing": sorted(_prev & _new),
         "new_regressions": sorted(_new - _prev),
+        "reflection_text": reflection_text,
+        "refinement_mode": refinement_mode,
     }
 
 
@@ -1612,41 +1629,45 @@ def _diminishing_returns(
     epsilon: float | None = None,
     lookback: int | None = None,
 ) -> bool:
-    """Return True if the last *lookback* accepted iterations each improved
-    by less than *epsilon* percent on average across judges."""
+    """Return True if none of the last *lookback* iterations (accepted or
+    rolled back) achieved a mean accuracy improvement >= *epsilon*.
+
+    Rolled-back iterations count as zero improvement, which correctly
+    signals the optimizer is stuck.
+    """
     if epsilon is None:
         epsilon = DIMINISHING_RETURNS_EPSILON
     if lookback is None:
         lookback = DIMINISHING_RETURNS_LOOKBACK
 
-    recent_accepted = [r for r in reflection_buffer if r.get("accepted")][-lookback:]
-    if len(recent_accepted) < lookback:
+    recent = reflection_buffer[-lookback:]
+    if len(recent) < lookback:
         return False
 
-    for r in recent_accepted:
-        deltas = r.get("score_deltas", {})
-        if not deltas:
-            continue
-        mean_delta = sum(deltas.values()) / len(deltas)
-        if mean_delta >= epsilon:
+    for r in recent:
+        if r.get("accepted") and r.get("accuracy_delta", 0.0) >= epsilon:
             return False
     return True
 
 
 def _filter_tried_clusters(
     clusters: list[dict],
-    tried_patches: set[tuple[str, str]],
+    tried_root_causes: set[tuple[str, str]],
 ) -> list[dict]:
     """Remove clusters whose (failure_type, blame_set) was already tried
     and rolled back.  Keeps clusters that were tried and *accepted* (they
-    should no longer appear in fresh failure data anyway)."""
-    if not tried_patches:
+    should no longer appear in fresh failure data anyway).
+
+    *tried_root_causes* stores ``(asi_failure_type, asi_blame_set)`` tuples
+    recorded at rollback time so the key space matches the cluster fields.
+    """
+    if not tried_root_causes:
         return clusters
     filtered: list[dict] = []
     for c in clusters:
         ft = c.get("asi_failure_type") or c.get("root_cause", "other")
         blame = c.get("asi_blame_set") or ""
-        if (ft, blame) not in tried_patches:
+        if (ft, blame) not in tried_root_causes:
             filtered.append(c)
     return filtered
 
@@ -1821,20 +1842,25 @@ def _build_question_persistence_summary(
     reflection_buffer: list[dict],
     *,
     min_failures: int | None = None,
-) -> str:
+) -> tuple[str, dict[str, dict]]:
     """Render a per-question failure persistence summary for the strategist.
 
     Only includes questions that failed in >= *min_failures* iterations.
     For each, shows the question text, consecutive failure count, verdict
     breakdown, patches previously tried for that question, and an
     exhaustion classification.
+
+    Returns ``(text, structured)`` where *text* feeds the strategist prompt
+    and *structured* is ``{qid: {question_text, fail_count, max_consecutive,
+    classification, patches_tried, fail_iterations}}`` for trace enrichment
+    and hard-quarantine decisions.
     """
     from genie_space_optimizer.common.config import PERSISTENCE_MIN_FAILURES
 
     if min_failures is None:
         min_failures = PERSISTENCE_MIN_FAILURES
     if not verdict_history:
-        return "(No cross-iteration verdict data available yet.)"
+        return "(No cross-iteration verdict data available yet.)", {}
 
     _PASSING = {"both_correct"}
     _ADDITIVE_PATCH_TYPES = {"add_instruction", "add_example_sql"}
@@ -1903,8 +1929,21 @@ def _build_question_persistence_summary(
             "classification": classification,
         })
 
+    structured: dict[str, dict] = {}
+    for p in persistent:
+        structured[p["qid"]] = {
+            "question_text": p["question_text"],
+            "fail_count": p["fail_count"],
+            "total_evals": p["total_evals"],
+            "max_consecutive": p["max_consecutive"],
+            "classification": p["classification"],
+            "patches_tried": p["patches_tried"],
+            "fail_iterations": p["fail_iterations"],
+            "verdict_counts": p["verdict_counts"],
+        }
+
     if not persistent:
-        return "(No persistent failures detected across iterations.)"
+        return "(No persistent failures detected across iterations.)", structured
 
     persistent.sort(key=lambda p: (-p["max_consecutive"], -p["fail_count"]))
 
@@ -1929,7 +1968,7 @@ def _build_question_persistence_summary(
         lines.append(f"  ASSESSMENT: {p['classification']}")
         lines.append("")
 
-    return "\n".join(lines)
+    return "\n".join(lines), structured
 
 
 def _score_tvf_removal_confidence(
@@ -2086,8 +2125,16 @@ def _handle_escalation(
             tvf_id, benchmarks, verdict_history, reflection_buffer,
             schema_overlap, prov_list,
         )
+        previous_tvf_asset: dict = {}
+        for fn in (metadata_snapshot.get("instructions") or {}).get("sql_functions", []):
+            if isinstance(fn, dict) and fn.get("identifier") == tvf_id:
+                previous_tvf_asset = dict(fn)
+                break
+
         result["detail"]["confidence"] = confidence
         result["detail"]["tvf_identifier"] = tvf_id
+        result["detail"]["tvf_id"] = tvf_id
+        result["detail"]["previous_tvf_asset"] = previous_tvf_asset
         result["detail"]["schema_overlap"] = schema_overlap
 
         if confidence is None:
@@ -2770,12 +2817,31 @@ def _run_gate_checks(
         mlflow.end_run()
     except Exception:
         pass
-    affected_qids: set[str] = affected_question_ids or set()
-    slice_benchmarks = filter_benchmarks_by_scope(
-        benchmarks, "slice", patched_objects,
-        affected_question_ids=affected_qids,
-    )
-    if slice_benchmarks:
+
+    _run_slice = False
+    if ENABLE_SLICE_GATE:
+        affected_qids: set[str] = affected_question_ids or set()
+        slice_benchmarks = filter_benchmarks_by_scope(
+            benchmarks, "slice", patched_objects,
+            affected_question_ids=affected_qids,
+        )
+        _total = len(benchmarks)
+        _sliced = len(slice_benchmarks) if slice_benchmarks else 0
+        if slice_benchmarks and _sliced <= (1 - SLICE_GATE_MIN_REDUCTION) * _total:
+            _run_slice = True
+        else:
+            print(
+                _section(f"SLICE GATE [{ag_id}]: SKIPPED", "-") + "\n"
+                + _kv("Reason", f"slice too broad ({_sliced}/{_total} benchmarks)") + "\n"
+                + _bar("-")
+            )
+    else:
+        print(
+            _section(f"SLICE GATE [{ag_id}]: DISABLED", "-") + "\n"
+            + _bar("-")
+        )
+
+    if _run_slice:
         _ensure_sql_context(spark, catalog, schema)
         write_stage(
             spark, run_id, f"AG_{ag_id}_SLICE_EVAL", "STARTED",
@@ -2801,6 +2867,15 @@ def _run_gate_checks(
             slice_scores, best_scores, threshold=effective_slice_tol,
             skip_judges=_informational_judges,
         )
+
+        try:
+            write_iteration(
+                spark, run_id, iteration_counter, slice_result,
+                catalog=catalog, schema=schema,
+                lever=0, eval_scope="slice", model_id=prev_model_id,
+            )
+        except Exception:
+            logger.debug("Failed to write slice iteration", exc_info=True)
 
         if slice_drops:
             _score_changes = ", ".join(
@@ -2856,6 +2931,15 @@ def _run_gate_checks(
             spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
             reference_sqls=reference_sqls if reference_sqls else None,
         )
+        try:
+            write_iteration(
+                spark, run_id, iteration_counter, p0_result,
+                catalog=catalog, schema=schema,
+                lever=0, eval_scope="p0", model_id=prev_model_id,
+            )
+        except Exception:
+            logger.debug("Failed to write P0 iteration", exc_info=True)
+
         p0_failures = p0_result.get("failures", [])
         if p0_failures:
             print(
@@ -2904,35 +2988,41 @@ def _run_gate_checks(
     accuracy_1 = full_result_1.get("overall_accuracy", 0.0)
 
     # ── Confirmation eval (2nd run) to smooth Genie non-determinism ──
-    try:
-        mlflow.end_run()
-    except Exception:
-        pass
-    print(_kv("Confirmation eval", "running 2nd evaluation to average out variance"))
-    _ensure_sql_context(spark, catalog, schema)
-    full_result_2 = run_evaluation(
-        space_id, exp_name, iteration_counter, benchmarks,
-        domain, new_model_id, "full_confirm",
-        predict_fn, scorers,
-        spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
-        reference_sqls=reference_sqls if reference_sqls else None,
-    )
-    scores_2 = full_result_2.get("scores", {})
-    accuracy_2 = full_result_2.get("overall_accuracy", 0.0)
+    if accuracy_1 > best_accuracy:
+        print(_kv("Confirmation eval", f"SKIPPED (accuracy improved {best_accuracy:.1f}% -> {accuracy_1:.1f}%)"))
+        full_scores = scores_1
+        full_accuracy = accuracy_1
+        full_result = full_result_1
+    else:
+        try:
+            mlflow.end_run()
+        except Exception:
+            pass
+        print(_kv("Confirmation eval", "running 2nd evaluation to average out variance"))
+        _ensure_sql_context(spark, catalog, schema)
+        full_result_2 = run_evaluation(
+            space_id, exp_name, iteration_counter, benchmarks,
+            domain, new_model_id, "full_confirm",
+            predict_fn, scorers,
+            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+            reference_sqls=reference_sqls if reference_sqls else None,
+        )
+        scores_2 = full_result_2.get("scores", {})
+        accuracy_2 = full_result_2.get("overall_accuracy", 0.0)
 
-    all_judge_keys = set(scores_1) | set(scores_2)
-    full_scores = {
-        j: (scores_1.get(j, 0.0) + scores_2.get(j, 0.0)) / 2.0
-        for j in all_judge_keys
-    }
-    full_accuracy = (accuracy_1 + accuracy_2) / 2.0
-    full_result = full_result_1
+        all_judge_keys = set(scores_1) | set(scores_2)
+        full_scores = {
+            j: (scores_1.get(j, 0.0) + scores_2.get(j, 0.0)) / 2.0
+            for j in all_judge_keys
+        }
+        full_accuracy = (accuracy_1 + accuracy_2) / 2.0
+        full_result = full_result_1
 
-    print(
-        _kv("Eval run 1 accuracy", f"{accuracy_1:.1f}%") + "\n"
-        + _kv("Eval run 2 accuracy", f"{accuracy_2:.1f}%") + "\n"
-        + _kv("Averaged accuracy", f"{full_accuracy:.1f}%")
-    )
+        print(
+            _kv("Eval run 1 accuracy", f"{accuracy_1:.1f}%") + "\n"
+            + _kv("Eval run 2 accuracy", f"{accuracy_2:.1f}%") + "\n"
+            + _kv("Averaged accuracy", f"{full_accuracy:.1f}%")
+        )
 
     write_iteration(
         spark, run_id, iteration_counter, full_result,
@@ -3106,6 +3196,7 @@ def _run_lever_loop(
     all_failure_trace_ids: list[str] = []
     all_regression_trace_ids: list[str] = []
     all_eval_mlflow_run_ids: list[str] = []
+    all_failure_question_ids: list[str] = []
 
     _human_sql_fixes = [
         {"question": c.get("question", ""), "new_expected_sql": c["corrected_sql"], "verdict": "genie_correct"}
@@ -3249,8 +3340,11 @@ def _run_lever_loop(
     noise_floor = min(100.0 / max(len(benchmarks), 1), MAX_NOISE_FLOOR)
 
     reflection_buffer: list[dict] = []
+    skill_exemplars: list[dict] = []
     tried_patches: set[tuple[str, str]] = set()
+    tried_root_causes: set[tuple[str, str]] = set()
     prev_failure_qids: set[str] = set()
+    _last_full_mlflow_run_id: str = baseline_iter.get("mlflow_run_id", "") if baseline_iter else ""
 
     for _iter_num in range(1, max_iterations + 1):
         # ── Exit checks ──────────────────────────────────────────────
@@ -3259,6 +3353,18 @@ def _run_lever_loop(
             break
         if _diminishing_returns(reflection_buffer):
             logger.info("Diminishing returns detected — stopping at iteration %d", _iter_num)
+            break
+        _consecutive_rb = 0
+        for _rb_entry in reversed(reflection_buffer):
+            if not _rb_entry.get("accepted"):
+                _consecutive_rb += 1
+            else:
+                break
+        if _consecutive_rb >= CONSECUTIVE_ROLLBACK_LIMIT:
+            logger.info(
+                "Consecutive rollback limit (%d) reached — stopping at iteration %d",
+                CONSECUTIVE_ROLLBACK_LIMIT, _iter_num,
+            )
             break
 
         iteration_counter += 1
@@ -3283,7 +3389,7 @@ def _run_lever_loop(
         soft_signal_clusters = _analysis["soft_signal_clusters"]
 
         try:
-            write_asi_results(spark, run_id, iteration_counter - 1, _analysis["asi_rows"], catalog, schema, mlflow_run_id="")
+            write_asi_results(spark, run_id, iteration_counter - 1, _analysis["asi_rows"], catalog, schema, mlflow_run_id=_last_full_mlflow_run_id)
         except Exception:
             logger.debug("Failed to write ASI results", exc_info=True)
         try:
@@ -3291,7 +3397,7 @@ def _run_lever_loop(
         except Exception:
             logger.debug("Failed to write provenance rows", exc_info=True)
 
-        clusters = _filter_tried_clusters(clusters, tried_patches)
+        clusters = _filter_tried_clusters(clusters, tried_root_causes)
         if not clusters and not soft_signal_clusters:
             logger.info("No actionable clusters remain — stopping at iteration %d", _iter_num)
             break
@@ -3303,6 +3409,66 @@ def _run_lever_loop(
         print(_section(f"ADAPTIVE STRATEGIST — Iteration {iteration_counter}", "="))
 
         _verdict_history = _build_verdict_history(spark, run_id, catalog, schema)
+
+        # ── 3B.3b: Hard-quarantine exhausted questions ────────────────
+        if reflection_buffer:
+            _, _persist_data = _build_question_persistence_summary(
+                _verdict_history, reflection_buffer,
+            )
+            _quarantine_qids: set[str] = set()
+            for _pq_id, _pq_info in _persist_data.items():
+                _pq_class = _pq_info.get("classification", "")
+                _pq_consec = _pq_info.get("max_consecutive", 0)
+                if _pq_class == "ADDITIVE_LEVERS_EXHAUSTED" or (
+                    _pq_class == "PERSISTENT" and _pq_consec >= 3
+                ):
+                    _quarantine_qids.add(_pq_id)
+            if _quarantine_qids:
+                _newly_quarantined = _quarantine_qids - _correction_state["quarantined_qids"]
+                if _newly_quarantined:
+                    logger.info(
+                        "Hard-quarantining %d exhausted question(s): %s",
+                        len(_newly_quarantined), _newly_quarantined,
+                    )
+                    _correction_state["quarantined_qids"] |= _newly_quarantined
+                    try:
+                        from genie_space_optimizer.optimization.labeling import flag_for_human_review
+                        _flag_items = []
+                        for _hq_id in sorted(_newly_quarantined):
+                            _hq_info = _persist_data[_hq_id]
+                            _tried_str = "; ".join(
+                                f"iter{it}: {pt}" for it, pt in _hq_info.get("patches_tried", [])
+                            )
+                            _flag_items.append({
+                                "question_id": _hq_id,
+                                "question_text": _hq_info.get("question_text", ""),
+                                "reason": (
+                                    f"{_hq_info['classification']}: "
+                                    f"failed {_hq_info['fail_count']}/{_hq_info['total_evals']} evals, "
+                                    f"{_hq_info['max_consecutive']} consecutive"
+                                ),
+                                "iterations_failed": _hq_info.get("fail_count", 0),
+                                "patches_tried": _tried_str,
+                            })
+                        if _flag_items:
+                            _flagged = flag_for_human_review(
+                                spark, run_id, catalog, schema, domain, _flag_items,
+                            )
+                            print(
+                                _section("PERSISTENCE QUARANTINE", "!") + "\n"
+                                + _kv("Questions quarantined", len(_newly_quarantined)) + "\n"
+                                + _kv("Flagged for human review", _flagged) + "\n"
+                                + _bar("!")
+                            )
+                    except Exception:
+                        logger.warning("Failed to flag quarantined questions for human review", exc_info=True)
+                for c in clusters:
+                    c_qids = c.get("question_ids", [])
+                    c["question_ids"] = [q for q in c_qids if q not in _quarantine_qids]
+                clusters = [c for c in clusters if c.get("question_ids")]
+                if not clusters and not soft_signal_clusters:
+                    logger.info("All clusters emptied after quarantine — stopping at iteration %d", _iter_num)
+                    break
 
         _total_q = len(benchmarks)
         _passing_q = _total_q - sum(len(c.get("question_ids", [])) for c in clusters)
@@ -3317,6 +3483,7 @@ def _run_lever_loop(
             total_benchmarks=_total_q,
             passing_benchmarks=max(0, _passing_q),
             verdict_history=_verdict_history,
+            skill_exemplars=skill_exemplars or None,
         )
         action_groups = strategy.get("action_groups", [])
         ag = action_groups[0] if action_groups else None
@@ -3357,9 +3524,25 @@ def _run_lever_loop(
             + _bar("=")
         )
 
+        _ag_source_cids = set(ag.get("source_cluster_ids", []))
+        _ag_cluster_info: dict = {}
+        for _rc_idx, _rc in enumerate(ranked):
+            _rc_cid = _rc.get("cluster_id", "")
+            if _ag_source_cids and _rc_cid not in _ag_source_cids:
+                continue
+            _ag_cluster_info = {
+                "cluster_id": _rc_cid,
+                "impact_score": _rc.get("impact_score"),
+                "rank": _rc_idx + 1,
+                "question_count": len(_rc.get("question_ids", [])),
+                "root_cause": _rc.get("root_cause") or _rc.get("asi_failure_type"),
+                "affected_questions": _rc.get("question_ids", [])[:20],
+            }
+            break
         write_stage(
             spark, run_id, f"AG_{ag_id}_STARTED", "STARTED",
             task_key="lever_loop", iteration=iteration_counter,
+            detail=_ag_cluster_info if _ag_cluster_info else None,
             catalog=catalog, schema=schema,
         )
 
@@ -3412,6 +3595,56 @@ def _run_lever_loop(
                     new_failure_qids=prev_failure_qids,
                 ))
                 continue
+
+            if _escalation == "remove_tvf" and _esc_tier in ("auto_apply", "apply_and_flag"):
+                _tvf_id = _esc_result.get("detail", {}).get("tvf_id", "")
+                _prev_asset = _esc_result.get("detail", {}).get("previous_tvf_asset", {})
+                if _tvf_id:
+                    _synthetic_patch = {
+                        "type": "remove_tvf",
+                        "target": _tvf_id,
+                        "new_text": "",
+                        "old_text": "",
+                        "previous_tvf_asset": _prev_asset,
+                        "lever": 3,
+                        "risk_level": "high",
+                        "predicted_affected_questions": len(ag.get("affected_questions", [])),
+                        "rationale": (
+                            f"TVF {_tvf_id} auto-removed by tiered confidence model "
+                            f"(tier={_esc_tier})"
+                        ),
+                    }
+                    _tvf_conf = _esc_result.get("detail", {}).get("confidence", "?")
+                    print(
+                        _section(f"[{ag_id}] SYNTHETIC remove_tvf PATCH", "!") + "\n"
+                        + _kv("TVF", _tvf_id) + "\n"
+                        + _kv("Confidence", _tvf_conf) + "\n"
+                        + _kv("Tier action", _esc_tier) + "\n"
+                        + _bar("!")
+                    )
+                    _tvf_apply_log = apply_patch_set(
+                        w, space_id, [_synthetic_patch], metadata_snapshot,
+                        apply_mode=apply_mode,
+                    )
+                    for idx, entry in enumerate(_tvf_apply_log.get("applied", [])):
+                        write_patch(
+                            spark, run_id, iteration_counter, 0, idx,
+                            _build_patch_record(entry, 0, apply_mode),
+                            catalog, schema,
+                        )
+                    if _tvf_apply_log.get("patch_deployed", False):
+                        logger.info("TVF %s removed successfully (tier=%s)", _tvf_id, _esc_tier)
+                        metadata_snapshot = _tvf_apply_log.get("post_snapshot", metadata_snapshot)
+                    else:
+                        logger.warning(
+                            "TVF removal patch deploy failed: %s",
+                            _tvf_apply_log.get("patch_error", "unknown"),
+                        )
+                else:
+                    logger.warning(
+                        "remove_tvf escalation with tier %s but no tvf_id — skipping",
+                        _esc_tier,
+                    )
 
         # ── 3B.5: Generate proposals + apply patches ─────────────────
         all_proposals: list[dict] = []
@@ -3625,6 +3858,7 @@ def _run_lever_loop(
             _failed_eval = gate_result.get("failed_eval_result", {})
             _fail_tmap = _failed_eval.get("trace_map", {})
             _fail_qids = set(_failed_eval.get("failure_question_ids", []))
+            all_failure_question_ids.extend(_fail_qids)
             for qid, tid in _fail_tmap.items():
                 if qid in _fail_qids:
                     all_failure_trace_ids.append(tid)
@@ -3638,6 +3872,31 @@ def _run_lever_loop(
             _rb_fail_qids = set(
                 gate_result.get("failed_eval_result", {}).get("failure_question_ids", [])
             )
+            _affected_set = set(ag.get("affected_questions", []))
+            _any_target_improved = bool(
+                _affected_set and prev_failure_qids
+                and (_affected_set & prev_failure_qids) - (_rb_fail_qids or prev_failure_qids)
+            )
+            _rb_refinement = "in_plan" if _any_target_improved else "out_of_plan"
+            _rb_acc_delta = (
+                sum(_failed_scores.values()) / max(len(_failed_scores), 1)
+                - sum(best_scores.values()) / max(len(best_scores), 1)
+            )
+            _regressions = gate_result.get("regressions", [])
+            _rb_patch_types = sorted({p.get("patch_type", "?") for p in patches})
+            if _any_target_improved and _regressions:
+                _rb_reflection = (
+                    f"Rollback ({_rb_refinement}): patches ({', '.join(_rb_patch_types)}) "
+                    f"improved some target questions but caused regressions on "
+                    f"{len(_regressions)} other(s). Narrower scope on the same lever may help."
+                )
+            else:
+                _rb_reflection = (
+                    f"Rollback ({_rb_refinement}): {ag.get('root_cause_summary', 'unknown root cause')} "
+                    f"was not resolved by {', '.join(_rb_patch_types)} "
+                    f"(accuracy delta {_rb_acc_delta:+.1f}%). "
+                    f"A different lever or escalation is needed."
+                )
             reflection = _build_reflection_entry(
                 iteration=iteration_counter, ag_id=ag_id, accepted=False,
                 levers=[int(lk) for lk in lever_keys],
@@ -3647,13 +3906,31 @@ def _run_lever_loop(
                 affected_question_ids=ag.get("affected_questions", []),
                 prev_failure_qids=prev_failure_qids,
                 new_failure_qids=_rb_fail_qids or prev_failure_qids,
+                reflection_text=_rb_reflection,
+                refinement_mode=_rb_refinement,
             )
             reflection_buffer.append(reflection)
+            try:
+                update_iteration_reflection(
+                    spark, run_id, iteration_counter, reflection,
+                    catalog=catalog, schema=schema, eval_scope="full",
+                )
+            except Exception:
+                logger.debug("Failed to persist reflection for rollback iter %d", iteration_counter, exc_info=True)
             for p in patches:
                 ft = p.get("patch_type", "")
                 tgt = p.get("target_object", "")
                 if ft and tgt:
                     tried_patches.add((ft, tgt))
+            source_cids = set(ag.get("source_cluster_ids", []))
+            for c in clusters:
+                cid = c.get("cluster_id", "")
+                if source_cids and cid not in source_cids:
+                    continue
+                rc_ft = c.get("asi_failure_type") or c.get("root_cause", "other")
+                rc_blame = c.get("asi_blame_set") or ""
+                if rc_ft:
+                    tried_root_causes.add((rc_ft, rc_blame))
             continue
 
         # ── Accept action group ──────────────────────────────────────
@@ -3665,9 +3942,11 @@ def _run_lever_loop(
         full_accuracy = gate_result["full_accuracy"]
         new_model_id = gate_result["new_model_id"]
         full_result = gate_result["full_result"]
+        _last_full_mlflow_run_id = full_result.get("mlflow_run_id") or full_result.get("run_id", "")
 
         _full_trace_map = full_result.get("trace_map", {})
         _full_failures = set(full_result.get("failure_question_ids", []))
+        all_failure_question_ids.extend(_full_failures)
         for qid, tid in _full_trace_map.items():
             if qid in _full_failures:
                 all_failure_trace_ids.append(tid)
@@ -3692,6 +3971,14 @@ def _run_lever_loop(
         })
 
         _accepted_fail_qids = set(full_result.get("failure_question_ids", []))
+        _acc_delta = full_accuracy - best_accuracy
+        _acc_patch_types = sorted({p.get("patch_type", "?") for p in patches})
+        _acc_reflection = (
+            f"Accepted: {ag.get('root_cause_summary', 'improvement')} resolved via "
+            f"{', '.join(_acc_patch_types)}. "
+            f"Accuracy improved by {_acc_delta:+.1f}% "
+            f"affecting {len(ag.get('affected_questions', []))} question(s)."
+        )
         reflection = _build_reflection_entry(
             iteration=iteration_counter, ag_id=ag_id, accepted=True,
             levers=[int(lk) for lk in lever_keys],
@@ -3701,9 +3988,25 @@ def _run_lever_loop(
             affected_question_ids=ag.get("affected_questions", []),
             prev_failure_qids=prev_failure_qids,
             new_failure_qids=_accepted_fail_qids,
+            reflection_text=_acc_reflection,
         )
         reflection_buffer.append(reflection)
+        try:
+            update_iteration_reflection(
+                spark, run_id, iteration_counter, reflection,
+                catalog=catalog, schema=schema, eval_scope="full",
+            )
+        except Exception:
+            logger.debug("Failed to persist reflection for accepted iter %d", iteration_counter, exc_info=True)
         prev_failure_qids = _accepted_fail_qids
+
+        if _acc_delta >= 1.0:
+            skill_exemplars.append({
+                "root_cause": ag.get("root_cause_summary", ""),
+                "lever_pattern": sorted(ag.get("lever_directives", {}).keys()),
+                "patch_types": [p.get("patch_type") for p in patches[:5]],
+                "accuracy_gain": round(_acc_delta, 1),
+            })
 
         best_scores = full_scores
         best_accuracy = full_accuracy
@@ -3766,7 +4069,7 @@ def _run_lever_loop(
     )
 
     session_info: dict = {}
-    if all_failure_trace_ids or all_regression_trace_ids or all_eval_mlflow_run_ids:
+    if all_failure_trace_ids or all_regression_trace_ids or all_eval_mlflow_run_ids or all_failure_question_ids:
         try:
             from genie_space_optimizer.optimization.labeling import create_review_session
             session_info = create_review_session(
@@ -3777,6 +4080,7 @@ def _run_lever_loop(
                 failure_trace_ids=list(dict.fromkeys(all_failure_trace_ids)),
                 regression_trace_ids=list(dict.fromkeys(all_regression_trace_ids)),
                 eval_mlflow_run_ids=list(dict.fromkeys(all_eval_mlflow_run_ids)),
+                failure_question_ids=list(dict.fromkeys(all_failure_question_ids)),
             )
             _sname = session_info.get("session_name", "")
             _srun = session_info.get("session_run_id", "")

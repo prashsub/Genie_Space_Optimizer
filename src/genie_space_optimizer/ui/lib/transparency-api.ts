@@ -85,7 +85,78 @@ export interface IterationSummary {
   judgeScores: Record<string, number | null>;
 }
 
+export interface QuestionResult {
+  questionId: string;
+  question: string;
+  resultCorrectness: string | null;
+  judgeVerdicts: Record<string, string>;
+  failureTypes: string[];
+  matchType: string | null;
+  expectedSql: string | null;
+  generatedSql: string | null;
+}
+
+export interface GateResultEntry {
+  gateName: string;
+  accuracy: number | null;
+  totalQuestions: number | null;
+  passed: boolean | null;
+  mlflowRunId: string | null;
+}
+
+export interface ReflectionEntry {
+  iteration: number;
+  agId: string;
+  accepted: boolean;
+  action: string;
+  levers: number[];
+  targetObjects: string[];
+  scoreDeltas: Record<string, number>;
+  accuracyDelta: number;
+  newFailures: string | null;
+  rollbackReason: string | null;
+  doNotRetry: string[];
+  affectedQuestionIds: string[];
+  fixedQuestions: string[];
+  stillFailing: string[];
+  newRegressions: string[];
+  reflectionText: string;
+  refinementMode: string;
+}
+
+export interface IterationDetail {
+  iteration: number;
+  agId: string | null;
+  status: string;
+  overallAccuracy: number;
+  judgeScores: Record<string, number | null>;
+  totalQuestions: number;
+  correctCount: number;
+  mlflowRunId: string | null;
+  modelId: string | null;
+  gates: GateResultEntry[];
+  patches: Record<string, unknown>[];
+  reflection: ReflectionEntry | null;
+  questions: QuestionResult[];
+  clusterInfo: Record<string, unknown> | null;
+  timestamp: string | null;
+}
+
+export interface IterationDetailResponse {
+  runId: string;
+  spaceId: string;
+  baselineScore: number | null;
+  optimizedScore: number | null;
+  totalIterations: number;
+  iterations: IterationDetail[];
+  flaggedQuestions: Record<string, unknown>[];
+  labelingSessionUrl: string | null;
+}
+
 // ── Fetch functions ──────────────────────────────────────────────────
+
+export const getIterationDetail = (runId: string) =>
+  fetchJson<IterationDetailResponse>(`/api/genie/runs/${runId}/iteration-detail`);
 
 export const getIterations = (runId: string) =>
   fetchJson<IterationSummary[]>(`/api/genie/runs/${runId}/iterations`);
@@ -105,6 +176,9 @@ export const getProvenance = (runId: string, iteration?: number, lever?: number)
 
 // ── Query keys ───────────────────────────────────────────────────────
 
+export const iterationDetailKey = (runId: string) =>
+  ["/api/genie/runs/iteration-detail", runId] as const;
+
 export const iterationsKey = (runId: string) =>
   ["/api/genie/runs/iterations", runId] as const;
 
@@ -115,6 +189,28 @@ export const provenanceKey = (runId: string, iteration?: number, lever?: number)
   ["/api/genie/runs/provenance", runId, iteration, lever] as const;
 
 // ── Hooks ────────────────────────────────────────────────────────────
+
+export function useIterationDetail(
+  runId: string,
+  queryOpts?: Partial<UseQueryOptions<IterationDetailResponse, ApiError>>,
+) {
+  return useQuery({
+    queryKey: iterationDetailKey(runId),
+    queryFn: () => getIterationDetail(runId),
+    ...queryOpts,
+  });
+}
+
+export function useIterationDetailSuspense(
+  runId: string,
+  queryOpts?: Partial<UseSuspenseQueryOptions<IterationDetailResponse, ApiError>>,
+) {
+  return useSuspenseQuery({
+    queryKey: iterationDetailKey(runId),
+    queryFn: () => getIterationDetail(runId),
+    ...queryOpts,
+  });
+}
 
 export function useIterations(
   runId: string,

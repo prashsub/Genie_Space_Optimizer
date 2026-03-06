@@ -20,6 +20,9 @@ from ..models import (
     AsiSummary,
     ComparisonData,
     DimensionScore,
+    GateResult,
+    IterationDetail,
+    IterationDetailResponse,
     IterationSummary,
     LeverStatus,
     PipelineLink,
@@ -27,6 +30,8 @@ from ..models import (
     PipelineStep,
     ProvenanceRecord,
     ProvenanceSummary,
+    QuestionResult,
+    ReflectionEntry,
     SpaceConfiguration,
     TableDescription,
 )
@@ -1675,6 +1680,258 @@ def get_provenance(
         )
 
     return summaries
+
+
+@router.get(
+    "/runs/{run_id}/iteration-detail",
+    response_model=IterationDetailResponse,
+    operation_id="getIterationDetail",
+)
+def get_iteration_detail(run_id: str, config: Dependencies.Config):
+    """Comprehensive per-iteration breakdown for the transparency pane."""
+    from genie_space_optimizer.optimization.state import (
+        load_iterations,
+        load_patches,
+        load_run,
+        load_stages,
+    )
+
+    spark = get_spark()
+    run_data = load_run(spark, run_id, config.catalog, config.schema_name)
+    if not run_data:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    iters_df = load_iterations(spark, run_id, config.catalog, config.schema_name)
+    iters_rows = iters_df.to_dict("records") if not iters_df.empty else []
+
+    stages_df = load_stages(spark, run_id, config.catalog, config.schema_name)
+    stages_rows = stages_df.to_dict("records") if not stages_df.empty else []
+
+    patches_df = load_patches(spark, run_id, config.catalog, config.schema_name)
+    patches_rows = patches_df.to_dict("records") if not patches_df.empty else []
+
+    ag_stages: dict[str, dict] = {}
+    for s in stages_rows:
+        stage_name = str(s.get("stage", ""))
+        if stage_name.startswith("AG_") and "_STARTED" in stage_name:
+            ag_id = stage_name.replace("AG_", "").replace("_STARTED", "")
+            iteration = s.get("iteration")
+            detail = safe_json_parse(s.get("detail_json"))
+            status_val = str(s.get("status", "")).upper()
+            entry = ag_stages.setdefault(ag_id, {})
+            if status_val == "STARTED":
+                entry["cluster_info"] = detail if isinstance(detail, dict) else {}
+                entry["iteration"] = iteration
+            if status_val == "COMPLETE":
+                entry["accepted"] = True
+                entry.setdefault("iteration", iteration)
+                if isinstance(detail, dict):
+                    entry.setdefault("cluster_info", {}).update(detail)
+            if status_val == "ROLLED_BACK":
+                entry["accepted"] = False
+                entry.setdefault("iteration", iteration)
+                if isinstance(detail, dict):
+                    entry["rollback_detail"] = detail
+
+    full_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "full"]
+    slice_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "slice"]
+    p0_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "p0"]
+
+    by_iter: dict[int, dict] = {}
+    for row in full_rows:
+        it = int(row.get("iteration", 0))
+        by_iter.setdefault(it, {"full": row})
+        by_iter[it]["full"] = row
+    for row in slice_rows:
+        it = int(row.get("iteration", 0))
+        by_iter.setdefault(it, {})
+        by_iter[it]["slice"] = row
+    for row in p0_rows:
+        it = int(row.get("iteration", 0))
+        by_iter.setdefault(it, {})
+        by_iter[it]["p0"] = row
+
+    patches_by_iter: dict[int, list[dict]] = {}
+    for p in patches_rows:
+        it = _safe_int(p.get("iteration"))
+        if it is not None:
+            patches_by_iter.setdefault(it, []).append(p)
+
+    ag_iter_map: dict[int, str] = {}
+    for ag_id, ag_data in ag_stages.items():
+        it = ag_data.get("iteration")
+        if it is not None:
+            ag_iter_map[int(it)] = ag_id
+
+    iterations: list[IterationDetail] = []
+    for it_num in sorted(by_iter.keys()):
+        data = by_iter[it_num]
+        full_row = data.get("full")
+        if not full_row:
+            continue
+
+        scores = _iteration_scores(full_row)
+        accuracy = _finite(full_row.get("overall_accuracy", 0))
+        total_q = int(full_row.get("total_questions", 0))
+        correct_c = int(full_row.get("correct_count", 0))
+        mlflow_rid = full_row.get("mlflow_run_id")
+        model_id = full_row.get("model_id")
+        timestamp = str(full_row.get("timestamp", ""))
+
+        ag_id = ag_iter_map.get(it_num)
+        ag_info = ag_stages.get(ag_id, {}) if ag_id else {}
+        cluster_info = ag_info.get("cluster_info") if ag_info else None
+
+        if it_num == 0:
+            status = "baseline"
+        elif ag_info.get("accepted") is True:
+            status = "accepted"
+        elif ag_info.get("accepted") is False:
+            status = "rolled_back"
+        else:
+            status = "completed"
+
+        gates: list[GateResult] = []
+        slice_row = data.get("slice")
+        if slice_row:
+            gates.append(GateResult(
+                gateName="slice",
+                accuracy=_safe_float(slice_row.get("overall_accuracy")),
+                totalQuestions=_safe_int(slice_row.get("total_questions")),
+                passed=status != "rolled_back" or not str(ag_info.get("rollback_detail", {}).get("reason", "")).startswith("slice"),
+                mlflowRunId=slice_row.get("mlflow_run_id"),
+            ))
+        p0_row = data.get("p0")
+        if p0_row:
+            gates.append(GateResult(
+                gateName="p0",
+                accuracy=_safe_float(p0_row.get("overall_accuracy")),
+                totalQuestions=_safe_int(p0_row.get("total_questions")),
+                passed=status != "rolled_back" or not str(ag_info.get("rollback_detail", {}).get("reason", "")).startswith("p0"),
+                mlflowRunId=p0_row.get("mlflow_run_id"),
+            ))
+        if full_row and it_num > 0:
+            gates.append(GateResult(
+                gateName="full",
+                accuracy=_safe_float(full_row.get("overall_accuracy")),
+                totalQuestions=_safe_int(full_row.get("total_questions")),
+                passed=status == "accepted",
+                mlflowRunId=mlflow_rid,
+            ))
+
+        iter_patches = [_patch_for_ui(p) for p in patches_by_iter.get(it_num, [])]
+
+        reflection: ReflectionEntry | None = None
+        refl_raw = safe_json_parse(full_row.get("reflection_json"))
+        if isinstance(refl_raw, dict) and refl_raw:
+            reflection = ReflectionEntry(
+                iteration=refl_raw.get("iteration", it_num),
+                agId=refl_raw.get("ag_id", ag_id or ""),
+                accepted=refl_raw.get("accepted", status == "accepted"),
+                action=refl_raw.get("action", ""),
+                levers=refl_raw.get("levers", []),
+                targetObjects=refl_raw.get("target_objects", []),
+                scoreDeltas=refl_raw.get("score_deltas", {}),
+                accuracyDelta=refl_raw.get("accuracy_delta", 0),
+                newFailures=refl_raw.get("new_failures"),
+                rollbackReason=refl_raw.get("rollback_reason"),
+                doNotRetry=refl_raw.get("do_not_retry", []),
+                affectedQuestionIds=refl_raw.get("affected_question_ids", []),
+                fixedQuestions=refl_raw.get("fixed_questions", []),
+                stillFailing=refl_raw.get("still_failing", []),
+                newRegressions=refl_raw.get("new_regressions", []),
+                reflectionText=refl_raw.get("reflection_text", ""),
+                refinementMode=refl_raw.get("refinement_mode", ""),
+            )
+
+        questions: list[QuestionResult] = []
+        rows_json = safe_json_parse(full_row.get("rows_json"))
+        if isinstance(rows_json, list):
+            for row in rows_json:
+                if not isinstance(row, dict):
+                    continue
+                q_text = ""
+                if isinstance(row.get("inputs"), dict):
+                    q_text = str(row["inputs"].get("question", "")).strip()
+                if not q_text:
+                    q_text = str(row.get("inputs/question", "")).strip()
+
+                q_id = str(row.get("request_id", "") or row.get("question_id", ""))
+                if not q_id and q_text:
+                    q_id = q_text[:80]
+
+                verdicts: dict[str, str] = {}
+                failure_types: list[str] = []
+                for key, val in row.items():
+                    if key.endswith("/value") and "/" in key:
+                        judge_name = key.rsplit("/value", 1)[0]
+                        verdicts[judge_name] = str(val)
+
+                rc = row.get("result_correctness/value", row.get("result_correctness"))
+                if rc:
+                    verdicts.setdefault("result_correctness", str(rc))
+
+                match_type = None
+                gen_sql = None
+                expected_sql = None
+                if isinstance(row.get("outputs"), dict):
+                    comp = row["outputs"].get("comparison", {})
+                    if isinstance(comp, dict):
+                        match_type = comp.get("match_type")
+                    gen_sql = str(row["outputs"].get("generated_sql", ""))[:500] or None
+                    expected_sql = str(row["outputs"].get("expected_sql", ""))[:500] or None
+
+                questions.append(QuestionResult(
+                    questionId=q_id,
+                    question=q_text,
+                    resultCorrectness=verdicts.get("result_correctness"),
+                    judgeVerdicts=verdicts,
+                    failureTypes=failure_types,
+                    matchType=match_type,
+                    expectedSql=expected_sql,
+                    generatedSql=gen_sql,
+                ))
+
+        iterations.append(IterationDetail(
+            iteration=it_num,
+            agId=ag_id,
+            status=status,
+            overallAccuracy=accuracy,
+            judgeScores=scores,
+            totalQuestions=total_q,
+            correctCount=correct_c,
+            mlflowRunId=mlflow_rid,
+            modelId=model_id,
+            gates=gates,
+            patches=iter_patches,
+            reflection=reflection,
+            questions=questions,
+            clusterInfo=cluster_info if isinstance(cluster_info, dict) else None,
+            timestamp=timestamp,
+        ))
+
+    baseline_score, optimized_score = _get_baseline_and_best_accuracy(iters_rows)
+
+    flagged: list[dict] = []
+    domain = run_data.get("domain", run_data.get("space_id", ""))
+    try:
+        from genie_space_optimizer.optimization.labeling import get_flagged_questions
+        flagged = get_flagged_questions(spark, config.catalog, config.schema_name, domain)
+    except Exception:
+        logger.debug("Could not load flagged questions for iteration detail", exc_info=True)
+
+    labeling_url = run_data.get("labeling_session_url")
+
+    return IterationDetailResponse(
+        runId=run_id,
+        spaceId=run_data.get("space_id", ""),
+        baselineScore=baseline_score,
+        optimizedScore=optimized_score,
+        totalIterations=len(iterations),
+        iterations=iterations,
+        flaggedQuestions=flagged,
+        labelingSessionUrl=labeling_url,
+    )
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────

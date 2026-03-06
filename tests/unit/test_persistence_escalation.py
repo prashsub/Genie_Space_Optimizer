@@ -50,6 +50,8 @@ def _reflection(iteration: int, accepted: bool, affected: list[str], action: str
         "fixed_questions": [],
         "still_failing": affected,
         "new_regressions": [],
+        "reflection_text": "",
+        "refinement_mode": "",
     }
 
 
@@ -85,6 +87,28 @@ class TestBuildReflectionEntry:
         assert entry["still_failing"] == []
         assert entry["new_regressions"] == []
 
+    def test_reflection_text_and_refinement_mode(self):
+        entry = _build_reflection_entry(
+            iteration=2, ag_id="AG2", accepted=False,
+            levers=[1, 5], target_objects=["tbl"],
+            prev_scores={"s": 80.0}, new_scores={"s": 75.0},
+            rollback_reason="regression", patches=[],
+            reflection_text="Rollback: instructions caused regressions.",
+            refinement_mode="in_plan",
+        )
+        assert entry["reflection_text"] == "Rollback: instructions caused regressions."
+        assert entry["refinement_mode"] == "in_plan"
+
+    def test_defaults_for_new_fields(self):
+        entry = _build_reflection_entry(
+            iteration=1, ag_id="AG1", accepted=True,
+            levers=[1], target_objects=["tbl"],
+            prev_scores={"s": 50.0}, new_scores={"s": 60.0},
+            rollback_reason=None, patches=[],
+        )
+        assert entry["reflection_text"] == ""
+        assert entry["refinement_mode"] == ""
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # _build_question_persistence_summary
@@ -93,13 +117,15 @@ class TestBuildReflectionEntry:
 
 class TestBuildQuestionPersistenceSummary:
     def test_no_data_returns_placeholder(self):
-        result = _build_question_persistence_summary({}, [])
-        assert "No cross-iteration" in result
+        text, structured = _build_question_persistence_summary({}, [])
+        assert "No cross-iteration" in text
+        assert structured == {}
 
     def test_below_threshold_not_shown(self):
         history = {"q1": [_ve(1, "both_correct")]}
-        result = _build_question_persistence_summary(history, [], min_failures=2)
-        assert "No persistent" in result
+        text, structured = _build_question_persistence_summary(history, [], min_failures=2)
+        assert "No persistent" in text
+        assert structured == {}
 
     def test_persistent_question_shown(self):
         history = {
@@ -109,10 +135,13 @@ class TestBuildQuestionPersistenceSummary:
                 _ve(3, "ground_truth_correct"),
             ],
         }
-        result = _build_question_persistence_summary(history, [], min_failures=2)
-        assert "q1" in result
-        assert "3/3" in result
-        assert "PERSISTENT" in result
+        text, structured = _build_question_persistence_summary(history, [], min_failures=2)
+        assert "q1" in text
+        assert "3/3" in text
+        assert "PERSISTENT" in text
+        assert "q1" in structured
+        assert structured["q1"]["classification"] == "PERSISTENT"
+        assert structured["q1"]["fail_count"] == 3
 
     def test_additive_exhausted_classification(self):
         history = {
@@ -127,8 +156,9 @@ class TestBuildQuestionPersistenceSummary:
             _reflection(2, False, ["q1"], "add_example_sql on tbl"),
             _reflection(3, False, ["q1"], "add_instruction on tbl, add_example_sql on tbl"),
         ]
-        result = _build_question_persistence_summary(history, reflection_buffer, min_failures=2)
-        assert "ADDITIVE_LEVERS_EXHAUSTED" in result
+        text, structured = _build_question_persistence_summary(history, reflection_buffer, min_failures=2)
+        assert "ADDITIVE_LEVERS_EXHAUSTED" in text
+        assert structured["q1"]["classification"] == "ADDITIVE_LEVERS_EXHAUSTED"
 
     def test_intermittent_classification(self):
         history = {
@@ -138,8 +168,8 @@ class TestBuildQuestionPersistenceSummary:
                 _ve(3, "ground_truth_correct"),
             ],
         }
-        result = _build_question_persistence_summary(history, [], min_failures=2)
-        assert "INTERMITTENT" in result
+        text, structured = _build_question_persistence_summary(history, [], min_failures=2)
+        assert "INTERMITTENT" in text
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -75,11 +75,16 @@ INLINE_EVAL_DELAY = 12
 
 # ── 3. Iteration and Convergence ───────────────────────────────────────
 
-MAX_ITERATIONS = 5
+MAX_ITERATIONS = 3
 SLICE_GATE_TOLERANCE = 15.0
+ENABLE_SLICE_GATE: bool = False
+SLICE_GATE_MIN_REDUCTION = 0.5
 REGRESSION_THRESHOLD = 5.0
 MAX_NOISE_FLOOR = 5.0
 PLATEAU_ITERATIONS = 2
+CONSECUTIVE_ROLLBACK_LIMIT = 2
+"""Stop the lever loop after this many consecutive rollbacks, indicating
+the optimizer is stuck and further iterations are unlikely to help."""
 ARBITER_CORRECTION_TRIGGER = 3  # deprecated — use per-question thresholds below
 GENIE_CORRECT_CONFIRMATION_THRESHOLD = 2
 """Minimum independent evaluations where a question must receive ``genie_correct``
@@ -1704,6 +1709,15 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     'ONLY reference identifiers from this allowlist:\n'
     '{{ identifier_allowlist }}\n'
     '\n'
+    '## Refinement Mode Guidance\n'
+    'When the Reflection History shows a ROLLED_BACK entry:\n'
+    '- If "in_plan": The lever direction was correct but caused regressions. '
+    'Refine the SAME lever with narrower scope or more specific targeting. '
+    'Do NOT switch to a different root cause.\n'
+    '- If "out_of_plan": The approach fundamentally did not work. Switch to a '
+    'different lever class or escalate. Do NOT retry the same lever type on '
+    'the same target.\n'
+    '\n'
     '## Escalation for Persistent Failures\n'
     'Check the Persistent Question Failures section.  If a question is marked '
     'ADDITIVE_LEVERS_EXHAUSTED, do NOT propose more add_instruction or add_example_sql '
@@ -1733,6 +1747,11 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     '## Reflection History\n'
     '{{ reflection_buffer }}\n'
+    '\n'
+    '## Proven Patterns\n'
+    'Approaches that were tried and ACCEPTED in prior iterations. Consider '
+    'replicating similar patterns for analogous root causes.\n'
+    '{{ proven_patterns }}\n'
     '\n'
     '## Persistent Question Failures\n'
     '{{ question_persistence_summary }}\n'

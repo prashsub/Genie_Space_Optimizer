@@ -2,6 +2,8 @@
 
 This guide is written for an LLM agent that will execute a full end-to-end test of the Genie Space Optimizer. It describes every API call, UI interaction, expected response, failure mode, and diagnostic step. Follow the journeys sequentially -- each builds on the prior.
 
+> **Related documentation:** [Architecture Overview](docs/genie-space-optimizer-design/02-architecture-overview.md) | [API Reference](docs/genie-space-optimizer-design/07-api-reference.md) | [Permissions Guide](docs/genie-space-optimizer-design/08-permissions-and-security.md) | [Troubleshooting](docs/genie-space-optimizer-design/appendices/B-troubleshooting.md) | [Full Documentation Index](docs/genie-space-optimizer-design/00-index.md)
+
 ---
 
 ## Table of Contents
@@ -28,7 +30,7 @@ This guide is written for an LLM agent that will execute a full end-to-end test 
 
 ## 1. System Architecture
 
-Understanding the architecture is critical for diagnosing failures.
+Understanding the architecture is critical for diagnosing failures. For a comprehensive architecture overview with mermaid diagrams, see [02 -- Architecture Overview](docs/genie-space-optimizer-design/02-architecture-overview.md).
 
 ### Components
 
@@ -583,6 +585,8 @@ After apply or discard, verify:
 
 ## 12. Journey 10: Settings & Data Access
 
+> **Reference:** For the complete permissions model, see [08 -- Permissions and Security](docs/genie-space-optimizer-design/08-permissions-and-security.md).
+
 ### Navigation
 
 Click the **gear icon** in the navbar → navigates to `/settings`.
@@ -647,6 +651,8 @@ Click the **gear icon** in the navbar → navigates to `/settings`.
 ---
 
 ## 13. Journey 11: Programmatic Trigger API
+
+> **Reference:** For the complete API specification with request/response schemas, see [07 -- API Reference](docs/genie-space-optimizer-design/07-api-reference.md).
 
 ### Overview
 
@@ -744,6 +750,8 @@ done
 ---
 
 ## 14. Troubleshooting Databricks Job Failures
+
+> **Reference:** For the complete error-solution matrix and convergence reason decoder, see [Appendix B -- Troubleshooting](docs/genie-space-optimizer-design/appendices/B-troubleshooting.md). For operational diagnostic queries, see [10 -- Operations Guide](docs/genie-space-optimizer-design/10-operations-guide.md).
 
 This is the most common source of issues. The optimization pipeline runs as a multi-task Databricks Job with 5 sequential notebook tasks. Each task can fail independently.
 

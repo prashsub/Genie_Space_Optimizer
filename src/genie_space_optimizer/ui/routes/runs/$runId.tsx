@@ -6,12 +6,16 @@ import { Progress } from "@/components/ui/progress";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PipelineStepCard } from "@/components/PipelineStepCard";
 import { LeverProgress } from "@/components/LeverProgress";
 import { ResourceLinks } from "@/components/ResourceLinks";
 import { IterationChart } from "@/components/IterationChart";
 import { AsiResultsPanel } from "@/components/AsiResultsPanel";
 import { StageTimeline, type StageEvent } from "@/components/StageTimeline";
+import { InsightTabs } from "@/components/InsightTabs";
+import { IterationExplorer } from "@/components/IterationExplorer";
+import { useIterationDetail } from "@/lib/transparency-api";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
@@ -24,6 +28,8 @@ import {
   TrendingUp,
   ExternalLink,
   UserCheck,
+  Eye,
+  Microscope,
 } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
 
@@ -522,19 +528,13 @@ function PipelineView() {
           </div>
         )}
 
-      {/* Score Progression & Timeline (shown when completed) */}
+      {/* Transparency Pane (shown when completed) */}
       {isCompleted && (
-        <div className="grid gap-4 lg:grid-cols-2">
-          <IterationChart runId={run.runId} />
-          <StageTimeline stageEvents={allStageEvents} />
-        </div>
-      )}
-
-      {/* ASI Judge Feedback (shown when completed) */}
-      {isCompleted && (
-        <AsiResultsPanel
+        <TransparencyPane
           runId={run.runId}
+          stageEvents={allStageEvents}
           availableIterations={availableIterations}
+          links={run.links ?? []}
         />
       )}
 
@@ -630,6 +630,69 @@ function PipelineView() {
         </Alert>
       )}
     </div>
+  );
+}
+
+function TransparencyPane({
+  runId,
+  stageEvents,
+  availableIterations,
+  links,
+}: {
+  runId: string;
+  stageEvents: StageEvent[];
+  availableIterations: number[];
+  links: { label: string; url: string; category: string }[];
+}) {
+  const { data: iterDetail, isLoading } = useIterationDetail(runId);
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-10 w-full" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    );
+  }
+
+  if (!iterDetail) {
+    return (
+      <div className="space-y-4">
+        <div className="grid gap-4 lg:grid-cols-2">
+          <IterationChart runId={runId} />
+          <StageTimeline stageEvents={stageEvents} />
+        </div>
+        <AsiResultsPanel runId={runId} availableIterations={availableIterations} />
+      </div>
+    );
+  }
+
+  return (
+    <Tabs defaultValue="summary">
+      <TabsList>
+        <TabsTrigger value="summary" className="gap-1.5">
+          <Eye className="h-3.5 w-3.5" />
+          Summary
+        </TabsTrigger>
+        <TabsTrigger value="explorer" className="gap-1.5">
+          <Microscope className="h-3.5 w-3.5" />
+          Iteration Explorer
+        </TabsTrigger>
+      </TabsList>
+
+      <TabsContent value="summary" className="mt-4 space-y-4">
+        <InsightTabs
+          runId={runId}
+          detail={iterDetail}
+          stageEvents={stageEvents}
+          links={links}
+        />
+      </TabsContent>
+
+      <TabsContent value="explorer" className="mt-4">
+        <IterationExplorer detail={iterDetail} links={links} />
+      </TabsContent>
+    </Tabs>
   );
 }
 

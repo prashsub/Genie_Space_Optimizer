@@ -2134,6 +2134,57 @@ def _is_retryable_eval_exception(exc: Exception) -> bool:
     return False
 
 
+def _recover_trace_map(
+    experiment_id: str,
+    optimization_run_id: str,
+    iteration: int,
+    expected_count: int = 0,
+) -> dict[str, str]:
+    """Recover question_id -> trace_id mapping by searching experiment traces.
+
+    When mlflow.genai.evaluate() loses trace context (e.g. due to Spark
+    Connect gRPC calls), traces still exist in the tracking store with
+    tags set by genie_predict_fn.  This function finds them via tag search.
+    """
+    if not experiment_id or not optimization_run_id:
+        return {}
+
+    try:
+        filter_parts = [
+            f"tags.`genie.optimization_run_id` = '{optimization_run_id}'",
+            f"tags.`genie.iteration` = '{iteration}'",
+        ]
+        traces_df = mlflow.search_traces(
+            experiment_ids=[experiment_id],
+            filter_string=" AND ".join(filter_parts),
+            max_results=max(500, expected_count * 2),
+        )
+        if traces_df is None or len(traces_df) == 0:
+            logger.info("Trace recovery found 0 traces for iteration %d", iteration)
+            return {}
+
+        recovered: dict[str, str] = {}
+        for _, row in traces_df.iterrows():
+            tid = row.get("trace_id")
+            tags = row.get("tags")
+            if isinstance(tags, dict):
+                qid = tags.get("question_id", "")
+            else:
+                qid = ""
+            if tid and qid:
+                recovered[qid] = str(tid)
+
+        if recovered:
+            logger.info(
+                "Recovered %d trace IDs from experiment via tag search (iteration=%d)",
+                len(recovered), iteration,
+            )
+        return recovered
+    except Exception:
+        logger.debug("Trace recovery via tag search failed", exc_info=True)
+        return {}
+
+
 _HARNESS_PATCHED = False
 
 
@@ -2482,7 +2533,15 @@ def create_evaluation_dataset(
                 uc_table_name, exp_ids,
             )
         records = []
+        _seen_questions: set[str] = set()
+        _dup_count = 0
         for b in benchmarks:
+            _q_key = str(b.get("question", "")).lower().strip()
+            if _q_key in _seen_questions:
+                _dup_count += 1
+                continue
+            _seen_questions.add(_q_key)
+
             _expected_sql = b.get("expected_sql", "")
             expectations = {
                 "expected_response": _expected_sql,
@@ -2512,6 +2571,11 @@ def create_evaluation_dataset(
                     },
                     "expectations": expectations,
                 }
+            )
+        if _dup_count:
+            logger.warning(
+                "Dropped %d duplicate benchmark(s) by question text before persisting to %s",
+                _dup_count, uc_table_name,
             )
         eval_dataset.merge_records(records)
         logger.info("UC Evaluation Dataset: %s (%d records merged)", uc_table_name, len(records))
@@ -2832,18 +2896,12 @@ def run_evaluation(
             _version_tags["genie.lever"] = "baseline"
         mlflow.set_tags(_version_tags)
 
-        _eval_dataset_obj = None
-        try:
-            _ds_table = f"{uc_schema}.genie_benchmarks_{domain}" if uc_schema and domain else ""
-            if _ds_table:
-                _eval_dataset_obj = mlflow.genai.datasets.get_dataset(name=_ds_table)
-                logger.info("Loaded evaluation dataset '%s' for linking", _ds_table)
-        except Exception as _ds_err:
-            logger.warning(
-                "Failed to load evaluation dataset '%s': %s — "
-                "will use plain DataFrame (dataset won't appear in experiment Datasets tab)",
-                _ds_table, _ds_err,
-            )
+        # NOTE: We intentionally use the in-memory deduped eval_data DataFrame
+        # for evaluation instead of the MLflow EvaluationDataset object.  The
+        # underlying Delta table may contain stale duplicate rows (e.g. 54 rows
+        # when only 30 unique benchmarks exist) because merge_records upserts
+        # by record-id and never deletes old rows.  Using eval_data guarantees
+        # the evaluation runs exactly the deduped benchmark set.
 
         if spark is not None:
             known_functions = _load_known_functions(spark, catalog, gold_schema)
@@ -2966,7 +3024,7 @@ def run_evaluation(
 
         evaluate_kwargs: dict[str, Any] = {
             "predict_fn": predict_fn,
-            "data": _eval_dataset_obj if _eval_dataset_obj is not None else eval_data,
+            "data": eval_data,
             "scorers": scorers,
         }
         if mlflow_model_id:
@@ -3308,6 +3366,18 @@ def run_evaluation(
                 "(trace context may have been lost during Genie API calls)",
                 run_name, len(rows_for_output),
             )
+            if exp:
+                trace_map = _recover_trace_map(
+                    experiment_id=exp.experiment_id,
+                    optimization_run_id=optimization_run_id,
+                    iteration=iteration,
+                    expected_count=len(rows_for_output),
+                )
+                if trace_map:
+                    print(
+                        f"[Eval] Recovered {len(trace_map)}/{len(rows_for_output)} "
+                        f"trace IDs via tag search"
+                    )
         elif _rows_without_tid:
             logger.info(
                 "Evaluation %s: %d/%d rows have trace IDs (%d missing)",
@@ -4828,6 +4898,22 @@ def load_benchmarks_from_dataset(
                     "correction_source": expectations.get("correction_source", ""),
                 }
             )
+        pre_dedup = len(benchmarks)
+        _seen: set[str] = set()
+        deduped: list[dict] = []
+        for b in benchmarks:
+            key = str(b.get("question", "")).lower().strip()
+            if key in _seen:
+                continue
+            _seen.add(key)
+            deduped.append(b)
+        if len(deduped) < pre_dedup:
+            logger.warning(
+                "Dropped %d duplicate benchmark(s) by question text when loading from %s",
+                pre_dedup - len(deduped), table_name,
+            )
+        benchmarks = deduped
+
         logger.info("Loaded %d benchmarks from %s", len(benchmarks), table_name)
         return benchmarks
     except Exception:
