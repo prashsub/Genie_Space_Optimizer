@@ -1606,6 +1606,7 @@ def _generate_proactive_instructions(
             return ""
         if len(text) > 1500:
             text = text[:1500].rsplit("\n", 1)[0]
+        text = normalize_instructions(text)
         logger.info("Proactive instruction generation: produced %d chars", len(text))
         return text
     except Exception:
@@ -4082,6 +4083,11 @@ def _merge_structured_instructions(
     return _sanitize_plaintext_instructions(result)
 
 
+def normalize_instructions(text: str) -> str:
+    """Parse text into canonical structured sections and reassemble."""
+    return _merge_structured_instructions(existing=text, contributions=[], global_guidance="")
+
+
 def _repair_truncated_holistic_json(text: str) -> dict:
     """Extract instruction_text and example_sql_proposals from a truncated JSON.
 
@@ -5730,7 +5736,22 @@ def _mine_benchmark_example_sqls(
     ``example_question_sqls``.  Validates each via
     ``validate_ground_truth_sql(..., execute=True)`` so only SQL that
     actually runs and returns rows is proposed.
+
+    Respects the 100-slot instruction budget — stops mining once the
+    remaining slot budget is exhausted.
     """
+    from genie_space_optimizer.common.genie_schema import count_instruction_slots, MAX_INSTRUCTION_SLOTS
+
+    current_slots = count_instruction_slots(metadata_snapshot)
+    remaining_budget = max(0, MAX_INSTRUCTION_SLOTS - current_slots)
+
+    if remaining_budget <= 0:
+        logger.info(
+            "Benchmark mining: skipping — slot budget already exhausted (%d/%d)",
+            current_slots, MAX_INSTRUCTION_SLOTS,
+        )
+        return []
+
     existing_eqs_raw = (
         (metadata_snapshot.get("config") or metadata_snapshot).get("example_question_sqls")
         or metadata_snapshot.get("example_question_sqls")
@@ -5794,6 +5815,13 @@ def _mine_benchmark_example_sqls(
                 logger.debug("Benchmark mining: validation error, skipping", exc_info=True)
                 skipped_invalid += 1
                 continue
+
+        if len(proposals) >= remaining_budget:
+            logger.info(
+                "Benchmark mining: stopping — slot budget exhausted (%d/%d used)",
+                current_slots + len(proposals), MAX_INSTRUCTION_SLOTS,
+            )
+            break
 
         proposals.append({
             "proposal_id": f"P_BM_{len(proposals) + 1:03d}",
@@ -6323,14 +6351,24 @@ def generate_proposals_from_strategy(
                 example_sqls_list = [example_sqls_list] if isinstance(example_sqls_list, dict) else []
 
             if instruction_guidance:
+                from genie_space_optimizer.optimization.applier import _get_general_instructions
+
+                current_instructions = _get_general_instructions(
+                    metadata_snapshot.get("config") or metadata_snapshot
+                )
+                merged_text = _merge_structured_instructions(
+                    existing=current_instructions,
+                    contributions=[instruction_guidance],
+                )
                 proposals.append({
                     "proposal_id": f"P{len(proposals) + 1:03d}",
                     "cluster_id": ag_id,
                     "lever": 5,
                     "scope": "genie_config",
-                    "patch_type": "add_instruction",
-                    "change_description": f"[{ag_id}] Instruction contribution ({len(instruction_guidance)} chars)",
-                    "proposed_value": instruction_guidance,
+                    "patch_type": "rewrite_instruction",
+                    "change_description": f"[{ag_id}] Instruction rewrite ({len(merged_text)} chars)",
+                    "proposed_value": merged_text,
+                    "old_value": current_instructions,
                     "rationale": f"Strategy: {root_cause}. {coordination_notes}",
                     "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
                     "confidence": 0.85,
@@ -6344,7 +6382,7 @@ def generate_proposals_from_strategy(
                         "counterfactual_fixes": [],
                         "ambiguity_detected": False,
                     },
-                    "provenance": {**provenance_base, "patch_type": "add_instruction"},
+                    "provenance": {**provenance_base, "patch_type": "rewrite_instruction"},
                 })
 
             for ex_idx, example_sql_dir in enumerate(example_sqls_list):

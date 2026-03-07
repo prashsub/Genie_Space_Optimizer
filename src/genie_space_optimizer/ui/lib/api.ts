@@ -34,9 +34,12 @@ export interface FunctionInfo {
     name: string;
     schema_name: string;
 }
+export type GateResult = unknown;
 export interface HTTPValidationError {
     detail?: ValidationError[];
 }
+export type IterationDetail = unknown;
+export type IterationDetailResponse = unknown;
 export type IterationSummary = unknown;
 export interface JoinInfo {
     joinColumns?: string[];
@@ -83,6 +86,8 @@ export type PipelineRun = unknown;
 export type PipelineStep = unknown;
 export type ProvenanceRecord = unknown;
 export type ProvenanceSummary = unknown;
+export type QuestionResult = unknown;
+export type ReflectionEntry = unknown;
 export type RunStatusResponse = unknown;
 export type RunSummary = unknown;
 export interface SchemaPermission {
@@ -760,6 +765,64 @@ export function useDiscardOptimization(options?: {
     return useMutation({
         mutationFn: (vars)=>discardOptimization(vars.params),
         ...options?.mutation
+    });
+}
+export interface GetIterationDetailParams {
+    run_id: string;
+}
+export const getIterationDetail = async (params: GetIterationDetailParams, options?: RequestInit): Promise<{
+    data: IterationDetailResponse;
+}> =>{
+    const res = await fetch(`/api/genie/runs/${params.run_id}/iteration-detail`, {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const getIterationDetailKey = (params?: GetIterationDetailParams)=>{
+    return [
+        "/api/genie/runs/{run_id}/iteration-detail",
+        params
+    ] as const;
+};
+export function useGetIterationDetail<TData = {
+    data: IterationDetailResponse;
+}>(options: {
+    params: GetIterationDetailParams;
+    query?: Omit<UseQueryOptions<{
+        data: IterationDetailResponse;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: getIterationDetailKey(options.params),
+        queryFn: ()=>getIterationDetail(options.params),
+        ...options?.query
+    });
+}
+export function useGetIterationDetailSuspense<TData = {
+    data: IterationDetailResponse;
+}>(options: {
+    params: GetIterationDetailParams;
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: IterationDetailResponse;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: getIterationDetailKey(options.params),
+        queryFn: ()=>getIterationDetail(options.params),
+        ...options?.query
     });
 }
 export interface GetIterationsParams {

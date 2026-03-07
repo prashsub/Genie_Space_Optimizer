@@ -13,12 +13,14 @@ from genie_space_optimizer.common.genie_schema import (
     ColumnConfig,
     ExampleQuestionSql,
     JoinSpec,
+    MAX_INSTRUCTION_SLOTS,
     SerializedSpace,
     SqlSnippetExpression,
     SqlSnippetFilter,
     SqlSnippetMeasure,
     SqlSnippets,
     TextInstruction,
+    count_instruction_slots,
     generate_genie_id,
     validate_serialized_space,
 )
@@ -1076,3 +1078,128 @@ class TestStrictSnippetSqlNotEmpty:
         }
         ok, errors = validate_serialized_space(config, strict=True)
         assert ok is True, f"Valid snippet SQL rejected: {errors}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# count_instruction_slots
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestCountInstructionSlots:
+    def test_empty_config(self):
+        assert count_instruction_slots({}) == 0
+
+    def test_instructions_only(self):
+        config = {
+            "instructions": {
+                "text_instructions": [{"id": "ti1", "content": ["text"]}],
+                "example_question_sqls": [
+                    {"id": "eq1", "question": ["Q1?"], "sql": ["SELECT 1"]},
+                    {"id": "eq2", "question": ["Q2?"], "sql": ["SELECT 2"]},
+                ],
+                "sql_functions": [
+                    {"id": "sf1", "identifier": "cat.sch.fn1"},
+                ],
+            },
+        }
+        assert count_instruction_slots(config) == 4  # 1 text + 2 examples + 1 function
+
+    def test_table_descriptions_counted(self):
+        config = {
+            "data_sources": {
+                "tables": [
+                    {"identifier": "cat.sch.t1", "description": ["Table one"]},
+                    {"identifier": "cat.sch.t2", "description": ["Table two"]},
+                    {"identifier": "cat.sch.t3", "description": ["Table three"]},
+                ],
+            },
+        }
+        assert count_instruction_slots(config) == 3
+
+    def test_metric_view_descriptions_counted(self):
+        config = {
+            "data_sources": {
+                "metric_views": [
+                    {"identifier": "cat.sch.mv1", "description": ["MV desc"]},
+                    {"identifier": "cat.sch.mv2", "description": ["MV desc 2"]},
+                ],
+            },
+        }
+        assert count_instruction_slots(config) == 2
+
+    def test_empty_descriptions_not_counted(self):
+        config = {
+            "data_sources": {
+                "tables": [
+                    {"identifier": "cat.sch.t1", "description": []},
+                    {"identifier": "cat.sch.t2", "description": None},
+                    {"identifier": "cat.sch.t3"},
+                ],
+                "metric_views": [
+                    {"identifier": "cat.sch.mv1", "description": []},
+                ],
+            },
+        }
+        assert count_instruction_slots(config) == 0
+
+    def test_mixed_all_types(self):
+        config = {
+            "data_sources": {
+                "tables": [
+                    {"identifier": "cat.sch.t1", "description": ["Desc"]},
+                    {"identifier": "cat.sch.t2"},
+                ],
+                "metric_views": [
+                    {"identifier": "cat.sch.mv1", "description": ["MV desc"]},
+                ],
+            },
+            "instructions": {
+                "text_instructions": [{"id": "ti1", "content": ["text"]}],
+                "example_question_sqls": [
+                    {"id": "eq1", "question": ["Q?"], "sql": ["SELECT 1"]},
+                ],
+                "sql_functions": [
+                    {"id": "sf1", "identifier": "cat.sch.fn"},
+                    {"id": "sf2", "identifier": "cat.sch.fn2"},
+                ],
+            },
+        }
+        # 1 text + 1 example + 2 functions + 1 table desc + 1 mv desc = 6
+        assert count_instruction_slots(config) == 6
+
+    def test_no_data_sources_key(self):
+        """Configs without data_sources (e.g. simplified metadata) count only instructions."""
+        config = {
+            "instructions": {
+                "example_question_sqls": [
+                    {"id": "eq1", "question": ["Q?"], "sql": ["SELECT 1"]},
+                ],
+            },
+        }
+        assert count_instruction_slots(config) == 1
+
+    def test_strict_validation_rejects_with_descriptions(self):
+        """Descriptions push slot count over 100 even with few instruction items."""
+        config = _minimal_strict_config()
+        config["data_sources"] = {
+            "tables": [
+                {"identifier": f"cat.sch.t{i:03d}", "description": [f"Table {i}"]}
+                for i in range(6)
+            ],
+        }
+        config["instructions"] = {
+            "example_question_sqls": [
+                {
+                    "id": f"{i:032x}",
+                    "question": [f"Question {i}?"],
+                    "sql": [f"SELECT {i}"],
+                }
+                for i in range(95)
+            ],
+        }
+        # 95 examples + 6 table descs = 101 > 100
+        assert count_instruction_slots(config) == 101
+        ok, errors = validate_serialized_space(config, strict=True)
+        assert ok is False
+        assert any("Instruction slot budget exceeded" in e for e in errors)
+        assert any("table_descs=6" in e for e in errors)

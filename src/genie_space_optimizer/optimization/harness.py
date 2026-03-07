@@ -3488,6 +3488,12 @@ def _run_lever_loop(
         action_groups = strategy.get("action_groups", [])
         ag = action_groups[0] if action_groups else None
 
+        _global_rewrite = (strategy.get("global_instruction_rewrite") or "").strip()
+        if _global_rewrite and ag is not None:
+            ld = ag.setdefault("lever_directives", {})
+            l5 = ld.setdefault("5", {})
+            l5["instruction_guidance"] = _global_rewrite
+
         if ag is None and _iter_num == 1:
             logger.info("Adaptive strategist returned 0 AGs on iter 1 — trying holistic fallback")
             fallback_strategy = _generate_holistic_strategy(

@@ -1724,3 +1724,60 @@ class TestMineBenchmarkExampleSqls:
         ]
         result = _mine_benchmark_example_sqls(benchmarks, self._METADATA)
         assert len(result) == 1
+
+    def test_caps_at_slot_budget(self):
+        """With 98 slots used, only 2 proposals should be produced from 5 valid benchmarks."""
+        metadata = {
+            "tables": [{"name": "cat.sch.orders", "columns": []}],
+            "functions": [],
+            "metric_views": [],
+            "config": {"example_question_sqls": []},
+            "data_sources": {
+                "tables": [
+                    {"identifier": f"cat.sch.t{i}", "description": [f"Table {i}"]}
+                    for i in range(8)
+                ],
+            },
+            "instructions": {
+                "text_instructions": [{"id": "ti1", "content": ["text"]}],
+                "example_question_sqls": [
+                    {"id": f"eq{i:032x}", "question": [f"Q{i}?"], "sql": [f"SELECT {i}"]}
+                    for i in range(85)
+                ],
+                "sql_functions": [
+                    {"id": f"sf{i:032x}", "identifier": f"cat.sch.fn{i}"}
+                    for i in range(4)
+                ],
+            },
+        }
+        # 1 (text) + 85 (examples) + 4 (functions) + 8 (table descs) = 98 slots
+        from genie_space_optimizer.common.genie_schema import count_instruction_slots
+        assert count_instruction_slots(metadata) == 98
+
+        benchmarks = [
+            {"question": f"Bench question {i}?", "expected_sql": f"SELECT {i} FROM cat.sch.orders"}
+            for i in range(5)
+        ]
+        result = _mine_benchmark_example_sqls(benchmarks, metadata)
+        assert len(result) == 2
+
+    def test_caps_at_slot_budget(self):
+        """Mining stops once the instruction slot budget is exhausted."""
+        metadata = {
+            "data_sources": {
+                "tables": [],
+                "metric_views": [],
+            },
+            "instructions": {
+                "example_question_sqls": [
+                    {"id": f"{i:032x}", "question": [f"Q{i}?"], "sql": [f"SELECT {i}"]}
+                    for i in range(98)
+                ],
+            },
+        }
+        benchmarks = [
+            {"question": f"New question {j}?", "expected_sql": f"SELECT {j} FROM t"}
+            for j in range(5)
+        ]
+        result = _mine_benchmark_example_sqls(benchmarks, metadata)
+        assert len(result) == 2

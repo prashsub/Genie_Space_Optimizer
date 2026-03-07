@@ -1035,11 +1035,14 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
 
     # ── Instructions ──────────────────────────────────────────────
     if section == "instructions":
+        from genie_space_optimizer.optimization.optimizer import normalize_instructions
+
         if op == "add":
             text = cmd.get("new_text", "")
             if text:
                 current = _get_general_instructions(config)
-                _set_general_instructions(config, (current + "\n" + text).strip())
+                merged = normalize_instructions((current + "\n" + text).strip())
+                _set_general_instructions(config, merged)
             return True
         if op == "update":
             current = _get_general_instructions(config)
@@ -1048,18 +1051,18 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
             if old_text and old_text not in current:
                 return False
             replaced = current.replace(old_text, new_text, 1) if old_text else current + "\n" + new_text
-            _set_general_instructions(config, replaced.strip())
+            _set_general_instructions(config, normalize_instructions(replaced.strip()))
             return True
         if op == "remove":
             current = _get_general_instructions(config)
             old_text = cmd.get("old_text", "")
             if old_text and old_text not in current:
                 return False
-            _set_general_instructions(config, current.replace(old_text, "").strip())
+            _set_general_instructions(config, normalize_instructions(current.replace(old_text, "").strip()))
             return True
         if op == "rewrite":
             text = cmd.get("new_text", "")
-            _set_general_instructions(config, text)
+            _set_general_instructions(config, normalize_instructions(text))
             return True
 
     # ── Example SQL Queries (preferred over text instructions) ────
@@ -1528,6 +1531,13 @@ def apply_patch_set(
                     excess, trim_fn,
                 )
                 config["instructions"]["sql_functions"] = fns[:-trim_fn]
+                excess -= trim_fn
+        if excess > 0:
+            logger.error(
+                "Cannot trim enough instruction slots — %d excess slots from "
+                "table/metric descriptions alone. Manual description cleanup required.",
+                excess,
+            )
 
     config_ok, validation_errors = validate_serialized_space(config, strict=True)
     if not config_ok:
