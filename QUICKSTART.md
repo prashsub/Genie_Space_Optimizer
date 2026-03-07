@@ -314,8 +314,8 @@ DEFAULT_THRESHOLDS = {
 ### Iteration Limits
 
 ```python
-MAX_ITERATIONS = 5            # Max adaptive loop iterations
-REGRESSION_THRESHOLD = 10.0   # % drop that triggers rollback
+MAX_ITERATIONS = 3            # Max adaptive loop iterations
+REGRESSION_THRESHOLD = 5.0    # % drop that triggers rollback
 SLICE_GATE_TOLERANCE = 15.0   # % tolerance for per-dimension slice gate
 PLATEAU_ITERATIONS = 2        # Consecutive no-improvement before stopping
 MAX_NOISE_FLOOR = 5.0         # Min score improvement to accept (below = cosmetic noise)
@@ -409,6 +409,14 @@ The app logs the resolved wheel at startup (`App wheel: genie_space_optimizer-x.
 ```bash
 databricks apps logs genie-space-optimizer -p <your-profile>
 ```
+
+### Many benchmarks flagged as "temporal-stale"
+
+The optimizer auto-detects benchmarks whose ground-truth SQL returns 0 rows (typically due to stale temporal references like "this year" or "last quarter" whose date ranges no longer match any data). These benchmarks are flagged `temporal_stale=True` and excluded from the accuracy denominator so they don't penalize the score. If you see many benchmarks flagged, consider regenerating benchmarks with fresh date-relative queries, or check that the underlying data actually contains records for the referenced time periods.
+
+### "Connection pool is full, discarding connection" warnings
+
+The optimizer automatically configures a larger urllib3 connection pool (`CONNECTION_POOL_SIZE = 20`) at job startup to handle concurrent API calls during evaluation. If you still see these warnings, increase `CONNECTION_POOL_SIZE` in `src/genie_space_optimizer/common/config.py`.
 
 ### Score didn't improve
 

@@ -170,6 +170,9 @@ Key log lines to look for:
 | `OBO token not available` | Falling back to SP client |
 | `Reconciling stale run` | Auto-fixing a stuck run |
 | `Job submission: run_id=...` | Optimization job submitted |
+| `Configured connection pool size=20` | urllib3 pool resized for concurrent API calls |
+| `Flagged N/M benchmarks as temporal-stale (excluded from accuracy)` | Temporal benchmarks with 0-row GT SQL excluded |
+| `Restored N reflection entries from Delta for resume` | Lever loop resumed with prior iteration context |
 
 ### Job logs
 

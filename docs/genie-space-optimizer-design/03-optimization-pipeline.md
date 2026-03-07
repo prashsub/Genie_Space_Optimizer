@@ -139,6 +139,10 @@ Preflight writes `PREFLIGHT_STARTED` and `PREFLIGHT_COMPLETE` (or `PREFLIGHT_FAI
 
 The baseline evaluation establishes the "before" score by running all benchmark questions through Genie and scoring the responses.
 
+### 2.0 Connection Pool Initialization
+
+At job startup, `optimize_genie_space()` calls `configure_connection_pool(w, CONNECTION_POOL_SIZE)` (default 20) to increase the urllib3 connection pool on the `WorkspaceClient`. This prevents "Connection pool is full, discarding connection" warnings under the concurrent load typical of optimization runs (many Genie API calls, Statement Execution API polling, and LLM judge calls).
+
 ### 2.1 Temporal Date Resolution
 
 Before evaluation, the optimizer scans benchmark questions for relative time references and rewrites the ground-truth SQL to match the current date:
@@ -153,6 +157,8 @@ Before evaluation, the optimizer scans benchmark questions for relative time ref
 | "last year" | Previous year dates | Updated to current minus 1 year |
 
 Explicit years (e.g., "for 2024") are intentionally **not** rewritten. A `temporal_note` is attached to evaluation traces so LLM judges know dates were auto-adjusted.
+
+After temporal rewriting, `_flag_stale_temporal_benchmarks()` executes each temporal benchmark's GT SQL via Spark. Benchmarks returning 0 rows are flagged `temporal_stale=True` and excluded from the accuracy denominator, preventing false failures from data gaps. Similarly, `both_empty` comparisons (where both GT and Genie SQL return 0 rows) are excluded from accuracy.
 
 ### 2.2 Run Benchmarks Through Genie
 
@@ -394,7 +400,18 @@ The loop stops when any of these conditions is met:
 | `CONSECUTIVE_ROLLBACK_LIMIT` (2) consecutive rollbacks | `STALLED` | `no_further_improvement` |
 | Baseline already met all thresholds | `CONVERGED` | `baseline_meets_thresholds` |
 
-### 4.8 Escalation Mechanisms
+### 4.8 Resume State Restoration
+
+When the lever loop task retries (e.g., after a transient Spark or API failure), `_resume_lever_loop()` reconstructs the optimizer's strategic context from Delta:
+
+- **Reflection buffer** -- rebuilt from the `reflection_json` column on `genie_opt_iterations`
+- **Tried patches** -- `(failure_type, blame_set)` tuples extracted from rolled-back reflection entries
+- **Tried root causes** -- root causes from failed iterations, added to the DO NOT RETRY list
+- **Skill exemplars** -- proven strategies from accepted iterations with >= 1% accuracy gain
+
+This ensures the adaptive strategist resumes with full knowledge of what worked and what failed, rather than starting from scratch and potentially repeating rolled-back approaches.
+
+### 4.9 Escalation Mechanisms
 
 For questions that resist automated fixes across multiple iterations:
 

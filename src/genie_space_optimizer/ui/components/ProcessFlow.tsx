@@ -40,6 +40,8 @@ import {
   MessageCircle,
   UserCheck,
   RotateCw,
+  Rocket,
+  Ban,
   type LucideIcon,
 } from "lucide-react";
 
@@ -220,10 +222,9 @@ function FailureRoutingDetail() {
 
 function ThreeGateDetail() {
   const gates = [
-    { name: "Slice Eval", desc: "Quick check on affected questions only", icon: Filter, color: "amber" as const },
-    { name: "P0 Eval", desc: "Evaluate high-priority questions for critical accuracy", icon: ShieldCheck, color: "orange" as const },
-    { name: "Full Eval", desc: "Complete benchmark re-evaluation against all judges", icon: CheckCircle2, color: "green" as const },
-    { name: "Confirmation Eval", desc: "Full eval runs a second time; the two scores are averaged to smooth Genie non-determinism", icon: Repeat, color: "blue" as const },
+    { name: "Slice Eval", desc: "Quick check on affected questions only (currently disabled)", icon: Filter, color: "amber" as const, disabled: true },
+    { name: "P0 Eval", desc: "Evaluate high-priority questions for critical accuracy", icon: ShieldCheck, color: "orange" as const, disabled: false },
+    { name: "Full Eval", desc: "Complete benchmark re-evaluation. Runs a confirmation pass if accuracy did not improve, averaging both to smooth Genie non-determinism", icon: CheckCircle2, color: "green" as const, disabled: false },
   ];
   const colorMap = {
     amber: { border: "border-amber-200", bg: "bg-amber-50/50", circle: "bg-amber-100", iconColor: "text-amber-700", title: "text-amber-900", text: "text-amber-800" },
@@ -244,6 +245,7 @@ function ThreeGateDetail() {
                   <gate.icon className={`h-5 w-5 ${c.iconColor}`} />
                 </div>
                 <p className={`text-sm font-semibold ${c.title}`}>Gate {idx + 1}: {gate.name}</p>
+                {gate.disabled && <Badge variant="outline" className="mt-1 text-[8px] px-1.5 py-0 border-muted-foreground/30 text-muted-foreground">Disabled</Badge>}
                 <p className={`mt-1 text-xs leading-snug ${c.text}`}>{gate.desc}</p>
               </div>
               {idx < gates.length - 1 && (
@@ -258,7 +260,7 @@ function ThreeGateDetail() {
       </div>
       <div className="rounded-lg border border-green-200 bg-green-50/50 p-3">
         <p className="text-xs text-green-800">
-          <span className="font-semibold">Rollback protection:</span> Regressions on any gate cause automatic rollback. The confirmation eval (Gate 4) averages two Full Eval runs to reduce variance from Genie non-determinism.
+          <span className="font-semibold">Rollback protection:</span> Regressions on any gate cause automatic rollback. Single-question noise is filtered — if all regressions fall within one question's weight band, they are treated as Genie variance and the changes are kept.
         </p>
       </div>
     </div>
@@ -272,8 +274,8 @@ function ThreeGateDetail() {
 const STEPS: StepDef[] = [
   {
     number: 1,
-    title: "Configuration Analysis",
-    description: "Reads the Genie Space configuration to understand the current setup before making any changes.",
+    title: "Preflight",
+    description: "Loads the Genie Space configuration, discovers benchmarks, and initialises the MLflow experiment, evaluation dataset, and model registrations.",
     icon: Search,
     leaves: [
       { id: "s1-tables", title: "Table Definitions", description: "Parse all table schemas, column names, and data types", icon: Table2 },
@@ -282,6 +284,10 @@ const STEPS: StepDef[] = [
       { id: "s1-functions", title: "Functions", description: "Identify registered TVFs and metric views", icon: Code2 },
       { id: "s1-joins", title: "Join Specifications", description: "Map existing join specifications between tables", icon: Link2 },
       { id: "s1-coverage", title: "Description Coverage", description: "Measure how many columns and tables have descriptions", icon: Filter },
+      { id: "s1-columns", title: "Column Metadata", description: "Fetch descriptions, comments, and tags from Unity Catalog", icon: Database },
+      { id: "s1-profiling", title: "Data Profiling", description: "Profile data distributions, cardinality, and sample values", icon: BarChart3 },
+      { id: "s1-fk", title: "FK Discovery", description: "Detect foreign-key relationships between tables using UC constraints", icon: Link2 },
+      { id: "s1-graph", title: "Metadata Graph", description: "Build a comprehensive metadata graph for optimization decisions", icon: Layers },
     ],
     mlflow: [
       { label: "Experiment Creation", api: "mlflow.set_experiment()", icon: FlaskConical },
@@ -295,31 +301,12 @@ const STEPS: StepDef[] = [
   },
   {
     number: 2,
-    title: "Metadata Collection",
-    description: "Queries Unity Catalog for rich metadata and runs preparatory enrichment stages.",
-    icon: Database,
-    leaves: [
-      { id: "s2-columns", title: "Column Metadata", description: "Fetch descriptions, comments, and tags from Unity Catalog", icon: Database },
-      { id: "s2-profiling", title: "Data Profiling", description: "Profile data distributions, cardinality, and sample values", icon: BarChart3 },
-      { id: "s2-fk", title: "FK Discovery", description: "Detect foreign-key relationships between tables using UC constraints", icon: Link2 },
-      { id: "s2-graph", title: "Metadata Graph", description: "Build a comprehensive metadata graph for optimization decisions", icon: Layers },
-      { id: "s2-prompt", title: "Prompt Matching", description: "Enable format assistance on visible columns and entity matching on STRING columns so Genie shows example values. Deterministic, no LLM. Capped at 120 columns.", icon: Sparkles, variant: "proactive" },
-      { id: "s2-enrich", title: "Description Enrichment", description: "Find columns where both Genie description and UC comment are blank, generate structured descriptions (definition, values, join hints) via Databricks LLM.", icon: Sparkles, variant: "proactive" },
-      { id: "s2-joindisco", title: "Join Discovery", description: "Parse JOINs from baseline SQL results, merge with UC FK constraints, validate type compatibility, and patch new join specifications into the Genie Space.", icon: Sparkles, variant: "proactive" },
-      { id: "s2-instrseed", title: "Instruction Seeding", description: "For spaces with empty or minimal instructions, generates conservative routing instructions via LLM and patches them before the lever loop.", icon: Sparkles, variant: "proactive" },
-    ],
-    mlflow: [
-      { label: "Instruction Versioning", api: "mlflow.genai.register_prompt()", icon: BookMarked },
-    ],
-  },
-  {
-    number: 3,
     title: "Baseline Evaluation",
     description: "Runs all benchmark questions through the Genie API with 9 evaluation judges to establish the current accuracy baseline.",
     icon: BarChart3,
     leaves: [
-      { id: "s3-judges", title: "9 Evaluation Judges", description: "3 deterministic code judges and 6 LLM reasoning judges score every question independently", icon: Scale, detail: JudgesDetail },
-      { id: "s3-arbiter", title: "Arbiter Corrections", description: "When 3+ benchmark questions have arbiter verdict 'genie_correct', the benchmark dataset is updated with Genie's SQL as the new ground truth before the strategist runs.", icon: ShieldCheck, variant: "proactive" },
+      { id: "s2-judges", title: "9 Evaluation Judges", description: "3 deterministic code judges and 6 LLM reasoning judges score every question independently", icon: Scale, detail: JudgesDetail },
+      { id: "s2-arbiter", title: "Arbiter Corrections", description: "When 3+ benchmark questions have arbiter verdict 'genie_correct', the benchmark dataset is updated with Genie's SQL as the new ground truth before the strategist runs", icon: ShieldCheck, variant: "proactive" },
     ],
     mlflow: [
       { label: "MLflow Run", api: "mlflow.start_run()", icon: FlaskConical },
@@ -330,9 +317,26 @@ const STEPS: StepDef[] = [
     ],
   },
   {
+    number: 3,
+    title: "Proactive Enrichment",
+    description: "Before the optimization loop, the pipeline runs a series of deterministic and LLM-powered stages that proactively enrich the Genie Space metadata.",
+    icon: Sparkles,
+    leaves: [
+      { id: "s3-prompt", title: "Prompt Matching", description: "Enable format assistance on visible columns and entity matching on STRING columns so Genie shows example values. Deterministic, no LLM. Capped at 120 columns.", icon: Sparkles, variant: "proactive" },
+      { id: "s3-enrich", title: "Description Enrichment", description: "Find columns where both Genie description and UC comment are blank, generate structured descriptions (definition, values, join hints) via Databricks LLM", icon: Sparkles, variant: "proactive" },
+      { id: "s3-joindisco", title: "Join Discovery", description: "Parse JOINs from baseline SQL results, merge with UC FK constraints, validate type compatibility, and patch new join specifications into the Genie Space", icon: Sparkles, variant: "proactive" },
+      { id: "s3-instrseed", title: "Instruction Seeding", description: "For spaces with empty or minimal instructions, generates conservative routing instructions via LLM and patches them before the lever loop", icon: Sparkles, variant: "proactive" },
+      { id: "s3-spacemeta", title: "Space Metadata", description: "Generate or refine the Genie Space description and sample questions using LLM analysis of the space's tables and columns", icon: Sparkles, variant: "proactive" },
+      { id: "s3-examplesql", title: "Benchmark Example Mining", description: "Extract correct SQL from baseline evaluation results and inject them as example question-SQL pairs into the Genie Space", icon: Sparkles, variant: "proactive" },
+    ],
+    mlflow: [
+      { label: "Instruction Versioning", api: "mlflow.genai.register_prompt()", icon: BookMarked },
+    ],
+  },
+  {
     number: 4,
-    title: "Configuration Generation",
-    description: "An adaptive loop re-clusters failures each iteration, ranks them by impact, generates one targeted action group, applies it, and reflects on the outcome to guide the next iteration.",
+    title: "Adaptive Lever Loop",
+    description: "An adaptive loop re-clusters failures each iteration, ranks them by impact, generates one targeted action group, applies it through 3-gate evaluation, and reflects on the outcome to guide the next iteration.",
     icon: Wrench,
     leaves: [
       { id: "s4-strategist", title: "Adaptive Strategist", description: "Each iteration: re-cluster from latest eval, filter already-tried patches, rank by impact score, then a single LLM call produces exactly one action group", icon: Brain, detail: StrategistDetail },
@@ -340,46 +344,48 @@ const STEPS: StepDef[] = [
       { id: "s4-reflection", title: "Reflection Buffer", description: "Memory of prior iterations (accepted/rolled back, score deltas, do-not-retry list) passed to the strategist to avoid repeating mistakes", icon: Layers },
       { id: "s4-levers", title: "5 Optimization Levers", description: "Tables & Columns, Metric Views, TVFs, Join Specs, and Instructions — each lever is an executor that generates patch proposals", icon: Wrench, detail: LeversDetail },
       { id: "s4-routing", title: "Failure-to-Lever Routing", description: "Judge failure types are automatically mapped to the appropriate optimization lever", icon: GitBranch, detail: FailureRoutingDetail },
-      { id: "s4-fallback", title: "Fallback Retry", description: "When all action groups are rolled back, a conservative single-lever retry using the holistic strategist is attempted as a last resort", icon: RotateCw },
+      { id: "s4-gates", title: "3-Gate Evaluation", description: "Slice Eval, P0 Eval, and Full Eval with confirmation — the Full gate runs a confirmation pass if accuracy did not improve, averaging both to smooth Genie non-determinism", icon: ShieldCheck, detail: ThreeGateDetail },
+      { id: "s4-rollback", title: "Rollback Protection", description: "Regressions cause automatic rollback, but single-question noise is filtered — if all regressions fall within one question's weight band, they're treated as Genie variance and the changes are kept", icon: Repeat },
+      { id: "s4-arbiter", title: "Per-Iteration Arbiter Corrections", description: "After each evaluation, arbiter corrections update the benchmark ground truth for questions Genie answered correctly — this runs every iteration, not just at baseline", icon: ShieldCheck, variant: "proactive" },
+      { id: "s4-quarantine", title: "Persistence Quarantine", description: "Questions that persistently fail across multiple iterations are quarantined from future analysis and flagged for human review", icon: Ban },
+      { id: "s4-fallback", title: "Holistic Fallback", description: "On the first iteration, if the adaptive strategist returns zero action groups, a holistic single-lever fallback strategy is attempted", icon: RotateCw },
+      { id: "s4-convergence", title: "Convergence Criteria", description: "Loop stops when: (1) all thresholds met, (2) diminishing returns (last 2 iterations each < 2% gain), (3) 2 consecutive rollbacks, (4) no actionable clusters remain, or (5) max iterations reached (default: 3)", icon: Target },
     ],
     mlflow: [
       { label: "Tracing Spans", api: "mlflow.start_span()", icon: Activity },
       { label: "LoggedModel per Iteration", api: "mlflow.initialize_logged_model()", icon: Box },
-    ],
-  },
-  {
-    number: 5,
-    title: "Optimized Evaluation",
-    description: "Each action group's changes pass through a 3-gate evaluation system. Only improvements that survive all gates are kept.",
-    icon: CheckCircle2,
-    leaves: [
-      { id: "s5-gates", title: "3-Gate Evaluation", description: "Slice Eval, P0 Eval, and Full Eval with confirmation — the Full gate runs twice and averages scores to smooth Genie non-determinism", icon: ShieldCheck, detail: ThreeGateDetail },
-      { id: "s5-rollback", title: "Rollback Protection", description: "Regressions cause automatic rollback, but single-question noise is filtered — if all regressions fall within one question's weight band, they're treated as Genie variance and the changes are kept", icon: Repeat },
-      { id: "s5-convergence", title: "Convergence", description: "Pipeline stops when all thresholds are met, diminishing returns are detected (last N iterations each improved by less than epsilon), no actionable clusters remain, or max iterations reached", icon: Target },
-    ],
-    mlflow: [
       { label: "3-Gate Evaluations", api: "mlflow.genai.evaluate()", icon: Scale },
       { label: "Gate Feedback", api: "mlflow.log_feedback()", icon: MessageCircle },
       { label: "ASI Feedback", api: "mlflow.log_feedback()", icon: MessageCircle },
       { label: "Instruction Versioning", api: "mlflow.genai.register_prompt()", icon: BookMarked },
-      { label: "LoggedModel per Iteration", api: "mlflow.initialize_logged_model()", icon: Box },
     ],
   },
   {
-    number: 6,
+    number: 5,
     title: "Finalization",
-    description: "After the optimization loop completes, the pipeline runs final verification and publishes results.",
+    description: "After the optimization loop completes, the pipeline runs repeatability tests, promotes the champion model, creates a review session, and optionally writes descriptions back to Unity Catalog.",
     icon: Flag,
     leaves: [
-      { id: "s6-repeat", title: "Repeatability Tests", description: "2 additional full evaluation passes confirm improvements are stable and non-flaky across independent runs", icon: Repeat },
-      { id: "s6-publish", title: "Benchmark Publishing", description: "Push updated benchmark questions and ground-truth SQL back to the Genie Space for future evaluations", icon: Upload },
-      { id: "s6-uc", title: "UC Write-backs", description: "When apply_mode includes uc_artifact, column and table descriptions are written back to Unity Catalog via ALTER TABLE ... COMMENT. Executes under the user's OBO identity, only replays non-rolled-back patches.", icon: Database, variant: "optional" },
+      { id: "s5-repeat", title: "Repeatability Tests", description: "2 additional full evaluation passes confirm improvements are stable and non-flaky across independent runs", icon: Repeat },
+      { id: "s5-publish", title: "Benchmark Publishing", description: "Push updated benchmark questions and ground-truth SQL back to the Genie Space for future evaluations", icon: Upload },
+      { id: "s5-review", title: "Review Session", description: "Creates an MLflow labeling session from the final evaluation so domain experts can review flagged questions", icon: UserCheck },
+      { id: "s5-uc", title: "UC Write-backs", description: "When apply_mode includes uc_artifact, column and table descriptions are written back to Unity Catalog via ALTER TABLE ... COMMENT. Executes under the user's OBO identity, only replays non-rolled-back patches.", icon: Database, variant: "optional" },
     ],
     mlflow: [
       { label: "Repeatability Evaluation", api: "mlflow.genai.evaluate()", icon: Scale },
       { label: "Champion Promotion", api: 'mlflow.set_logged_model_alias("champion")', icon: Award },
       { label: "Review Session", api: "mlflow.genai.labeling.create_labeling_session()", icon: UserCheck },
     ],
+  },
+  {
+    number: 6,
+    title: "Deploy",
+    description: "Optionally deploys the optimized configuration to the target Genie Space environment.",
+    icon: Rocket,
+    leaves: [
+      { id: "s6-deploy", title: "Optional Deployment", description: "When enabled, the optimized configuration is pushed to the target Genie Space, replacing the previous configuration with the champion model's metadata", icon: Rocket, variant: "optional" },
+    ],
+    mlflow: [],
   },
 ];
 

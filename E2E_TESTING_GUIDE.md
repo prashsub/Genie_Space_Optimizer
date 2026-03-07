@@ -819,6 +819,10 @@ WHERE run_id = '<run_id>' AND iteration = 0
 
 **Important:** If `thresholds_met = true` after baseline, the lever loop will skip early (this is correct behavior, not a failure).
 
+**Temporal-stale benchmark handling:** Before scoring, `_flag_stale_temporal_benchmarks()` runs each benchmark's GT SQL via Spark. Benchmarks whose GT SQL returns 0 rows (due to stale temporal references like "this year" or "last quarter") are flagged `temporal_stale=True` and excluded from the accuracy denominator.
+
+**`both_empty` comparison handling:** When both the GT SQL and Genie's generated SQL return 0 rows, the comparison result is `both_empty`. These results, along with `genie_result_unavailable` errors, are excluded from the accuracy denominator so they don't inflate or deflate scores.
+
 #### Task 3: `lever_loop`
 
 **What it does:** Runs in three phases:
@@ -836,10 +840,14 @@ WHERE run_id = '<run_id>' AND iteration = 0
    - Applies patches in risk order (low → medium → high)
    - Propagation wait: 90s if value dictionary changes, 30s otherwise
    - Runs **3-gate evaluation** (slice → P0 → full) with noise-floor-adjusted tolerances
-   - Rolls back if any gate detects regression beyond the effective threshold (default `REGRESSION_THRESHOLD=10.0%`, adjusted upward for small benchmark sets)
+   - Rolls back if any gate detects regression beyond the effective threshold (default `REGRESSION_THRESHOLD=5.0%`, adjusted upward for small benchmark sets)
    - On acceptance: updates best scores, registers instruction version snapshot, refreshes reference SQLs
    - **Lever 4** always runs its join discovery path (even without join failure clusters), detecting implicit joins from successful Genie queries and proposing explicit documentation
    - **Lever 5** generates a holistic instruction rewrite using `LEVER_5_HOLISTIC_PROMPT` (inspired by [AgentSkills.io](https://agentskills.io/specification)), considering the space's purpose, all benchmark evaluation learnings, prior lever tweaks, and both hard failure clusters and soft signal clusters. Produces a `rewrite_instruction` patch that replaces the full instruction body.
+
+**Connection pool initialization:** At job startup, `optimize_genie_space()` calls `configure_connection_pool(w, CONNECTION_POOL_SIZE)` (default 20) to increase the urllib3 pool on the `WorkspaceClient`, preventing "Connection pool is full" warnings under concurrent evaluation load.
+
+**Resume state restoration:** On task retry, `_resume_lever_loop()` restores `reflection_buffer`, `tried_patches`, `tried_root_causes`, and `skill_exemplars` from the `reflection_json` column on `genie_opt_iterations` Delta table. This ensures the adaptive strategist resumes with full context (DO NOT RETRY list, proven patterns) rather than starting from scratch.
 
 | Error Pattern | Likely Cause | Resolution |
 |--------------|-------------|------------|
@@ -935,6 +943,7 @@ ORDER BY started_at
 | **Job terminated but run still shows IN_PROGRESS** | Delta state not updated | Load the space detail page -- `_reconcile_active_runs()` will check job state and update Delta. |
 | **`convergence_reason: job_submission_error`** | Run created but job never started | Check app logs for the specific error. Common causes: SP lacks job creation permission, workspace at compute limits. |
 | **NaN/Inf in scores** | JSON serialization error in frontend | Backend scrubs NaN/Inf to null via `_scrub_nan()`. If you see NaN in API responses, this is a bug -- report it. |
+| **Connection pool is full** | urllib3 warnings during concurrent evaluation | Automatically configured at startup via `configure_connection_pool(w, CONNECTION_POOL_SIZE=20)`. If warnings persist, increase `CONNECTION_POOL_SIZE` in `config.py`. |
 
 ### How to Read the `convergence_reason` Field
 
@@ -944,7 +953,7 @@ The `convergence_reason` on a run tells you exactly what happened:
 |-------|---------|
 | `threshold_met` | All quality thresholds met (CONVERGED) |
 | `no_further_improvement` | No levers improved score enough (STALLED) |
-| `max_iterations` | Hit 5 iteration limit (MAX_ITERATIONS) |
+| `max_iterations` | Hit 3 iteration limit (MAX_ITERATIONS) |
 | `baseline_meets_thresholds` | No optimization needed — baseline already converged |
 | `finalize_timeout` | Finalize exceeded soft timeout (default 6600s, FAILED) |
 | `finalize_error` | Unhandled exception during finalize (FAILED) |
@@ -1138,8 +1147,13 @@ databricks apps logs genie-space-optimizer -p <profile>
 - [ ] Preflight returns `human_corrections` from prior labeling session (if available)
 - [ ] Preflight `_validate_write_access()`: fails fast if `apply_mode=both/uc_artifact` and MODIFY missing
 - [ ] Baseline eval completes: scores recorded in `genie_opt_iterations` with iteration=0
+- [ ] Baseline temporal-stale benchmarks flagged (GT SQL returns 0 rows) and excluded from accuracy
+- [ ] Baseline `both_empty` comparisons (both GT and Genie return 0 rows) excluded from accuracy
 - [ ] Baseline labeling session auto-created for failure trace IDs
 - [ ] Baseline traces tagged with `genie.optimization_run_id`, `genie.iteration`, `genie.eval_scope`
+- [ ] Connection pool configured at job startup (`configure_connection_pool`, `CONNECTION_POOL_SIZE=20`)
+- [ ] `fetch_genie_result_df` retries up to 3 times on PENDING/RUNNING statements with linear backoff
+- [ ] Lever loop resume restores `reflection_buffer`, `tried_patches`, `tried_root_causes`, `skill_exemplars` from Delta
 - [ ] Lever loop applies human benchmark corrections from prior labeling session (if any)
 - [ ] Lever loop Stage 2.5: prompt matching auto-config applied (format assistance + entity matching)
 - [ ] Lever loop Stage 2.75: proactive description enrichment for insufficient columns (< 10 chars)

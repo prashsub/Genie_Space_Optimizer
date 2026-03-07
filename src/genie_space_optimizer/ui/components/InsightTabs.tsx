@@ -22,9 +22,12 @@ import {
   ExternalLink,
   ChevronDown,
   ChevronRight,
+  Layers,
+  RotateCcw,
 } from "lucide-react";
 import type {
   IterationDetailResponse,
+  ProactiveChanges,
   QuestionResult,
 } from "@/lib/transparency-api";
 import type { StageEvent } from "@/components/StageTimeline";
@@ -90,6 +93,45 @@ export function InsightTabs({
   );
 }
 
+const PROACTIVE_LABELS: Record<keyof ProactiveChanges, string> = {
+  descriptionsEnriched: "Column descriptions enriched",
+  tablesEnriched: "Table descriptions enriched",
+  joinSpecsDiscovered: "Join specs discovered",
+  spaceDescriptionGenerated: "Space description generated",
+  sampleQuestionsGenerated: "Sample questions generated",
+  instructionsSeeded: "Instructions seeded",
+  promptsMatched: "Prompts matched",
+  exampleSqlsMined: "Example SQLs mined",
+};
+
+function ProactiveEnrichmentCard({ proactive }: { proactive: ProactiveChanges }) {
+  const entries = (Object.entries(proactive) as [keyof ProactiveChanges, unknown][]).filter(
+    ([, v]) => v !== false && v !== 0 && v != null,
+  );
+  if (entries.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <Activity className="h-4 w-4 text-violet-500" />
+          Pre-Loop Enrichment
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="flex flex-wrap gap-2">
+          {entries.map(([key, value]) => (
+            <Badge key={key} variant="outline" className="border-violet-200 text-violet-700">
+              {PROACTIVE_LABELS[key]}
+              {typeof value === "number" ? `: ${value}` : ""}
+            </Badge>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function OverviewTab({
   runId,
   detail,
@@ -121,6 +163,8 @@ function OverviewTab({
         <IterationChart runId={runId} />
         <StageTimeline stageEvents={stageEvents} />
       </div>
+
+      {detail.proactiveChanges && <ProactiveEnrichmentCard proactive={detail.proactiveChanges} />}
 
       {judgeProgressionData.length > 0 && (
         <Card>
@@ -175,6 +219,91 @@ function OverviewTab({
                   ))}
                 </TableBody>
               </Table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Optimization Narrative */}
+      {detail.iterations.some(i => i.iteration > 0 && i.reflection) && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <Layers className="h-4 w-4 text-violet-500" />
+              Optimization Narrative
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-3">
+              {detail.iterations
+                .filter(i => i.iteration > 0 && i.reflection)
+                .map(iter => {
+                  const r = iter.reflection!;
+                  const accepted = r.accepted;
+                  return (
+                    <div
+                      key={iter.iteration}
+                      className={`flex items-start gap-3 rounded-lg border px-3 py-2.5 ${
+                        accepted
+                          ? "border-green-200 bg-green-50/50"
+                          : "border-red-200 bg-red-50/50"
+                      }`}
+                    >
+                      <Badge
+                        variant="outline"
+                        className={`shrink-0 mt-0.5 ${
+                          accepted
+                            ? "border-green-300 text-green-700"
+                            : "border-red-300 text-red-700"
+                        }`}
+                      >
+                        {accepted ? (
+                          <CheckCircle2 className="mr-1 h-3 w-3" />
+                        ) : (
+                          <RotateCcw className="mr-1 h-3 w-3" />
+                        )}
+                        Iter {iter.iteration}
+                      </Badge>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs leading-relaxed">
+                          {r.reflectionText || "—"}
+                        </p>
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                          {r.refinementMode && (
+                            <Badge
+                              variant="outline"
+                              className={`text-[9px] px-1.5 py-0 ${
+                                r.refinementMode === "in_plan"
+                                  ? "border-blue-300 text-blue-700"
+                                  : "border-orange-300 text-orange-700"
+                              }`}
+                            >
+                              {r.refinementMode.replace("_", " ")}
+                            </Badge>
+                          )}
+                          {r.fixedQuestions.length > 0 && (
+                            <Badge variant="outline" className="text-[9px] px-1.5 py-0 border-green-300 text-green-700">
+                              {r.fixedQuestions.length} fixed
+                            </Badge>
+                          )}
+                          {r.newRegressions.length > 0 && (
+                            <Badge variant="outline" className="text-[9px] px-1.5 py-0 border-red-300 text-red-700">
+                              {r.newRegressions.length} regressed
+                            </Badge>
+                          )}
+                        </div>
+                      </div>
+                      <span
+                        className={`shrink-0 text-xs font-semibold tabular-nums ${
+                          r.accuracyDelta >= 0 ? "text-green-600" : "text-red-500"
+                        }`}
+                      >
+                        {r.accuracyDelta >= 0 ? "+" : ""}
+                        {r.accuracyDelta.toFixed(1)}%
+                      </span>
+                    </div>
+                  );
+                })}
             </div>
           </CardContent>
         </Card>

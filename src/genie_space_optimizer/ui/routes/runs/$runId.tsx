@@ -76,8 +76,8 @@ const TERMINAL_STATUSES = [
 const STEP_DESCRIPTIONS: Record<number, string> = {
   1: "Reads the Genie Space configuration — tables, instructions, sample questions, and functions — to understand the current setup.",
   2: "Queries Unity Catalog for column-level metadata, tags, descriptions, and data profiles used to inform optimization decisions.",
-  3: "Runs all benchmark questions through the Genie API with 8 evaluation judges to establish the current accuracy baseline.",
-  4: "Applies up to 6 optimization levers (descriptions, instructions, synonyms, filters, etc.) and evaluates each change.",
+  3: "Runs all benchmark questions through the Genie API with 9 evaluation judges to establish the current accuracy baseline.",
+  4: "Applies 5 optimization levers (table/column metadata, metric views, TVFs, join specs, instructions) and evaluates each change.",
   5: "Final evaluation pass on the optimized configuration with repeatability checks to confirm stable improvements.",
 };
 
@@ -893,9 +893,53 @@ function StepInsights({
     const iterationCounter = outputs.iterationCounter as number | undefined;
     const baselineAccuracy = outputs.baselineAccuracy as number | undefined;
     const bestAccuracy = outputs.bestAccuracy as number | undefined;
+    const proactive = outputs.proactiveChanges as Record<string, unknown> | undefined;
 
     return (
       <div className="space-y-2 text-xs">
+        {proactive && Object.keys(proactive).length > 0 && (
+          <div className="space-y-1">
+            <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Pre-loop enrichment</p>
+            <div className="flex flex-wrap gap-1.5">
+              {(proactive.descriptionsEnriched as number) > 0 && (
+                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                  Descriptions: {proactive.descriptionsEnriched as number} cols
+                </Badge>
+              )}
+              {(proactive.tablesEnriched as number) > 0 && (
+                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                  Tables described: {proactive.tablesEnriched as number}
+                </Badge>
+              )}
+              {(proactive.joinSpecsDiscovered as number) > 0 && (
+                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                  Joins discovered: {proactive.joinSpecsDiscovered as number}
+                </Badge>
+              )}
+              {proactive.spaceDescriptionGenerated && (
+                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">Space description generated</Badge>
+              )}
+              {(proactive.sampleQuestionsGenerated as number) > 0 && (
+                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                  Sample questions: {proactive.sampleQuestionsGenerated as number}
+                </Badge>
+              )}
+              {proactive.instructionsSeeded && (
+                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">Instructions seeded</Badge>
+              )}
+              {(proactive.promptsMatched as number) > 0 && (
+                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                  Prompts matched: {proactive.promptsMatched as number}
+                </Badge>
+              )}
+              {(proactive.exampleSqlsMined as number) > 0 && (
+                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                  Example SQLs: {proactive.exampleSqlsMined as number}
+                </Badge>
+              )}
+            </div>
+          </div>
+        )}
         <div className="flex flex-wrap gap-2">
           {patchesApplied != null && <Badge variant="secondary">Patches applied: {patchesApplied}</Badge>}
           <Badge variant="secondary">Levers accepted: {leversAccepted.length}</Badge>

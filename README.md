@@ -19,7 +19,7 @@ Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 │  │ Analysis │   │ Eval     │   │  Loop    │   │ & Report │       │
 │  └──────────┘   └──────────┘   └──────────┘   └──────────┘       │
 │       │              │              │               │              │
-│  Config scan    9 LLM judges   6 levers ×5     Repeatability      │
+│  Config scan    9 LLM judges   5 levers ×3     Repeatability      │
 │  UC metadata    20 benchmarks  iterations       Final scores       │
 │  Validation     7 dimensions   Auto-rollback    Deploy (opt.)      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -156,7 +156,7 @@ Genie_Space_Optimizer/
 │   │   ├── harness.py                # Full pipeline orchestration
 │   │   ├── preflight.py              # Pre-flight validation
 │   │   ├── labeling.py               # MLflow labeling sessions (overwrite-based schema creation, batched trace population, console diagnostics)
-│   │   ├── state.py                  # Delta-backed state machine (6 tables + provenance)
+│   │   ├── state.py                  # Delta-backed state machine (8 tables incl. provenance)
 │   │   ├── benchmarks.py             # Benchmark question definitions
 │   │   ├── repeatability.py          # Repeatability testing & variance classification
 │   │   ├── report.py                 # Run report generation
@@ -176,7 +176,7 @@ Genie_Space_Optimizer/
 │   └── jobs/                         # Databricks Job entry points
 │       ├── run_preflight.py          # Task 1: config analysis & metadata collection
 │       ├── run_baseline.py           # Task 2: baseline evaluation & benchmark generation
-│       ├── run_lever_loop.py         # Task 3: iterative optimization (6 levers × 5 iterations)
+│       ├── run_lever_loop.py         # Task 3: iterative optimization (5 levers × 3 iterations)
 │       ├── run_evaluation_only.py    # Standalone evaluation (called by other tasks)
 │       ├── run_optimization.py       # Single-entry-point optimization runner
 │       ├── run_finalize.py           # Task 4: repeatability tests & final report
@@ -289,7 +289,7 @@ Environment variables (set via `databricks.yml`):
 | `GENIE_SPACE_OPTIMIZER_EVAL_DEBUG` | Enable verbose evaluation logging | `true` |
 | `GENIE_SPACE_OPTIMIZER_EVAL_MAX_ATTEMPTS` | Max retry attempts per evaluation query | `4` |
 
-All optimization parameters (thresholds, rate limits, iterations, LLM config) are centralized in `src/genie_space_optimizer/common/config.py` and can be tuned without code changes. See [Appendix A -- Configuration Reference](docs/genie-space-optimizer-design/appendices/A-configuration-reference.md) for the full parameter list.
+All optimization parameters (thresholds, rate limits, iterations, LLM config, connection pool size) are centralized in `src/genie_space_optimizer/common/config.py` and can be tuned without code changes. Notable code-level constants include `CONNECTION_POOL_SIZE` (default `20`, controls urllib3 pool for concurrent API calls) and `ENABLE_SLICE_GATE` (default `False`, per-dimension regression gate). See [Appendix A -- Configuration Reference](docs/genie-space-optimizer-design/appendices/A-configuration-reference.md) for the full parameter list.
 
 ### Permissions
 

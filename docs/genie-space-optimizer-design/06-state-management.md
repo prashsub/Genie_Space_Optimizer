@@ -227,6 +227,21 @@ The backend reads state via `state.load_run()`, `state.load_stages()`, `state.lo
 - NaN/Inf scrubbing via `_scrub_nan()`
 - Partition pruning on `run_id`
 
+`load_all_full_iterations()` auto-parses JSON columns including `scores_json`, `failures_json`, `arbiter_actions_json`, `repeatability_json`, `rows_json`, and `reflection_json`.
+
+### Resume State Reconstruction
+
+When the lever loop task retries after a transient failure, `_resume_lever_loop()` reconstructs the optimizer's strategic context from Delta by reading all iterations for the run:
+
+| Restored State | Source | Purpose |
+|---------------|--------|---------|
+| `reflection_buffer` | `reflection_json` on each iteration | Full history for the adaptive strategist prompt |
+| `tried_patches` | `do_not_retry` entries in reflection | Prevents repeating rolled-back approaches |
+| `tried_root_causes` | Root causes from failed iterations | Feeds into the DO NOT RETRY list |
+| `skill_exemplars` | Accepted iterations with >= 1% gain | Proven patterns for the strategist |
+
+This ensures the loop resumes with complete knowledge of past iterations rather than starting fresh.
+
 ### Writing State
 
 State writes use `state.create_run()`, `state.update_run_status()`, `state.write_stage()`, `state.write_iteration()`, `state.write_patch()`. These append to Delta tables with automatic schema evolution.

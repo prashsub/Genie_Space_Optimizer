@@ -44,6 +44,7 @@ These define the target scores for each quality dimension. If all are met, the r
 | `SQL_STATEMENT_POLL_LIMIT` | 30 | -- | Max SQL statement polls |
 | `SQL_STATEMENT_POLL_INTERVAL` | 2 | -- | SQL statement poll interval (seconds) |
 | `INLINE_EVAL_DELAY` | 12 | -- | Delay between inline eval queries |
+| `CONNECTION_POOL_SIZE` | 20 | -- | urllib3 connection pool size on WorkspaceClient |
 
 ---
 

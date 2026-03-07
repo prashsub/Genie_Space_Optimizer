@@ -83,6 +83,7 @@ The `convergence_reason` field on a run tells you exactly what happened:
 | Stale run stuck in QUEUED | No progress for >10 min | Load space detail page to trigger reconciliation |
 | Job terminated but run shows IN_PROGRESS | Delta state not updated | Load space detail page for reconciliation |
 | NaN/Inf in scores | JSON serialization error | Backend scrubs to null; if you see NaN, report a bug |
+| Connection pool is full | urllib3 warnings during concurrent eval | Auto-configured at startup (`CONNECTION_POOL_SIZE=20`); increase if warnings persist |
 
 ---
 
@@ -114,6 +115,18 @@ The preflight uses the UC REST API by default. If it falls back to Spark SQL and
 ### Benchmark dates look stale
 
 The optimizer auto-detects and rewrites relative time references. Explicit years (e.g., "for 2024") are not rewritten. If dates still look wrong, manually check the benchmark SQL.
+
+### Many benchmarks flagged as "temporal-stale"
+
+The optimizer runs each temporal benchmark's GT SQL via Spark before scoring. If the GT SQL returns 0 rows (typically because date-relative filters no longer match any data), the benchmark is flagged `temporal_stale=True` and excluded from the accuracy denominator. If many benchmarks are flagged, the underlying data may not cover the current time period. Consider regenerating benchmarks with `TARGET_BENCHMARK_COUNT` or checking that the source tables contain recent data.
+
+### "Connection pool is full, discarding connection" warnings
+
+The optimizer automatically configures a larger urllib3 connection pool (`CONNECTION_POOL_SIZE = 20`) on the `WorkspaceClient` at job startup via `configure_connection_pool()`. If warnings persist despite this, increase `CONNECTION_POOL_SIZE` in `config.py`. This typically happens during concurrent evaluation where many Genie API calls, Statement Execution API polls, and LLM judge calls run simultaneously.
+
+### Both GT and Genie SQL return 0 rows (`both_empty`)
+
+When both the ground-truth SQL and Genie's generated SQL return 0 rows, the comparison result is `both_empty`. This is not an error -- it typically means both queries use filters that don't match current data (e.g., date ranges with no records). These comparisons are excluded from the accuracy denominator and do not affect the optimization score.
 
 ### Score didn't improve
 

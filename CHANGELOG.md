@@ -6,6 +6,36 @@ All notable changes to the Genie Space Optimizer are documented here.
 
 ## [Unreleased]
 
+### Added — Connection Pooling, Temporal-Stale Flagging, Resume State, Both-Empty Handling
+- **Connection pool sizing** (`config.py`, `genie_client.py`, `harness.py`): new
+  `CONNECTION_POOL_SIZE = 20` constant; `configure_connection_pool()` increases
+  urllib3 connection pool on `WorkspaceClient` to prevent "Connection pool is full,
+  discarding connection" warnings under concurrent evaluation load. Applied
+  automatically at `optimize_genie_space()` startup.
+- **`fetch_genie_result_df()` retry logic** (`genie_client.py`): now retries up to
+  3 times with linear backoff (2s base delay) when the statement is still
+  `PENDING`/`RUNNING` or results are transiently unavailable.
+- **Temporal-stale benchmark flagging** (`evaluation.py`): new
+  `_flag_stale_temporal_benchmarks()` runs GT SQL via Spark and flags benchmarks
+  returning 0 rows as `temporal_stale=True`. Flagged benchmarks are excluded from
+  the accuracy denominator in `_compute_arbiter_adjusted_accuracy()`.
+- **`both_empty` comparison handling** (`evaluation.py`): new comparison result type
+  when both GT and Genie SQL return 0 rows. `both_empty` and
+  `genie_result_unavailable` error types now excluded from the accuracy denominator
+  alongside GT infrastructure failures and quarantined questions.
+- **Resume state restoration** (`harness.py`, `state.py`): `_resume_lever_loop()`
+  now restores `reflection_buffer`, `tried_patches`, `tried_root_causes`, and
+  `skill_exemplars` from Delta `genie_opt_iterations.reflection_json` column. The
+  lever loop resumes with full strategic context instead of starting fresh.
+- **`reflection_json` parsing** (`state.py`): `load_all_full_iterations()` now
+  auto-parses the `reflection_json` JSON column alongside other JSON columns.
+
+### Fixed
+- Filtered `None` values from `skill_exemplars` patch_types in `harness.py` and
+  `optimizer.py` to prevent `TypeError` in adaptive strategist prompt formatting.
+
+---
+
 ### Changed — Labeling Module Simplification, Console Diagnostics
 - **Simplified label schema creation** (`labeling.py`): removed the defensive
   `_create_or_reuse_schema()` helper; schemas are now defined in a data-driven list

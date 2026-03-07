@@ -414,3 +414,4 @@ class IterationDetailResponse(SafeModel):
     iterations: list[IterationDetail]
     flaggedQuestions: list[dict] = []
     labelingSessionUrl: str | None = None
+    proactiveChanges: dict | None = None

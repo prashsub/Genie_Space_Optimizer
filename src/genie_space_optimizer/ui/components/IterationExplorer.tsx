@@ -193,13 +193,51 @@ function IterationView({
             </>
           )}
           {iteration.reflection && (
-            <div className="mt-2 rounded bg-muted/50 p-2">
+            <div className="mt-2 space-y-2 rounded bg-muted/50 p-2">
               <p className="mb-1 font-medium text-muted-foreground">Reflection</p>
               <p>{iteration.reflection.reflectionText || "—"}</p>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {iteration.reflection.refinementMode && (
+                  <Badge
+                    variant="outline"
+                    className={`text-[9px] px-1.5 py-0 ${
+                      iteration.reflection.refinementMode === "in_plan"
+                        ? "border-blue-300 text-blue-700"
+                        : "border-orange-300 text-orange-700"
+                    }`}
+                  >
+                    {iteration.reflection.refinementMode.replace("_", " ")}
+                  </Badge>
+                )}
+                {iteration.reflection.fixedQuestions.length > 0 && (
+                  <Badge variant="outline" className="text-[9px] px-1.5 py-0 border-green-300 text-green-700">
+                    {iteration.reflection.fixedQuestions.length} fixed
+                  </Badge>
+                )}
+                {iteration.reflection.newRegressions.length > 0 && (
+                  <Badge variant="outline" className="text-[9px] px-1.5 py-0 border-red-300 text-red-700">
+                    {iteration.reflection.newRegressions.length} regressed
+                  </Badge>
+                )}
+              </div>
               {iteration.reflection.rollbackReason && (
-                <p className="mt-1 text-red-500">
+                <p className="text-red-500">
                   Rollback: {iteration.reflection.rollbackReason}
                 </p>
+              )}
+              {iteration.reflection.doNotRetry.length > 0 && (
+                <details className="text-[11px]">
+                  <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                    {iteration.reflection.doNotRetry.length} patch type(s) will not be retried
+                  </summary>
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {iteration.reflection.doNotRetry.map((item) => (
+                      <Badge key={item} variant="secondary" className="text-[9px]">
+                        {item}
+                      </Badge>
+                    ))}
+                  </div>
+                </details>
               )}
             </div>
           )}

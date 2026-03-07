@@ -265,12 +265,12 @@ _STEP_DEFINITIONS: list[_StepDefinition] = [
         "stepNumber": 3,
         "name": "Baseline Evaluation",
         "stage_prefixes": ["BASELINE_EVAL"],
-        "summary_template": "Evaluated {questions} benchmark questions with 8 judges. Baseline score: {score}%",
+        "summary_template": "Evaluated {questions} benchmark questions with 9 judges. Baseline score: {score}%",
     },
     {
         "stepNumber": 4,
         "name": "Configuration Generation",
-        "stage_prefixes": ["LEVER_", "AG_"],
+        "stage_prefixes": ["LEVER_", "AG_", "DESCRIPTION_ENRICHMENT", "JOIN_DISCOVERY", "SPACE_METADATA", "INSTRUCTION_SEED", "PROMPT_MATCH", "EXAMPLE_SQL"],
         "summary_template": "Applied {patches} optimizations across {levers} categories. Score improved from {before}% to {after}%",
     },
     {
@@ -376,6 +376,31 @@ def map_stages_to_steps(
         )
 
     return steps
+
+
+def _extract_proactive_changes(matching: list[dict]) -> dict:
+    """Scan matched stages for proactive pre-loop enrichment results."""
+    proactive: dict = {}
+    for s in matching:
+        stage_name = str(s.get("stage", ""))
+        d = _parse_detail(s)
+        if not d:
+            continue
+        if "DESCRIPTION_ENRICHMENT" in stage_name:
+            proactive["descriptionsEnriched"] = d.get("total_enriched", 0)
+            proactive["tablesEnriched"] = d.get("tables_enriched", 0)
+        elif "JOIN_DISCOVERY" in stage_name:
+            proactive["joinSpecsDiscovered"] = d.get("total_applied", 0)
+        elif "SPACE_METADATA" in stage_name:
+            proactive["spaceDescriptionGenerated"] = d.get("description_generated", False)
+            proactive["sampleQuestionsGenerated"] = d.get("questions_count", 0)
+        elif "INSTRUCTION_SEED" in stage_name:
+            proactive["instructionsSeeded"] = d.get("instructions_seeded", False)
+        elif "PROMPT_MATCH" in stage_name:
+            proactive["promptsMatched"] = d.get("total_matched", 0)
+        elif "EXAMPLE_SQL" in stage_name:
+            proactive["exampleSqlsMined"] = d.get("total_mined", 0)
+    return proactive
 
 
 def _build_step_io(
@@ -649,6 +674,8 @@ def _build_step_io(
         levers_accepted = detail.get("levers_accepted", [])
         levers_rolled_back = detail.get("levers_rolled_back", [])
 
+        proactive = _extract_proactive_changes(matching)
+
         return (
             {
                 "leverCountConfigured": len(run_data.get("levers", []))
@@ -663,6 +690,7 @@ def _build_step_io(
                 "iterationCounter": iteration_counter,
                 "baselineAccuracy": run_data.get("baseline_accuracy"),
                 "bestAccuracy": _safe_float(run_data.get("best_accuracy")),
+                "proactiveChanges": proactive if proactive else None,
                 "stageEvents": timeline,
             },
         )
@@ -1980,6 +2008,8 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
 
     labeling_url = run_data.get("labeling_session_url")
 
+    proactive = _extract_proactive_changes(stages_rows)
+
     return IterationDetailResponse(
         runId=run_id,
         spaceId=run_data.get("space_id", ""),
@@ -1989,6 +2019,7 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
         iterations=iterations,
         flaggedQuestions=flagged,
         labelingSessionUrl=labeling_url,
+        proactiveChanges=proactive if proactive else None,
     )
 
 

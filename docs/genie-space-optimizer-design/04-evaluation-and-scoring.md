@@ -95,6 +95,34 @@ The `_detect_temporal_intent()` function scans question text using regex pattern
 
 Explicit years in the question text (e.g., "for 2024") are **not** rewritten -- these are assumed to be intentional.
 
+### Temporal-Stale Benchmark Flagging
+
+After temporal date rewriting, the optimizer runs a second pass: `_flag_stale_temporal_benchmarks()` executes each temporal benchmark's GT SQL via Spark and checks whether it returns any rows. Benchmarks whose GT SQL returns 0 rows (e.g., because the underlying data doesn't extend to the rewritten date range) are flagged `temporal_stale=True`. These benchmarks are excluded from the accuracy denominator entirely, preventing false failures from data gaps that are not the Genie Space's fault.
+
+The log message `Flagged N/M benchmarks as temporal-stale (excluded from accuracy)` is emitted when flagging occurs.
+
+---
+
+## Result Comparison
+
+### Comparison Types
+
+When comparing GT and Genie SQL results, the evaluation produces one of several comparison outcomes:
+
+| Comparison Type | Condition | Accuracy Impact |
+|----------------|-----------|-----------------|
+| `match` | Results match (exact, subset, or fuzzy) | Counted as correct |
+| `mismatch` | Results differ | Counted as failure |
+| `genie_result_unavailable` | Genie produced no result | Excluded from denominator |
+| `both_empty` | Both GT and Genie SQL returned 0 rows | Excluded from denominator |
+| `gt_infra_error` | GT SQL hit infrastructure error | Excluded from denominator |
+
+The `both_empty` comparison type was introduced to handle cases where neither query returns data (e.g., both use date filters that no longer match any records). Rather than treating this as a failure, it is excluded from scoring.
+
+### `fetch_genie_result_df()` Retry Behavior
+
+The helper that retrieves Genie's query results via the Statement Execution API retries up to 3 times with linear backoff (2s base delay) when the statement is still `PENDING` or `RUNNING`, or when results are transiently unavailable. This prevents premature `genie_result_unavailable` comparisons caused by slow-executing statements.
+
 ---
 
 ## The 9-Judge Scoring Framework
@@ -169,6 +197,14 @@ The overall accuracy calculation uses arbiter verdicts to correct the raw scores
 - `genie_correct` and `both_correct` verdicts are counted as **correct** (overriding individual judge failures)
 - `ground_truth_correct` and `neither_correct` verdicts use the individual judge scores as-is
 - This prevents the optimizer from chasing false failures caused by stale benchmark SQL
+
+The following are **excluded from the denominator** entirely (they neither help nor hurt the score):
+
+- GT infrastructure failures (`result_correctness == "excluded"`)
+- Quarantined questions (repeated `neither_correct` with failed GT repair)
+- Temporal-stale benchmarks (GT SQL returns 0 rows due to date drift)
+- `both_empty` comparisons (both GT and Genie returned 0 rows)
+- `genie_result_unavailable` comparisons (Genie produced no result)
 
 ---
 

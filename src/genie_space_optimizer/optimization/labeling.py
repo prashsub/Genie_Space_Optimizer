@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -31,7 +32,6 @@ SCHEMA_IMPROVEMENTS = "improvement_suggestions"
 ALL_SCHEMA_NAMES = [
     SCHEMA_JUDGE_VERDICT,
     SCHEMA_CORRECTED_SQL,
-    SCHEMA_PATCH_APPROVAL,
     SCHEMA_IMPROVEMENTS,
 ]
 
@@ -82,24 +82,26 @@ def ensure_labeling_schemas() -> list[str]:
             ),
         },
         {
-            "name": SCHEMA_PATCH_APPROVAL,
-            "type": "feedback",
-            "title": "Should the proposed optimization patch be applied?",
-            "input": InputCategorical(options=["Approve", "Reject", "Modify"]),
-            "instruction": (
-                "Review the proposed metadata change (column description, instruction, "
-                "join condition, etc.). Approve it, reject it, or suggest modifications."
-            ),
-            "enable_comment": True,
-        },
-        {
             "name": SCHEMA_IMPROVEMENTS,
             "type": "expectation",
             "title": "Suggest improvements for this Genie Space",
             "input": InputTextList(max_count=5, max_length_each=500),
             "instruction": (
-                "Provide specific, actionable improvements: better column descriptions, "
-                "missing join conditions, instruction changes, or table-level fixes."
+                "Provide specific, actionable improvements using the format:\n"
+                "  [type] target: suggestion\n"
+                "\n"
+                "Supported types:\n"
+                "  [column] table.column: description of what the column means\n"
+                "  [rule] question or topic: business rule Genie should follow\n"
+                "  [join] tableA JOIN tableB: correct join condition\n"
+                "  [instruction] topic: instruction Genie should follow\n"
+                "  [general] suggestion text (no target needed)\n"
+                "\n"
+                "Examples:\n"
+                "  [column] orders.revenue: Net revenue after returns and discounts\n"
+                "  [rule] What is total revenue?: Use net_revenue, not gross_revenue\n"
+                "  [join] orders JOIN customers: Join on customer_id, not name\n"
+                "  [instruction] date handling: Fiscal year starts April 1"
             ),
         },
     ]
@@ -388,6 +390,47 @@ def _find_session_by_name(session_name: str) -> Any | None:
     return None
 
 
+_SUGGESTION_TYPE_MAP: dict[str, str] = {
+    "column": "column_description",
+    "rule": "business_rule",
+    "join": "join_condition",
+    "instruction": "instruction",
+    "general": "general",
+}
+
+_SUGGESTION_RE = re.compile(
+    r"^\[(?P<type>[a-zA-Z_]+)\]\s*(?:(?P<target>.+?):\s*)?(?P<suggestion>.+)$",
+    re.DOTALL,
+)
+
+
+def _parse_structured_suggestion(text: str) -> dict[str, Any]:
+    """Parse a ``[type] target: suggestion`` string into a typed dict.
+
+    Falls back to ``target_type="general"`` for entries that don't match
+    the expected format.
+    """
+    text = text.strip()
+    m = _SUGGESTION_RE.match(text)
+    if m:
+        raw_type = m.group("type").lower().strip()
+        target_type = _SUGGESTION_TYPE_MAP.get(raw_type, "general")
+        target_id = (m.group("target") or "").strip()
+        suggestion = m.group("suggestion").strip()
+        return {
+            "type": "improvement",
+            "target_type": target_type,
+            "target_identifier": target_id,
+            "suggestion": suggestion,
+        }
+    return {
+        "type": "improvement",
+        "target_type": "general",
+        "target_identifier": "",
+        "suggestion": text,
+    }
+
+
 def ingest_human_feedback(
     session_name: str,
 ) -> dict[str, Any]:
@@ -482,18 +525,11 @@ def ingest_human_feedback(
                     "question": _q,
                 })
             elif a_name == SCHEMA_IMPROVEMENTS and a_value:
-                corrections.append({
-                    "type": "improvement",
-                    "trace_id": trace_id,
-                    "suggestions": a_value,
-                })
-            elif a_name == SCHEMA_PATCH_APPROVAL and a_value:
-                corrections.append({
-                    "type": "patch_review",
-                    "trace_id": trace_id,
-                    "decision": a_value,
-                    "comment": a_rationale or "",
-                })
+                items = a_value if isinstance(a_value, list) else [a_value]
+                for item in items:
+                    parsed = _parse_structured_suggestion(str(item))
+                    parsed["trace_id"] = trace_id
+                    corrections.append(parsed)
 
     logger.info(
         "Ingested %d corrections from %d reviewed traces (session '%s')",

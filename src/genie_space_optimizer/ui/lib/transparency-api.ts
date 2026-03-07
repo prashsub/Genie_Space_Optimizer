@@ -142,6 +142,17 @@ export interface IterationDetail {
   timestamp: string | null;
 }
 
+export interface ProactiveChanges {
+  descriptionsEnriched?: number;
+  tablesEnriched?: number;
+  joinSpecsDiscovered?: number;
+  spaceDescriptionGenerated?: boolean;
+  sampleQuestionsGenerated?: number;
+  instructionsSeeded?: boolean;
+  promptsMatched?: number;
+  exampleSqlsMined?: number;
+}
+
 export interface IterationDetailResponse {
   runId: string;
   spaceId: string;
@@ -151,6 +162,7 @@ export interface IterationDetailResponse {
   iterations: IterationDetail[];
   flaggedQuestions: Record<string, unknown>[];
   labelingSessionUrl: string | null;
+  proactiveChanges: ProactiveChanges | null;
 }
 
 // ── Fetch functions ──────────────────────────────────────────────────

@@ -3331,16 +3331,6 @@ def _run_lever_loop(
         for c in (human_corrections or [])
         if c.get("type") == "benchmark_correction" and c.get("corrected_sql")
     ]
-    if _human_sql_fixes:
-        try:
-            from genie_space_optimizer.optimization.benchmarks import apply_benchmark_corrections
-            _hfix = apply_benchmark_corrections(_human_sql_fixes, spark, f"{catalog}.{schema}", domain)
-            print(
-                f"\n[Human Feedback] Applied {_hfix['applied']} benchmark corrections "
-                f"from prior review (skipped {_hfix['skipped']})"
-            )
-        except Exception:
-            logger.warning("Failed to apply human benchmark corrections", exc_info=True)
 
     _judge_overrides = [c for c in (human_corrections or []) if c.get("type") == "judge_override"]
     for ov in _judge_overrides:
@@ -3358,36 +3348,29 @@ def _run_lever_loop(
                 from genie_space_optimizer.optimization.benchmarks import quarantine_benchmark_question
                 quarantine_benchmark_question(
                     spark, f"{catalog}.{schema}", domain,
-                    ov.get("question_id", "") or ov.get("question", ""),
+                    ov.get("question", "") or ov.get("question_id", ""),
                     reason="both_wrong",
-                    comment=ov.get("comment", ""),
                 )
             elif "Ambiguous" in feedback:
                 from genie_space_optimizer.optimization.benchmarks import quarantine_benchmark_question
                 quarantine_benchmark_question(
                     spark, f"{catalog}.{schema}", domain,
-                    ov.get("question_id", "") or ov.get("question", ""),
+                    ov.get("question", "") or ov.get("question_id", ""),
                     reason="ambiguous",
-                    comment=ov.get("comment", ""),
                 )
         except Exception:
             logger.warning("Failed to process judge_override feedback", exc_info=True)
 
-    _patch_reviews = [c for c in (human_corrections or []) if c.get("type") == "patch_review"]
-    if _patch_reviews:
+    if _human_sql_fixes:
         try:
-            from genie_space_optimizer.optimization.state import get_queued_patches
-            _pending = get_queued_patches(spark, catalog, schema, status="pending")
-            for pr in _patch_reviews:
-                decision = pr.get("decision", "")
-                if "Approve" in decision:
-                    logger.info("Human approved patch from trace %s", pr.get("trace_id", ""))
-                elif "Reject" in decision:
-                    logger.info("Human rejected patch from trace %s: %s", pr.get("trace_id", ""), pr.get("comment", ""))
-                elif "Modify" in decision:
-                    logger.info("Human modification hint for trace %s: %s", pr.get("trace_id", ""), pr.get("comment", ""))
+            from genie_space_optimizer.optimization.benchmarks import apply_benchmark_corrections
+            _hfix = apply_benchmark_corrections(_human_sql_fixes, spark, f"{catalog}.{schema}", domain)
+            print(
+                f"\n[Human Feedback] Applied {_hfix['applied']} benchmark corrections "
+                f"from prior review (skipped {_hfix['skipped']})"
+            )
         except Exception:
-            logger.warning("Failed to process patch_review feedback", exc_info=True)
+            logger.warning("Failed to apply human benchmark corrections", exc_info=True)
 
     _human_suggestions = [c for c in (human_corrections or []) if c.get("type") == "improvement"]
 

@@ -4689,9 +4689,31 @@ def _call_llm_for_adaptive_strategy(
     # ── Build human reviewer suggestions text ──────────────────────────
     suggestions_text = ""
     if human_suggestions:
-        lines_hs: list[str] = ["Human reviewer suggestions from prior review:"]
+        _TYPE_LABELS = {
+            "column_description": "Column descriptions",
+            "business_rule": "Business rules",
+            "join_condition": "Join conditions",
+            "instruction": "Instructions",
+            "general": "General suggestions",
+        }
+        grouped: dict[str, list[str]] = {}
         for s in human_suggestions:
-            for item in s.get("suggestions", []):
+            ttype = s.get("target_type", "general")
+            target = s.get("target_identifier", "")
+            suggestion = s.get("suggestion", "")
+            if not suggestion:
+                for item in s.get("suggestions", []):
+                    grouped.setdefault("general", []).append(str(item))
+                continue
+            label = f"{target}: {suggestion}" if target else suggestion
+            grouped.setdefault(ttype, []).append(label)
+        lines_hs: list[str] = ["Human reviewer suggestions from prior review:"]
+        for ttype, type_label in _TYPE_LABELS.items():
+            items = grouped.get(ttype)
+            if not items:
+                continue
+            lines_hs.append(f"\n{type_label}:")
+            for item in items:
                 lines_hs.append(f"- {item}")
         suggestions_text = "\n".join(lines_hs)
 
