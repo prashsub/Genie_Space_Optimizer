@@ -8,12 +8,14 @@ import re
 import pytest
 
 from genie_space_optimizer.optimization.optimizer import (
+    _EXAMPLE_SQL_SIMILARITY_THRESHOLD,
     _JOIN_FQN_RE,
     _MIN_DESCRIPTION_LENGTH,
     _SQL_FROM_TABLE_RE,
     _collect_blank_columns,
     _collect_insufficient_tables,
     _convert_fk_to_candidates,
+    _deduplicate_proposals,
     _detect_instruction_content_in_description,
     _extract_equijoin_predicates,
     _extract_proven_joins,
@@ -24,6 +26,7 @@ from genie_space_optimizer.optimization.optimizer import (
     _is_fuzzy_match,
     _map_to_lever,
     _mine_benchmark_example_sqls,
+    _ngram_similarity,
     _resolve_lever5_llm_result,
     _sanitize_join_sql,
     _types_compatible,
@@ -1671,6 +1674,109 @@ class TestExampleSqlDedup:
         result = _filter_no_op_proposals(proposals, self._METADATA)
         assert len(result) == 0
 
+    def test_rejects_fuzzy_duplicate_of_existing(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "How many orders are there",
+                "example_sql": "SELECT COUNT(*) FROM cat.sch.orders",
+                "parameters": [],
+            },
+        ]
+        result = _validate_lever5_proposals(proposals, self._METADATA)
+        assert len(result) == 0
+
+    def test_rejects_fuzzy_duplicate_within_batch(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "What is the total order count?",
+                "example_sql": "SELECT COUNT(*) FROM cat.sch.orders",
+                "parameters": [],
+            },
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "What is total order count?",
+                "example_sql": "SELECT COUNT(*) FROM cat.sch.orders",
+                "parameters": [],
+            },
+        ]
+        result = _validate_lever5_proposals(proposals, self._METADATA)
+        ex_results = [p for p in result if p.get("patch_type") == "add_example_sql"]
+        assert len(ex_results) == 1
+
+    def test_accepts_genuinely_different_question(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "What is the average order value?",
+                "example_sql": "SELECT AVG(amount) FROM cat.sch.orders",
+                "parameters": [],
+            },
+        ]
+        sim = _ngram_similarity(
+            "what is the average order value?",
+            "how many orders are there?",
+        )
+        assert sim < _EXAMPLE_SQL_SIMILARITY_THRESHOLD
+        result = _validate_lever5_proposals(proposals, self._METADATA)
+        assert len(result) == 1
+
+    def test_filter_no_op_rejects_fuzzy_duplicate(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "example_question": "How many orders are there",
+                "example_sql": "SELECT COUNT(*) FROM cat.sch.orders",
+            },
+        ]
+        result = _filter_no_op_proposals(proposals, self._METADATA)
+        assert len(result) == 0
+
+    def test_dedup_proposals_fuzzy_keeps_higher_impact(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "proposed_value": "What is the total order count?",
+                "example_question": "What is the total order count?",
+                "example_sql": "SELECT COUNT(*) FROM orders",
+                "net_impact": 0.5,
+            },
+            {
+                "patch_type": "add_example_sql",
+                "proposed_value": "What is total order count?",
+                "example_question": "What is total order count?",
+                "example_sql": "SELECT COUNT(*) FROM orders",
+                "net_impact": 0.9,
+            },
+        ]
+        result = _deduplicate_proposals(proposals)
+        ex_results = [p for p in result if p.get("patch_type") == "add_example_sql"]
+        assert len(ex_results) == 1
+        assert ex_results[0]["net_impact"] == 0.9
+
+    def test_dedup_proposals_fuzzy_keeps_first_when_equal_impact(self):
+        proposals = [
+            {
+                "patch_type": "add_example_sql",
+                "proposed_value": "Show me total revenue by region?",
+                "example_question": "Show me total revenue by region?",
+                "example_sql": "SELECT region, SUM(revenue) FROM sales GROUP BY region",
+                "net_impact": 0.7,
+            },
+            {
+                "patch_type": "add_example_sql",
+                "proposed_value": "Show me the total revenue by region?",
+                "example_question": "Show me the total revenue by region?",
+                "example_sql": "SELECT region, SUM(revenue) FROM sales GROUP BY 1",
+                "net_impact": 0.7,
+            },
+        ]
+        result = _deduplicate_proposals(proposals)
+        ex_results = [p for p in result if p.get("patch_type") == "add_example_sql"]
+        assert len(ex_results) == 1
+        assert ex_results[0]["example_question"] == "Show me total revenue by region?"
+
 
 # ── Benchmark Mining ───────────────────────────────────────────────────
 
@@ -1721,6 +1827,21 @@ class TestMineBenchmarkExampleSqls:
         benchmarks = [
             {"question": "Same question?", "expected_sql": "SELECT 1"},
             {"question": "Same question?", "expected_sql": "SELECT 2"},
+        ]
+        result = _mine_benchmark_example_sqls(benchmarks, self._METADATA)
+        assert len(result) == 1
+
+    def test_skips_fuzzy_duplicate_of_existing(self):
+        benchmarks = [
+            {"question": "Existing question", "expected_sql": "SELECT 1"},
+        ]
+        result = _mine_benchmark_example_sqls(benchmarks, self._METADATA)
+        assert len(result) == 0
+
+    def test_fuzzy_dedup_within_benchmarks(self):
+        benchmarks = [
+            {"question": "How many total orders?", "expected_sql": "SELECT COUNT(*) FROM cat.sch.orders"},
+            {"question": "How many total orders", "expected_sql": "SELECT COUNT(*) FROM cat.sch.orders"},
         ]
         result = _mine_benchmark_example_sqls(benchmarks, self._METADATA)
         assert len(result) == 1

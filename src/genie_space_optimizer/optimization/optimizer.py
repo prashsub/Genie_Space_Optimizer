@@ -60,6 +60,7 @@ from genie_space_optimizer.common.genie_schema import ensure_join_spec_fields
 logger = logging.getLogger(__name__)
 
 _LLM_TIMEOUT_SECONDS = 600
+_EXAMPLE_SQL_SIMILARITY_THRESHOLD = 0.85
 
 
 def _ws_with_timeout(
@@ -5713,8 +5714,16 @@ def _validate_lever5_proposals(
             if eq_norm in existing_questions:
                 logger.info("Rejecting add_example_sql duplicate of existing config: %.80s", eq)
                 continue
+            if any(_ngram_similarity(eq_norm, eq_existing) > _EXAMPLE_SQL_SIMILARITY_THRESHOLD
+                   for eq_existing in existing_questions):
+                logger.info("Rejecting add_example_sql fuzzy-duplicate of existing config: %.80s", eq)
+                continue
             if eq_norm in seen_new_questions:
                 logger.info("Rejecting add_example_sql duplicate within batch: %.80s", eq)
+                continue
+            if any(_ngram_similarity(eq_norm, seen) > _EXAMPLE_SQL_SIMILARITY_THRESHOLD
+                   for seen in seen_new_questions):
+                logger.info("Rejecting add_example_sql fuzzy-duplicate within batch: %.80s", eq)
                 continue
             seen_new_questions.add(eq_norm)
 
@@ -5813,7 +5822,10 @@ def _mine_benchmark_example_sqls(
             continue
 
         q_norm = question.lower().strip()
-        if q_norm in existing_questions:
+        if q_norm in existing_questions or any(
+            _ngram_similarity(q_norm, eq) > _EXAMPLE_SQL_SIMILARITY_THRESHOLD
+            for eq in existing_questions
+        ):
             skipped_dup += 1
             continue
         existing_questions.add(q_norm)
@@ -5967,8 +5979,12 @@ def _filter_no_op_proposals(proposals: list[dict], metadata_snapshot: dict) -> l
                 continue
         if ptype == "add_example_sql":
             eq = (p.get("example_question") or "").lower().strip()
-            if eq and eq in existing_eq_questions:
-                logger.info("Filtering no-op add_example_sql already in config: %.80s", eq)
+            if eq and (
+                eq in existing_eq_questions
+                or any(_ngram_similarity(eq, existing) > _EXAMPLE_SQL_SIMILARITY_THRESHOLD
+                       for existing in existing_eq_questions)
+            ):
+                logger.info("Filtering no-op/near-duplicate add_example_sql: %.80s", eq)
                 dropped += 1
                 continue
         kept.append(p)
@@ -6036,6 +6052,15 @@ def _deduplicate_proposals(proposals: list[dict]) -> list[dict]:
                 existing_idx = example_sql_seen[normalized]
                 if impact > out[existing_idx].get("net_impact", 0):
                     out[existing_idx] = p
+                continue
+            fuzzy_match_idx = None
+            for seen_norm, seen_idx in example_sql_seen.items():
+                if _ngram_similarity(normalized, seen_norm) > _EXAMPLE_SQL_SIMILARITY_THRESHOLD:
+                    fuzzy_match_idx = seen_idx
+                    break
+            if fuzzy_match_idx is not None:
+                if impact > out[fuzzy_match_idx].get("net_impact", 0):
+                    out[fuzzy_match_idx] = p
                 continue
             example_sql_seen[normalized] = len(out)
             out.append(p)
