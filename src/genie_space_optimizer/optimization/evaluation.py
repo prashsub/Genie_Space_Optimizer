@@ -112,6 +112,51 @@ def _truncate_benchmarks(benchmarks: list[dict], max_count: int) -> list[dict]:
     return result
 
 
+_TEMPORAL_PATTERNS = re.compile(
+    r"\b(this year|last \d+ months?|last \d+ days?|current year"
+    r"|year-to-date|ytd|this month|this quarter|past \d+ months?)\b",
+    re.IGNORECASE,
+)
+
+
+def _flag_stale_temporal_benchmarks(
+    benchmarks: list[dict],
+    spark: "SparkSession",
+) -> list[dict]:
+    """Flag benchmarks whose GT SQL returns 0 rows due to stale temporal filters.
+
+    Sets ``temporal_stale=True`` on benchmarks where the question contains
+    temporal patterns and the GT SQL returns 0 rows.  Flagged benchmarks are
+    excluded from accuracy scoring in ``_compute_arbiter_adjusted_accuracy``.
+    """
+    flagged_count = 0
+    for b in benchmarks:
+        q = b.get("question", "")
+        sql = b.get("expected_sql", "")
+        if not _TEMPORAL_PATTERNS.search(q):
+            continue
+        if not sql:
+            continue
+        try:
+            df = spark.sql(sql).limit(1)
+            if df.count() == 0:
+                b["temporal_stale"] = True
+                flagged_count += 1
+                logger.info(
+                    "Temporal benchmark '%s' returns 0 rows -- flagged as stale",
+                    q[:60],
+                )
+        except Exception:
+            pass
+    if flagged_count:
+        logger.warning(
+            "Flagged %d/%d benchmarks as temporal-stale (excluded from accuracy)",
+            flagged_count,
+            len(benchmarks),
+        )
+    return benchmarks
+
+
 def _cache_scorer_feedback(
     question_id: str, judge_name: str, rationale: str, metadata: dict | None = None
 ) -> None:
@@ -838,6 +883,7 @@ def _compute_arbiter_adjusted_accuracy(
     rows: list[dict],
     *,
     quarantined_qids: set[str] | None = None,
+    temporal_stale_qids: set[str] | None = None,
 ) -> tuple[float, int, list[str], int]:
     """Compute overall accuracy that accounts for arbiter overrides.
 
@@ -847,8 +893,9 @@ def _compute_arbiter_adjusted_accuracy(
         ``genie_correct`` or ``both_correct``
 
     Rows where ``result_correctness`` == "excluded" (GT-side infrastructure
-    failures) or whose question is quarantined are removed from the
-    denominator entirely.
+    failures), whose question is quarantined, whose comparison error_type is
+    ``both_empty`` or ``genie_result_unavailable``, or whose question is
+    temporal-stale are removed from the denominator entirely.
 
     Returns ``(accuracy_pct, correct_count, failure_ids, excluded_count)``.
     """
@@ -856,6 +903,7 @@ def _compute_arbiter_adjusted_accuracy(
         return 0.0, 0, [], 0
 
     _quarantined = quarantined_qids or set()
+    _temporal_stale = temporal_stale_qids or set()
     total = 0
     correct = 0
     excluded = 0
@@ -866,6 +914,16 @@ def _compute_arbiter_adjusted_accuracy(
         ).lower()
 
         if rc == "excluded":
+            excluded += 1
+            continue
+
+        _err_type = str(
+            row.get("outputs/comparison/error_type")
+            or row.get("comparison/error_type")
+            or row.get("comparison.error_type")
+            or ""
+        ).lower()
+        if _err_type in ("both_empty", "genie_result_unavailable"):
             excluded += 1
             continue
 
@@ -886,6 +944,10 @@ def _compute_arbiter_adjusted_accuracy(
         )
 
         if qid and qid in _quarantined:
+            excluded += 1
+            continue
+
+        if qid and qid in _temporal_stale:
             excluded += 1
             continue
 
@@ -1407,6 +1469,20 @@ def make_predict_fn(
                                     comparison["error_type"] = "genie_result_unavailable"
                                     comparison["gt_rows"] = len(gt_df)
                                     comparison["gt_sample"] = gt_df.head(5).to_csv(index=False, float_format="%.4f")
+                                elif len(gt_df) == 0 and len(genie_df) == 0:
+                                    comparison = {
+                                        "match": False,
+                                        "match_type": "both_empty",
+                                        "gt_rows": 0,
+                                        "genie_rows": 0,
+                                        "gt_columns": sorted(gt_df.columns.tolist()),
+                                        "genie_columns": sorted(genie_df.columns.tolist()),
+                                        "gt_hash": "",
+                                        "genie_hash": "",
+                                        "error": None,
+                                        "error_type": "both_empty",
+                                        "note": "Both GT and Genie SQL returned 0 rows",
+                                    }
                                 else:
                                     mapped_genie_df = genie_df
                                     _FLOAT_FMT = "%.4f"
@@ -2614,6 +2690,7 @@ def create_evaluation_dataset(
             )
             for r in records:
                 r.pop("provenance", None)
+        records = _flag_stale_temporal_benchmarks(records, spark)
         eval_dataset.merge_records(records)
         logger.info("UC Evaluation Dataset: %s (%d records merged)", uc_table_name, len(records))
         return eval_dataset
@@ -2851,7 +2928,7 @@ def _print_eval_summary(
     lines.append(f"|")
     lines.append(f"|   Overall accuracy: {adj_accuracy:.1f}%  (result_correctness raw: {rc_raw:.1f}%)")
     if adj_excluded:
-        lines.append(f"|   Excluded (GT infra): {adj_excluded}")
+        lines.append(f"|   Excluded (GT infra / both-empty / unavailable): {adj_excluded}")
     lines.append(f"|   Thresholds met: {'YES' if thresholds_passed else 'NO'}")
     if adj_failures:
         lines.append(f"|   Failed questions: {adj_failures}")
@@ -3344,6 +3421,14 @@ def run_evaluation(
                 _rc_val = str(_rc_row.get("result_correctness/value", "")).lower()
                 if _rc_val == "excluded":
                     continue
+                _rc_err_type = str(
+                    _rc_row.get("outputs/comparison/error_type")
+                    or _rc_row.get("comparison/error_type")
+                    or _rc_row.get("comparison.error_type")
+                    or ""
+                ).lower()
+                if _rc_err_type in ("both_empty", "genie_result_unavailable"):
+                    continue
                 _rc_total += 1
                 if _rc_val in ("yes", "true", "1", "1.0"):
                     _rc_correct += 1
@@ -3494,6 +3579,7 @@ def run_repeatability_evaluation(
     uc_schema: str = "",
     model_id: str | None = None,
     run_label: str = "",
+    reference_result_hashes: dict[str, str] | None = None,
 ) -> dict:
     """Run a repeatability evaluation through ``mlflow.genai.evaluate()``.
 
@@ -3501,8 +3587,14 @@ def run_repeatability_evaluation(
     compare the new SQL against *reference_sqls* (``{question_id: sql}``
     from a prior iteration).  Produces full MLflow traces and judge verdicts.
 
+    When *reference_result_hashes* is provided (``{question_id: genie_hash}``
+    from a prior iteration), the scorer uses execution-based comparison as
+    its primary tier before falling back to structural / exact SQL matching.
+
     Args:
         reference_sqls: Mapping of question_id → SQL from a previous run.
+        reference_result_hashes: Mapping of question_id → normalised
+            result-set hash from a previous run (enables Tier 1 scoring).
         run_label: Optional suffix for the run name (e.g. "final_1").
     """
     from genie_space_optimizer.optimization.scorers import make_repeatability_scorers
@@ -3528,10 +3620,13 @@ def run_repeatability_evaluation(
         else None
     )
 
+    _ref_hashes = reference_result_hashes or {}
+
     eval_records = []
     for b in benchmarks:
         qid = b.get("id", "")
         prev_sql = reference_sqls.get(qid, "")
+        prev_result_hash = _ref_hashes.get(qid, "")
         eval_records.append(
             {
                 "inputs": {
@@ -3549,6 +3644,7 @@ def run_repeatability_evaluation(
                         b.get("expected_sql", ""),
                     ),
                     "previous_sql": prev_sql,
+                    "previous_result_hash": prev_result_hash,
                 },
             }
         )
@@ -3641,26 +3737,79 @@ def run_repeatability_evaluation(
 
                 rows_for_output.append(row_dict)
 
-        mlflow.log_metric("repeatability_pct", repeatability_pct)
+        # ── Three-tier sub-metrics ─────────────────────────────────────
+        _tier_counts: dict[str, int] = {
+            "execution": 0,
+            "structural": 0,
+            "exact": 0,
+            "first_eval": 0,
+            "none": 0,
+            "no_output": 0,
+        }
+        _total_scored = 0
+        for _row in rows_for_output:
+            _rep_meta = _row.get("repeatability/metadata") or {}
+            if isinstance(_rep_meta, str):
+                try:
+                    _rep_meta = json.loads(_rep_meta)
+                except (json.JSONDecodeError, TypeError):
+                    _rep_meta = {}
+            tier = _rep_meta.get("match_tier", "")
+            if tier in _tier_counts:
+                _tier_counts[tier] += 1
+            _total_scored += 1
+
+        if _total_scored > 0:
+            _pass_execution = (
+                _tier_counts["execution"] + _tier_counts["structural"]
+                + _tier_counts["exact"] + _tier_counts["first_eval"]
+            )
+            _pass_structural = _pass_execution
+            _pass_exact = (
+                _tier_counts["exact"] + _tier_counts["first_eval"]
+            )
+            repeatability_execution_pct = (_pass_execution / _total_scored) * 100
+            repeatability_structural_pct = (_pass_structural / _total_scored) * 100
+            repeatability_exact_pct = (_pass_exact / _total_scored) * 100
+        else:
+            repeatability_execution_pct = repeatability_pct
+            repeatability_structural_pct = repeatability_pct
+            repeatability_exact_pct = repeatability_pct
+
+        mlflow.log_metrics({
+            "repeatability_pct": repeatability_pct,
+            "repeatability_execution_pct": repeatability_execution_pct,
+            "repeatability_structural_pct": repeatability_structural_pct,
+            "repeatability_exact_pct": repeatability_exact_pct,
+        })
         mlflow.set_tags(
             {
                 "evaluation_type": "repeatability",
                 "repeatability_pct": f"{repeatability_pct:.1f}",
+                "repeatability_execution_pct": f"{repeatability_execution_pct:.1f}",
                 "iteration": str(iteration),
             }
         )
 
     logger.info(
-        "Repeatability evaluation complete: %s — repeatability=%.1f%%",
+        "Repeatability evaluation complete: %s — "
+        "headline=%.1f%% (execution=%.1f%%, structural=%.1f%%, exact=%.1f%%)",
         run_name,
         repeatability_pct,
+        repeatability_execution_pct,
+        repeatability_structural_pct,
+        repeatability_exact_pct,
     )
 
     _rep_lines = [
         f"\n-- REPEATABILITY EVALUATION: {run_name} " + "-" * 30,
-        f"  |  Repeatability:  {repeatability_pct:.1f}%",
-        f"  |  Questions:      {len(benchmarks)}",
-        f"  |  Reference SQLs: {sum(1 for v in reference_sqls.values() if v)}",
+        f"  |  Repeatability (headline):    {repeatability_pct:.1f}%",
+        f"  |  Execution equivalence:       {repeatability_execution_pct:.1f}%",
+        f"  |  Structural equivalence:      {repeatability_structural_pct:.1f}%",
+        f"  |  Exact SQL match:             {repeatability_exact_pct:.1f}%",
+        f"  |  Questions:                   {len(benchmarks)}",
+        f"  |  Reference SQLs:              {sum(1 for v in reference_sqls.values() if v)}",
+        f"  |  Reference result hashes:     {sum(1 for v in _ref_hashes.values() if v)}",
     ]
     for _judge, _score in per_judge.items():
         _disp = _score * 100 if _score <= 1.0 else _score
@@ -3684,6 +3833,10 @@ def run_repeatability_evaluation(
         "mlflow_run_id": run.info.run_id,
         "run_name": run_name,
         "repeatability_pct": repeatability_pct,
+        "repeatability_execution_pct": repeatability_execution_pct,
+        "repeatability_structural_pct": repeatability_structural_pct,
+        "repeatability_exact_pct": repeatability_exact_pct,
+        "tier_counts": _tier_counts,
         "per_judge": per_judge,
         "rows": rows_for_output,
         "scores": normalize_scores(per_judge),
@@ -3717,6 +3870,41 @@ def extract_reference_sqls(eval_result: dict) -> dict[str, str]:
         )
         if qid:
             ref[str(qid)] = str(sql or "")
+    return ref
+
+
+def extract_reference_result_hashes(eval_result: dict) -> dict[str, str]:
+    """Extract ``{question_id: genie_result_hash}`` from an evaluation output.
+
+    Mirrors :func:`extract_reference_sqls` but pulls the result-set hash
+    (``comparison.genie_hash``) computed by the predict function.  Used to
+    enable execution-based repeatability comparison in subsequent runs.
+    """
+    ref: dict[str, str] = {}
+    rows = eval_result.get("rows", [])
+    for row in rows:
+        _req = row.get("request") or {}
+        _req_kwargs = _req.get("kwargs", {}) if isinstance(_req, dict) else {}
+        qid = (
+            row.get("inputs/question_id")
+            or (row.get("inputs", {}) or {}).get("question_id", "")
+            or _req_kwargs.get("question_id", "")
+            or row.get("question_id", "")
+        )
+        if not qid:
+            continue
+
+        outputs = row.get("outputs") or {}
+        if isinstance(outputs, str):
+            outputs = {}
+        cmp = outputs.get("comparison") or {}
+        genie_hash = cmp.get("genie_hash", "")
+
+        if not genie_hash:
+            genie_hash = row.get("outputs/comparison/genie_hash", "")
+
+        if qid and genie_hash:
+            ref[str(qid)] = str(genie_hash)
     return ref
 
 

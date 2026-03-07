@@ -352,3 +352,270 @@ class TestArbiterScorerNullDefense:
             expectations={"expected_response": "SELECT SUM(amount) FROM orders"},
         )
         assert feedback.value == "both_correct"
+
+
+# ── Repeatability scorer tests ───────────────────────────────────────
+
+
+class TestRepeatabilityScorer:
+    """Three-tier repeatability scorer tests."""
+
+    def _call(self, inputs, outputs, expectations):
+        from genie_space_optimizer.optimization.scorers.repeatability import (
+            repeatability_scorer,
+        )
+        return repeatability_scorer._original_func(
+            inputs=inputs, outputs=outputs, expectations=expectations,
+        )
+
+    # -- Tier 1: Execution equivalence ------------------------------------
+
+    def test_tier1_matching_result_hashes(self):
+        """Matching genie_hash values → yes, match_tier=execution."""
+        fb = self._call(
+            inputs={"question_id": "q1"},
+            outputs={
+                "response": "SELECT a, b FROM t",
+                "comparison": {"genie_hash": "abc12345"},
+            },
+            expectations={
+                "previous_sql": "SELECT b, a FROM t",
+                "previous_result_hash": "abc12345",
+            },
+        )
+        assert fb.value == "yes"
+        assert fb.metadata["match_tier"] == "execution"
+
+    def test_tier1_mismatching_result_hashes(self):
+        """Different genie_hash values → no (genuine divergence)."""
+        fb = self._call(
+            inputs={"question_id": "q2"},
+            outputs={
+                "response": "SELECT SUM(x) FROM t",
+                "comparison": {"genie_hash": "abc12345"},
+            },
+            expectations={
+                "previous_sql": "SELECT SUM(y) FROM t",
+                "previous_result_hash": "zzz99999",
+            },
+        )
+        assert fb.value == "no"
+        assert fb.metadata["match_tier"] == "execution"
+
+    # -- Tier 2: Structural equivalence ------------------------------------
+
+    def test_tier2_structurally_equivalent_sql(self):
+        """No result hashes, structurally equivalent SQL → yes, structural."""
+        fb = self._call(
+            inputs={"question_id": "q3"},
+            outputs={
+                "response": "SELECT a, b, c FROM orders WHERE status = 'active'",
+                "comparison": {},
+            },
+            expectations={
+                "previous_sql": "SELECT a, b, c FROM orders WHERE status = 'active'",
+                "previous_result_hash": "",
+            },
+        )
+        assert fb.value == "yes"
+        assert fb.metadata["match_tier"] in ("structural", "exact")
+
+    def test_tier2_cosmetic_sql_differences(self):
+        """SQL with cosmetic differences should pass structural check."""
+        fb = self._call(
+            inputs={"question_id": "q4"},
+            outputs={
+                "response": "select a, b from orders where status = 'active'",
+                "comparison": {},
+            },
+            expectations={
+                "previous_sql": "SELECT a, b FROM orders WHERE status = 'active'",
+                "previous_result_hash": "",
+            },
+        )
+        assert fb.value == "yes"
+
+    # -- Tier 3: Exact SQL match -------------------------------------------
+
+    def test_tier3_exact_sql_match(self):
+        """Byte-identical lowercased SQL → yes, exact."""
+        fb = self._call(
+            inputs={"question_id": "q5"},
+            outputs={
+                "response": "SELECT COUNT(*) FROM orders",
+                "comparison": {},
+            },
+            expectations={
+                "previous_sql": "SELECT COUNT(*) FROM orders",
+                "previous_result_hash": "",
+            },
+        )
+        assert fb.value == "yes"
+        assert fb.metadata["match_tier"] in ("structural", "exact")
+
+    # -- Edge cases --------------------------------------------------------
+
+    def test_first_eval_no_reference(self):
+        """No reference SQL or hash → yes (first evaluation)."""
+        fb = self._call(
+            inputs={"question_id": "q6"},
+            outputs={
+                "response": "SELECT 1",
+                "comparison": {"genie_hash": "aaa"},
+            },
+            expectations={
+                "previous_sql": "",
+                "previous_result_hash": "",
+            },
+        )
+        assert fb.value == "yes"
+        assert fb.metadata["match_tier"] == "first_eval"
+
+    def test_no_current_sql(self):
+        """Genie returned no SQL → no."""
+        fb = self._call(
+            inputs={"question_id": "q7"},
+            outputs={
+                "response": "",
+                "comparison": {},
+            },
+            expectations={
+                "previous_sql": "SELECT 1",
+                "previous_result_hash": "abc",
+            },
+        )
+        assert fb.value == "no"
+        assert fb.metadata["match_tier"] == "no_output"
+
+    def test_all_tiers_fail(self):
+        """Completely different SQL with no result hashes → no, none."""
+        fb = self._call(
+            inputs={"question_id": "q8"},
+            outputs={
+                "response": "SELECT * FROM customers",
+                "comparison": {},
+            },
+            expectations={
+                "previous_sql": "SELECT total FROM revenue_summary",
+                "previous_result_hash": "",
+            },
+        )
+        assert fb.value == "no"
+        assert fb.metadata["match_tier"] == "none"
+
+    def test_none_expectations_handled(self):
+        """None expectations dict doesn't crash."""
+        fb = self._call(
+            inputs={"question_id": "q9"},
+            outputs={"response": "SELECT 1", "comparison": {}},
+            expectations=None,
+        )
+        assert fb.value == "yes"
+        assert fb.metadata["match_tier"] == "first_eval"
+
+
+class TestStructuralEquivalence:
+    """Tests for the _structurally_equivalent and _structurally_similar helpers."""
+
+    def test_sqlglot_normalisation(self):
+        from genie_space_optimizer.optimization.scorers.repeatability import (
+            _structurally_equivalent,
+        )
+        assert _structurally_equivalent(
+            "SELECT   a, b  FROM  t  WHERE  x=1",
+            "SELECT a, b FROM t WHERE x = 1",
+        )
+
+    def test_different_queries(self):
+        from genie_space_optimizer.optimization.scorers.repeatability import (
+            _structurally_equivalent,
+        )
+        assert not _structurally_equivalent(
+            "SELECT a FROM t1",
+            "SELECT b FROM t2",
+        )
+
+    def test_token_overlap_fallback(self):
+        from genie_space_optimizer.optimization.scorers.repeatability import (
+            _structurally_similar,
+        )
+        assert _structurally_similar(
+            "SELECT a, b, c FROM orders WHERE status = 'active' AND region = 'US'",
+            "SELECT a, b, c FROM orders WHERE region = 'US' AND status = 'active'",
+        )
+
+    def test_token_overlap_low(self):
+        from genie_space_optimizer.optimization.scorers.repeatability import (
+            _structurally_similar,
+        )
+        assert not _structurally_similar(
+            "SELECT * FROM customers",
+            "SELECT total FROM revenue_summary WHERE year = 2024",
+        )
+
+    def test_empty_sql(self):
+        from genie_space_optimizer.optimization.scorers.repeatability import (
+            _structurally_similar,
+        )
+        assert not _structurally_similar("", "SELECT 1")
+        assert not _structurally_similar("SELECT 1", "")
+
+
+class TestExtractReferenceResultHashes:
+    """Tests for extract_reference_result_hashes."""
+
+    def test_nested_outputs(self):
+        from genie_space_optimizer.optimization.evaluation import (
+            extract_reference_result_hashes,
+        )
+        result = extract_reference_result_hashes({
+            "rows": [
+                {
+                    "inputs": {"question_id": "q1"},
+                    "outputs": {"comparison": {"genie_hash": "abc123"}},
+                },
+                {
+                    "inputs": {"question_id": "q2"},
+                    "outputs": {"comparison": {"genie_hash": "def456"}},
+                },
+            ]
+        })
+        assert result == {"q1": "abc123", "q2": "def456"}
+
+    def test_missing_hash_skipped(self):
+        from genie_space_optimizer.optimization.evaluation import (
+            extract_reference_result_hashes,
+        )
+        result = extract_reference_result_hashes({
+            "rows": [
+                {
+                    "inputs": {"question_id": "q1"},
+                    "outputs": {"comparison": {"genie_hash": "abc123"}},
+                },
+                {
+                    "inputs": {"question_id": "q2"},
+                    "outputs": {"comparison": {}},
+                },
+            ]
+        })
+        assert result == {"q1": "abc123"}
+
+    def test_empty_rows(self):
+        from genie_space_optimizer.optimization.evaluation import (
+            extract_reference_result_hashes,
+        )
+        assert extract_reference_result_hashes({"rows": []}) == {}
+
+    def test_flat_column_format(self):
+        from genie_space_optimizer.optimization.evaluation import (
+            extract_reference_result_hashes,
+        )
+        result = extract_reference_result_hashes({
+            "rows": [
+                {
+                    "inputs/question_id": "q1",
+                    "outputs/comparison/genie_hash": "flat_hash",
+                },
+            ]
+        })
+        assert result == {"q1": "flat_hash"}

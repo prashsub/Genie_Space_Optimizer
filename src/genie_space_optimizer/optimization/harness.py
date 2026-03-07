@@ -67,6 +67,7 @@ from genie_space_optimizer.optimization.evaluation import (
     _extract_genie_sql_from_trace,
     all_thresholds_met,
     extract_reference_sqls,
+    extract_reference_result_hashes,
     filter_benchmarks_by_scope,
     log_asi_feedback_on_traces,
     log_gate_feedback_on_traces,
@@ -3462,20 +3463,24 @@ def _run_lever_loop(
 
     baseline_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
     reference_sqls: dict[str, str] = {}
+    reference_result_hashes: dict[str, str] = {}
     if baseline_iter:
         rows_json = baseline_iter.get("rows_json")
         if isinstance(rows_json, list):
-            reference_sqls = extract_reference_sqls({"rows": rows_json})
+            _rows_payload = {"rows": rows_json}
+            reference_sqls = extract_reference_sqls(_rows_payload)
+            reference_result_hashes = extract_reference_result_hashes(_rows_payload)
         elif isinstance(rows_json, str):
             try:
-                reference_sqls = extract_reference_sqls(
-                    {"rows": json.loads(rows_json)}
-                )
+                _rows_payload = {"rows": json.loads(rows_json)}
+                reference_sqls = extract_reference_sqls(_rows_payload)
+                reference_result_hashes = extract_reference_result_hashes(_rows_payload)
             except (json.JSONDecodeError, TypeError):
                 pass
     logger.info(
-        "Lever loop: %d reference SQLs from baseline for repeatability scoring",
+        "Lever loop: %d reference SQLs, %d result hashes from baseline",
         len(reference_sqls),
+        len(reference_result_hashes),
     )
 
     # ── Per-question cross-iteration arbiter corrections ─────────────
@@ -3520,10 +3525,10 @@ def _run_lever_loop(
     ags_rolled_back: list[str] = []
     noise_floor = min(100.0 / max(len(benchmarks), 1), MAX_NOISE_FLOOR)
 
-    reflection_buffer: list[dict] = []
-    skill_exemplars: list[dict] = []
-    tried_patches: set[tuple[str, str]] = set()
-    tried_root_causes: set[tuple[str, str]] = set()
+    reflection_buffer: list[dict] = resume_state.get("reflection_buffer", [])
+    skill_exemplars: list[dict] = resume_state.get("skill_exemplars", [])
+    tried_patches: set[tuple[str, str]] = resume_state.get("tried_patches", set())
+    tried_root_causes: set[tuple[str, str]] = resume_state.get("tried_root_causes", set())
     prev_failure_qids: set[str] = set()
     _verdict_history: dict[str, list] = {}
     _last_full_mlflow_run_id: str = baseline_iter.get("mlflow_run_id", "") if baseline_iter else ""
@@ -4246,7 +4251,7 @@ def _run_lever_loop(
             skill_exemplars.append({
                 "root_cause": ag.get("root_cause_summary", ""),
                 "lever_pattern": sorted(ag.get("lever_directives", {}).keys()),
-                "patch_types": [p.get("patch_type") for p in patches[:5]],
+                "patch_types": [p.get("patch_type") for p in patches[:5] if p.get("patch_type") is not None],
                 "accuracy_gain": round(_acc_delta, 1),
             })
 
@@ -4260,6 +4265,9 @@ def _run_lever_loop(
         new_refs = extract_reference_sqls(full_result)
         if new_refs:
             reference_sqls.update(new_refs)
+        new_hashes = extract_reference_result_hashes(full_result)
+        if new_hashes:
+            reference_result_hashes.update(new_hashes)
 
         link_eval_scores_to_model(new_model_id, full_scores)
         update_run_status(
@@ -4514,15 +4522,18 @@ def _run_finalize(
             uc_schema = f"{catalog}.{schema}"
             latest_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
             reference_sqls: dict[str, str] = {}
+            reference_result_hashes: dict[str, str] = {}
             if latest_iter:
                 rows_json = latest_iter.get("rows_json")
                 if isinstance(rows_json, list):
-                    reference_sqls = extract_reference_sqls({"rows": rows_json})
+                    _rows_payload = {"rows": rows_json}
+                    reference_sqls = extract_reference_sqls(_rows_payload)
+                    reference_result_hashes = extract_reference_result_hashes(_rows_payload)
                 elif isinstance(rows_json, str):
                     try:
-                        reference_sqls = extract_reference_sqls(
-                            {"rows": json.loads(rows_json)}
-                        )
+                        _rows_payload = {"rows": json.loads(rows_json)}
+                        reference_sqls = extract_reference_sqls(_rows_payload)
+                        reference_result_hashes = extract_reference_result_hashes(_rows_payload)
                     except (json.JSONDecodeError, TypeError):
                         pass
             if not reference_sqls and benchmarks:
@@ -4533,10 +4544,14 @@ def _run_finalize(
                     if qid and sql:
                         reference_sqls[qid] = sql
             logger.info(
-                "Repeatability: %d reference SQLs loaded",
+                "Repeatability: %d reference SQLs, %d result hashes loaded",
                 len(reference_sqls),
+                len(reference_result_hashes),
             )
-            print(f"  Repeatability: {len(reference_sqls)} reference SQLs loaded")
+            print(
+                f"  Repeatability: {len(reference_sqls)} reference SQLs, "
+                f"{len(reference_result_hashes)} result hashes loaded"
+            )
 
             _ensure_sql_context(spark, catalog, schema)
             predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
@@ -4564,6 +4579,7 @@ def _run_finalize(
                         uc_schema=uc_schema,
                         model_id=prev_model_id,
                         run_label=f"final_{rep_run_idx}",
+                        reference_result_hashes=reference_result_hashes,
                     )
                     rep_results.append(rep_result)
                     rep_pcts.append(rep_result.get("repeatability_pct", 0.0))
@@ -4965,7 +4981,8 @@ def _resume_lever_loop(
 ) -> dict:
     """Read Delta to find last completed lever for resume after task retry.
 
-    Returns: resume_from_lever, iteration_counter, prev_scores, prev_model_id.
+    Returns: resume_from_lever, iteration_counter, prev_scores, prev_model_id,
+    reflection_buffer, tried_patches, tried_root_causes, skill_exemplars.
     """
     latest_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
     if not latest_iter:
@@ -4990,12 +5007,49 @@ def _resume_lever_loop(
         except (json.JSONDecodeError, TypeError):
             scores_json = {}
 
+    all_iters = load_all_full_iterations(spark, run_id, catalog, schema)
+    restored_reflections: list[dict] = []
+    restored_tried_patches: set[tuple[str, str]] = set()
+    restored_tried_root_causes: set[tuple[str, str]] = set()
+    restored_skill_exemplars: list[dict] = []
+    for it in all_iters:
+        rj = it.get("reflection_json")
+        if not isinstance(rj, dict):
+            continue
+        restored_reflections.append(rj)
+        for dnr in rj.get("do_not_retry", []):
+            parts = dnr.split(" on ", 1)
+            if len(parts) == 2:
+                restored_tried_patches.add((parts[0], parts[1]))
+        if not rj.get("accepted"):
+            root_cause = rj.get("root_cause", "")
+            blame = rj.get("blame_set", "")
+            if root_cause and blame:
+                restored_tried_root_causes.add((root_cause, blame))
+        if rj.get("accepted") and rj.get("accuracy_delta", 0.0) >= 1.0:
+            restored_skill_exemplars.append({
+                "root_cause": rj.get("root_cause", ""),
+                "lever_pattern": rj.get("levers", []),
+                "patch_types": [x for x in rj.get("patch_types", []) if x is not None],
+                "accuracy_gain": rj.get("accuracy_delta", 0.0),
+            })
+
+    if restored_reflections:
+        logger.info(
+            "Restored %d reflection entries from Delta for resume",
+            len(restored_reflections),
+        )
+
     return {
         "resume_from_lever": last_lever,
         "iteration_counter": int(latest_iter.get("iteration", 0)),
         "prev_scores": scores_json if isinstance(scores_json, dict) else {},
         "prev_model_id": latest_iter.get("model_id", ""),
         "prev_accuracy": float(latest_iter.get("overall_accuracy", 0.0)),
+        "reflection_buffer": restored_reflections,
+        "tried_patches": restored_tried_patches,
+        "tried_root_causes": restored_tried_root_causes,
+        "skill_exemplars": restored_skill_exemplars,
     }
 
 
@@ -5096,6 +5150,10 @@ def optimize_genie_space(
     ``create_run`` to avoid duplicating the row.
     """
     w = WorkspaceClient()
+    from genie_space_optimizer.common.genie_client import configure_connection_pool
+    from genie_space_optimizer.common.config import CONNECTION_POOL_SIZE
+    configure_connection_pool(w, CONNECTION_POOL_SIZE)
+
     from pyspark.sql import SparkSession
     spark = SparkSession.builder.getOrCreate()
 

@@ -351,28 +351,51 @@ def run_genie_query(
     return {"status": "ERROR", "sql": None, "error": "exhausted rate-limit retries"}
 
 
-def fetch_genie_result_df(w: WorkspaceClient, statement_id: str):
+def fetch_genie_result_df(
+    w: WorkspaceClient,
+    statement_id: str,
+    max_retries: int = 3,
+    initial_delay: float = 2.0,
+):
     """Fetch Genie's query result as a pandas DataFrame using the Statement Execution API.
 
-    Returns ``None`` if the result cannot be retrieved.
+    Retries up to *max_retries* times with linear backoff when the statement is
+    still ``PENDING``/``RUNNING`` or when results are transiently unavailable.
+    Returns ``None`` if the result cannot be retrieved after all attempts.
     """
     import pandas as pd
 
-    try:
-        stmt = w.statement_execution.get_statement(statement_id)
-        if stmt.result and stmt.result.data_array and stmt.manifest and stmt.manifest.schema:
-            cols = stmt.manifest.schema.columns
-            if cols:
-                col_names = pd.Index([str(c.name) for c in cols])
-                rows = [
-                    [str(v) if v is not None else None for v in row]
-                    for row in stmt.result.data_array
-                ]
-                return pd.DataFrame(rows, columns=col_names)
-        return None
-    except Exception:
-        logger.debug("Could not fetch statement %s results", statement_id, exc_info=True)
-        return None
+    for attempt in range(max_retries):
+        try:
+            stmt = w.statement_execution.get_statement(statement_id)
+            if stmt.status and str(stmt.status.state) in ("PENDING", "RUNNING"):
+                time.sleep(initial_delay * (attempt + 1))
+                continue
+            if stmt.result and stmt.result.data_array and stmt.manifest and stmt.manifest.schema:
+                cols = stmt.manifest.schema.columns
+                if cols:
+                    col_names = pd.Index([str(c.name) for c in cols])
+                    rows = [
+                        [str(v) if v is not None else None for v in row]
+                        for row in stmt.result.data_array
+                    ]
+                    return pd.DataFrame(rows, columns=col_names)
+            if attempt < max_retries - 1:
+                time.sleep(initial_delay * (attempt + 1))
+                continue
+            return None
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(initial_delay * (attempt + 1))
+                continue
+            logger.debug(
+                "Could not fetch statement %s results after %d attempts",
+                statement_id,
+                max_retries,
+                exc_info=True,
+            )
+            return None
+    return None
 
 
 # ── Asset Detection ────────────────────────────────────────────────────
@@ -767,3 +790,28 @@ def publish_benchmarks_to_genie_space(
         space_id,
     )
     return len(genie_questions)
+
+
+def configure_connection_pool(w: WorkspaceClient, pool_size: int = 20) -> None:
+    """Increase urllib3 connection pool size on the client's HTTP session.
+
+    The default ``maxsize=1`` causes ``Connection pool is full, discarding
+    connection`` warnings under the concurrent evaluation load typical of
+    optimization runs.
+    """
+    try:
+        from requests.adapters import HTTPAdapter
+
+        session = getattr(w.api_client, "_session", None) or getattr(w, "_session", None)
+        if session is None:
+            session = getattr(w.config, "_session", None)
+        if session is not None:
+            adapter = HTTPAdapter(
+                pool_connections=pool_size,
+                pool_maxsize=pool_size,
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            logger.debug("Configured connection pool size=%d", pool_size)
+    except Exception:
+        logger.debug("Could not configure connection pool size", exc_info=True)

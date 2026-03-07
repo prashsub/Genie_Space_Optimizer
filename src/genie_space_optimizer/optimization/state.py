@@ -951,7 +951,8 @@ def load_all_full_iterations(
     rows = df.to_dict("records")
     for row in rows:
         for col in ("scores_json", "failures_json", "remaining_failures",
-                     "arbiter_actions_json", "repeatability_json", "rows_json"):
+                     "arbiter_actions_json", "repeatability_json", "rows_json",
+                     "reflection_json"):
             if row.get(col) and isinstance(row[col], str):
                 try:
                     row[col] = json.loads(row[col])

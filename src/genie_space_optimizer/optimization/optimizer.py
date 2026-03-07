@@ -4677,7 +4677,7 @@ def _call_llm_for_adaptive_strategy(
         _proven_lines.append(
             f"- Root cause: {_ex.get('root_cause', '?')[:80]} | "
             f"Levers: {', '.join(str(l) for l in _ex.get('lever_pattern', []))} | "
-            f"Patches: {', '.join(_ex.get('patch_types', [])[:4])} | "
+            f"Patches: {', '.join(str(x) for x in _ex.get('patch_types', [])[:4] if x is not None)} | "
             f"Gain: {_ex.get('accuracy_gain', 0):+.1f}%"
         )
     proven_patterns_text = (

@@ -72,6 +72,7 @@ UI_POLL_INTERVAL = 5
 SQL_STATEMENT_POLL_LIMIT = 30
 SQL_STATEMENT_POLL_INTERVAL = 2
 INLINE_EVAL_DELAY = 12
+CONNECTION_POOL_SIZE = 20
 
 # ── 3. Iteration and Convergence ───────────────────────────────────────
 
@@ -1923,9 +1924,9 @@ HIGH_RISK_PATCHES = {
 # ── 9. Repeatability Classification ────────────────────────────────────
 
 REPEATABILITY_CLASSIFICATIONS = {
-    100: "IDENTICAL",
-    70: "MINOR_VARIANCE",
-    50: "SIGNIFICANT_VARIANCE",
+    95: "IDENTICAL",
+    80: "MINOR_VARIANCE",
+    60: "SIGNIFICANT_VARIANCE",
     0: "CRITICAL_VARIANCE",
 }
 
