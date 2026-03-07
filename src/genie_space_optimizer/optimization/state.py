@@ -199,7 +199,7 @@ CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_data_access_grants (
     granted_at          TIMESTAMP     NOT NULL COMMENT 'When the grant was applied',
     revoked_at          TIMESTAMP              COMMENT 'When the grant was revoked (null if active)',
     status              STRING        NOT NULL COMMENT 'active|revoked',
-    grant_type          STRING        NOT NULL DEFAULT 'read' COMMENT 'read|write — read grants SELECT/EXECUTE, write adds MODIFY'
+    grant_type          STRING        NOT NULL COMMENT 'read|write — read grants SELECT/EXECUTE, write adds MODIFY'
 )
 USING DELTA
 COMMENT 'Tracks UC privileges granted to the app SP for accessing Genie space assets'
@@ -1051,7 +1051,7 @@ def _ensure_queued_patches_table(spark: Any, catalog: str, schema: str) -> None:
             confidence_tier     STRING,
             coverage_analysis   STRING      COMMENT 'JSON blob with schema overlap details',
             blame_iterations    INT,
-            status              STRING      NOT NULL  DEFAULT 'pending',
+            status              STRING      NOT NULL,
             created_at          TIMESTAMP   NOT NULL,
             resolved_at         TIMESTAMP
         ) USING DELTA

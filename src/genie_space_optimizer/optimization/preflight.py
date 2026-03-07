@@ -205,8 +205,8 @@ def _collect_data_profile(
 
         select_clause = ", ".join(select_parts)
         query = (
-            f"SELECT {select_clause} FROM {fq_table} "
-            f"TABLESAMPLE ({sample_size} ROWS)"
+            f"SELECT {select_clause} "
+            f"FROM (SELECT * FROM {fq_table} TABLESAMPLE ({sample_size} ROWS))"
         )
 
         try:
@@ -248,9 +248,8 @@ def _collect_data_profile(
             escaped_col = f"`{col_name}`"
             dv_query = (
                 f"SELECT COLLECT_SET({escaped_col}) AS vals "
-                f"FROM {fq_table} "
-                f"WHERE {escaped_col} IS NOT NULL "
-                f"TABLESAMPLE ({sample_size} ROWS)"
+                f"FROM (SELECT * FROM {fq_table} TABLESAMPLE ({sample_size} ROWS)) "
+                f"WHERE {escaped_col} IS NOT NULL"
             )
             try:
                 dv_rows = spark.sql(dv_query).collect()
@@ -309,8 +308,7 @@ def _compute_join_overlaps(
             f"COUNT(DISTINCT b.`{pk_col}`) AS right_distinct, "
             f"COUNT(DISTINCT CASE WHEN b.`{pk_col}` IS NOT NULL "
             f"THEN a.`{fk_col}` END) AS overlap "
-            f"FROM {_fq(left_table)} a "
-            f"TABLESAMPLE ({sample_size} ROWS) "
+            f"FROM (SELECT * FROM {_fq(left_table)} TABLESAMPLE ({sample_size} ROWS)) a "
             f"LEFT JOIN {_fq(right_table)} b "
             f"ON a.`{fk_col}` = b.`{pk_col}`"
         )

@@ -916,7 +916,7 @@ function StepInsights({
                   Joins discovered: {proactive.joinSpecsDiscovered as number}
                 </Badge>
               )}
-              {proactive.spaceDescriptionGenerated && (
+              {!!proactive.spaceDescriptionGenerated && (
                 <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">Space description generated</Badge>
               )}
               {(proactive.sampleQuestionsGenerated as number) > 0 && (
@@ -924,7 +924,7 @@ function StepInsights({
                   Sample questions: {proactive.sampleQuestionsGenerated as number}
                 </Badge>
               )}
-              {proactive.instructionsSeeded && (
+              {!!proactive.instructionsSeeded && (
                 <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">Instructions seeded</Badge>
               )}
               {(proactive.promptsMatched as number) > 0 && (

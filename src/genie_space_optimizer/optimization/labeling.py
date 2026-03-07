@@ -8,7 +8,7 @@ Provides:
 Uses the MLflow 3.x labeling API:
   - mlflow.genai.labeling.create_labeling_session()
   - session.add_dataset() / session.add_traces()
-  - session.sync(dataset_name=...)
+  - session.sync(to_dataset=...)
   - mlflow.genai.labeling.get_labeling_sessions()
 """
 
@@ -544,7 +544,7 @@ def sync_corrections_to_dataset(
 ) -> bool:
     """Sync corrected expectations from a labeling session to the eval dataset.
 
-    Finds the session by name and calls ``session.sync(dataset_name=...)``
+    Finds the session by name and calls ``session.sync(to_dataset=...)``
     to propagate human corrections back to the UC-backed evaluation dataset.
     """
     session = _find_session_by_name(session_name)
@@ -553,7 +553,7 @@ def sync_corrections_to_dataset(
         return False
 
     try:
-        session.sync(dataset_name=dataset_name)
+        session.sync(to_dataset=dataset_name)
         logger.info("Synced session '%s' to dataset %s", session_name, dataset_name)
         return True
     except Exception:
@@ -603,7 +603,7 @@ def flag_for_human_review(
                 flag_reason         STRING,
                 iterations_failed   INT,
                 patches_tried       STRING,
-                status              STRING      NOT NULL  DEFAULT 'pending',
+                status              STRING      NOT NULL,
                 flagged_at          TIMESTAMP   NOT NULL,
                 resolved_at         TIMESTAMP
             ) USING DELTA

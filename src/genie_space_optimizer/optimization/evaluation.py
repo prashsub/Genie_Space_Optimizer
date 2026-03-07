@@ -112,7 +112,7 @@ def _truncate_benchmarks(benchmarks: list[dict], max_count: int) -> list[dict]:
     return result
 
 
-_TEMPORAL_PATTERNS = re.compile(
+_TEMPORAL_QUESTION_RE = re.compile(
     r"\b(this year|last \d+ months?|last \d+ days?|current year"
     r"|year-to-date|ytd|this month|this quarter|past \d+ months?)\b",
     re.IGNORECASE,
@@ -133,7 +133,7 @@ def _flag_stale_temporal_benchmarks(
     for b in benchmarks:
         q = b.get("question", "")
         sql = b.get("expected_sql", "")
-        if not _TEMPORAL_PATTERNS.search(q):
+        if not _TEMPORAL_QUESTION_RE.search(q):
             continue
         if not sql:
             continue
@@ -3761,6 +3761,8 @@ def run_repeatability_evaluation(
                 rows_for_output.append(row_dict)
 
         # ── Three-tier sub-metrics ─────────────────────────────────────
+        # Recompute tier classification from row data rather than relying
+        # on Feedback metadata propagation (which varies by MLflow version).
         _tier_counts: dict[str, int] = {
             "execution": 0,
             "structural": 0,
@@ -3770,17 +3772,74 @@ def run_repeatability_evaluation(
             "no_output": 0,
         }
         _total_scored = 0
+
+        from genie_space_optimizer.optimization.scorers.repeatability import (
+            _sql_hash,
+            _structurally_equivalent,
+        )
+
         for _row in rows_for_output:
-            _rep_meta = _row.get("repeatability/metadata") or {}
+            _total_scored += 1
+
+            # First try scorer metadata (works in some MLflow versions)
+            _rep_meta = (
+                _row.get("repeatability/metadata")
+                or _row.get("feedback/repeatability/metadata")
+                or {}
+            )
             if isinstance(_rep_meta, str):
                 try:
                     _rep_meta = json.loads(_rep_meta)
                 except (json.JSONDecodeError, TypeError):
                     _rep_meta = {}
-            tier = _rep_meta.get("match_tier", "")
-            if tier in _tier_counts:
+            tier = _rep_meta.get("match_tier", "") if isinstance(_rep_meta, dict) else ""
+
+            if tier and tier in _tier_counts:
                 _tier_counts[tier] += 1
-            _total_scored += 1
+                continue
+
+            # Recompute tier from the verdict and available reference data
+            verdict = str(
+                _row.get("repeatability/value")
+                or _row.get("feedback/repeatability/value")
+                or _row.get("repeatability")
+                or ""
+            ).lower().strip()
+
+            _prev_sql = (
+                (_row.get("expectations") or {}).get("previous_sql", "")
+                if isinstance(_row.get("expectations"), dict) else ""
+            ) or _row.get("expectations/previous_sql", "")
+            _prev_rh = (
+                (_row.get("expectations") or {}).get("previous_result_hash", "")
+                if isinstance(_row.get("expectations"), dict) else ""
+            ) or _row.get("expectations/previous_result_hash", "")
+            _curr_sql = (
+                (_row.get("outputs") or {}).get("response", "")
+                if isinstance(_row.get("outputs"), dict) else ""
+            ) or _row.get("outputs/response", "")
+            if not _curr_sql:
+                _resp = _row.get("response") or {}
+                if isinstance(_resp, dict):
+                    _curr_sql = _resp.get("response", "")
+
+            _curr_rh = _extract_genie_hash_from_row(_row)
+
+            if not _prev_sql and not _prev_rh:
+                _tier_counts["first_eval"] += 1
+            elif not _curr_sql:
+                _tier_counts["no_output"] += 1
+            elif _prev_rh and _curr_rh:
+                _tier_counts["execution"] += 1
+            elif verdict == "yes":
+                if _prev_sql and _curr_sql and _structurally_equivalent(_prev_sql, _curr_sql):
+                    _tier_counts["structural"] += 1
+                elif _prev_sql and _curr_sql and _sql_hash(_prev_sql) == _sql_hash(_curr_sql):
+                    _tier_counts["exact"] += 1
+                else:
+                    _tier_counts["structural"] += 1
+            else:
+                _tier_counts["none"] += 1
 
         if _total_scored > 0:
             _pass_execution = (
@@ -3902,6 +3961,9 @@ def extract_reference_result_hashes(eval_result: dict) -> dict[str, str]:
     Mirrors :func:`extract_reference_sqls` but pulls the result-set hash
     (``comparison.genie_hash``) computed by the predict function.  Used to
     enable execution-based repeatability comparison in subsequent runs.
+
+    Handles multiple MLflow column formats (``outputs``, ``response``,
+    semi-flat, and fully flat variants).
     """
     ref: dict[str, str] = {}
     rows = eval_result.get("rows", [])
@@ -3917,18 +3979,53 @@ def extract_reference_result_hashes(eval_result: dict) -> dict[str, str]:
         if not qid:
             continue
 
-        outputs = row.get("outputs") or {}
-        if isinstance(outputs, str):
-            outputs = {}
-        cmp = outputs.get("comparison") or {}
-        genie_hash = cmp.get("genie_hash", "")
-
-        if not genie_hash:
-            genie_hash = row.get("outputs/comparison/genie_hash", "")
+        genie_hash = _extract_genie_hash_from_row(row)
 
         if qid and genie_hash:
             ref[str(qid)] = str(genie_hash)
     return ref
+
+
+def _extract_genie_hash_from_row(row: dict) -> str:
+    """Extract ``genie_hash`` from a single eval-result row.
+
+    Checks ``outputs``, ``response``, semi-flat, and fully flat column
+    formats used by different MLflow versions.
+    """
+    genie_hash = ""
+
+    # 1. Nested outputs dict: outputs.comparison.genie_hash
+    outputs = row.get("outputs") or {}
+    if isinstance(outputs, dict):
+        cmp = outputs.get("comparison") or {}
+        if isinstance(cmp, dict):
+            genie_hash = cmp.get("genie_hash", "")
+
+    # 2. MLflow 'response' column (some versions store predict output here)
+    if not genie_hash:
+        _resp = row.get("response") or {}
+        if isinstance(_resp, dict):
+            cmp = _resp.get("comparison") or {}
+            if isinstance(cmp, dict):
+                genie_hash = cmp.get("genie_hash", "")
+
+    # 3. Semi-flat: outputs/comparison as a dict or JSON string
+    if not genie_hash:
+        cmp_raw = row.get("outputs/comparison") or {}
+        if isinstance(cmp_raw, dict):
+            genie_hash = cmp_raw.get("genie_hash", "")
+        elif isinstance(cmp_raw, str):
+            try:
+                cmp_parsed = json.loads(cmp_raw)
+                genie_hash = cmp_parsed.get("genie_hash", "")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+
+    # 4. Fully flat: outputs/comparison/genie_hash
+    if not genie_hash:
+        genie_hash = row.get("outputs/comparison/genie_hash", "")
+
+    return genie_hash or ""
 
 
 # ── Benchmark Extraction from Genie Space ──────────────────────────────

@@ -619,3 +619,56 @@ class TestExtractReferenceResultHashes:
             ]
         })
         assert result == {"q1": "flat_hash"}
+
+    def test_semi_flat_column_format(self):
+        """Most common MLflow format: outputs/comparison as a dict."""
+        from genie_space_optimizer.optimization.evaluation import (
+            extract_reference_result_hashes,
+        )
+        result = extract_reference_result_hashes({
+            "rows": [
+                {
+                    "inputs/question_id": "q1",
+                    "outputs/comparison": {"genie_hash": "semi_hash", "gt_hash": "gt1"},
+                },
+            ]
+        })
+        assert result == {"q1": "semi_hash"}
+
+    def test_semi_flat_json_string(self):
+        """outputs/comparison stored as JSON string."""
+        import json
+        from genie_space_optimizer.optimization.evaluation import (
+            extract_reference_result_hashes,
+        )
+        result = extract_reference_result_hashes({
+            "rows": [
+                {
+                    "inputs/question_id": "q1",
+                    "outputs/comparison": json.dumps({"genie_hash": "json_hash"}),
+                },
+            ]
+        })
+        assert result == {"q1": "json_hash"}
+
+    def test_response_column_format(self):
+        """MLflow sometimes stores predict output in 'response' instead of 'outputs'."""
+        from genie_space_optimizer.optimization.evaluation import (
+            extract_reference_result_hashes,
+        )
+        result = extract_reference_result_hashes({
+            "rows": [
+                {
+                    "inputs": {"question_id": "q1"},
+                    "response": {
+                        "response": "SELECT 1",
+                        "comparison": {"genie_hash": "resp_hash"},
+                    },
+                },
+                {
+                    "inputs": {"question_id": "q2"},
+                    "response": {"response": "SELECT 2", "comparison": {}},
+                },
+            ]
+        })
+        assert result == {"q1": "resp_hash"}

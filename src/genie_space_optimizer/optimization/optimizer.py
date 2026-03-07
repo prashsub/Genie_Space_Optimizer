@@ -3080,8 +3080,8 @@ def _format_structured_column_context(
 
             _profile = metadata_snapshot.get("_data_profile", {})
             _tbl_profile = (
-                _profile.get(table_id, {})
-                or _profile.get(table_id.lower(), {})
+                _profile.get(identifier, {})
+                or _profile.get(identifier.lower(), {})
             )
             _col_profile = _tbl_profile.get("columns", {}).get(col_name, {})
             if _col_profile.get("distinct_values"):

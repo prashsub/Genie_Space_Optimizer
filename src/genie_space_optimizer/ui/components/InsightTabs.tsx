@@ -356,10 +356,9 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
     const entries = Array.from(questionJourney.entries());
     if (filter === "all") return entries;
 
-    const baseline = detail.iterations.find((i) => i.iteration === 0);
     const final = detail.iterations[detail.iterations.length - 1];
 
-    return entries.filter(([qid, data]) => {
+    return entries.filter(([, data]) => {
       const baseResult = data.results.get(0);
       const finalResult = data.results.get(final?.iteration ?? 0);
       const basePassed =
