@@ -429,44 +429,12 @@ def _run_baseline(
         except Exception:
             logger.debug("Failed to log judge verdicts on baseline traces", exc_info=True)
 
-        _bl_trace_map = eval_result.get("trace_map", {})
-        _bl_failures = set(eval_result.get("failure_question_ids", []))
-        _bl_fail_tids = [tid for qid, tid in _bl_trace_map.items() if qid in _bl_failures]
-        _bl_eval_run_id = eval_result.get("mlflow_run_id") or eval_result.get("run_id", "")
-        _bl_eval_run_ids = [_bl_eval_run_id] if _bl_eval_run_id else []
-        _bl_session_name = ""
-        if _bl_fail_tids or _bl_eval_run_ids or _bl_failures:
-            try:
-                from genie_space_optimizer.optimization.labeling import create_review_session
-                _bl_session_info = create_review_session(
-                    run_id=run_id, domain=domain, experiment_name=exp_name,
-                    uc_schema=f"{catalog}.{schema}",
-                    failure_trace_ids=_bl_fail_tids, regression_trace_ids=[],
-                    eval_mlflow_run_ids=_bl_eval_run_ids,
-                    failure_question_ids=list(_bl_failures),
-                )
-                _bl_session_name = _bl_session_info.get("session_name", "")
-                _bl_session_url = _bl_session_info.get("session_url", "")
-                if _bl_session_name:
-                    update_run_status(
-                        spark, run_id, catalog, schema,
-                        labeling_session_name=_bl_session_name,
-                        labeling_session_url=_bl_session_url,
-                    )
-                    print(f"\n[MLflow Review] Baseline labeling session: {_bl_session_name}")
-                    if _bl_session_url:
-                        print(f"  URL: {_bl_session_url}")
-            except Exception as exc:
-                print(f"[Labeling] Failed to create baseline labeling session: {exc}")
-                logger.warning("Failed to create baseline labeling session", exc_info=True)
-
         return {
             "scores": scores,
             "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
             "thresholds_met": thresholds_met,
             "model_id": model_id,
             "eval_result": eval_result,
-            "baseline_session_name": _bl_session_name,
         }
     except Exception as exc:
         err_msg = f"{type(exc).__name__}: {exc}"

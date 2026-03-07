@@ -5582,10 +5582,12 @@ def log_persistence_context_on_traces(
             tids = [tid] if tid else []
         for tid in tids:
             try:
+                classification = ctx.get("classification", "UNKNOWN")
+                is_persistent = classification not in ("INTERMITTENT", "UNKNOWN")
                 mlflow.log_feedback(
                     trace_id=tid,
                     name="persistence_context",
-                    value=ctx.get("classification", "UNKNOWN") != "INTERMITTENT",
+                    value=is_persistent,
                     rationale=(
                         f"Failed {ctx.get('fail_count', 0)} times, "
                         f"{ctx.get('max_consecutive', 0)} consecutive"
@@ -5598,11 +5600,13 @@ def log_persistence_context_on_traces(
                         "question_id": qid,
                         "fail_count": ctx.get("fail_count", 0),
                         "max_consecutive": ctx.get("max_consecutive", 0),
-                        "classification": ctx.get("classification", ""),
+                        "classification": classification,
                         "patches_tried": str(ctx.get("patches_tried", [])),
                         "fail_iterations": ctx.get("fail_iterations", []),
                     },
                 )
+                mlflow.set_trace_tag(tid, "persistent_failure", str(is_persistent).lower())
+                mlflow.set_trace_tag(tid, "persistence_classification", classification)
                 logged += 1
             except Exception:
                 logger.debug("Failed to log persistence context for trace %s", tid, exc_info=True)
