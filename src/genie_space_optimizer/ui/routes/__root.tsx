@@ -26,7 +26,7 @@ function RootLayout() {
           <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4">
             <Link to="/" className="flex items-center gap-2.5 hover:opacity-90">
               <img
-                src="/genie_logo.jpg"
+                src="/genie_logo.png"
                 alt="Genie Optimizer"
                 className="h-9 w-9 rounded-md object-cover"
               />

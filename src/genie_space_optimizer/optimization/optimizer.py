@@ -3077,6 +3077,20 @@ def _format_structured_column_context(
             preamble = sections.get("_preamble", "").strip()
             if preamble:
                 lines.append(f"    [Legacy text]: {preamble}")
+
+            _profile = metadata_snapshot.get("_data_profile", {})
+            _tbl_profile = (
+                _profile.get(table_id, {})
+                or _profile.get(table_id.lower(), {})
+            )
+            _col_profile = _tbl_profile.get("columns", {}).get(col_name, {})
+            if _col_profile.get("distinct_values"):
+                lines.append(f"    Data values: {_col_profile['distinct_values']}")
+            elif _col_profile.get("min") is not None:
+                lines.append(
+                    f"    Data range: [{_col_profile['min']}, {_col_profile['max']}]"
+                )
+
             lines.append("")
             columns_shown += 1
 
@@ -3221,11 +3235,18 @@ def _describe_patch_type(patch_type: str) -> str:
     return patch_type
 
 
-def _format_sql_diffs(cluster: dict, *, max_sql_chars: int = 0) -> str:
+def _format_sql_diffs(
+    cluster: dict,
+    *,
+    max_sql_chars: int = 0,
+    max_sample_chars: int = 500,
+) -> str:
     """Build a human-readable summary of SQL diffs for the LLM prompt.
 
     When *max_sql_chars* > 0, individual SQL blocks are truncated to that
-    length to keep overall prompt size manageable.
+    length to keep overall prompt size manageable.  When *max_sample_chars*
+    > 0, ground-truth and Genie result samples from the comparison dict are
+    included (truncated to *max_sample_chars*).
     """
     sql_contexts = cluster.get("sql_contexts", [])
     if not sql_contexts:
@@ -3250,6 +3271,17 @@ def _format_sql_diffs(cluster: dict, *, max_sql_chars: int = 0) -> str:
         elif isinstance(comp, dict) and not comp.get("match"):
             match_type = comp.get("match_type", "unknown")
             lines.append(f"**Mismatch type:** {match_type}")
+        if max_sample_chars > 0 and isinstance(comp, dict):
+            gt_sample = comp.get("gt_sample")
+            if gt_sample:
+                lines.append(
+                    f"**Expected Result (sample):**\n```\n{str(gt_sample)[:max_sample_chars]}\n```"
+                )
+            genie_sample = comp.get("genie_sample")
+            if genie_sample:
+                lines.append(
+                    f"**Genie Result (sample):**\n```\n{str(genie_sample)[:max_sample_chars]}\n```"
+                )
         lines.append("")
     cf = cluster.get("asi_counterfactual_fixes", [])
     if cf:
@@ -3257,6 +3289,64 @@ def _format_sql_diffs(cluster: dict, *, max_sql_chars: int = 0) -> str:
         for fix in cf[:3]:
             lines.append(f"- {fix}")
     return "\n".join(lines)
+
+
+def _format_blamed_column_values(
+    clusters: list[dict],
+    data_profile: dict,
+    *,
+    max_columns: int = 20,
+) -> str:
+    """Build a compact value-hint section for columns that appear in blame sets.
+
+    Extracts blamed column and table references from failure clusters, looks
+    them up in *data_profile*, and renders their distinct values or ranges.
+    """
+    if not data_profile:
+        return "(no data profile available)"
+
+    blamed_refs: set[str] = set()
+    for cluster in clusters:
+        blame = cluster.get("asi_blame_set")
+        if isinstance(blame, str) and blame:
+            blamed_refs.update(b.strip().lower() for b in blame.split("|") if b.strip())
+        elif isinstance(blame, list):
+            blamed_refs.update(str(b).strip().lower() for b in blame if b)
+
+    if not blamed_refs:
+        return "(no blamed columns identified)"
+
+    profile_lower: dict[str, dict] = {}
+    for table_fqn, tinfo in data_profile.items():
+        tkey = table_fqn.lower()
+        short_name = tkey.split(".")[-1] if "." in tkey else tkey
+        for col_name, cinfo in tinfo.get("columns", {}).items():
+            col_lower = col_name.lower()
+            profile_lower[f"{tkey}.{col_lower}"] = cinfo
+            profile_lower[f"{short_name}.{col_lower}"] = cinfo
+            profile_lower[col_lower] = cinfo
+
+    lines: list[str] = []
+    matched = 0
+    for ref in sorted(blamed_refs):
+        if matched >= max_columns:
+            break
+        cinfo = profile_lower.get(ref)
+        if not cinfo:
+            continue
+        matched += 1
+        card = cinfo.get("cardinality", "?")
+        parts = [f"cardinality={card}"]
+        vals = cinfo.get("distinct_values")
+        if vals:
+            parts.append(f"values={vals}")
+        minv = cinfo.get("min")
+        maxv = cinfo.get("max")
+        if minv is not None:
+            parts.append(f"range=[{minv}, {maxv}]")
+        lines.append(f"- {ref}: {', '.join(parts)}")
+
+    return "\n".join(lines) if lines else "(no matching column profiles found)"
 
 
 def _derive_blame_from_sql(cluster: dict) -> list[str] | None:
@@ -3750,10 +3840,24 @@ def _call_llm_for_proposal(
     }
 
 
-def _format_discovery_hints(hints: list[dict]) -> str:
-    """Format discovery hints into a human-readable string for the LLM prompt."""
+def _format_discovery_hints(
+    hints: list[dict],
+    join_overlaps: list[dict] | None = None,
+) -> str:
+    """Format discovery hints into a human-readable string for the LLM prompt.
+
+    When *join_overlaps* are available (from preflight data profiling), each
+    hint is annotated with the FK overlap ratio for the relevant table pair.
+    """
     if not hints:
         return "(no heuristic hints)"
+
+    overlap_index: dict[tuple[str, str], dict] = {}
+    for ov in (join_overlaps or []):
+        key = (ov.get("left_table", "").lower(), ov.get("right_table", "").lower())
+        overlap_index[key] = ov
+        overlap_index[(key[1], key[0])] = ov
+
     lines: list[str] = []
     for idx, h in enumerate(hints, 1):
         lt = h.get("left_table", "")
@@ -3762,6 +3866,18 @@ def _format_discovery_hints(hints: list[dict]) -> str:
         lines.append(f"### Hint {idx}: {lt} ↔ {rt}")
         if not compat:
             lines.append("  ⚠️  Some candidate columns have mismatched types")
+
+        ov = overlap_index.get((lt.lower(), rt.lower()))
+        if ov:
+            ratio = ov.get("overlap_ratio", 0)
+            fk_col = ov.get("fk_column", "?")
+            pk_col = ov.get("pk_column", "?")
+            pct = f"{ratio * 100:.0f}%"
+            lines.append(
+                f"  📊 FK overlap: {fk_col} → {pk_col} = {pct} "
+                f"({ov.get('left_distinct', '?')} distinct FK values)"
+            )
+
         for cc in h.get("candidate_columns", []):
             lines.append(
                 f"  - {cc.get('left_col', '?')} ↔ {cc.get('right_col', '?')} "
@@ -3853,7 +3969,10 @@ def _call_llm_for_join_discovery(
         "full_schema_context": scoped_schema,
         "identifier_allowlist": _format_identifier_allowlist(_allowlist),
         "current_join_specs": json.dumps(_join_specs, default=str),
-        "discovery_hints": _format_discovery_hints(hints),
+        "discovery_hints": _format_discovery_hints(
+            hints,
+            join_overlaps=metadata_snapshot.get("_join_overlaps"),
+        ),
     }
 
     format_kwargs = _truncate_to_budget(
@@ -4473,13 +4592,17 @@ def _call_llm_for_strategy(
             metadata_snapshot.get("general_instructions", "") or "(No current instructions.)"
         ),
         "existing_example_sqls": _format_existing_example_sqls(metadata_snapshot),
+        "blamed_column_values": _format_blamed_column_values(
+            clusters, metadata_snapshot.get("_data_profile", {}),
+        ),
         "instruction_char_budget": max(0, 24500 - 500),
     }
 
     format_kwargs = _truncate_to_budget(
         format_kwargs, STRATEGIST_PROMPT,
-        priority_keys=["full_schema_context", "existing_example_sqls", "soft_signal_summary",
-                        "structured_function_context", "structured_column_context", "cluster_briefs"],
+        priority_keys=["blamed_column_values", "full_schema_context", "existing_example_sqls",
+                        "soft_signal_summary", "structured_function_context",
+                        "structured_column_context", "cluster_briefs"],
     )
 
     prompt = format_mlflow_template(STRATEGIST_PROMPT, **format_kwargs)
@@ -4747,6 +4870,9 @@ def _call_llm_for_adaptive_strategy(
         "identifier_allowlist": _format_identifier_allowlist(
             _build_identifier_allowlist(metadata_snapshot)
         ),
+        "blamed_column_values": _format_blamed_column_values(
+            clusters, metadata_snapshot.get("_data_profile", {}),
+        ),
         "instruction_char_budget": max(0, 24500 - 500),
     }
 
@@ -4754,6 +4880,7 @@ def _call_llm_for_adaptive_strategy(
         format_kwargs,
         ADAPTIVE_STRATEGIST_PROMPT,
         priority_keys=[
+            "blamed_column_values",
             "soft_signal_summary",
             "existing_example_sqls",
             "structured_function_context",

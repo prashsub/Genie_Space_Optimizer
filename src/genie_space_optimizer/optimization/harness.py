@@ -42,6 +42,7 @@ from genie_space_optimizer.common.config import (
     ENABLE_PROMPT_MATCHING_AUTO_APPLY,
     ENABLE_SLICE_GATE,
     GENIE_CORRECT_CONFIRMATION_THRESHOLD,
+    GT_REPAIR_PROMPT,
     INLINE_EVAL_DELAY,
     INSTRUCTION_PROMPT_NAME_TEMPLATE,
     LEVER_NAMES,
@@ -2426,28 +2427,6 @@ def _should_quarantine(candidate: dict) -> bool:
     return candidate.get("consecutive_nc", 0) >= NEITHER_CORRECT_QUARANTINE_THRESHOLD
 
 
-_GT_REPAIR_PROMPT_TEMPLATE = """\
-You are a SQL expert reviewing a benchmark question where BOTH the ground-truth SQL \
-and Genie's generated SQL were judged incorrect by the arbiter.
-
-QUESTION: {question}
-
-GROUND TRUTH SQL (judged incorrect):
-{expected_sql}
-
-GENIE SQL (also judged incorrect):
-{genie_sql}
-
-ARBITER RATIONALE(S):
-{rationale}
-
-Your task: produce a CORRECTED ground-truth SQL that correctly answers the question.
-- Use proper Databricks SQL syntax
-- Respect temporal semantics (e.g. "this year" = DATE_TRUNC('year', CURRENT_DATE()), \
-"last 12 months" = ADD_MONTHS(CURRENT_DATE(), -12))
-- Use MEASURE() for metric view columns where appropriate
-- Return ONLY the corrected SQL, no explanation
-"""
 
 
 def _attempt_gt_repair(
@@ -2462,7 +2441,8 @@ def _attempt_gt_repair(
     from genie_space_optimizer.optimization.evaluation import _call_llm_for_scoring
     from genie_space_optimizer.optimization.benchmarks import validate_ground_truth_sql
 
-    prompt = _GT_REPAIR_PROMPT_TEMPLATE.format(
+    prompt = format_mlflow_template(
+        GT_REPAIR_PROMPT,
         question=candidate["question"],
         expected_sql=candidate.get("expected_sql", ""),
         genie_sql=candidate.get("genie_sql", ""),
@@ -5328,3 +5308,51 @@ def _get_failure_rows(
     if isinstance(rows_json, list):
         return rows_json
     return []
+
+
+def _compute_category_performance(
+    iteration_rows: list[dict],
+    benchmarks: list[dict],
+) -> dict[str, dict]:
+    """Compute per-category benchmark accuracy from an evaluation iteration.
+
+    Maps each evaluation row to its benchmark's ``category`` and computes
+    ``{category: {"total": N, "correct": M}}``.  Used to identify weak
+    categories for targeted gap-filling.
+    """
+    qid_to_category: dict[str, str] = {}
+    for b in benchmarks:
+        qid = b.get("question_id") or b.get("id") or ""
+        cat = b.get("category", "")
+        question = b.get("question", "")
+        if qid and cat:
+            qid_to_category[str(qid)] = cat
+        if question and cat:
+            qid_to_category[question.lower().strip()] = cat
+
+    category_stats: dict[str, dict] = {}
+    for row in iteration_rows:
+        req = row.get("request") or row.get("inputs") or {}
+        if isinstance(req, dict):
+            question = str(req.get("question", "")).lower().strip()
+            qid = str(req.get("question_id", ""))
+        else:
+            question = ""
+            qid = ""
+
+        cat = qid_to_category.get(qid) or qid_to_category.get(question) or "unknown"
+        if cat not in category_stats:
+            category_stats[cat] = {"total": 0, "correct": 0}
+
+        category_stats[cat]["total"] += 1
+
+        arbiter = (
+            row.get("arbiter/value")
+            or row.get("feedback/arbiter/value")
+            or (row.get("arbiter") if isinstance(row.get("arbiter"), str) else "")
+            or "skipped"
+        ).lower()
+        if arbiter in ("both_correct", "genie_correct"):
+            category_stats[cat]["correct"] += 1
+
+    return category_stats

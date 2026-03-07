@@ -146,6 +146,18 @@ TEMPLATE_VARIABLES = {
     "${gold_schema}": "gold_schema",
 }
 
+# ── 5b. Data Profiling ────────────────────────────────────────────────
+
+MAX_PROFILE_TABLES = 20
+"""Maximum number of tables to profile during preflight."""
+
+PROFILE_SAMPLE_SIZE = 100
+"""Number of rows sampled per table via TABLESAMPLE."""
+
+LOW_CARDINALITY_THRESHOLD = 20
+"""Columns with fewer distinct values than this threshold get their actual
+distinct values collected (useful for generating realistic filter values)."""
+
 BENCHMARK_GENERATION_PROMPT = (
     '<role>\n'
     'You are a Databricks Genie Space evaluation expert.\n'
@@ -174,10 +186,18 @@ BENCHMARK_GENERATION_PROMPT = (
     '\n'
     '## Sample Questions (from Genie Space config)\n'
     '{{ sample_questions_context }}\n'
+    '\n'
+    '## Data Profile (actual values from database)\n'
+    '{{ data_profile_context }}\n'
     '</context>\n'
     '\n'
     '<instructions>\n'
     'Generate exactly {{ target_count }} diverse benchmark questions that a business user would ask.\n'
+    '\n'
+    '## Data-Grounded Values\n'
+    'Use the Data Profile to generate realistic filter values — reference actual '
+    'column values (e.g. WHERE status = \'active\') rather than inventing values. '
+    'For numeric columns, use values within the profiled min/max range.\n'
     '\n'
     '## Asset Constraint (Extract-Over-Generate)\n'
     'expected_sql MUST ONLY reference tables, metric views, and functions from VALID Data Assets. '
@@ -237,6 +257,9 @@ BENCHMARK_CORRECTION_PROMPT = (
     '## Table-Valued Functions\n'
     '{{ tvfs_context }}\n'
     '\n'
+    '## Data Profile (actual values from database)\n'
+    '{{ data_profile_context }}\n'
+    '\n'
     '## Benchmarks to Fix\n'
     '{{ benchmarks_to_fix }}\n'
     '</context>\n'
@@ -248,6 +271,8 @@ BENCHMARK_CORRECTION_PROMPT = (
     '- Field drift (e.g., property_name vs property): map to closest valid column.\n'
     '- Metric views: use MEASURE() syntax for aggregates in SELECT/ORDER BY.\n'
     '- TVFs: use correct function call signature.\n'
+    '- If error says "Query returns 0 rows", the SQL is syntactically valid but\n'
+    '  references impossible filter values. Use the Data Profile to pick realistic values.\n'
     '- If no valid asset can answer the question, set expected_sql to null with unfixable_reason.\n'
     '- Preserve original question text.\n'
     '- Apply MINIMAL SQL PRINCIPLE: corrected SQL answers exactly what the question asks.\n'
@@ -323,11 +348,20 @@ BENCHMARK_COVERAGE_GAP_PROMPT = (
     '\n'
     '## Already Covered Questions (do NOT duplicate these)\n'
     '{{ existing_questions }}\n'
+    '\n'
+    '## Data Profile (actual values from database)\n'
+    '{{ data_profile_context }}\n'
+    '\n'
+    '{{ weak_categories_context }}\n'
     '</context>\n'
     '\n'
     '<instructions>\n'
     'The uncovered assets above have ZERO benchmark questions. Generate 1-2 questions '
     'PER uncovered asset. Each question MUST reference the asset in its FROM/JOIN/function call.\n'
+    '\n'
+    '## Data-Grounded Values\n'
+    'Use the Data Profile to generate realistic filter values — reference actual '
+    'column values rather than inventing values.\n'
     '\n'
     '## Asset Constraint (Extract-Over-Generate)\n'
     'expected_sql MUST ONLY reference tables, metric views, and functions from VALID Data Assets. '
@@ -1287,6 +1321,9 @@ STRATEGIST_PROMPT = (
     '\n'
     '## Existing Example SQL\n'
     '{{ existing_example_sqls }}\n'
+    '\n'
+    '## Data Values for Blamed Columns\n'
+    '{{ blamed_column_values }}\n'
     '</context>\n'
     '\n'
     '<output_schema>\n'
@@ -1797,6 +1834,9 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     '## Existing Example SQL\n'
     '{{ existing_example_sqls }}\n'
+    '\n'
+    '## Data Values for Blamed Columns\n'
+    '{{ blamed_column_values }}\n'
     '</context>\n'
     '\n'
     '<output_schema>\n'
@@ -1844,6 +1884,31 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '  {"action_groups": [], "global_instruction_rewrite": "", '
     '"rationale": "No actionable failures"}\n'
     '</output_schema>'
+)
+
+# ── 5e. GT Repair Prompt ───────────────────────────────────────────────
+
+GT_REPAIR_PROMPT = (
+    'You are a SQL expert reviewing a benchmark question where BOTH the ground-truth SQL '
+    'and Genie\'s generated SQL were judged incorrect by the arbiter.\n'
+    '\n'
+    'QUESTION: {{ question }}\n'
+    '\n'
+    'GROUND TRUTH SQL (judged incorrect):\n'
+    '{{ expected_sql }}\n'
+    '\n'
+    'GENIE SQL (also judged incorrect):\n'
+    '{{ genie_sql }}\n'
+    '\n'
+    'ARBITER RATIONALE(S):\n'
+    '{{ rationale }}\n'
+    '\n'
+    'Your task: produce a CORRECTED ground-truth SQL that correctly answers the question.\n'
+    '- Use proper Databricks SQL syntax\n'
+    '- Respect temporal semantics (e.g. "this year" = DATE_TRUNC(\'year\', CURRENT_DATE()), '
+    '"last 12 months" = ADD_MONTHS(CURRENT_DATE(), -12))\n'
+    '- Use MEASURE() for metric view columns where appropriate\n'
+    '- Return ONLY the corrected SQL, no explanation'
 )
 
 
@@ -2667,6 +2732,7 @@ LEVER_PROMPTS: dict[str, str] = {
     "strategist": STRATEGIST_PROMPT,
     "strategist_triage": STRATEGIST_TRIAGE_PROMPT,
     "strategist_detail": STRATEGIST_DETAIL_PROMPT,
+    "adaptive_strategist": ADAPTIVE_STRATEGIST_PROMPT,
     "lever_1_2_column": LEVER_1_2_COLUMN_PROMPT,
     "lever_4_join_spec": LEVER_4_JOIN_SPEC_PROMPT,
     "lever_4_join_discovery": LEVER_4_JOIN_DISCOVERY_PROMPT,
@@ -2674,8 +2740,11 @@ LEVER_PROMPTS: dict[str, str] = {
     "lever_5_holistic": LEVER_5_HOLISTIC_PROMPT,
     "proposal_generation": PROPOSAL_GENERATION_PROMPT,
     "description_enrichment": DESCRIPTION_ENRICHMENT_PROMPT,
+    "table_description_enrichment": TABLE_DESCRIPTION_ENRICHMENT_PROMPT,
+    "proactive_instruction": PROACTIVE_INSTRUCTION_PROMPT,
     "space_description": SPACE_DESCRIPTION_PROMPT,
     "sample_questions": SAMPLE_QUESTIONS_PROMPT,
+    "gt_repair": GT_REPAIR_PROMPT,
 }
 
 # ── 20c. Benchmark Prompts (registered in MLflow for traceability) ─────

@@ -41,6 +41,7 @@ from genie_space_optimizer.optimization.benchmarks import validate_benchmarks
 from genie_space_optimizer.optimization.applier import _get_general_instructions
 from genie_space_optimizer.optimization.evaluation import (
     _drop_benchmark_table,
+    _flag_stale_temporal_benchmarks,
     create_evaluation_dataset,
     extract_genie_space_benchmarks,
     generate_benchmarks,
@@ -113,6 +114,229 @@ def _ensure_experiment_parent_dir(ws: WorkspaceClient, experiment_path: str) -> 
     except Exception as exc:
         logger.warning("Could not ensure experiment parent directory %s: %s", parent, exc)
         return False
+
+
+def _collect_data_profile(
+    spark: "SparkSession",
+    tables: list[str],
+    uc_columns: list[dict],
+    *,
+    max_tables: int = 0,
+    sample_size: int = 0,
+    low_cardinality_threshold: int = 0,
+) -> dict[str, dict]:
+    """Profile actual data values for Genie Space tables.
+
+    For each table (up to *max_tables*) runs a single TABLESAMPLE-bounded
+    Spark SQL query that collects per-column cardinality, distinct values
+    for low-cardinality string columns, and min/max for numeric/date columns.
+
+    Returns ``{table_fqn: {"row_count": N, "columns": {col: {...}}}}``.
+    Failures on individual tables are logged and skipped.
+    """
+    from genie_space_optimizer.common.config import (
+        LOW_CARDINALITY_THRESHOLD,
+        MAX_PROFILE_TABLES,
+        PROFILE_SAMPLE_SIZE,
+    )
+
+    max_tables = max_tables or MAX_PROFILE_TABLES
+    sample_size = sample_size or PROFILE_SAMPLE_SIZE
+    low_cardinality_threshold = low_cardinality_threshold or LOW_CARDINALITY_THRESHOLD
+
+    _NUMERIC_TYPES = frozenset({
+        "int", "integer", "bigint", "smallint", "tinyint",
+        "float", "double", "decimal", "numeric", "long", "short",
+    })
+    _DATE_TYPES = frozenset({"date", "timestamp", "timestamp_ntz"})
+
+    cols_by_table: dict[str, list[dict]] = {}
+    for c in uc_columns:
+        if not isinstance(c, dict):
+            continue
+        tbl = str(c.get("table_name") or "").strip()
+        if tbl:
+            cols_by_table.setdefault(tbl, []).append(c)
+
+    profile: dict[str, dict] = {}
+    for table_fqn in tables[:max_tables]:
+        tbl_key = table_fqn.strip().lower()
+        tbl_cols = cols_by_table.get(tbl_key, [])
+        if not tbl_cols:
+            for k, v in cols_by_table.items():
+                if k.endswith(table_fqn.split(".")[-1].strip("`").lower()):
+                    tbl_cols = v
+                    break
+        if not tbl_cols:
+            logger.debug("Data profiling: no columns known for %s, skipping", table_fqn)
+            continue
+
+        escaped_table = table_fqn.replace("`", "")
+        parts = escaped_table.split(".")
+        fq_table = ".".join(f"`{p.strip()}`" for p in parts)
+
+        try:
+            count_row = spark.sql(f"SELECT COUNT(*) AS cnt FROM {fq_table}").collect()
+            row_count = count_row[0]["cnt"] if count_row else 0
+        except Exception:
+            logger.debug("Data profiling: COUNT(*) failed for %s", table_fqn, exc_info=True)
+            row_count = -1
+
+        select_parts: list[str] = []
+        col_meta: list[tuple[str, str]] = []
+        for c in tbl_cols:
+            col_name = str(c.get("column_name") or "").strip()
+            dtype_raw = str(c.get("data_type") or "").strip().lower()
+            dtype = dtype_raw.split("(")[0].strip()
+            if not col_name:
+                continue
+            escaped_col = f"`{col_name}`"
+            alias_card = f"`_card_{col_name}`"
+            select_parts.append(f"COUNT(DISTINCT {escaped_col}) AS {alias_card}")
+
+            if dtype in _NUMERIC_TYPES or dtype in _DATE_TYPES:
+                select_parts.append(f"MIN({escaped_col}) AS `_min_{col_name}`")
+                select_parts.append(f"MAX({escaped_col}) AS `_max_{col_name}`")
+
+            col_meta.append((col_name, dtype))
+
+        if not select_parts:
+            continue
+
+        select_clause = ", ".join(select_parts)
+        query = (
+            f"SELECT {select_clause} FROM {fq_table} "
+            f"TABLESAMPLE ({sample_size} ROWS)"
+        )
+
+        try:
+            stats_row = spark.sql(query).collect()
+        except Exception:
+            logger.info("Data profiling: stats query failed for %s, skipping", table_fqn, exc_info=True)
+            continue
+
+        if not stats_row:
+            continue
+        row = stats_row[0]
+
+        columns_profile: dict[str, dict] = {}
+        low_card_cols: list[tuple[str, str]] = []
+
+        for col_name, dtype in col_meta:
+            card = row[f"_card_{col_name}"]
+            col_info: dict[str, Any] = {"cardinality": int(card) if card is not None else 0}
+
+            if dtype in _NUMERIC_TYPES or dtype in _DATE_TYPES:
+                min_val = row[f"_min_{col_name}"]
+                max_val = row[f"_max_{col_name}"]
+                if min_val is not None:
+                    col_info["min"] = str(min_val)
+                if max_val is not None:
+                    col_info["max"] = str(max_val)
+
+            if (
+                col_info["cardinality"] > 0
+                and col_info["cardinality"] <= low_cardinality_threshold
+                and dtype not in _NUMERIC_TYPES
+                and dtype not in _DATE_TYPES
+            ):
+                low_card_cols.append((col_name, dtype))
+
+            columns_profile[col_name] = col_info
+
+        for col_name, _dtype in low_card_cols:
+            escaped_col = f"`{col_name}`"
+            dv_query = (
+                f"SELECT COLLECT_SET({escaped_col}) AS vals "
+                f"FROM {fq_table} "
+                f"WHERE {escaped_col} IS NOT NULL "
+                f"TABLESAMPLE ({sample_size} ROWS)"
+            )
+            try:
+                dv_rows = spark.sql(dv_query).collect()
+                if dv_rows and dv_rows[0]["vals"]:
+                    vals = sorted(str(v) for v in dv_rows[0]["vals"])
+                    columns_profile[col_name]["distinct_values"] = vals
+            except Exception:
+                logger.debug(
+                    "Data profiling: COLLECT_SET failed for %s.%s",
+                    table_fqn, col_name, exc_info=True,
+                )
+
+        profile[escaped_table] = {
+            "row_count": row_count,
+            "columns": columns_profile,
+        }
+        logger.info(
+            "Data profiling: %s — %d rows, %d columns profiled, %d low-cardinality",
+            table_fqn, row_count, len(columns_profile), len(low_card_cols),
+        )
+
+    return profile
+
+
+def _compute_join_overlaps(
+    spark: "SparkSession",
+    fk_constraints: list[dict],
+    *,
+    sample_size: int = 1000,
+) -> list[dict]:
+    """Compute FK-to-PK overlap ratios for known foreign-key pairs.
+
+    For each FK constraint, runs a sampled LEFT JOIN to measure how many
+    FK values actually match a PK value on the other side. Returns a list
+    of ``{left_table, right_table, fk_column, pk_column, overlap_ratio}``
+    dicts.  Failures are logged and skipped.
+    """
+    results: list[dict] = []
+    for fk in fk_constraints:
+        if not isinstance(fk, dict):
+            continue
+        left_table = str(fk.get("table_name") or fk.get("child_table") or "").strip()
+        right_table = str(fk.get("referenced_table") or fk.get("parent_table") or "").strip()
+        fk_col = str(fk.get("column_name") or fk.get("child_column") or "").strip()
+        pk_col = str(fk.get("referenced_column") or fk.get("parent_column") or "").strip()
+        if not all([left_table, right_table, fk_col, pk_col]):
+            continue
+
+        def _fq(tbl: str) -> str:
+            parts = tbl.replace("`", "").split(".")
+            return ".".join(f"`{p.strip()}`" for p in parts)
+
+        query = (
+            f"SELECT "
+            f"COUNT(DISTINCT a.`{fk_col}`) AS left_distinct, "
+            f"COUNT(DISTINCT b.`{pk_col}`) AS right_distinct, "
+            f"COUNT(DISTINCT CASE WHEN b.`{pk_col}` IS NOT NULL "
+            f"THEN a.`{fk_col}` END) AS overlap "
+            f"FROM {_fq(left_table)} a "
+            f"TABLESAMPLE ({sample_size} ROWS) "
+            f"LEFT JOIN {_fq(right_table)} b "
+            f"ON a.`{fk_col}` = b.`{pk_col}`"
+        )
+        try:
+            rows = spark.sql(query).collect()
+            if rows:
+                r = rows[0]
+                left_d = r["left_distinct"] or 0
+                overlap_ratio = (r["overlap"] / left_d) if left_d > 0 else 0.0
+                results.append({
+                    "left_table": left_table,
+                    "right_table": right_table,
+                    "fk_column": fk_col,
+                    "pk_column": pk_col,
+                    "overlap_ratio": round(overlap_ratio, 3),
+                    "left_distinct": left_d,
+                    "right_distinct": r["right_distinct"] or 0,
+                })
+        except Exception:
+            logger.debug(
+                "Join overlap query failed for %s.%s -> %s.%s",
+                left_table, fk_col, right_table, pk_col,
+                exc_info=True,
+            )
+
+    return results
 
 
 def _validate_core_access(
@@ -544,6 +768,68 @@ def run_preflight(
         detail=stage_detail,
     )
 
+    # ── Data Profiling ──
+    table_names = config.get("_tables", [])
+    if table_names and uc_columns_dicts:
+        write_stage(
+            spark, run_id, "DATA_PROFILING", "STARTED",
+            task_key="preflight", catalog=catalog, schema=schema,
+        )
+        try:
+            data_profile = _collect_data_profile(
+                spark, table_names, uc_columns_dicts,
+            )
+            config["_data_profile"] = data_profile
+            profiled_tables = len(data_profile)
+            total_cols_profiled = sum(
+                len(t.get("columns", {})) for t in data_profile.values()
+            )
+            low_card_count = sum(
+                1
+                for t in data_profile.values()
+                for c in t.get("columns", {}).values()
+                if c.get("distinct_values")
+            )
+            print(
+                f"\n  Data Profiling: {profiled_tables} tables, "
+                f"{total_cols_profiled} columns, "
+                f"{low_card_count} low-cardinality with value hints"
+            )
+            write_stage(
+                spark, run_id, "DATA_PROFILING", "COMPLETE",
+                task_key="preflight", catalog=catalog, schema=schema,
+                detail={
+                    "tables_profiled": profiled_tables,
+                    "columns_profiled": total_cols_profiled,
+                    "low_cardinality_columns": low_card_count,
+                },
+            )
+        except Exception:
+            logger.warning("Data profiling failed — continuing without profile", exc_info=True)
+            config["_data_profile"] = {}
+            write_stage(
+                spark, run_id, "DATA_PROFILING", "COMPLETE",
+                task_key="preflight", catalog=catalog, schema=schema,
+                detail={"error": "profiling failed, continuing without profile"},
+            )
+    else:
+        config["_data_profile"] = {}
+
+    # ── Join Overlap Scores ──
+    if uc_fk_dicts:
+        try:
+            join_overlaps = _compute_join_overlaps(spark, uc_fk_dicts)
+            config["_join_overlaps"] = join_overlaps
+            if join_overlaps:
+                logger.info(
+                    "Computed join overlaps for %d FK pairs", len(join_overlaps),
+                )
+        except Exception:
+            logger.debug("Join overlap computation failed", exc_info=True)
+            config["_join_overlaps"] = []
+    else:
+        config["_join_overlaps"] = []
+
     uc_schema = f"{catalog}.{schema}"
     if experiment_name is None:
         experiment_name = _resolve_experiment_path(space_id=space_id, domain=domain)
@@ -707,6 +993,8 @@ def run_preflight(
             f"Sample errors: {invalid_errors[:5]}. "
             "Check that the Genie space's referenced tables actually exist."
         )
+
+    _flag_stale_temporal_benchmarks(benchmarks, spark)
 
     _uc_table = f"{uc_schema}.genie_benchmarks_{domain}"
     logger.info(

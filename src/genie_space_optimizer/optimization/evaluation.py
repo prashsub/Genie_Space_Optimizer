@@ -2663,6 +2663,7 @@ def create_evaluation_dataset(
                 "correction_source": b.get("correction_source", ""),
                 "required_tables": b.get("required_tables", []),
                 "required_columns": b.get("required_columns", []),
+                "temporal_stale": b.get("temporal_stale", False),
             }
             expectations = {k: v for k, v in expectations.items() if v is not None}
             records.append(
@@ -2690,13 +2691,12 @@ def create_evaluation_dataset(
             )
             for r in records:
                 r.pop("provenance", None)
-        records = _flag_stale_temporal_benchmarks(records, spark)
         eval_dataset.merge_records(records)
         logger.info("UC Evaluation Dataset: %s (%d records merged)", uc_table_name, len(records))
         return eval_dataset
     except Exception:
         logger.exception("UC dataset creation failed for %s", uc_table_name)
-        return None
+        raise
 
 
 def _drop_benchmark_table(spark: SparkSession, uc_table_name: str) -> None:
@@ -3409,8 +3409,31 @@ def run_evaluation(
                 + " | ".join(infra_errors[:3]),
             )
 
+        _temporal_stale_qids: set[str] = set()
+        for _ts_row in rows_for_output:
+            if ((_ts_row.get("expectations") or {}).get("temporal_stale")
+                    or (_ts_row.get("inputs", {}) or {}).get("temporal_stale")):
+                _ts_req = _ts_row.get("request") or {}
+                if isinstance(_ts_req, str):
+                    try:
+                        _ts_req = json.loads(_ts_req)
+                    except (json.JSONDecodeError, TypeError):
+                        _ts_req = {}
+                _ts_kw = _ts_req.get("kwargs", {}) if isinstance(_ts_req, dict) else {}
+                _ts_qid = str(
+                    _ts_row.get("inputs/question_id")
+                    or (_ts_row.get("inputs", {}) or {}).get("question_id", "")
+                    or _ts_kw.get("question_id", "")
+                    or _ts_row.get("question_id", "")
+                )
+                if _ts_qid:
+                    _temporal_stale_qids.add(_ts_qid)
+
         arbiter_adjusted_accuracy, arbiter_adjusted_correct, failure_ids, excluded_count = (
-            _compute_arbiter_adjusted_accuracy(rows_for_output)
+            _compute_arbiter_adjusted_accuracy(
+                rows_for_output,
+                temporal_stale_qids=_temporal_stale_qids if _temporal_stale_qids else None,
+            )
         )
 
         # Arbiter-adjust result_correctness so detect_regressions sees true
@@ -4060,6 +4083,33 @@ def _build_valid_assets_context(config: dict) -> str:
     return "\n".join(lines) if lines else "(no assets configured)"
 
 
+def _format_data_profile_context(config: dict) -> str:
+    """Build a compact data-profile section for benchmark generation prompts.
+
+    Renders per-table row counts, per-column cardinality, distinct values
+    for low-cardinality columns, and min/max ranges for numeric/date columns.
+    """
+    profile = config.get("_data_profile", {})
+    if not profile:
+        return "(no data profile available)"
+    lines: list[str] = []
+    for table, tinfo in sorted(profile.items()):
+        row_count = tinfo.get("row_count", "?")
+        lines.append(f"### {table} (~{row_count} rows)")
+        for col, cinfo in sorted(tinfo.get("columns", {}).items()):
+            card = cinfo.get("cardinality", "?")
+            vals = cinfo.get("distinct_values")
+            minv = cinfo.get("min")
+            maxv = cinfo.get("max")
+            parts = [f"cardinality={card}"]
+            if vals:
+                parts.append(f"values={vals}")
+            if minv is not None:
+                parts.append(f"range=[{minv}, {maxv}]")
+            lines.append(f"  - {col}: {', '.join(parts)}")
+    return "\n".join(lines)
+
+
 def _build_schema_contexts(
     config: dict,
     uc_columns: list[dict],
@@ -4115,6 +4165,7 @@ def _build_schema_contexts(
         "sample_questions_context": sample_questions_context,
         "valid_assets_context": _build_valid_assets_context(config),
         "column_allowlist": column_allowlist,
+        "data_profile_context": _format_data_profile_context(config),
     }
 
 
@@ -4163,6 +4214,11 @@ def _attempt_benchmark_correction(
                 "question": b["question"],
                 "original_expected_sql": b["expected_sql"],
                 "error": b.get("validation_error", "unknown"),
+                "execution_note": (
+                    "Query returns 0 rows — pick realistic filter values from the Data Profile"
+                    if b.get("validation_error") == "Query returns 0 rows"
+                    else ""
+                ),
             }
             for b in invalid_benchmarks
         ],
@@ -4176,6 +4232,7 @@ def _attempt_benchmark_correction(
         column_allowlist=ctx.get("column_allowlist", "(no columns)"),
         metric_views_context=ctx.get("metric_views_context", "None"),
         tvfs_context=ctx.get("tvfs_context", "None"),
+        data_profile_context=ctx.get("data_profile_context", "(no data profile available)"),
         benchmarks_to_fix=benchmarks_to_fix,
     )
 
@@ -4359,6 +4416,7 @@ def _fill_coverage_gaps(
     allowlist: dict[str, Any],
     domain: str,
     existing_questions: set[str],
+    category_performance: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Generate targeted benchmarks for Genie Space assets with zero coverage.
 
@@ -4366,6 +4424,10 @@ def _fill_coverage_gaps(
     ``_compute_asset_coverage``, then makes a single LLM call asking for 1-2
     questions per uncovered asset.  Results go through the same metadata
     constraint and SQL validation pipeline as normal benchmarks.
+
+    When *category_performance* is provided, categories performing below the
+    median accuracy are highlighted in the prompt so the LLM prioritises
+    generating questions for weak areas.
 
     Returns only validated gap-fill benchmarks (may be empty).
     """
@@ -4415,12 +4477,38 @@ def _fill_coverage_gaps(
     existing_q_lines = "\n".join(f"- {q}" for q in sorted(existing_questions)) or "(none)"
     uncovered_lines = "\n".join(f"- {a}" for a in targeted)
 
+    weak_categories_context = ""
+    if category_performance:
+        accuracies = []
+        for cat, stats in category_performance.items():
+            if cat == "unknown" or stats.get("total", 0) == 0:
+                continue
+            accuracies.append(stats["correct"] / stats["total"])
+        if accuracies:
+            median_acc = sorted(accuracies)[len(accuracies) // 2]
+            weak_lines = []
+            for cat, stats in sorted(category_performance.items()):
+                total = stats.get("total", 0)
+                if total == 0 or cat == "unknown":
+                    continue
+                acc = stats["correct"] / total
+                if acc < median_acc:
+                    weak_lines.append(
+                        f"- {cat}: {stats['correct']}/{total} correct ({acc:.0%})"
+                    )
+            if weak_lines:
+                weak_categories_context = (
+                    "## Weak Categories (prioritize these)\n"
+                    + "\n".join(weak_lines)
+                )
+
     prompt = format_mlflow_template(
         BENCHMARK_COVERAGE_GAP_PROMPT,
         domain=domain,
         categories=json.dumps(BENCHMARK_CATEGORIES),
         uncovered_assets=uncovered_lines,
         existing_questions=existing_q_lines,
+        weak_categories_context=weak_categories_context,
         **ctx,
     )
 
@@ -4809,6 +4897,14 @@ def generate_benchmarks(
         is_valid, err = _validate_benchmark_sql(
             expected_sql, spark, catalog, schema, execute=True,
         )
+        if is_valid:
+            try:
+                test_rows = spark.sql(f"SELECT * FROM ({expected_sql}) LIMIT 1").collect()
+                if not test_rows:
+                    is_valid = False
+                    err = "Query returns 0 rows"
+            except Exception:
+                pass
         if is_valid:
             benchmark["validation_status"] = "valid"
             benchmark["validation_reason_code"] = "ok"
