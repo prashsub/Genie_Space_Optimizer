@@ -43,6 +43,7 @@ from genie_space_optimizer.common.config import (
     ENABLE_SLICE_GATE,
     GENIE_CORRECT_CONFIRMATION_THRESHOLD,
     INLINE_EVAL_DELAY,
+    INSTRUCTION_PROMPT_NAME_TEMPLATE,
     LEVER_NAMES,
     MAX_ITERATIONS,
     MAX_NOISE_FLOOR,
@@ -53,6 +54,7 @@ from genie_space_optimizer.common.config import (
     REGRESSION_THRESHOLD,
     SLICE_GATE_MIN_REDUCTION,
     SLICE_GATE_TOLERANCE,
+    format_mlflow_template,
 )
 from genie_space_optimizer.optimization.applier import (
     _get_general_instructions,
@@ -62,11 +64,14 @@ from genie_space_optimizer.optimization.applier import (
     rollback,
 )
 from genie_space_optimizer.optimization.evaluation import (
+    _extract_genie_sql_from_trace,
     all_thresholds_met,
     extract_reference_sqls,
     filter_benchmarks_by_scope,
     log_asi_feedback_on_traces,
     log_gate_feedback_on_traces,
+    log_judge_verdicts_on_traces,
+    log_persistence_context_on_traces,
     make_predict_fn,
     normalize_scores,
     register_instruction_version,
@@ -361,7 +366,14 @@ def _run_baseline(
         baseline_benchmarks = benchmarks
 
         _ensure_sql_context(spark, catalog, schema)
-        predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
+        _instr_prompt = format_mlflow_template(
+            INSTRUCTION_PROMPT_NAME_TEMPLATE,
+            uc_schema=f"{catalog}.{schema}", space_id=space_id,
+        )
+        predict_fn = make_predict_fn(
+            w, space_id, spark, catalog, schema,
+            instruction_prompt_name=_instr_prompt,
+        )
         scorers = make_all_scorers(w, spark, catalog, schema)
 
         eval_result = _safe_stage(
@@ -409,6 +421,11 @@ def _run_baseline(
             log_expectations_on_traces(eval_result)
         except Exception:
             logger.debug("Failed to log expectations on baseline traces", exc_info=True)
+
+        try:
+            log_judge_verdicts_on_traces(eval_result)
+        except Exception:
+            logger.debug("Failed to log judge verdicts on baseline traces", exc_info=True)
 
         _bl_trace_map = eval_result.get("trace_map", {})
         _bl_failures = set(eval_result.get("failure_question_ids", []))
@@ -1971,6 +1988,99 @@ def _build_question_persistence_summary(
     return "\n".join(lines), structured
 
 
+def _validate_tvf_removal_coverage(
+    tvf_identifier: str,
+    benchmarks: list[dict],
+    schema_overlap: dict,
+    metadata_snapshot: dict,
+) -> dict:
+    """Hard gate: verify alternative assets exist before allowing TVF removal.
+
+    Only TVFs can be removed through escalation — tables and MVs are rejected.
+    If the TVF's output columns are not sufficiently covered by other assets
+    in the Genie Space, the removal is rejected.
+
+    Returns ``{"valid": bool, "reason": str, ...}``.
+    """
+    tvf_lower = tvf_identifier.lower()
+
+    is_tvf = any(
+        isinstance(fn, dict) and fn.get("identifier", "").lower() == tvf_lower
+        for fn in (metadata_snapshot.get("instructions") or {}).get("sql_functions", [])
+    )
+
+    if not is_tvf:
+        ds = metadata_snapshot.get("data_sources", {})
+        if not isinstance(ds, dict):
+            ds = {}
+        is_table = any(
+            (t.get("identifier", "").lower() == tvf_lower or t.get("name", "").lower() == tvf_lower)
+            for t in ds.get("tables", [])
+        )
+        is_mv = any(
+            (m.get("identifier", "").lower() == tvf_lower or m.get("name", "").lower() == tvf_lower)
+            for m in ds.get("metric_views", [])
+        )
+        if is_table:
+            return {
+                "valid": False,
+                "reason": f"Cannot remove table '{tvf_identifier}' — only TVFs may be removed via escalation",
+                "affected_questions": [],
+                "coverage_ratio": 0.0,
+                "uncovered_columns": [],
+            }
+        if is_mv:
+            return {
+                "valid": False,
+                "reason": f"Cannot remove metric view '{tvf_identifier}' — only TVFs may be removed via escalation",
+                "affected_questions": [],
+                "coverage_ratio": 0.0,
+                "uncovered_columns": [],
+            }
+        return {
+            "valid": False,
+            "reason": f"Asset '{tvf_identifier}' not found as a TVF in the Genie Space",
+            "affected_questions": [],
+            "coverage_ratio": 0.0,
+            "uncovered_columns": [],
+        }
+
+    affected_questions = [
+        b.get("question_id", b.get("id", ""))
+        for b in benchmarks
+        if tvf_lower in (b.get("expected_asset") or "").lower()
+    ]
+
+    coverage_ratio = schema_overlap.get("coverage_ratio", 0.0)
+    uncovered = schema_overlap.get("uncovered_columns", [])
+    full_coverage = schema_overlap.get("full_coverage", False)
+
+    if affected_questions and not full_coverage and coverage_ratio < 0.5:
+        return {
+            "valid": False,
+            "reason": (
+                f"Insufficient alternative coverage for TVF '{tvf_identifier}': "
+                f"{coverage_ratio:.0%} of columns covered, {len(uncovered)} uncovered "
+                f"({', '.join(uncovered[:5])}). {len(affected_questions)} benchmark "
+                f"question(s) reference this TVF."
+            ),
+            "affected_questions": affected_questions,
+            "coverage_ratio": coverage_ratio,
+            "uncovered_columns": uncovered,
+        }
+
+    return {
+        "valid": True,
+        "reason": (
+            f"TVF '{tvf_identifier}' coverage OK: {coverage_ratio:.0%} columns covered"
+            + (f", {len(affected_questions)} benchmark question(s) affected" if affected_questions else "")
+        ),
+        "affected_questions": affected_questions,
+        "coverage_ratio": coverage_ratio,
+        "uncovered_columns": uncovered,
+    }
+
+
 def _score_tvf_removal_confidence(
     tvf_identifier: str,
     benchmarks: list[dict],
@@ -2117,6 +2227,22 @@ def _handle_escalation(
             return result
 
         schema_overlap = check_tvf_schema_overlap(spark, tvf_id, metadata_snapshot)
+
+        coverage_validation = _validate_tvf_removal_coverage(
+            tvf_id, benchmarks, schema_overlap, metadata_snapshot,
+        )
+        if not coverage_validation["valid"]:
+            logger.warning(
+                "TVF removal coverage check failed for %s: %s",
+                tvf_id, coverage_validation["reason"],
+            )
+            result["detail"] = {
+                "error": "coverage_check_failed",
+                "reason": coverage_validation["reason"],
+                "affected_questions": coverage_validation["affected_questions"],
+                "coverage_ratio": coverage_validation["coverage_ratio"],
+            }
+            return result
 
         prov_df = load_provenance(spark, run_id, catalog, schema)
         prov_list = prov_df.to_dict("records") if not prov_df.empty else []
@@ -3197,6 +3323,7 @@ def _run_lever_loop(
     all_regression_trace_ids: list[str] = []
     all_eval_mlflow_run_ids: list[str] = []
     all_failure_question_ids: list[str] = []
+    question_trace_map: dict[str, list[str]] = {}
 
     _human_sql_fixes = [
         {"question": c.get("question", ""), "new_expected_sql": c["corrected_sql"], "verdict": "genie_correct"}
@@ -3214,14 +3341,68 @@ def _run_lever_loop(
         except Exception:
             logger.warning("Failed to apply human benchmark corrections", exc_info=True)
 
+    _judge_overrides = [c for c in (human_corrections or []) if c.get("type") == "judge_override"]
+    for ov in _judge_overrides:
+        try:
+            feedback = ov.get("feedback", "")
+            if "Genie answer is actually fine" in feedback or "Correct" in feedback:
+                genie_sql = _extract_genie_sql_from_trace(ov.get("trace_id", ""))
+                if genie_sql:
+                    _human_sql_fixes.append({
+                        "question": ov.get("question", ""),
+                        "new_expected_sql": genie_sql,
+                        "verdict": "genie_correct",
+                    })
+            elif "both answers are wrong" in feedback or "Both Wrong" in feedback:
+                from genie_space_optimizer.optimization.benchmarks import quarantine_benchmark_question
+                quarantine_benchmark_question(
+                    spark, f"{catalog}.{schema}", domain,
+                    ov.get("question_id", "") or ov.get("question", ""),
+                    reason="both_wrong",
+                    comment=ov.get("comment", ""),
+                )
+            elif "Ambiguous" in feedback:
+                from genie_space_optimizer.optimization.benchmarks import quarantine_benchmark_question
+                quarantine_benchmark_question(
+                    spark, f"{catalog}.{schema}", domain,
+                    ov.get("question_id", "") or ov.get("question", ""),
+                    reason="ambiguous",
+                    comment=ov.get("comment", ""),
+                )
+        except Exception:
+            logger.warning("Failed to process judge_override feedback", exc_info=True)
+
+    _patch_reviews = [c for c in (human_corrections or []) if c.get("type") == "patch_review"]
+    if _patch_reviews:
+        try:
+            from genie_space_optimizer.optimization.state import get_queued_patches
+            _pending = get_queued_patches(spark, catalog, schema, status="pending")
+            for pr in _patch_reviews:
+                decision = pr.get("decision", "")
+                if "Approve" in decision:
+                    logger.info("Human approved patch from trace %s", pr.get("trace_id", ""))
+                elif "Reject" in decision:
+                    logger.info("Human rejected patch from trace %s: %s", pr.get("trace_id", ""), pr.get("comment", ""))
+                elif "Modify" in decision:
+                    logger.info("Human modification hint for trace %s: %s", pr.get("trace_id", ""), pr.get("comment", ""))
+        except Exception:
+            logger.warning("Failed to process patch_review feedback", exc_info=True)
+
+    _human_suggestions = [c for c in (human_corrections or []) if c.get("type") == "improvement"]
+
     _ensure_sql_context(spark, catalog, schema)
     from genie_space_optimizer.optimization.evaluation import build_metric_view_measures
     _mv_measures = build_metric_view_measures(config)
+    _instr_prompt = format_mlflow_template(
+        INSTRUCTION_PROMPT_NAME_TEMPLATE,
+        uc_schema=f"{catalog}.{schema}", space_id=space_id,
+    )
     predict_fn = make_predict_fn(
         w, space_id, spark, catalog, schema,
         metric_view_measures=_mv_measures,
         optimization_run_id=run_id,
         triggered_by=triggered_by,
+        instruction_prompt_name=_instr_prompt,
     )
     scorers = make_all_scorers(w, spark, catalog, schema)
     uc_schema = f"{catalog}.{schema}"
@@ -3344,6 +3525,7 @@ def _run_lever_loop(
     tried_patches: set[tuple[str, str]] = set()
     tried_root_causes: set[tuple[str, str]] = set()
     prev_failure_qids: set[str] = set()
+    _verdict_history: dict[str, list] = {}
     _last_full_mlflow_run_id: str = baseline_iter.get("mlflow_run_id", "") if baseline_iter else ""
 
     for _iter_num in range(1, max_iterations + 1):
@@ -3484,6 +3666,7 @@ def _run_lever_loop(
             passing_benchmarks=max(0, _passing_q),
             verdict_history=_verdict_history,
             skill_exemplars=skill_exemplars or None,
+            human_suggestions=_human_suggestions or None,
         )
         action_groups = strategy.get("action_groups", [])
         ag = action_groups[0] if action_groups else None
@@ -3777,6 +3960,43 @@ def _run_lever_loop(
                 catalog, schema,
             )
 
+        _queued = apply_log.get("queued_high", [])
+        if _queued:
+            from genie_space_optimizer.optimization.state import write_queued_patch
+            from genie_space_optimizer.optimization.labeling import flag_for_human_review
+            for qentry in _queued:
+                _qpatch = qentry.get("patch", {})
+                write_queued_patch(
+                    spark, run_id, iteration_counter,
+                    _qpatch.get("type", ""),
+                    _qpatch.get("target", ""),
+                    catalog, schema,
+                    confidence_tier="queued_high_risk",
+                )
+            _queued_flag_items = [
+                {
+                    "question_id": qentry.get("patch", {}).get("target", "unknown"),
+                    "question_text": "",
+                    "reason": (
+                        f"High-risk patch queued for review: "
+                        f"{qentry.get('patch', {}).get('type', '')} on "
+                        f"{qentry.get('patch', {}).get('target', '')}"
+                    ),
+                    "iterations_failed": 0,
+                    "patches_tried": qentry.get("patch", {}).get("type", ""),
+                }
+                for qentry in _queued
+            ]
+            flag_for_human_review(spark, run_id, catalog, schema, domain, _queued_flag_items)
+            _qh_lines = [_section(f"[{ag_id}] Queued {len(_queued)} High-Risk Patch(es) for Human Review", "!")]
+            for qi, qe in enumerate(_queued, 1):
+                _qp = qe.get("patch", {})
+                _qh_lines.append(
+                    _kv(f"  [{qi}]", f"{_qp.get('type', '?')} \u2192 {_qp.get('target', '?')}")
+                )
+            _qh_lines.append(_bar("!"))
+            print("\n".join(_qh_lines))
+
         if not apply_log.get("patch_deployed", False) and apply_log.get("applied"):
             _pe = apply_log.get("patch_error", "unknown")
             print(
@@ -3866,6 +4086,7 @@ def _run_lever_loop(
             _fail_qids = set(_failed_eval.get("failure_question_ids", []))
             all_failure_question_ids.extend(_fail_qids)
             for qid, tid in _fail_tmap.items():
+                question_trace_map.setdefault(qid, []).append(tid)
                 if qid in _fail_qids:
                     all_failure_trace_ids.append(tid)
                 elif "regressions" in gate_result:
@@ -3954,6 +4175,7 @@ def _run_lever_loop(
         _full_failures = set(full_result.get("failure_question_ids", []))
         all_failure_question_ids.extend(_full_failures)
         for qid, tid in _full_trace_map.items():
+            question_trace_map.setdefault(qid, []).append(tid)
             if qid in _full_failures:
                 all_failure_trace_ids.append(tid)
         _full_run_id = full_result.get("mlflow_run_id") or full_result.get("run_id", "")
@@ -3965,6 +4187,20 @@ def _run_lever_loop(
             log_expectations_on_traces(full_result)
         except Exception:
             logger.debug("Failed to log expectations on iter %d traces", iteration_counter, exc_info=True)
+
+        try:
+            log_judge_verdicts_on_traces(full_result)
+        except Exception:
+            logger.debug("Failed to log judge verdicts on iter %d traces", iteration_counter, exc_info=True)
+
+        try:
+            _persist_text, _persist_data = _build_question_persistence_summary(
+                _verdict_history, reflection_buffer,
+            )
+            if _persist_data:
+                log_persistence_context_on_traces(full_result, _persist_data)
+        except Exception:
+            logger.debug("Failed to log persistence context on iter %d traces", iteration_counter, exc_info=True)
 
         lever_changes.append({
             "lever": ag_id,
@@ -4074,42 +4310,6 @@ def _run_lever_loop(
         catalog=catalog, schema=schema,
     )
 
-    session_info: dict = {}
-    if all_failure_trace_ids or all_regression_trace_ids or all_eval_mlflow_run_ids or all_failure_question_ids:
-        try:
-            from genie_space_optimizer.optimization.labeling import create_review_session
-            session_info = create_review_session(
-                run_id=run_id,
-                domain=domain,
-                experiment_name=exp_name,
-                uc_schema=f"{catalog}.{schema}",
-                failure_trace_ids=list(dict.fromkeys(all_failure_trace_ids)),
-                regression_trace_ids=list(dict.fromkeys(all_regression_trace_ids)),
-                eval_mlflow_run_ids=list(dict.fromkeys(all_eval_mlflow_run_ids)),
-                failure_question_ids=list(dict.fromkeys(all_failure_question_ids)),
-            )
-            _sname = session_info.get("session_name", "")
-            _srun = session_info.get("session_run_id", "")
-            _surl = session_info.get("session_url", "")
-            if _sname:
-                print(
-                    f"\n[MLflow Review] Labeling session created for human review:\n"
-                    f"  Name: {_sname}\n"
-                    f"  Traces: {session_info.get('trace_count', 0)}\n"
-                )
-                if _surl:
-                    print(f"  URL: {_surl}\n")
-            if _sname or _srun:
-                update_run_status(
-                    spark, run_id, catalog, schema,
-                    labeling_session_name=_sname,
-                    labeling_session_run_id=_srun,
-                    labeling_session_url=_surl,
-                )
-        except Exception as exc:
-            print(f"[Labeling] Failed to create labeling session: {exc}")
-            logger.warning("Failed to create labeling session", exc_info=True)
-
     # ── End-of-Run Summary ─────────────────────────────────────────
     _summary = [_section("OPTIMIZATION RUN SUMMARY", "=")]
     _summary.append(_kv("Space ID", space_id))
@@ -4176,7 +4376,12 @@ def _run_lever_loop(
         "levers_attempted": levers_attempted,
         "levers_accepted": levers_accepted,
         "levers_rolled_back": levers_rolled_back,
-        "labeling_session": session_info,
+        "question_trace_map": question_trace_map,
+        "reflection_buffer": reflection_buffer,
+        "all_eval_mlflow_run_ids": list(dict.fromkeys(all_eval_mlflow_run_ids)),
+        "all_failure_trace_ids": list(dict.fromkeys(all_failure_trace_ids)),
+        "all_regression_trace_ids": list(dict.fromkeys(all_regression_trace_ids)),
+        "all_failure_question_ids": list(dict.fromkeys(all_failure_question_ids)),
         "_debug_ref_sqls_count": len(reference_sqls),
         "_debug_failure_rows_loaded": len(_get_failure_rows(spark, run_id, catalog, schema)),
     }
@@ -4202,6 +4407,12 @@ def _run_finalize(
     thresholds: dict[str, float] | None = None,
     finalize_timeout_seconds: int = FINALIZE_TIMEOUT_SECONDS,
     heartbeat_interval_seconds: int = FINALIZE_HEARTBEAT_SECONDS,
+    question_trace_map: dict[str, list[str]] | None = None,
+    reflection_buffer: list[dict] | None = None,
+    all_eval_mlflow_run_ids: list[str] | None = None,
+    all_failure_trace_ids: list[str] | None = None,
+    all_regression_trace_ids: list[str] | None = None,
+    all_failure_question_ids: list[str] | None = None,
 ) -> dict:
     """Stage 4: Repeatability test, promote model, generate report.
 
@@ -4277,9 +4488,17 @@ def _run_finalize(
     )
     _emit_heartbeat("finalize_started", force=True)
 
+    question_trace_map = question_trace_map or {}
+    reflection_buffer = reflection_buffer or []
+    all_eval_mlflow_run_ids = list(all_eval_mlflow_run_ids or [])
+    all_failure_trace_ids = list(all_failure_trace_ids or [])
+    all_regression_trace_ids = list(all_regression_trace_ids or [])
+    all_failure_question_ids = list(all_failure_question_ids or [])
+
     terminal_reason = ""
     repeatability_pct = 0.0
     try:
+        rep_results: list[dict] = []
         _check_timeout("pre_repeatability")
         if run_repeatability and benchmarks:
             write_stage(
@@ -4346,6 +4565,7 @@ def _run_finalize(
                         model_id=prev_model_id,
                         run_label=f"final_{rep_run_idx}",
                     )
+                    rep_results.append(rep_result)
                     rep_pcts.append(rep_result.get("repeatability_pct", 0.0))
                     logger.info(
                         "Repeatability run %d/2: %.1f%%",
@@ -4394,6 +4614,125 @@ def _run_finalize(
                 force=True,
                 detail={"reason": "disabled_or_no_benchmarks"},
             )
+
+        # ── Human review session (post-repeatability) ─────────────────
+        _check_timeout("human_review_session")
+        _emit_heartbeat("human_review_session", force=True)
+        session_info: dict = {}
+        try:
+            for _rr in (rep_results if run_repeatability and benchmarks else []):
+                _rr_tmap = _rr.get("trace_map", {})
+                for qid, tid in _rr_tmap.items():
+                    question_trace_map.setdefault(qid, []).append(tid)
+                _rr_run_id = _rr.get("mlflow_run_id") or _rr.get("run_id", "")
+                if _rr_run_id:
+                    all_eval_mlflow_run_ids.append(_rr_run_id)
+
+            _verdict_history = _build_verdict_history(spark, run_id, catalog, schema)
+            _persist_text, _persist_data = _build_question_persistence_summary(
+                _verdict_history, reflection_buffer,
+            )
+
+            from genie_space_optimizer.optimization.evaluation import log_patch_history_on_traces
+
+            persistent_question_ids = [
+                qid for qid, ctx in _persist_data.items()
+                if ctx["classification"] in ("PERSISTENT", "ADDITIVE_LEVERS_EXHAUSTED")
+            ]
+
+            if _persist_data:
+                log_persistence_context_on_traces(
+                    {}, _persist_data, extra_trace_map=question_trace_map,
+                )
+            if reflection_buffer and question_trace_map:
+                log_patch_history_on_traces(
+                    question_trace_map, reflection_buffer,
+                    persistent_question_ids=set(persistent_question_ids) if persistent_question_ids else None,
+                )
+
+            _persistent_items = [
+                {
+                    "question_id": qid,
+                    "question_text": ctx.get("question_text", ""),
+                    "reason": ctx["classification"],
+                    "iterations_failed": ctx["fail_count"],
+                    "patches_tried": str(ctx.get("patches_tried", [])),
+                }
+                for qid, ctx in _persist_data.items()
+                if ctx["classification"] in ("PERSISTENT", "ADDITIVE_LEVERS_EXHAUSTED")
+            ]
+            if _persistent_items:
+                from genie_space_optimizer.optimization.labeling import flag_for_human_review
+                flag_for_human_review(spark, run_id, catalog, schema, domain, _persistent_items)
+                _persistent_qids = {item["question_id"] for item in _persistent_items}
+                all_failure_question_ids.extend(
+                    qid for qid in _persistent_qids if qid not in set(all_failure_question_ids)
+                )
+
+            if persistent_question_ids:
+                _session_trace_ids = [
+                    question_trace_map[qid][-1]
+                    for qid in persistent_question_ids
+                    if qid in question_trace_map
+                ]
+                _session_question_ids = [
+                    qid for qid in persistent_question_ids if qid in question_trace_map
+                ]
+            elif all_failure_trace_ids or all_failure_question_ids:
+                _session_trace_ids = list(dict.fromkeys(all_failure_trace_ids))
+                _session_question_ids = list(dict.fromkeys(all_failure_question_ids))
+            else:
+                _session_trace_ids = []
+                _session_question_ids = []
+
+            _flagged_tids: list[str] = []
+            if persistent_question_ids:
+                _flagged_tids = [
+                    question_trace_map[qid][-1]
+                    for qid in persistent_question_ids
+                    if qid in question_trace_map
+                ]
+            from genie_space_optimizer.optimization.state import get_queued_patches
+            _pending_queued = get_queued_patches(spark, catalog, schema, status="pending")
+            for _qp in _pending_queued:
+                _qp_target = _qp.get("target_identifier", "")
+                if _qp_target and _qp_target in question_trace_map:
+                    _flagged_tids.append(question_trace_map[_qp_target][-1])
+
+            if _session_trace_ids or all_eval_mlflow_run_ids or _session_question_ids:
+                from genie_space_optimizer.optimization.labeling import create_review_session
+                session_info = create_review_session(
+                    run_id=run_id,
+                    domain=domain,
+                    experiment_name=exp_name,
+                    uc_schema=f"{catalog}.{schema}",
+                    failure_trace_ids=list(dict.fromkeys(_session_trace_ids)),
+                    regression_trace_ids=list(dict.fromkeys(all_regression_trace_ids)),
+                    eval_mlflow_run_ids=list(dict.fromkeys(all_eval_mlflow_run_ids)),
+                    failure_question_ids=list(dict.fromkeys(_session_question_ids)),
+                    flagged_trace_ids=list(dict.fromkeys(_flagged_tids)),
+                )
+                _sname = session_info.get("session_name", "")
+                _srun = session_info.get("session_run_id", "")
+                _surl = session_info.get("session_url", "")
+                if _sname:
+                    print(
+                        f"\n[MLflow Review] Labeling session created for human review:\n"
+                        f"  Name: {_sname}\n"
+                        f"  Traces: {session_info.get('trace_count', 0)}\n"
+                    )
+                    if _surl:
+                        print(f"  URL: {_surl}\n")
+                if _sname or _srun:
+                    update_run_status(
+                        spark, run_id, catalog, schema,
+                        labeling_session_name=_sname,
+                        labeling_session_run_id=_srun,
+                        labeling_session_url=_surl,
+                    )
+        except Exception as exc:
+            print(f"[Labeling] Failed to create post-repeatability review session: {exc}")
+            logger.warning("Failed to create post-repeatability review session", exc_info=True)
 
         _check_timeout("promote_best_model")
         _emit_heartbeat("promote_best_model", force=True)
@@ -4497,6 +4836,7 @@ def _run_finalize(
             "promoted_model": promoted_model,
             "terminal_reason": terminal_reason,
             "benchmark_publish_count": benchmark_publish_count,
+            "labeling_session": session_info,
             "elapsed_seconds": round(_elapsed_seconds(), 1),
             "heartbeat_count": heartbeat_count,
         }
@@ -4854,6 +5194,12 @@ def optimize_genie_space(
                 w, spark, run_id_str, space_id, domain, exp_name,
                 prev_scores, prev_model_id, int(loop_out["iteration_counter"]),
                 catalog, schema, run_repeat, benchmarks, thresholds,
+                question_trace_map=loop_out.get("question_trace_map"),
+                reflection_buffer=loop_out.get("reflection_buffer"),
+                all_eval_mlflow_run_ids=loop_out.get("all_eval_mlflow_run_ids"),
+                all_failure_trace_ids=loop_out.get("all_failure_trace_ids"),
+                all_regression_trace_ids=loop_out.get("all_regression_trace_ids"),
+                all_failure_question_ids=loop_out.get("all_failure_question_ids"),
             )
             result.status = str(finalize_out["status"])
             result.convergence_reason = str(finalize_out["convergence_reason"])

@@ -136,6 +136,7 @@ def create_review_session(
     reviewers: list[str] | None = None,
     eval_mlflow_run_ids: list[str] | None = None,
     failure_question_ids: list[str] | None = None,
+    flagged_trace_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a labeling session populated with evaluation traces for human review.
 
@@ -146,6 +147,9 @@ def create_review_session(
     cap on ``mlflow.search_traces()``.
 
     Falls back to experiment-wide search when no eval run IDs are provided.
+
+    When *flagged_trace_ids* is provided, those traces are prioritized first
+    in the session (before regressions and other failures).
 
     Returns dict with session_name, session_run_id, session_url,
     trace_count (or empty on failure).
@@ -197,6 +201,7 @@ def create_review_session(
             failure_trace_ids=failure_trace_ids,
             regression_trace_ids=regression_trace_ids,
             eval_mlflow_run_ids=eval_mlflow_run_ids or [],
+            flagged_trace_ids=flagged_trace_ids,
             failure_question_ids=failure_question_ids,
         )
     except Exception as exc:
@@ -433,12 +438,33 @@ def ingest_human_feedback(
             a_value = getattr(a, "value", None) or (a.get("value") if isinstance(a, dict) else None)
             a_rationale = getattr(a, "rationale", None) or (a.get("rationale") if isinstance(a, dict) else None)
 
-            if a_name == SCHEMA_JUDGE_VERDICT and a_value and "Wrong" in str(a_value):
+            if a_name == SCHEMA_JUDGE_VERDICT and a_value and (
+                "Wrong" in str(a_value)
+                or "Ambiguous" in str(a_value)
+                or "Correct" in str(a_value)
+                or "Both" in str(a_value)
+            ):
+                _jq = ""
+                _jqid = ""
+                try:
+                    _jreq = row.get("request") or ""
+                    if isinstance(_jreq, str):
+                        import json as _json
+                        _jq = _json.loads(_jreq).get("messages", [{}])[-1].get("content", "")
+                    _jqid = row.get("request_id", "") or ""
+                    if not _jqid:
+                        _a_meta = getattr(a, "metadata", None) or (a.get("metadata") if isinstance(a, dict) else None)
+                        if isinstance(_a_meta, dict):
+                            _jqid = _a_meta.get("question_id", "")
+                except Exception:
+                    pass
                 corrections.append({
                     "type": "judge_override",
                     "trace_id": trace_id,
                     "feedback": a_value,
                     "comment": a_rationale or "",
+                    "question": _jq,
+                    "question_id": _jqid,
                 })
             elif a_name == SCHEMA_CORRECTED_SQL and a_value:
                 _q = ""

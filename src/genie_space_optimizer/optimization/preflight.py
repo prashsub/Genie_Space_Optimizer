@@ -17,6 +17,7 @@ import mlflow
 
 from genie_space_optimizer.common.config import (
     EXPERIMENT_PATH_TEMPLATE,
+    MAX_BENCHMARK_COUNT,
     TARGET_BENCHMARK_COUNT,
     format_mlflow_template,
 )
@@ -908,6 +909,9 @@ def _load_or_generate_benchmarks(
                         benchmark.setdefault("validation_reason_code", "ok")
                         benchmark.setdefault("validation_error", None)
                         benchmark.setdefault("correction_source", "")
+                    if len(valid_existing) > MAX_BENCHMARK_COUNT:
+                        from genie_space_optimizer.optimization.evaluation import _truncate_benchmarks
+                        valid_existing = _truncate_benchmarks(valid_existing, MAX_BENCHMARK_COUNT)
                     return valid_existing, False
                 else:
                     gap = TARGET_BENCHMARK_COUNT - len(valid_existing)
@@ -948,6 +952,9 @@ def _load_or_generate_benchmarks(
                         },
                         catalog=catalog, schema=schema,
                     )
+                    if len(new_benchmarks) > MAX_BENCHMARK_COUNT:
+                        from genie_space_optimizer.optimization.evaluation import _truncate_benchmarks
+                        new_benchmarks = _truncate_benchmarks(new_benchmarks, MAX_BENCHMARK_COUNT)
                     return new_benchmarks, False
 
             print(
@@ -1004,4 +1011,7 @@ def _load_or_generate_benchmarks(
         },
         catalog=catalog, schema=schema,
     )
+    if len(benchmarks) > MAX_BENCHMARK_COUNT:
+        from genie_space_optimizer.optimization.evaluation import _truncate_benchmarks
+        benchmarks = _truncate_benchmarks(benchmarks, MAX_BENCHMARK_COUNT)
     return benchmarks, True

@@ -100,6 +100,12 @@ export function IterationChart({ runId }: { runId: string }) {
     );
   }
 
+  const accuracies = chartData.map((p) => p.accuracy);
+  const dataMin = Math.min(...accuracies);
+  const dataMax = Math.max(...accuracies);
+  const yMin = Math.max(0, Math.floor((dataMin - 10) / 5) * 5);
+  const yMax = Math.min(100, Math.ceil((dataMax + 10) / 5) * 5);
+
   return (
     <Card>
       <CardHeader>
@@ -119,7 +125,7 @@ export function IterationChart({ runId }: { runId: string }) {
                 return pt?.leverLabel ?? (val === 0 ? "Baseline" : String(val));
               }}
             />
-            <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
+            <YAxis domain={[yMin, yMax]} tickFormatter={(v) => `${v}%`} />
             <ReferenceLine
               y={80}
               stroke="hsl(var(--muted-foreground))"

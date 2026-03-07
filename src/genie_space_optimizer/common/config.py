@@ -125,6 +125,9 @@ LLM_MAX_RETRIES = 3
 # ── 5. Benchmark Generation ────────────────────────────────────────────
 
 TARGET_BENCHMARK_COUNT = 20
+MAX_BENCHMARK_COUNT = 25
+"""Hard ceiling on benchmark count.  No evaluation should ever run on more
+than this many questions, regardless of how many are generated or loaded."""
 COVERAGE_GAP_SOFT_CAP_FACTOR = 1.5
 
 BENCHMARK_CATEGORIES = [
@@ -1761,6 +1764,9 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     '## Persistent Question Failures\n'
     '{{ question_persistence_summary }}\n'
+    '\n'
+    '## Human Reviewer Suggestions\n'
+    '{{ human_reviewer_suggestions }}\n'
     '\n'
     '## Schema Context\n'
     '{{ full_schema_context }}\n'

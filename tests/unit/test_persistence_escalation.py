@@ -15,6 +15,7 @@ from genie_space_optimizer.optimization.harness import (
     _build_reflection_entry,
     _handle_escalation,
     _score_tvf_removal_confidence,
+    _validate_tvf_removal_coverage,
 )
 from genie_space_optimizer.common.uc_metadata import check_tvf_schema_overlap
 
@@ -402,3 +403,161 @@ class TestHandleEscalation:
             reflection_buffer=[], metadata_snapshot={},
         )
         assert result["handled"] is False
+
+    def test_remove_tvf_coverage_check_failure_blocks_removal(self):
+        """When the TVF target is actually a table, coverage check rejects it."""
+        ag = {
+            "affected_questions": ["q1"],
+            "lever_directives": {
+                "3": {"functions": [{"identifier": "cat.sch.my_table"}]}
+            },
+        }
+        metadata = {
+            "data_sources": {
+                "tables": [{"identifier": "cat.sch.my_table", "column_configs": []}],
+                "metric_views": [],
+            },
+            "instructions": {"sql_functions": []},
+        }
+        mock_spark = MagicMock()
+        mock_spark.sql.return_value.collect.return_value = []
+
+        result = _handle_escalation(
+            "remove_tvf", ag,
+            w=MagicMock(), spark=mock_spark, run_id="run1",
+            catalog="cat", schema="sch", domain="test",
+            iteration=3, benchmarks=[], verdict_history={},
+            reflection_buffer=[], metadata_snapshot=metadata,
+        )
+        assert result["handled"] is False
+        assert result["detail"].get("error") == "coverage_check_failed"
+        assert "table" in result["detail"]["reason"].lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# _validate_tvf_removal_coverage
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestValidateTvfRemovalCoverage:
+    def _metadata(
+        self,
+        tvf_id: str = "cat.sch.my_tvf",
+        tables: list[dict] | None = None,
+        mvs: list[dict] | None = None,
+    ) -> dict:
+        return {
+            "instructions": {
+                "sql_functions": [{"identifier": tvf_id}] if tvf_id else [],
+            },
+            "data_sources": {
+                "tables": tables or [],
+                "metric_views": mvs or [],
+            },
+        }
+
+    def test_rejects_table_removal(self):
+        metadata = {
+            "instructions": {"sql_functions": []},
+            "data_sources": {
+                "tables": [{"identifier": "cat.sch.tbl_a", "column_configs": []}],
+                "metric_views": [],
+            },
+        }
+        result = _validate_tvf_removal_coverage(
+            "cat.sch.tbl_a", [], {}, metadata,
+        )
+        assert result["valid"] is False
+        assert "table" in result["reason"].lower()
+
+    def test_rejects_metric_view_removal(self):
+        metadata = {
+            "instructions": {"sql_functions": []},
+            "data_sources": {
+                "tables": [],
+                "metric_views": [{"identifier": "cat.sch.mv_a"}],
+            },
+        }
+        result = _validate_tvf_removal_coverage(
+            "cat.sch.mv_a", [], {}, metadata,
+        )
+        assert result["valid"] is False
+        assert "metric view" in result["reason"].lower()
+
+    def test_rejects_unknown_asset(self):
+        metadata = self._metadata(tvf_id="")
+        result = _validate_tvf_removal_coverage(
+            "cat.sch.unknown_thing", [], {}, metadata,
+        )
+        assert result["valid"] is False
+        assert "not found" in result["reason"].lower()
+
+    def test_allows_tvf_with_full_coverage(self):
+        metadata = self._metadata("cat.sch.my_tvf")
+        schema_overlap = {
+            "full_coverage": True,
+            "coverage_ratio": 1.0,
+            "uncovered_columns": [],
+        }
+        benchmarks = [{"question_id": "q1", "expected_asset": "cat.sch.my_tvf"}]
+
+        result = _validate_tvf_removal_coverage(
+            "cat.sch.my_tvf", benchmarks, schema_overlap, metadata,
+        )
+        assert result["valid"] is True
+        assert result["affected_questions"] == ["q1"]
+
+    def test_allows_tvf_with_no_affected_questions(self):
+        metadata = self._metadata("cat.sch.my_tvf")
+        schema_overlap = {
+            "full_coverage": False,
+            "coverage_ratio": 0.0,
+            "uncovered_columns": ["col_x"],
+        }
+        result = _validate_tvf_removal_coverage(
+            "cat.sch.my_tvf", [], schema_overlap, metadata,
+        )
+        assert result["valid"] is True
+
+    def test_rejects_low_coverage_with_affected_questions(self):
+        metadata = self._metadata("cat.sch.my_tvf")
+        schema_overlap = {
+            "full_coverage": False,
+            "coverage_ratio": 0.3,
+            "uncovered_columns": ["col_x", "col_y"],
+        }
+        benchmarks = [{"question_id": "q1", "expected_asset": "cat.sch.my_tvf"}]
+
+        result = _validate_tvf_removal_coverage(
+            "cat.sch.my_tvf", benchmarks, schema_overlap, metadata,
+        )
+        assert result["valid"] is False
+        assert "Insufficient" in result["reason"]
+        assert result["affected_questions"] == ["q1"]
+        assert result["coverage_ratio"] == 0.3
+
+    def test_allows_half_coverage_with_affected_questions(self):
+        metadata = self._metadata("cat.sch.my_tvf")
+        schema_overlap = {
+            "full_coverage": False,
+            "coverage_ratio": 0.5,
+            "uncovered_columns": ["col_y"],
+        }
+        benchmarks = [{"question_id": "q1", "expected_asset": "cat.sch.my_tvf"}]
+
+        result = _validate_tvf_removal_coverage(
+            "cat.sch.my_tvf", benchmarks, schema_overlap, metadata,
+        )
+        assert result["valid"] is True
+
+    def test_case_insensitive_matching(self):
+        metadata = self._metadata("Cat.Sch.My_TVF")
+        schema_overlap = {
+            "full_coverage": True,
+            "coverage_ratio": 1.0,
+            "uncovered_columns": [],
+        }
+        result = _validate_tvf_removal_coverage(
+            "cat.sch.my_tvf", [], schema_overlap, metadata,
+        )
+        assert result["valid"] is True

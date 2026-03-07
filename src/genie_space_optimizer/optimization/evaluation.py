@@ -50,6 +50,7 @@ from genie_space_optimizer.common.config import (
     LLM_MAX_RETRIES,
     LLM_SOURCE_ID_TEMPLATE,
     LLM_TEMPERATURE,
+    MAX_BENCHMARK_COUNT,
     MLFLOW_THRESHOLDS,
     MODEL_NAME_TEMPLATE,
     PROMPT_ALIAS,
@@ -83,6 +84,32 @@ LLM_SOURCE = AssessmentSource(
 _SCORER_FEEDBACK_CACHE: dict[tuple[str, str], dict] = {}
 
 _REGISTERED_PROMPT_NAMES: dict[str, str] = {}
+
+_PROVENANCE_PRIORITY = ["curated", "synthetic", "auto_corrected", "coverage_gap_fill"]
+
+
+def _truncate_benchmarks(benchmarks: list[dict], max_count: int) -> list[dict]:
+    """Truncate benchmarks to *max_count* using provenance-based priority.
+
+    Curated benchmarks are kept first, then synthetic, auto_corrected,
+    coverage_gap_fill, and finally any other provenance.  Within each
+    tier the original order (which respects category diversity) is preserved.
+    """
+    if len(benchmarks) <= max_count:
+        return benchmarks
+    buckets: dict[str, list[dict]] = {p: [] for p in _PROVENANCE_PRIORITY}
+    buckets["other"] = []
+    for b in benchmarks:
+        prov = b.get("provenance", "other")
+        buckets.get(prov, buckets["other"]).append(b)
+    result: list[dict] = []
+    for p in _PROVENANCE_PRIORITY + ["other"]:
+        for b in buckets[p]:
+            if len(result) >= max_count:
+                break
+            result.append(b)
+    logger.warning("Truncated benchmarks from %d to %d", len(benchmarks), len(result))
+    return result
 
 
 def _cache_scorer_feedback(
@@ -1192,6 +1219,7 @@ def make_predict_fn(
     lever: int | None = None,
     eval_scope: str = "",
     triggered_by: str = "",
+    instruction_prompt_name: str = "",
 ):
     """Return a predict function with bound workspace/spark context.
 
@@ -1215,6 +1243,8 @@ def make_predict_fn(
         limitations (e.g. METRIC_VIEW_JOIN_NOT_SUPPORTED).
         """
         try:
+            if instruction_prompt_name:
+                _link_prompt_to_trace(instruction_prompt_name)
             _trace_tags: dict[str, str] = {
                 "question_id": kwargs.get("question_id", ""),
                 "space_id": space_id,
@@ -2577,6 +2607,13 @@ def create_evaluation_dataset(
                 "Dropped %d duplicate benchmark(s) by question text before persisting to %s",
                 _dup_count, uc_table_name,
             )
+        if len(records) > MAX_BENCHMARK_COUNT:
+            records = _truncate_benchmarks(
+                [{"provenance": r.get("expectations", {}).get("provenance", "other"), **r} for r in records],
+                MAX_BENCHMARK_COUNT,
+            )
+            for r in records:
+                r.pop("provenance", None)
         eval_dataset.merge_records(records)
         logger.info("UC Evaluation Dataset: %s (%d records merged)", uc_table_name, len(records))
         return eval_dataset
@@ -2955,6 +2992,13 @@ def run_evaluation(
                     "expectations": expectations,
                 }
             )
+        if len(eval_records) > MAX_BENCHMARK_COUNT:
+            eval_records = _truncate_benchmarks(
+                [{**r, "provenance": r.get("expectations", {}).get("provenance", "other")} for r in eval_records],
+                MAX_BENCHMARK_COUNT,
+            )
+            for r in eval_records:
+                r.pop("provenance", None)
         eval_data = pd.DataFrame(eval_records)
 
         run_params = {
@@ -4137,7 +4181,10 @@ def _fill_coverage_gaps(
 
     Returns only validated gap-fill benchmarks (may be empty).
     """
-    soft_cap = int(TARGET_BENCHMARK_COUNT * COVERAGE_GAP_SOFT_CAP_FACTOR)
+    soft_cap = min(
+        int(TARGET_BENCHMARK_COUNT * COVERAGE_GAP_SOFT_CAP_FACTOR),
+        MAX_BENCHMARK_COUNT,
+    )
     if len(benchmarks) >= soft_cap:
         logger.info(
             "Skipping coverage gap-fill: benchmark count %d already at soft cap %d",
@@ -5079,3 +5126,225 @@ def log_expectations_on_traces(eval_result: dict) -> int:
     if logged:
         logger.info("Logged expected_sql expectations on %d/%d traces", logged, len(trace_map))
     return logged
+
+
+def log_judge_verdicts_on_traces(eval_result: dict) -> int:
+    """Attach per-question judge verdicts as feedback on MLflow traces.
+
+    Enables human reviewers to see all judge scores at a glance in the
+    trace UI without re-running the evaluation.
+    """
+    trace_map = eval_result.get("trace_map", {})
+    rows = eval_result.get("rows", [])
+    logged = 0
+    for row in rows:
+        qid = row.get("question_id") or row.get("inputs/question_id") or ""
+        tid = trace_map.get(qid)
+        if not tid:
+            continue
+        verdicts: dict[str, Any] = {}
+        for judge in [
+            "schema_accuracy", "logical_accuracy", "completeness",
+            "asset_routing", "result_correctness", "arbiter",
+        ]:
+            val = row.get(f"{judge}/value") or row.get(judge)
+            if val is not None:
+                verdicts[judge] = val
+        if not verdicts:
+            continue
+        try:
+            mlflow.log_feedback(
+                trace_id=tid,
+                name="judge_verdicts",
+                value=all(
+                    v in ("yes", "both_correct", "genie_correct")
+                    for v in verdicts.values()
+                ),
+                rationale=json.dumps(verdicts),
+                source=AssessmentSource(
+                    source_type="CODE",
+                    source_id="genie_space_optimizer/judges",
+                ),
+                metadata={"question_id": qid, **verdicts},
+            )
+            logged += 1
+        except Exception:
+            logger.debug("Failed to log judge verdicts for trace %s", tid, exc_info=True)
+    if logged:
+        logger.info("Logged judge verdicts on %d/%d traces", logged, len(trace_map))
+    return logged
+
+
+def log_persistence_context_on_traces(
+    eval_result: dict,
+    persistence_data: dict[str, dict],
+    *,
+    extra_trace_map: dict[str, list[str]] | None = None,
+) -> int:
+    """Attach per-question failure persistence context as feedback on traces.
+
+    Lets human reviewers see how many times each question has failed
+    across iterations, its persistence classification, and which
+    patches have already been attempted.
+
+    When *extra_trace_map* is provided it is used as the primary source
+    of trace IDs per question, logging on **all** traces for each
+    question (not just the last eval's ``trace_map``).
+    """
+    fallback_trace_map = eval_result.get("trace_map", {})
+    logged = 0
+    for qid, ctx in persistence_data.items():
+        if extra_trace_map and qid in extra_trace_map:
+            tids = extra_trace_map[qid]
+        else:
+            tid = fallback_trace_map.get(qid)
+            tids = [tid] if tid else []
+        for tid in tids:
+            try:
+                mlflow.log_feedback(
+                    trace_id=tid,
+                    name="persistence_context",
+                    value=ctx.get("classification", "UNKNOWN") != "INTERMITTENT",
+                    rationale=(
+                        f"Failed {ctx.get('fail_count', 0)} times, "
+                        f"{ctx.get('max_consecutive', 0)} consecutive"
+                    ),
+                    source=AssessmentSource(
+                        source_type="CODE",
+                        source_id="genie_space_optimizer/persistence",
+                    ),
+                    metadata={
+                        "question_id": qid,
+                        "fail_count": ctx.get("fail_count", 0),
+                        "max_consecutive": ctx.get("max_consecutive", 0),
+                        "classification": ctx.get("classification", ""),
+                        "patches_tried": str(ctx.get("patches_tried", [])),
+                        "fail_iterations": ctx.get("fail_iterations", []),
+                    },
+                )
+                logged += 1
+            except Exception:
+                logger.debug("Failed to log persistence context for trace %s", tid, exc_info=True)
+    if logged:
+        logger.info("Logged persistence context on %d/%d traces", logged, len(persistence_data))
+    return logged
+
+
+def log_patch_history_on_traces(
+    question_trace_map: dict[str, list[str]],
+    reflection_buffer: list[dict],
+    persistent_question_ids: set[str] | None = None,
+) -> int:
+    """Log per-question patch history from the reflection buffer as feedback on traces.
+
+    For each question in *persistent_question_ids* (or all questions if None),
+    extracts which patches were proposed/applied/rolled-back and the score delta,
+    then logs as ``mlflow.log_feedback`` with ``name="patch_history"`` on the
+    question's **latest** trace from *question_trace_map*.
+
+    Returns the number of traces that received feedback.
+    """
+    q_history: dict[str, list[dict]] = {}
+    for entry in reflection_buffer:
+        iteration = entry.get("iteration", 0)
+        accepted = entry.get("accepted", False)
+        affected = entry.get("affected_question_ids", [])
+        action = entry.get("action", "")
+        prev_scores = entry.get("prev_scores", {})
+        new_scores = entry.get("new_scores", {})
+        prev_acc = sum(prev_scores.values()) / max(len(prev_scores), 1) if prev_scores else 0.0
+        new_acc = sum(new_scores.values()) / max(len(new_scores), 1) if new_scores else 0.0
+        acc_delta = new_acc - prev_acc
+
+        patches_info: list[str] = []
+        for part in action.split(", "):
+            if " on " in part:
+                patches_info.append(part.strip())
+            elif part.strip():
+                patches_info.append(part.strip())
+
+        record = {
+            "iteration": iteration,
+            "accepted": accepted,
+            "action": action,
+            "patches": patches_info,
+            "score_delta": round(acc_delta, 2),
+        }
+        for qid in affected:
+            q_history.setdefault(qid, []).append(record)
+
+    target_qids = persistent_question_ids if persistent_question_ids is not None else set(q_history.keys())
+    logged = 0
+    for qid in target_qids:
+        entries = q_history.get(qid, [])
+        tids = question_trace_map.get(qid, [])
+        if not tids:
+            continue
+        latest_tid = tids[-1]
+
+        lines: list[str] = []
+        iterations_list: list[int] = []
+        patches_list: list[str] = []
+        accepted_list: list[bool] = []
+        delta_list: list[float] = []
+        for e in entries:
+            status = "ACCEPTED" if e["accepted"] else "ROLLED_BACK"
+            delta_str = f"{e['score_delta']:+.1f}%"
+            action_str = e["action"][:120] if e["action"] else "unknown"
+            lines.append(f"Iter {e['iteration']}: {action_str}, {status} ({delta_str})")
+            iterations_list.append(e["iteration"])
+            patches_list.extend(e["patches"])
+            accepted_list.append(e["accepted"])
+            delta_list.append(e["score_delta"])
+
+        rationale = "; ".join(lines) if lines else "No patch history for this question"
+        try:
+            mlflow.log_feedback(
+                trace_id=latest_tid,
+                name="patch_history",
+                value=bool(entries),
+                rationale=rationale,
+                source=AssessmentSource(
+                    source_type="CODE",
+                    source_id="genie_space_optimizer/patch_history",
+                ),
+                metadata={
+                    "question_id": qid,
+                    "iterations": iterations_list,
+                    "patches": patches_list,
+                    "accepted": accepted_list,
+                    "score_deltas": delta_list,
+                },
+            )
+            logged += 1
+        except Exception:
+            logger.debug("Failed to log patch history for trace %s", latest_tid, exc_info=True)
+
+    if logged:
+        logger.info("Logged patch history on %d traces", logged)
+    return logged
+
+
+def _extract_genie_sql_from_trace(trace_id: str) -> str:
+    """Extract Genie's generated SQL from a stored MLflow trace.
+
+    Returns the SQL string if found, or empty string on failure.
+    """
+    if not trace_id:
+        return ""
+    try:
+        trace = mlflow.get_trace(trace_id)
+        if trace is None:
+            return ""
+        response = trace.data.response if hasattr(trace, "data") else None
+        if isinstance(response, dict):
+            return response.get("genie_sql", "") or response.get("sql", "")
+        if isinstance(response, str):
+            try:
+                parsed = json.loads(response)
+                return parsed.get("genie_sql", "") or parsed.get("sql", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+    except Exception:
+        logger.debug("Failed to extract Genie SQL from trace %s", trace_id, exc_info=True)
+    return ""

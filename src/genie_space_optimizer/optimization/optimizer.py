@@ -4617,6 +4617,7 @@ def _call_llm_for_adaptive_strategy(
     passing_benchmarks: int = 0,
     verdict_history: dict | None = None,
     skill_exemplars: list[dict] | None = None,
+    human_suggestions: list[dict] | None = None,
 ) -> dict:
     """Single-call strategist that produces exactly ONE action group.
 
@@ -4685,12 +4686,22 @@ def _call_llm_for_adaptive_strategy(
         else "(No accepted patterns yet. This is informed by prior successful iterations.)"
     )
 
+    # ── Build human reviewer suggestions text ──────────────────────────
+    suggestions_text = ""
+    if human_suggestions:
+        lines_hs: list[str] = ["Human reviewer suggestions from prior review:"]
+        for s in human_suggestions:
+            for item in s.get("suggestions", []):
+                lines_hs.append(f"- {item}")
+        suggestions_text = "\n".join(lines_hs)
+
     # ── Assemble prompt kwargs ───────────────────────────────────────
     format_kwargs: dict[str, Any] = {
         "success_summary": success_summary,
         "priority_ranking": ranking_text,
         "reflection_buffer": reflection_text,
         "question_persistence_summary": persistence_text,
+        "human_reviewer_suggestions": suggestions_text or "(No human reviewer suggestions available.)",
         "proven_patterns": proven_patterns_text,
         "full_schema_context": _format_full_schema_context(metadata_snapshot),
         "cluster_briefs": _format_cluster_briefs(clusters),

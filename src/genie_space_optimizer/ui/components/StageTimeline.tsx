@@ -75,7 +75,7 @@ function formatDateTime(iso?: string | null): string {
 }
 
 export function StageTimeline({ stageEvents }: StageTimelineProps) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(stageEvents.length > 0);
 
   const chartData = stageEvents
     .map((e) => {
