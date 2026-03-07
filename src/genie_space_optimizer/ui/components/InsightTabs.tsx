@@ -29,7 +29,7 @@ import type {
 } from "@/lib/transparency-api";
 import type { StageEvent } from "@/components/StageTimeline";
 import { IterationChart } from "@/components/IterationChart";
-import { StageTimeline } from "@/components/StageTimeline";
+import { StageTimeline, formatStageDisplayName } from "@/components/StageTimeline";
 
 interface InsightTabsProps {
   runId: string;
@@ -271,22 +271,22 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
       </CardHeader>
       <CardContent>
         <div className="max-h-[500px] overflow-auto">
-          <Table>
+          <Table className="table-fixed">
             <TableHeader>
               <TableRow>
-                <TableHead className="text-xs">Question</TableHead>
+                <TableHead className="min-w-[200px] w-[40%] text-xs">Question</TableHead>
                 {iters.map((it) => (
-                  <TableHead key={it} className="text-center text-xs">
+                  <TableHead key={it} className="w-[48px] text-center text-xs">
                     {it === 0 ? "Baseline" : `Iter ${it}`}
                   </TableHead>
                 ))}
-                <TableHead className="text-center text-xs">Status</TableHead>
+                <TableHead className="w-[80px] text-center text-xs">Status</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {filteredQuestions.slice(0, 100).map(([qid, data]) => (
                 <TableRow key={qid}>
-                  <TableCell className="max-w-[300px] truncate text-xs" title={data.question}>
+                  <TableCell className="truncate text-xs" title={data.question || qid}>
                     {data.question || qid}
                   </TableCell>
                   {iters.map((it) => {
@@ -488,7 +488,9 @@ function ActivityTab({ stageEvents }: { stageEvents: StageEvent[] }) {
               />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="font-medium">{event.stage}</span>
+                  <span className="font-medium">
+                    {formatStageDisplayName(event.stage ?? "Unknown", event.status)}
+                  </span>
                   <Badge variant="outline" className="text-[10px]">
                     {event.status}
                   </Badge>
@@ -578,6 +580,32 @@ function JudgesTab({
               </TableRow>
             </TableHeader>
             <TableBody>
+              {baseline && final && (() => {
+                const bAcc = baseline.overallAccuracy;
+                const fAcc = final.overallAccuracy;
+                const accDelta = bAcc != null && fAcc != null ? fAcc - bAcc : null;
+                return (
+                  <TableRow className="border-b-2 font-semibold">
+                    <TableCell className="text-xs font-semibold">Overall Accuracy</TableCell>
+                    <TableCell className="text-center text-xs font-semibold">
+                      {bAcc != null ? `${bAcc.toFixed(1)}%` : "—"}
+                    </TableCell>
+                    <TableCell className="text-center text-xs font-semibold">
+                      {fAcc != null ? `${fAcc.toFixed(1)}%` : "—"}
+                    </TableCell>
+                    <TableCell className="text-center text-xs font-semibold">
+                      {accDelta != null ? (
+                        <span className={accDelta > 0 ? "text-green-600" : accDelta < 0 ? "text-red-500" : ""}>
+                          {accDelta > 0 ? "+" : ""}
+                          {accDelta.toFixed(1)}%
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })()}
               {judgeComparison.map(({ judge, baseline: b, final: f, delta }) => (
                 <TableRow key={judge}>
                   <TableCell className="text-xs font-medium">{judge}</TableCell>

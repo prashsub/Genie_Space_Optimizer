@@ -55,6 +55,18 @@ function shortenStageName(stage: string): string {
     .join(" ");
 }
 
+export function formatStageDisplayName(stage: string, status?: string): string {
+  const base = shortenStageName(stage);
+  const s = (status ?? "").toLowerCase();
+  if (s === "complete" || s === "completed") {
+    if (/_STARTED$/i.test(stage)) return `${base} Ended`;
+    return `${base} Complete`;
+  }
+  if (s === "failed") return `${base} Failed`;
+  if (s === "started" || s === "running") return `${base} Running`;
+  return base;
+}
+
 function getStatusColor(status?: string): string {
   if (!status) return "hsl(var(--chart-4))";
   const s = status.toLowerCase();

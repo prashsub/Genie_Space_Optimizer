@@ -417,17 +417,26 @@ def _build_step_io(
             if q:
                 sample_questions.append(q)
 
+        table_count = _safe_int(detail.get("table_count")) or len(tables)
+        function_count = _safe_int(detail.get("function_count")) or len(functions)
+        instruction_count = _safe_int(detail.get("instruction_count")) or len(text_instructions)
+        sample_q_count = (
+            _safe_int(detail.get("benchmark_count"))
+            or _safe_int(detail.get("sample_question_count"))
+            or len(sample_questions)
+        )
+
         return (
             {
                 "spaceId": run_data.get("space_id"),
                 "domain": run_data.get("domain"),
             },
             {
-                "tableCount": len(tables),
+                "tableCount": table_count,
                 "tables": [str(t.get("identifier") or "") for t in tables[:12] if isinstance(t, dict)],
-                "functionCount": len(functions),
-                "instructionCount": len(text_instructions),
-                "sampleQuestionCount": len(sample_questions),
+                "functionCount": function_count,
+                "instructionCount": instruction_count,
+                "sampleQuestionCount": sample_q_count,
                 "sampleQuestionsPreview": sample_questions[:5],
                 "stageEvents": timeline,
             },
@@ -758,7 +767,7 @@ def _build_levers(
     patches_rows: list[dict] | None = None,
     iterations_rows: list[dict] | None = None,
 ) -> list[LeverStatus]:
-    """Build lever detail from LEVER_* stage rows."""
+    """Build lever detail from LEVER_* and AG_* stage rows."""
     from genie_space_optimizer.common.config import LEVER_NAMES
 
     lever_data: dict[int, dict] = {}
@@ -768,28 +777,53 @@ def _build_levers(
         except (TypeError, ValueError):
             continue
 
+    # Map iteration → lever from iterations table so we can assign AG stages
+    iter_to_lever: dict[int, int] = {}
+    for row in iterations_rows or []:
+        it = _safe_int(row.get("iteration"))
+        lv = _safe_int(row.get("lever"))
+        if it is not None and lv is not None:
+            iter_to_lever.setdefault(it, lv)
+
     for s in stages_rows:
         stage_name = str(s.get("stage", ""))
-        if not stage_name.startswith("LEVER_"):
-            continue
-        lever_num = s.get("lever")
-        if lever_num is None:
+
+        # Match LEVER_* stages (existing logic)
+        if stage_name.startswith("LEVER_"):
+            lever_num = s.get("lever")
+            if lever_num is None:
+                try:
+                    parts = stage_name.split("_")
+                    lever_num = int(parts[1])
+                except (IndexError, ValueError):
+                    continue
             try:
-                parts = stage_name.split("_")
-                lever_num = int(parts[1])
-            except (IndexError, ValueError):
+                lever_num_float = float(lever_num)
+            except (TypeError, ValueError):
                 continue
-        try:
-            lever_num_float = float(lever_num)
-        except (TypeError, ValueError):
+            if not math.isfinite(lever_num_float):
+                continue
+            lever_num = int(lever_num_float)
+            if lever_num not in lever_data:
+                lever_data[lever_num] = {"stages": [], "detail": {}, "patches": []}
+            lever_data[lever_num]["stages"].append(s)
+            lever_data[lever_num]["detail"].update(_parse_detail(s))
             continue
-        if not math.isfinite(lever_num_float):
-            continue
-        lever_num = int(lever_num_float)
-        if lever_num not in lever_data:
-            lever_data[lever_num] = {"stages": [], "detail": {}, "patches": []}
-        lever_data[lever_num]["stages"].append(s)
-        lever_data[lever_num]["detail"].update(_parse_detail(s))
+
+        # Match AG_* stages — map to lever via iteration number
+        if stage_name.startswith("AG_"):
+            iteration = _safe_int(s.get("iteration"))
+            if iteration is None:
+                continue
+            lever_num_mapped = iter_to_lever.get(iteration)
+            if lever_num_mapped is None:
+                continue
+            if lever_num_mapped not in lever_data:
+                lever_data[lever_num_mapped] = {"stages": [], "detail": {}, "patches": []}
+            lever_data[lever_num_mapped]["stages"].append(s)
+            detail = _parse_detail(s)
+            if detail:
+                lever_data[lever_num_mapped]["detail"].update(detail)
 
     for p in patches_rows or []:
         lever_num = _safe_int(p.get("lever"))
@@ -822,6 +856,7 @@ def _build_levers(
             iterations_rows=iterations_rows or [],
             patches_rows=patches_rows or [],
             run_status=run_status,
+            all_stages_rows=stages_rows,
         )
 
         levers.append(
@@ -868,9 +903,18 @@ def _build_lever_iterations(
     iterations_rows: list[dict],
     patches_rows: list[dict],
     run_status: str,
+    all_stages_rows: list[dict] | None = None,
 ) -> list[dict[str, Any]]:
     """Build iteration-by-iteration transparency payload for one lever."""
     by_iter: dict[int, dict[str, Any]] = {}
+
+    # Collect iterations that belong to this lever from iterations_rows
+    lever_iterations: set[int] = set()
+    for row in iterations_rows:
+        if _safe_int(row.get("lever")) == lever_num:
+            it = _safe_int(row.get("iteration"))
+            if it is not None:
+                lever_iterations.add(it)
 
     for stage in lever_stages:
         iteration = _safe_int(stage.get("iteration"))
@@ -879,6 +923,20 @@ def _build_lever_iterations(
         entry = by_iter.setdefault(iteration, {"stages": [], "detail": {}, "patches": [], "rows": []})
         entry["stages"].append(stage)
         entry["detail"].update(_parse_detail(stage))
+
+    # Also include AG_* stages for iterations belonging to this lever
+    for stage in all_stages_rows or []:
+        stage_name = str(stage.get("stage", ""))
+        if not stage_name.startswith("AG_"):
+            continue
+        iteration = _safe_int(stage.get("iteration"))
+        if iteration is None or iteration not in lever_iterations:
+            continue
+        entry = by_iter.setdefault(iteration, {"stages": [], "detail": {}, "patches": [], "rows": []})
+        entry["stages"].append(stage)
+        detail = _parse_detail(stage)
+        if detail:
+            entry["detail"].update(detail)
 
     for row in iterations_rows:
         if _safe_int(row.get("lever")) != lever_num:

@@ -644,7 +644,7 @@ function TransparencyPane({
   availableIterations: number[];
   links: { label: string; url: string; category: string }[];
 }) {
-  const { data: iterDetail, isLoading } = useIterationDetail(runId);
+  const { data: iterDetail, isLoading, isError } = useIterationDetail(runId);
 
   if (isLoading) {
     return (
@@ -655,9 +655,18 @@ function TransparencyPane({
     );
   }
 
-  if (!iterDetail) {
+  if (isError || !iterDetail) {
     return (
       <div className="space-y-4">
+        {isError && (
+          <Alert>
+            <AlertTriangle className="h-4 w-4" />
+            <AlertTitle>Could not load full iteration details</AlertTitle>
+            <AlertDescription>
+              Showing summary charts only. The detailed breakdown may become available once the run completes.
+            </AlertDescription>
+          </Alert>
+        )}
         <div className="grid gap-4 lg:grid-cols-2">
           <IterationChart runId={runId} />
           <StageTimeline stageEvents={stageEvents} />

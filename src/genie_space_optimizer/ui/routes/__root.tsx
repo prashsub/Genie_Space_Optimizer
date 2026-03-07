@@ -8,7 +8,7 @@ import {
   useRouterState,
 } from "@tanstack/react-router";
 import { Toaster } from "sonner";
-import { Zap, Settings } from "lucide-react";
+import { Settings } from "lucide-react";
 
 export const Route = createRootRouteWithContext<{
   queryClient: QueryClient;
@@ -25,9 +25,11 @@ function RootLayout() {
         <header className="sticky top-0 z-50 bg-db-dark text-white shadow-md">
           <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4">
             <Link to="/" className="flex items-center gap-2.5 hover:opacity-90">
-              <div className="flex h-8 w-8 items-center justify-center rounded-md bg-db-red">
-                <Zap className="h-5 w-5 text-white" />
-              </div>
+              <img
+                src="/genie_logo.jpg"
+                alt="Genie Optimizer"
+                className="h-9 w-9 rounded-md object-cover"
+              />
               <span className="text-lg font-semibold tracking-tight">
                 Genie Space Optimizer
               </span>

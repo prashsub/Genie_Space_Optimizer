@@ -27,6 +27,7 @@ interface LeverItem {
     rolledBack?: boolean;
     rollbackReason?: string | null;
     command?: unknown;
+    patch?: unknown;
     appliedAt?: string | null;
   }[];
   iterations?: {
@@ -53,6 +54,7 @@ interface LeverItem {
       rolledBack?: boolean;
       rollbackReason?: string | null;
       command?: unknown;
+      patch?: unknown;
       appliedAt?: string | null;
     }[];
     stageEvents?: {
@@ -218,11 +220,15 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
                       {patch.targetObject && (
                         <p className="mt-1 text-muted-foreground">target: {patch.targetObject}</p>
                       )}
-                      {patch.command != null && (
+                      {patch.command != null ? (
                         <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/40 p-1 text-[11px]">
                           {JSON.stringify(patch.command, null, 2)}
                         </pre>
-                      )}
+                      ) : patch.patch != null ? (
+                        <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/40 p-1 text-[11px]">
+                          {JSON.stringify(patch.patch, null, 2)}
+                        </pre>
+                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -307,11 +313,15 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
                                       <span className="text-muted-foreground">{patch.targetObject}</span>
                                     )}
                                   </div>
-                                  {patch.command != null && (
+                                  {patch.command != null ? (
                                     <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/40 p-1 text-[11px]">
                                       {JSON.stringify(patch.command, null, 2)}
                                     </pre>
-                                  )}
+                                  ) : patch.patch != null ? (
+                                    <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/40 p-1 text-[11px]">
+                                      {JSON.stringify(patch.patch, null, 2)}
+                                    </pre>
+                                  ) : null}
                                 </div>
                               ))}
                             </div>
