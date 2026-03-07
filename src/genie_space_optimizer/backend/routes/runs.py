@@ -315,6 +315,47 @@ def _parse_detail(stage: dict) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _resolve_parsed_space(config_snapshot: dict) -> dict:
+    """Extract the parsed Genie Space structure from config_snapshot.
+
+    Handles multiple storage formats:
+    1. ``_parsed_space`` key (normal fetch_space_config output)
+    2. ``serialized_space`` as a JSON string (raw API response)
+    3. ``data_sources`` at top level (the parsed space itself)
+    """
+    if not isinstance(config_snapshot, dict) or not config_snapshot:
+        return {}
+    parsed = config_snapshot.get("_parsed_space")
+    if isinstance(parsed, dict) and parsed:
+        return parsed
+    ss = config_snapshot.get("serialized_space")
+    if isinstance(ss, str):
+        try:
+            ss = json.loads(ss)
+        except (json.JSONDecodeError, TypeError):
+            ss = None
+    if isinstance(ss, dict) and ss:
+        return ss
+    if "data_sources" in config_snapshot:
+        return config_snapshot
+    return {}
+
+
+def _collect_all_preflight_detail(stages_rows: list[dict]) -> dict:
+    """Merge detail_json from ALL PREFLIGHT stages into a single dict.
+
+    This provides a comprehensive fallback — if PREFLIGHT_STARTED COMPLETE
+    wasn't written by an older harness, PREFLIGHT_METADATA_COLLECTION detail
+    (which has ``table_ref_count``) is still available.
+    """
+    merged: dict[str, Any] = {}
+    for s in stages_rows:
+        stage_name = str(s.get("stage", ""))
+        if stage_name.startswith("PREFLIGHT"):
+            merged.update(_parse_detail(s))
+    return merged
+
+
 def map_stages_to_steps(
     stages_rows: list[dict],
     iterations_rows: list[dict],
@@ -360,8 +401,8 @@ def map_stages_to_steps(
         )
         duration = _total_duration(matching)
 
-        summary = _build_step_summary(defn, matching, iterations_rows, run_data)
-        inputs, outputs = _build_step_io(defn, matching, iterations_rows, run_data)
+        summary = _build_step_summary(defn, matching, iterations_rows, run_data, stages_rows=stages_rows)
+        inputs, outputs = _build_step_io(defn, matching, iterations_rows, run_data, stages_rows=stages_rows)
 
         steps.append(
             PipelineStep(
@@ -408,6 +449,8 @@ def _build_step_io(
     matching: list[dict],
     iterations_rows: list[dict],
     run_data: dict,
+    *,
+    stages_rows: list[dict] | None = None,
 ) -> tuple[dict | None, dict | None]:
     """Build rich inputs/outputs payload for pipeline step drill-down."""
     if not matching:
@@ -418,10 +461,19 @@ def _build_step_io(
     for s in matching:
         detail.update(_parse_detail(s))
     timeline = _build_stage_timeline(matching)
-    config_snapshot = run_data.get("config_snapshot") if isinstance(run_data.get("config_snapshot"), dict) else {}
+    raw_snap = run_data.get("config_snapshot")
+    if isinstance(raw_snap, dict):
+        config_snapshot = raw_snap
+    elif isinstance(raw_snap, str):
+        config_snapshot = safe_json_parse(raw_snap)
+        if not isinstance(config_snapshot, dict):
+            config_snapshot = {}
+    else:
+        config_snapshot = {}
 
     if step_num == 1:
-        parsed = config_snapshot.get("_parsed_space", {}) if isinstance(config_snapshot, dict) else {}
+        all_pf = _collect_all_preflight_detail(stages_rows or [])
+        parsed = _resolve_parsed_space(config_snapshot)
         ds = parsed.get("data_sources", {}) if isinstance(parsed, dict) else {}
         tables = ds.get("tables", []) if isinstance(ds, dict) else []
         functions = ds.get("functions", []) if isinstance(ds, dict) else []
@@ -442,11 +494,25 @@ def _build_step_io(
             if q:
                 sample_questions.append(q)
 
-        table_count = _safe_int(detail.get("table_count")) or len(tables)
-        function_count = _safe_int(detail.get("function_count")) or len(functions)
-        instruction_count = _safe_int(detail.get("instruction_count")) or len(text_instructions)
+        table_count = (
+            _safe_int(detail.get("table_count"))
+            or _safe_int(all_pf.get("table_count"))
+            or _safe_int(all_pf.get("table_ref_count"))
+            or len(tables)
+        )
+        function_count = (
+            _safe_int(detail.get("function_count"))
+            or _safe_int(all_pf.get("function_count"))
+            or len(functions)
+        )
+        instruction_count = (
+            _safe_int(detail.get("instruction_count"))
+            or _safe_int(all_pf.get("instruction_count"))
+            or len(text_instructions)
+        )
         sample_q_count = (
             _safe_int(detail.get("benchmark_count"))
+            or _safe_int(all_pf.get("benchmark_count"))
             or _safe_int(detail.get("sample_question_count"))
             or len(sample_questions)
         )
@@ -733,6 +799,8 @@ def _build_step_summary(
     matching: list[dict],
     iterations_rows: list[dict],
     run_data: dict,
+    *,
+    stages_rows: list[dict] | None = None,
 ) -> str | None:
     """Build a human-readable summary for a pipeline step."""
     if not matching:
@@ -744,10 +812,25 @@ def _build_step_summary(
         detail.update(_parse_detail(s))
 
     if step_num == 1:
+        all_pf = _collect_all_preflight_detail(stages_rows or [])
+        tables_val = (
+            _safe_int(detail.get("table_count"))
+            or _safe_int(all_pf.get("table_count"))
+            or _safe_int(all_pf.get("table_ref_count"))
+        )
+        instr_val = (
+            _safe_int(detail.get("instruction_count"))
+            or _safe_int(all_pf.get("instruction_count"))
+        )
+        bench_val = (
+            _safe_int(detail.get("benchmark_count"))
+            or _safe_int(all_pf.get("benchmark_count"))
+            or _safe_int(run_data.get("benchmark_count"))
+        )
         return defn["summary_template"].format(
-            tables=detail.get("table_count", "?"),
-            instructions=detail.get("instruction_count", "?"),
-            questions=detail.get("benchmark_count", run_data.get("benchmark_count", "?")),
+            tables=tables_val if tables_val else "?",
+            instructions=instr_val if instr_val else "?",
+            questions=bench_val if bench_val else "?",
         )
     if step_num == 2:
         columns = detail.get("columns_collected", detail.get("columnsCollected", "?"))

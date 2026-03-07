@@ -28,7 +28,7 @@ function RootLayout() {
               <img
                 src="/genie_logo.png"
                 alt="Genie Optimizer"
-                className="h-9 w-9 rounded-md object-cover"
+                className="h-12 w-12 rounded-md object-cover"
               />
               <span className="text-lg font-semibold tracking-tight">
                 Genie Space Optimizer

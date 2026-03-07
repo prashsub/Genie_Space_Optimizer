@@ -1095,6 +1095,7 @@ def get_queued_patches(
     status: str = "pending",
 ) -> list[dict]:
     """Return all queued patches with the given status."""
+    _ensure_queued_patches_table(spark, catalog, schema)
     fqn = _fqn(catalog, schema, TABLE_QUEUED_PATCHES)
     try:
         df = run_query(

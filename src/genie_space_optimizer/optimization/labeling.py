@@ -318,6 +318,14 @@ def _populate_session_traces(
         qid_col = all_traces["request"].apply(_extract_question_id)
         failed_mask = qid_col.isin(fail_set)
         all_traces = all_traces[failed_mask]
+
+        # Keep only the latest trace per question for clean 1:1 review
+        all_traces = all_traces.assign(_qid=qid_col[failed_mask])
+        if "timestamp" in all_traces.columns:
+            all_traces = all_traces.sort_values("timestamp", ascending=False)
+        all_traces = all_traces.drop_duplicates(subset=["_qid"], keep="first")
+        all_traces = all_traces.drop(columns=["_qid"])
+
         print(
             f"[Labeling] Filtered to {len(all_traces)} failed-question traces "
             f"from {total_before} total ({len(fail_set)} failure question IDs)"
@@ -566,6 +574,27 @@ def sync_corrections_to_dataset(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _ensure_flagged_questions_table(spark: Any, catalog: str, schema: str) -> None:
+    fqn = f"{catalog}.{schema}.genie_opt_flagged_questions"
+    try:
+        spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {fqn} (
+                run_id              STRING      NOT NULL,
+                domain              STRING      NOT NULL,
+                question_id         STRING      NOT NULL,
+                question_text       STRING,
+                flag_reason         STRING,
+                iterations_failed   INT,
+                patches_tried       STRING,
+                status              STRING      NOT NULL,
+                flagged_at          TIMESTAMP   NOT NULL,
+                resolved_at         TIMESTAMP
+            ) USING DELTA
+        """)
+    except Exception:
+        logger.debug("Flagged questions table already exists or creation failed", exc_info=True)
+
+
 def flag_for_human_review(
     spark: Any,
     run_id: str,
@@ -592,24 +621,7 @@ def flag_for_human_review(
     from genie_space_optimizer.optimization.state import run_query
 
     fqn = f"{catalog}.{schema}.genie_opt_flagged_questions"
-
-    try:
-        spark.sql(f"""
-            CREATE TABLE IF NOT EXISTS {fqn} (
-                run_id              STRING      NOT NULL,
-                domain              STRING      NOT NULL,
-                question_id         STRING      NOT NULL,
-                question_text       STRING,
-                flag_reason         STRING,
-                iterations_failed   INT,
-                patches_tried       STRING,
-                status              STRING      NOT NULL,
-                flagged_at          TIMESTAMP   NOT NULL,
-                resolved_at         TIMESTAMP
-            ) USING DELTA
-        """)
-    except Exception:
-        logger.debug("Flagged questions table already exists or creation failed", exc_info=True)
+    _ensure_flagged_questions_table(spark, catalog, schema)
 
     flagged = 0
     from datetime import datetime, timezone
@@ -667,6 +679,7 @@ def get_flagged_questions(
     """Return flagged questions for a domain with the given status."""
     from genie_space_optimizer.optimization.state import run_query
 
+    _ensure_flagged_questions_table(spark, catalog, schema)
     fqn = f"{catalog}.{schema}.genie_opt_flagged_questions"
     try:
         df = run_query(

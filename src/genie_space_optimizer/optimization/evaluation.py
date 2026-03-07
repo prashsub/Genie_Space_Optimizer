@@ -5533,14 +5533,15 @@ def log_judge_verdicts_on_traces(eval_result: dict) -> int:
                 verdicts[judge] = val
         if not verdicts:
             continue
+        _passing = ("yes", "both_correct", "genie_correct")
+        overall = "PASS" if all(v in _passing for v in verdicts.values()) else "FAIL"
+        failed_judges = [j for j, v in verdicts.items() if v not in _passing]
+
         try:
             mlflow.log_feedback(
                 trace_id=tid,
                 name="judge_verdicts",
-                value=all(
-                    v in ("yes", "both_correct", "genie_correct")
-                    for v in verdicts.values()
-                ),
+                value=overall == "PASS",
                 rationale=json.dumps(verdicts),
                 source=AssessmentSource(
                     source_type="CODE",
@@ -5551,6 +5552,28 @@ def log_judge_verdicts_on_traces(eval_result: dict) -> int:
             logged += 1
         except Exception:
             logger.debug("Failed to log judge verdicts for trace %s", tid, exc_info=True)
+
+        try:
+            mlflow.set_trace_tag(tid, "judge_verdict", overall)
+            if failed_judges:
+                mlflow.set_trace_tag(tid, "failed_judges", ",".join(failed_judges))
+        except Exception:
+            logger.debug("Failed to set judge verdict tags for trace %s", tid, exc_info=True)
+
+        try:
+            verdict_lines = [f"  {j}: {v}" for j, v in verdicts.items()]
+            mlflow.log_expectation(
+                trace_id=tid,
+                name="judge_verdict_summary",
+                value=f"Overall: {overall}\n" + "\n".join(verdict_lines),
+                source=AssessmentSource(
+                    source_type="CODE",
+                    source_id="genie_space_optimizer/judges",
+                ),
+                metadata={"question_id": qid, "overall": overall, **verdicts},
+            )
+        except Exception:
+            logger.debug("Failed to log judge verdict expectation for trace %s", tid, exc_info=True)
     if logged:
         logger.info("Logged judge verdicts on %d/%d traces", logged, len(trace_map))
     return logged
@@ -5581,9 +5604,9 @@ def log_persistence_context_on_traces(
             tid = fallback_trace_map.get(qid)
             tids = [tid] if tid else []
         for tid in tids:
+            classification = ctx.get("classification", "UNKNOWN")
+            is_persistent = classification not in ("INTERMITTENT", "UNKNOWN")
             try:
-                classification = ctx.get("classification", "UNKNOWN")
-                is_persistent = classification not in ("INTERMITTENT", "UNKNOWN")
                 mlflow.log_feedback(
                     trace_id=tid,
                     name="persistence_context",
@@ -5605,11 +5628,14 @@ def log_persistence_context_on_traces(
                         "fail_iterations": ctx.get("fail_iterations", []),
                     },
                 )
+            except Exception:
+                logger.debug("Failed to log persistence feedback for trace %s", tid, exc_info=True)
+            try:
                 mlflow.set_trace_tag(tid, "persistent_failure", str(is_persistent).lower())
                 mlflow.set_trace_tag(tid, "persistence_classification", classification)
                 logged += 1
             except Exception:
-                logger.debug("Failed to log persistence context for trace %s", tid, exc_info=True)
+                logger.debug("Failed to set persistence tags for trace %s", tid, exc_info=True)
     if logged:
         logger.info("Logged persistence context on %d/%d traces", logged, len(persistence_data))
     return logged
