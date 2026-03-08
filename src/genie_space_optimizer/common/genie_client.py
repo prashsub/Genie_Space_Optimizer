@@ -831,19 +831,5 @@ def configure_mlflow_connection_pool(pool_size: int = 20) -> None:
             _ra.DEFAULT_POOLSIZE = pool_size
             _ra.DEFAULT_POOLCONNECTIONS = pool_size
             logger.debug("Patched requests.adapters.DEFAULT_POOLSIZE=%d", pool_size)
-
-        import urllib3
-        if hasattr(urllib3, "connectionpool"):
-            from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
-            for _pool_cls in (HTTPConnectionPool, HTTPSConnectionPool):
-                if hasattr(_pool_cls, "QueueCls") and _pool_cls.QueueCls is not None:
-                    _orig_init = _pool_cls.__init__
-
-                    def _patched_init(self, *args, _orig=_orig_init, _ps=pool_size, **kwargs):
-                        kwargs.setdefault("maxsize", _ps)
-                        _orig(self, *args, **kwargs)
-
-                    _pool_cls.__init__ = _patched_init  # type: ignore[method-assign]
-            logger.debug("urllib3 pool defaults updated (maxsize=%d)", pool_size)
     except Exception:
         logger.debug("Could not configure MLflow connection pool size", exc_info=True)
