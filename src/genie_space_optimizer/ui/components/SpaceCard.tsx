@@ -16,6 +16,7 @@ interface SpaceCardProps {
   tableCount?: number;
   lastModified?: string;
   qualityScore?: number | null;
+  accessLevel?: string | null;
   onClick: () => void;
 }
 
@@ -52,6 +53,22 @@ function relativeTime(iso: string): string {
   return `${days}d ago`;
 }
 
+function accessBadge(level: string | null | undefined) {
+  if (!level) return null;
+  if (level === "CAN_MANAGE" || level === "CAN_EDIT") {
+    return (
+      <Badge variant="outline" className="border-green-400 text-green-700">
+        Editable
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="border-gray-300 text-gray-500">
+      View Only
+    </Badge>
+  );
+}
+
 export function SpaceCard({
   id,
   name,
@@ -59,6 +76,7 @@ export function SpaceCard({
   tableCount,
   lastModified,
   qualityScore,
+  accessLevel,
   onClick,
 }: SpaceCardProps) {
   const { data: reviewsData } = useGetPendingReviews({
@@ -86,6 +104,7 @@ export function SpaceCard({
             {name}
           </CardTitle>
           <div className="flex items-center gap-1.5">
+            {accessBadge(accessLevel)}
             {pendingCount > 0 && (
               <Badge variant="outline" className="border-amber-300 text-amber-700">
                 {pendingCount} review{pendingCount > 1 ? "s" : ""}

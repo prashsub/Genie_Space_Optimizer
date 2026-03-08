@@ -12,6 +12,10 @@ export class ApiError extends Error {
         this.body = body;
     }
 }
+export interface AccessLevelEntry {
+    accessLevel?: string | null;
+    spaceId: string;
+}
 export interface ActionResponse {
     message: string;
     runId: string;
@@ -20,6 +24,9 @@ export interface ActionResponse {
 export type ActivityItem = Record<string, unknown>;
 export type AsiResult = Record<string, unknown>;
 export type AsiSummary = Record<string, unknown>;
+export interface CheckAccessRequest {
+    spaceIds: string[];
+}
 export type ComparisonData = Record<string, unknown>;
 export interface ComplexValue {
     display?: string | null;
@@ -116,6 +123,7 @@ export interface SpaceDetail {
     sampleQuestions: string[];
     tables: TableInfo[];
 }
+export type SpaceListResponse = Record<string, unknown>;
 export interface SpacePermissions {
     schemas: SchemaPermission[];
     spGrantInstructions?: string | null;
@@ -1046,7 +1054,7 @@ export interface ListSpacesParams {
     "X-Forwarded-Access-Token"?: string | null;
 }
 export const listSpaces = async (params?: ListSpacesParams, options?: RequestInit): Promise<{
-    data: SpaceSummary[];
+    data: SpaceListResponse;
 }> =>{
     const res = await fetch("/api/genie/spaces", {
         ...options,
@@ -1094,11 +1102,11 @@ export const listSpacesKey = (params?: ListSpacesParams)=>{
     ] as const;
 };
 export function useListSpaces<TData = {
-    data: SpaceSummary[];
+    data: SpaceListResponse;
 }>(options?: {
     params?: ListSpacesParams;
     query?: Omit<UseQueryOptions<{
-        data: SpaceSummary[];
+        data: SpaceListResponse;
     }, ApiError, TData>, "queryKey" | "queryFn">;
 }) {
     return useQuery({
@@ -1108,17 +1116,82 @@ export function useListSpaces<TData = {
     });
 }
 export function useListSpacesSuspense<TData = {
-    data: SpaceSummary[];
+    data: SpaceListResponse;
 }>(options?: {
     params?: ListSpacesParams;
     query?: Omit<UseSuspenseQueryOptions<{
-        data: SpaceSummary[];
+        data: SpaceListResponse;
     }, ApiError, TData>, "queryKey" | "queryFn">;
 }) {
     return useSuspenseQuery({
         queryKey: listSpacesKey(options?.params),
         queryFn: ()=>listSpaces(options?.params),
         ...options?.query
+    });
+}
+export interface CheckSpaceAccessParams {
+    "X-Forwarded-Host"?: string | null;
+    "X-Forwarded-Preferred-Username"?: string | null;
+    "X-Forwarded-User"?: string | null;
+    "X-Forwarded-Email"?: string | null;
+    "X-Request-Id"?: string | null;
+    "X-Forwarded-Access-Token"?: string | null;
+}
+export const checkSpaceAccess = async (data: CheckAccessRequest, params?: CheckSpaceAccessParams, options?: RequestInit): Promise<{
+    data: AccessLevelEntry[];
+}> =>{
+    const res = await fetch("/api/genie/spaces/check-access", {
+        ...options,
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            ...(params?.["X-Forwarded-Host"] != null && {
+                "X-Forwarded-Host": params["X-Forwarded-Host"]
+            }),
+            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
+                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
+            }),
+            ...(params?.["X-Forwarded-User"] != null && {
+                "X-Forwarded-User": params["X-Forwarded-User"]
+            }),
+            ...(params?.["X-Forwarded-Email"] != null && {
+                "X-Forwarded-Email": params["X-Forwarded-Email"]
+            }),
+            ...(params?.["X-Request-Id"] != null && {
+                "X-Request-Id": params["X-Request-Id"]
+            }),
+            ...(params?.["X-Forwarded-Access-Token"] != null && {
+                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
+            }),
+            ...options?.headers
+        },
+        body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export function useCheckSpaceAccess(options?: {
+    mutation?: UseMutationOptions<{
+        data: AccessLevelEntry[];
+    }, ApiError, {
+        params: CheckSpaceAccessParams;
+        data: CheckAccessRequest;
+    }>;
+}) {
+    return useMutation({
+        mutationFn: (vars)=>checkSpaceAccess(vars.data, vars.params),
+        ...options?.mutation
     });
 }
 export interface GetSpaceDetailParams {

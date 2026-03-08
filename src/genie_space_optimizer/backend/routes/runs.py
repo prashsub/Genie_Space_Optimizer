@@ -1385,7 +1385,7 @@ def get_comparison(
         original_snapshot = {}
 
     try:
-        client = _genie_client(ws, sp_ws)
+        client, _ = _genie_client(ws, sp_ws)
         current_config = fetch_space_config(client, space_id)
         current_ss = current_config.get("_parsed_space", {})
     except Exception:
@@ -1581,7 +1581,7 @@ def discard_optimization(
 
     if original_snapshot and isinstance(original_snapshot, dict):
         apply_log = {"pre_snapshot": original_snapshot}
-        client = _genie_client(ws, sp_ws)
+        client, _ = _genie_client(ws, sp_ws)
         rollback(apply_log, client, space_id)
 
     update_run_status(

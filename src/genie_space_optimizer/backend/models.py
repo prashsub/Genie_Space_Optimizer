@@ -67,6 +67,22 @@ class SpaceSummary(SafeModel):
     tableCount: int = 0
     lastModified: str = ""
     qualityScore: float | None = None
+    accessLevel: str | None = None
+
+
+class SpaceListResponse(SafeModel):
+    spaces: list[SpaceSummary]
+    totalCount: int
+    scopedToUser: bool = False
+
+
+class CheckAccessRequest(BaseModel):
+    spaceIds: list[str]
+
+
+class AccessLevelEntry(BaseModel):
+    spaceId: str
+    accessLevel: str | None = None
 
 
 class TableInfo(BaseModel):

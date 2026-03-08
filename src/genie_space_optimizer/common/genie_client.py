@@ -149,6 +149,70 @@ def _check_user_edit_from_perms(
     return False
 
 
+_PERMISSION_RANK = {"CAN_MANAGE": 3, "CAN_EDIT": 2, "CAN_VIEW": 1, "CAN_RUN": 1}
+
+
+def _get_user_access_level_from_rest_acl(
+    acl_response: dict, user_email: str, user_groups: set[str],
+) -> str | None:
+    """Return the user's highest permission level from a REST ACL response."""
+    best: str | None = None
+    best_rank = 0
+    for entry in acl_response.get("access_control_list", []):
+        principal = (
+            entry.get("user_name") or entry.get("group_name") or ""
+        ).lower()
+        is_me = (
+            principal == user_email
+            or principal in user_groups
+            or entry.get("group_name") == "admins"
+        )
+        if not is_me:
+            continue
+        for p in entry.get("all_permissions", []):
+            level = str(p.get("permission_level", ""))
+            rank = _PERMISSION_RANK.get(level, 0)
+            if rank > best_rank:
+                best_rank = rank
+                best = level
+    if best and best == "CAN_RUN":
+        best = "CAN_VIEW"
+    return best
+
+
+def get_user_access_level(
+    w: WorkspaceClient,
+    space_id: str,
+    *,
+    user_email: str | None = None,
+    user_groups: set[str] | None = None,
+    acl_client: WorkspaceClient | None = None,
+) -> str | None:
+    """Return the user's highest permission on a Genie space.
+
+    Returns ``"CAN_MANAGE"``, ``"CAN_EDIT"``, ``"CAN_VIEW"``, or ``None``.
+    """
+    try:
+        if not user_email:
+            me = w.current_user.me()
+            user_email = (me.user_name or "").lower()
+            if user_groups is None and me.groups:
+                user_groups = {g.display.lower() for g in me.groups if g.display}
+        else:
+            user_email = user_email.lower()
+        user_groups = user_groups or set()
+
+        for client in [w, acl_client] if acl_client else [w]:
+            acl_resp = get_space_permissions_rest(client, space_id)
+            if acl_resp is not None:
+                return _get_user_access_level_from_rest_acl(acl_resp, user_email, user_groups)
+
+        return None
+    except Exception:
+        logger.warning("Could not determine access level for space %s", space_id)
+        return None
+
+
 def user_can_edit_space(
     w: WorkspaceClient,
     space_id: str,

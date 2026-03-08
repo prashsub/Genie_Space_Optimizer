@@ -19,11 +19,14 @@ from fastapi import HTTPException
 from ..constants import ACTIVE_RUN_STATUSES, TERMINAL_JOB_STATES
 from ..core import Dependencies, create_router
 from ..models import (
+    AccessLevelEntry,
+    CheckAccessRequest,
     FunctionInfo,
     JoinInfo,
     OptimizeResponse,
     RunSummary,
     SpaceDetail,
+    SpaceListResponse,
     SpaceSummary,
     TableInfo,
 )
@@ -130,21 +133,23 @@ def _wh_create_run(
     logger.info("Created run %s via SQL warehouse fallback", run_id)
 
 
-def _genie_client(ws: WorkspaceClient, sp_ws: WorkspaceClient) -> WorkspaceClient:
+def _genie_client(ws: WorkspaceClient, sp_ws: WorkspaceClient) -> tuple[WorkspaceClient, bool]:
     """Pick the best client for Genie API calls.
 
     Tries the user OBO client first; if the token lacks the ``genie`` scope
     falls back to the service-principal client transparently.
+
+    Returns ``(client, is_obo)`` where *is_obo* is True when the OBO client was used.
     """
     try:
         ws.genie.list_spaces(page_size=1)
-        return ws
+        return ws, True
     except PermissionDenied:
         logger.info("OBO token missing genie scope — falling back to SP client")
-        return sp_ws
+        return sp_ws, False
     except Exception:
         logger.warning("Unexpected error probing OBO genie access — falling back to SP client", exc_info=True)
-        return sp_ws
+        return sp_ws, False
 
 
 def _parse_utc(raw: object) -> datetime | None:
@@ -374,7 +379,7 @@ def _fetch_uc_metadata_obo_for_tables(
     return result
 
 
-@router.get("/spaces", response_model=list[SpaceSummary], operation_id="listSpaces")
+@router.get("/spaces", response_model=SpaceListResponse, operation_id="listSpaces")
 def list_spaces(
     ws: Dependencies.UserClient,
     sp_ws: Dependencies.Client,
@@ -384,13 +389,13 @@ def list_spaces(
     """List all Genie Spaces the caller can see, enriched with quality scores.
 
     Returns every space visible to the caller without per-space permission or
-    config fetches.  Permission checks happen lazily on the detail/trigger
-    endpoints instead, keeping this endpoint fast.
+    config fetches.  Permission checks happen lazily via the batch
+    ``POST /spaces/check-access`` endpoint, keeping this endpoint fast.
     """
     from genie_space_optimizer.common.genie_client import list_spaces as _list_spaces
     from genie_space_optimizer.optimization.state import load_recent_activity
 
-    client = _genie_client(ws, sp_ws)
+    client, is_obo = _genie_client(ws, sp_ws)
     try:
         all_spaces = _list_spaces(client)
     except Exception as exc:
@@ -415,7 +420,7 @@ def list_spaces(
     except Exception:
         logger.debug("Delta tables not yet available, skipping activity enrichment")
 
-    return [
+    summaries = [
         SpaceSummary(
             id=s["id"],
             name=str(s.get("title", "") or ""),
@@ -423,6 +428,61 @@ def list_spaces(
         )
         for s in all_spaces
     ]
+    return SpaceListResponse(
+        spaces=summaries,
+        totalCount=len(summaries),
+        scopedToUser=is_obo,
+    )
+
+
+_MAX_ACCESS_CHECK_IDS = 20
+
+
+@router.post(
+    "/spaces/check-access",
+    response_model=list[AccessLevelEntry],
+    operation_id="checkSpaceAccess",
+)
+def check_space_access(
+    body: CheckAccessRequest,
+    ws: Dependencies.UserClient,
+    sp_ws: Dependencies.Client,
+    headers: Dependencies.Headers,
+):
+    """Return the caller's access level for a batch of space IDs."""
+    from genie_space_optimizer.common.genie_client import get_user_access_level
+
+    ids = body.spaceIds[:_MAX_ACCESS_CHECK_IDS]
+
+    user_email: str | None = (headers.user_email or headers.user_name or "").lower() or None
+    user_groups: set[str] | None = None
+    if not user_email:
+        try:
+            me = ws.current_user.me()
+            user_email = (me.user_name or "").lower()
+            if me.groups:
+                user_groups = {g.display.lower() for g in me.groups if g.display}
+        except Exception:
+            user_email = ""
+    if user_groups is None:
+        try:
+            me = ws.current_user.me()
+            if me.groups:
+                user_groups = {g.display.lower() for g in me.groups if g.display}
+        except Exception:
+            pass
+    user_groups = user_groups or set()
+
+    results: list[AccessLevelEntry] = []
+    for sid in ids:
+        level = get_user_access_level(
+            ws, sid,
+            user_email=user_email,
+            user_groups=user_groups,
+            acl_client=sp_ws,
+        )
+        results.append(AccessLevelEntry(spaceId=sid, accessLevel=level))
+    return results
 
 
 @router.get("/spaces/{space_id}", response_model=SpaceDetail, operation_id="getSpaceDetail")
@@ -434,14 +494,10 @@ def get_space_detail(
     headers: Dependencies.Headers,
 ):
     """Full space config with UC metadata and optimization history."""
-    from genie_space_optimizer.common.genie_client import fetch_space_config, user_can_edit_space
+    from genie_space_optimizer.common.genie_client import fetch_space_config
     from genie_space_optimizer.optimization.state import load_runs_for_space
 
-    caller_email = (headers.user_email or headers.user_name or "").lower()
-    if not user_can_edit_space(ws, space_id, user_email=caller_email, acl_client=sp_ws):
-        raise HTTPException(status_code=403, detail="You need CAN_EDIT or CAN_MANAGE on this space.")
-
-    client = _genie_client(ws, sp_ws)
+    client, _ = _genie_client(ws, sp_ws)
     try:
         space_config = fetch_space_config(client, space_id)
     except Exception as exc:
@@ -832,7 +888,7 @@ def do_start_optimization(
         title = str(space_snapshot.get("title", "") or "")
         domain = re.sub(r"[^a-z0-9_]+", "_", title.lower().replace(" ", "_").replace("-", "_")).strip("_") if title else "default"
     else:
-        domain = _infer_domain(_genie_client(ws, sp_ws), space_id)
+        domain = _infer_domain(_genie_client(ws, sp_ws)[0], space_id)
 
     from genie_space_optimizer.common.uc_metadata import extract_genie_space_table_refs
 
