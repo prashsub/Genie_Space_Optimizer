@@ -41,9 +41,9 @@ def list_spaces(w: WorkspaceClient) -> list[dict[str, str]]:
     page_token: str | None = None
     while True:
         resp = w.genie.list_spaces(page_size=100, page_token=page_token)
-        for s in (resp.spaces or []):
+        for s in resp.spaces or []:
             all_spaces.append({"id": s.space_id, "title": s.title})
-        page_token = getattr(resp, "next_page_token", None)
+        page_token = resp.next_page_token
         if not page_token:
             break
     return all_spaces

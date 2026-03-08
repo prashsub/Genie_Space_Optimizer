@@ -381,15 +381,13 @@ def list_spaces(
     config: Dependencies.Config,
     headers: Dependencies.Headers,
 ):
-    """List Genie Spaces enriched with latest optimization metadata from Delta.
+    """List all Genie Spaces the caller can see, enriched with quality scores.
 
-    Tries the user's OBO token first for proper permission scoping; falls back
-    to the service-principal client if the ``dashboards.genie`` scope is missing.
+    Returns every space visible to the caller without per-space permission or
+    config fetches.  Permission checks happen lazily on the detail/trigger
+    endpoints instead, keeping this endpoint fast.
     """
-    from genie_space_optimizer.common.genie_client import (
-        list_spaces as _list_spaces,
-        user_can_edit_space,
-    )
+    from genie_space_optimizer.common.genie_client import list_spaces as _list_spaces
     from genie_space_optimizer.optimization.state import load_recent_activity
 
     client = _genie_client(ws, sp_ws)
@@ -398,12 +396,6 @@ def list_spaces(
     except Exception as exc:
         logger.error("Genie list_spaces failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail=f"Could not fetch Genie spaces: {exc}") from exc
-
-    caller_email = headers.user_email or headers.user_name or ""
-    spaces = [
-        s for s in all_spaces
-        if user_can_edit_space(ws, s["id"], user_email=caller_email, acl_client=sp_ws)
-    ]
 
     score_by_space: dict[str, float] = {}
     try:
@@ -423,46 +415,14 @@ def list_spaces(
     except Exception:
         logger.debug("Delta tables not yet available, skipping activity enrichment")
 
-    result: list[SpaceSummary] = []
-    for s in spaces:
-        space_id = s["id"]
-        config_data: dict[str, Any] = {}
-        try:
-            raw_config = client.api_client.do(
-                "GET",
-                f"/api/2.0/genie/spaces/{space_id}",
-                query={"include_serialized_space": "true"},
-            )
-            if isinstance(raw_config, dict):
-                config_data = cast(dict[str, Any], raw_config)
-        except Exception:
-            logger.warning("Failed to fetch config for space %s", space_id)
-
-        ss = config_data.get("serialized_space", {})
-        if isinstance(ss, str):
-            try:
-                ss = json.loads(ss)
-            except (json.JSONDecodeError, TypeError):
-                ss = {}
-
-        ds = ss.get("data_sources", {}) if isinstance(ss, dict) else {}
-        tables = ds.get("tables", []) if isinstance(ds, dict) else []
-
-        result.append(
-            SpaceSummary(
-                id=space_id,
-                name=str(s.get("title", "") or ""),
-                description=str(config_data.get("description", "") or ""),
-                tableCount=len(tables),
-                lastModified=str(
-                    config_data.get("update_time")
-                    or config_data.get("create_time")
-                    or ""
-                ),
-                qualityScore=score_by_space.get(space_id),
-            )
+    return [
+        SpaceSummary(
+            id=s["id"],
+            name=str(s.get("title", "") or ""),
+            qualityScore=score_by_space.get(s["id"]),
         )
-    return result
+        for s in all_spaces
+    ]
 
 
 @router.get("/spaces/{space_id}", response_model=SpaceDetail, operation_id="getSpaceDetail")
@@ -752,6 +712,18 @@ def do_start_optimization(
             detail=(
                 f"Unsupported apply_mode '{apply_mode}'. "
                 f"Use one of: {sorted(_SUPPORTED_APPLY_MODES)}"
+            ),
+        )
+
+    from genie_space_optimizer.common.genie_client import user_can_edit_space
+
+    caller_email = (headers.user_email or headers.user_name or "").lower()
+    if not user_can_edit_space(ws, space_id, user_email=caller_email, acl_client=sp_ws):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "You need CAN_EDIT or CAN_MANAGE permission on this "
+                "Genie Space to start optimization."
             ),
         )
 

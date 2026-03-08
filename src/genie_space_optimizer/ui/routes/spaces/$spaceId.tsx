@@ -83,7 +83,9 @@ function SpaceDetail() {
     ...selector(),
   });
   const triggerOpt = useTriggerOptimization();
-  const { data: permData, isLoading: permsLoading } = useGetPermissionDashboard();
+  const { data: permData, isLoading: permsLoading } = useGetPermissionDashboard({
+    params: { space_id: spaceId },
+  });
   const [applyMode, setApplyMode] = useState<"genie_config" | "both">(
     "genie_config",
   );

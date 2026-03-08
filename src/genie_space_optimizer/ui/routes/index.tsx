@@ -22,9 +22,9 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 type SpaceSummary = {
   id: string;
   name: string;
-  description: string;
-  tableCount: number;
-  lastModified: string;
+  description?: string;
+  tableCount?: number;
+  lastModified?: string;
   qualityScore?: number | null;
 };
 
@@ -193,7 +193,7 @@ function Dashboard({ spaces }: { spaces: SpaceSummary[] }) {
     return spaces.filter(
       (s) =>
         s.name.toLowerCase().includes(q) ||
-        s.description.toLowerCase().includes(q) ||
+        (s.description ?? "").toLowerCase().includes(q) ||
         s.id.toLowerCase().includes(q),
     );
   }, [spaces, debouncedSearch]);

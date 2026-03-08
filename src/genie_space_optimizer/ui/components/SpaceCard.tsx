@@ -12,9 +12,9 @@ import { useGetPendingReviews } from "@/lib/api";
 interface SpaceCardProps {
   id: string;
   name: string;
-  description: string;
-  tableCount: number;
-  lastModified: string;
+  description?: string;
+  tableCount?: number;
+  lastModified?: string;
   qualityScore?: number | null;
   onClick: () => void;
 }
@@ -99,10 +99,12 @@ export function SpaceCard({
         </CardDescription>
       </CardHeader>
       <CardContent className="flex items-center gap-4 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1">
-          <Database className="h-3.5 w-3.5" />
-          {tableCount} table{tableCount !== 1 ? "s" : ""}
-        </span>
+        {!!tableCount && (
+          <span className="flex items-center gap-1">
+            <Database className="h-3.5 w-3.5" />
+            {tableCount} table{tableCount !== 1 ? "s" : ""}
+          </span>
+        )}
         {lastModified && (
           <span className="flex items-center gap-1">
             <Clock className="h-3.5 w-3.5" />

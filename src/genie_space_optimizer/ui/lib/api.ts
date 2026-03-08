@@ -949,6 +949,7 @@ export function useGetProvenanceSuspense<TData = {
     });
 }
 export interface GetPermissionDashboardParams {
+    space_id?: string | null;
     "X-Forwarded-Host"?: string | null;
     "X-Forwarded-Preferred-Username"?: string | null;
     "X-Forwarded-User"?: string | null;
@@ -959,7 +960,11 @@ export interface GetPermissionDashboardParams {
 export const getPermissionDashboard = async (params?: GetPermissionDashboardParams, options?: RequestInit): Promise<{
     data: PermissionDashboard;
 }> =>{
-    const res = await fetch("/api/genie/settings/permissions", {
+    const searchParams = new URLSearchParams();
+    if (params?.space_id != null) searchParams.set("space_id", String(params?.space_id));
+    const queryString = searchParams.toString();
+    const url = queryString ? `/api/genie/settings/permissions?${queryString}` : "/api/genie/settings/permissions";
+    const res = await fetch(url, {
         ...options,
         method: "GET",
         headers: {

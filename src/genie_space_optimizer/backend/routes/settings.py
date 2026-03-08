@@ -206,8 +206,14 @@ def get_permission_dashboard(
     sp_ws: Dependencies.Client,
     config: Dependencies.Config,
     headers: Dependencies.Headers,
+    space_id: str | None = None,
 ):
-    """Per-space permission overview — detect status and advise on missing grants."""
+    """Per-space permission overview — detect status and advise on missing grants.
+
+    When *space_id* is supplied, only that single space is checked (fast path
+    used by the detail page).  Without it the full list of visible spaces is
+    scanned (used by the Settings page).
+    """
     from genie_space_optimizer.common.genie_client import (
         list_spaces, fetch_space_config, user_can_edit_space,
         get_space_permissions_rest,
@@ -223,29 +229,34 @@ def get_permission_dashboard(
 
     caller_email = headers.user_email or headers.user_name or ""
 
-    all_spaces: list[dict] = []
-    spaces_source = ""
-    for _label, client in [("OBO", ws), ("SP", sp_ws)]:
-        try:
-            all_spaces = list_spaces(client)
-            spaces_source = _label
-            logger.info("Listed %d spaces via %s client", len(all_spaces), _label)
-            break
-        except Exception:
-            logger.info("list_spaces via %s failed, trying next", _label)
+    if space_id:
+        # Fast path: only check permissions for one space.
+        all_spaces = [{"id": space_id, "title": space_id}]
+        spaces_source = "single"
+    else:
+        all_spaces = []
+        spaces_source = ""
+        for _label, client in [("OBO", ws), ("SP", sp_ws)]:
+            try:
+                all_spaces = list_spaces(client)
+                spaces_source = _label
+                logger.info("Listed %d spaces via %s client", len(all_spaces), _label)
+                break
+            except Exception:
+                logger.info("list_spaces via %s failed, trying next", _label)
 
     _perm_cache: dict[str, dict | None] = {}
 
-    def _cached_perms_rest(space_id: str) -> dict | None:
-        if space_id not in _perm_cache:
+    def _cached_perms_rest(sid: str) -> dict | None:
+        if sid not in _perm_cache:
             for client in [ws, sp_ws]:
-                resp = get_space_permissions_rest(client, space_id)
+                resp = get_space_permissions_rest(client, sid)
                 if resp is not None:
-                    _perm_cache[space_id] = resp
+                    _perm_cache[sid] = resp
                     break
             else:
-                _perm_cache[space_id] = None
-        return _perm_cache[space_id]
+                _perm_cache[sid] = None
+        return _perm_cache[sid]
 
     listed_by_obo = spaces_source == "OBO"
 
@@ -254,7 +265,10 @@ def get_permission_dashboard(
         sid = s["id"]
         cached = _cached_perms_rest(sid)
 
-        if cached is not None:
+        if space_id:
+            # Single-space mode: always include (permission details shown in UI)
+            user_spaces.append(s)
+        elif cached is not None:
             can_edit = user_can_edit_space(
                 ws, sid, user_email=caller_email, acl_client=sp_ws,
                 cached_perms=cached,
@@ -272,6 +286,8 @@ def get_permission_dashboard(
         for c_label, c in [("OBO", ws), ("SP", sp_ws)]:
             try:
                 cfg = fetch_space_config(c, sid)
+                if cfg.get("title"):
+                    space["title"] = cfg["title"]
                 break
             except Exception:
                 continue

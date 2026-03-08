@@ -63,9 +63,9 @@ class VersionOut(BaseModel):
 class SpaceSummary(SafeModel):
     id: str
     name: str
-    description: str
-    tableCount: int
-    lastModified: str
+    description: str = ""
+    tableCount: int = 0
+    lastModified: str = ""
     qualityScore: float | None = None
 
 
