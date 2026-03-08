@@ -76,7 +76,7 @@ CONNECTION_POOL_SIZE = 20
 
 # ── 3. Iteration and Convergence ───────────────────────────────────────
 
-MAX_ITERATIONS = 3
+MAX_ITERATIONS = 5
 SLICE_GATE_TOLERANCE = 15.0
 ENABLE_SLICE_GATE: bool = False
 SLICE_GATE_MIN_REDUCTION = 0.5

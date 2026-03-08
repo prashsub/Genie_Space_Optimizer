@@ -11,6 +11,7 @@ import pytest
 
 from genie_space_optimizer.optimization.optimizer import (
     cluster_impact,
+    detect_regressions,
     format_reflection_buffer,
     rank_clusters,
 )
@@ -536,3 +537,137 @@ class TestArbiterAdjustedJudges:
                 _j_correct += 1
         assert _j_total == 1
         assert _j_correct == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Acceptance gate guard — overall accuracy hard guard
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _apply_noise_filter_and_guard(
+    best_scores: dict[str, float],
+    new_scores: dict[str, float],
+    best_accuracy: float,
+    full_accuracy: float,
+    num_benchmarks: int,
+    regression_threshold: float = 2.0,
+    has_patches: bool = True,
+) -> list[dict]:
+    """Reproduce the noise-filter + hard-guard logic from _run_gate_checks.
+
+    Returns the final ``regressions`` list after both the noise filter
+    and the overall_accuracy_guard have been applied.
+    """
+    question_weight = 100.0 / max(num_benchmarks, 1)
+    regressions = detect_regressions(
+        new_scores, best_scores, threshold=regression_threshold,
+    )
+
+    if regressions and has_patches:
+        _noise_limit = question_weight * 1.5
+        _noise_regs = [r for r in regressions if r["drop"] <= _noise_limit]
+        if len(_noise_regs) == len(regressions):
+            regressions = []
+
+    if not regressions and full_accuracy < best_accuracy:
+        regressions.append({
+            "judge": "overall_accuracy_guard",
+            "previous": best_accuracy,
+            "current": full_accuracy,
+            "drop": best_accuracy - full_accuracy,
+        })
+
+    return regressions
+
+
+class TestAcceptanceGateGuard:
+    """Tests for the overall_accuracy_guard that prevents accepting
+    iterations where noise filter clears per-judge regressions but
+    overall accuracy actually dropped."""
+
+    def test_guard_fires_when_noise_filter_clears_regressions_but_accuracy_dropped(self):
+        """Scenario from testrun6: 24 benchmarks, accuracy dropped 91.67% -> 87.5%.
+        Per-judge drops are within question_weight * 1.5 = 6.25%, so noise filter
+        clears them. The guard must re-inject a regression."""
+        best_scores = {"schema_accuracy": 95.0, "logical_accuracy": 92.0}
+        new_scores = {"schema_accuracy": 91.0, "logical_accuracy": 88.0}
+        regressions = _apply_noise_filter_and_guard(
+            best_scores=best_scores,
+            new_scores=new_scores,
+            best_accuracy=91.67,
+            full_accuracy=87.5,
+            num_benchmarks=24,
+        )
+        assert len(regressions) == 1
+        assert regressions[0]["judge"] == "overall_accuracy_guard"
+        assert regressions[0]["drop"] == pytest.approx(4.17, abs=0.01)
+
+    def test_guard_does_not_fire_when_accuracy_unchanged(self):
+        """If accuracy stayed the same, guard should not trigger."""
+        best_scores = {"schema_accuracy": 90.0}
+        new_scores = {"schema_accuracy": 87.0}
+        regressions = _apply_noise_filter_and_guard(
+            best_scores=best_scores,
+            new_scores=new_scores,
+            best_accuracy=90.0,
+            full_accuracy=90.0,
+            num_benchmarks=24,
+        )
+        assert len(regressions) == 0
+
+    def test_guard_does_not_fire_when_accuracy_improved(self):
+        """If accuracy improved, guard should not trigger."""
+        best_scores = {"schema_accuracy": 90.0}
+        new_scores = {"schema_accuracy": 87.0}
+        regressions = _apply_noise_filter_and_guard(
+            best_scores=best_scores,
+            new_scores=new_scores,
+            best_accuracy=88.0,
+            full_accuracy=90.0,
+            num_benchmarks=24,
+        )
+        assert len(regressions) == 0
+
+    def test_guard_not_needed_when_noise_filter_does_not_clear(self):
+        """If the noise filter does NOT clear regressions (large drops),
+        the guard is irrelevant — regressions already present."""
+        best_scores = {"schema_accuracy": 95.0}
+        new_scores = {"schema_accuracy": 80.0}
+        regressions = _apply_noise_filter_and_guard(
+            best_scores=best_scores,
+            new_scores=new_scores,
+            best_accuracy=95.0,
+            full_accuracy=80.0,
+            num_benchmarks=24,
+        )
+        assert len(regressions) >= 1
+        assert regressions[0]["judge"] == "schema_accuracy"
+
+    def test_guard_not_needed_when_no_regressions_and_no_accuracy_drop(self):
+        """If there are no regressions and accuracy held, everything is clean."""
+        best_scores = {"schema_accuracy": 90.0}
+        new_scores = {"schema_accuracy": 92.0}
+        regressions = _apply_noise_filter_and_guard(
+            best_scores=best_scores,
+            new_scores=new_scores,
+            best_accuracy=90.0,
+            full_accuracy=92.0,
+            num_benchmarks=24,
+        )
+        assert len(regressions) == 0
+
+    def test_guard_with_no_patches_skips_noise_filter(self):
+        """If no patches were applied, noise filter is not invoked,
+        so regressions remain and guard is not needed."""
+        best_scores = {"schema_accuracy": 95.0}
+        new_scores = {"schema_accuracy": 91.0}
+        regressions = _apply_noise_filter_and_guard(
+            best_scores=best_scores,
+            new_scores=new_scores,
+            best_accuracy=95.0,
+            full_accuracy=91.0,
+            num_benchmarks=24,
+            has_patches=False,
+        )
+        assert len(regressions) >= 1
+        assert regressions[0]["judge"] == "schema_accuracy"

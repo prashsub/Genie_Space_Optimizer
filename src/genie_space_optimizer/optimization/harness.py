@@ -3176,6 +3176,26 @@ def _run_gate_checks(
             )
             regressions = []
 
+    # ── Hard guard: never accept an iteration that reduced overall accuracy ─
+    # The noise filter above may have cleared per-judge regressions that
+    # individually fall within one question's weight, but if accuracy
+    # actually dropped, the iteration introduced a genuine regression
+    # on a previously-passing question.
+    if not regressions and full_accuracy < best_accuracy:
+        regressions.append({
+            "judge": "overall_accuracy_guard",
+            "previous": best_accuracy,
+            "current": full_accuracy,
+            "drop": best_accuracy - full_accuracy,
+        })
+        logger.info(
+            "Accuracy guard: noise filter cleared per-judge regressions but overall accuracy dropped %.1f%% -> %.1f%% — rejecting iteration",
+            best_accuracy, full_accuracy,
+        )
+        print(
+            _kv("Accuracy guard", f"TRIGGERED — accuracy dropped {best_accuracy:.1f}% -> {full_accuracy:.1f}% despite noise filter pass")
+        )
+
     if regressions:
         _reg_details = ", ".join(
             f"{r['judge']} {best_scores.get(r['judge'], 0):.1f}->{full_scores.get(r['judge'], 0):.1f} ({r['drop']:+.1f})"
