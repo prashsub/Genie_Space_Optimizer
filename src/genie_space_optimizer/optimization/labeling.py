@@ -58,16 +58,18 @@ def ensure_labeling_schemas() -> list[str]:
         {
             "name": SCHEMA_JUDGE_VERDICT,
             "type": "feedback",
-            "title": "Is the judge's verdict correct for this question?",
+            "title": "Is this question truly failing?",
             "input": InputCategorical(options=[
-                "Correct - judge is right",
-                "Wrong - Genie answer is actually fine",
-                "Wrong - both answers are wrong",
+                "Yes - Genie answer is wrong",
+                "No - Genie answer is actually correct",
+                "Benchmark is wrong - expected SQL needs fixing",
                 "Ambiguous - question is unclear",
             ]),
             "instruction": (
-                "Review the benchmark question, expected SQL, Genie-generated SQL, "
-                "and each judge's rationale. Was the overall verdict correct?"
+                "Compare the generated SQL response with the expected SQL shown in the "
+                "trace inputs. Review the comparison result (match/mismatch, column "
+                "differences). Is the Genie response actually incorrect, or is the "
+                "benchmark expectation wrong?"
             ),
             "enable_comment": True,
         },
@@ -342,47 +344,9 @@ def _populate_session_traces(
         print(f"[Labeling] Added {traces_added} failed-question traces to session {session_name}")
         return traces_added
 
-    # --- Fallback: priority/backfill when no question-level filtering ---
-    _flagged = flagged_trace_ids or []
-    priority_set = set(
-        dict.fromkeys(_flagged + regression_trace_ids + failure_trace_ids)
-    )
-
-    if priority_set and "trace_id" in all_traces.columns:
-        priority_mask = all_traces["trace_id"].isin(priority_set)
-        priority_traces = all_traces[priority_mask]
-        other_traces = all_traces[~priority_mask]
-    else:
-        priority_traces = pd.DataFrame()
-        other_traces = all_traces
-
-    traces_added = 0
-
-    if len(priority_traces) > 0:
-        batch = priority_traces.head(_MAX_SESSION_TRACES)
-        session.add_traces(batch)
-        traces_added += len(batch)
-        print(f"[Labeling] Added {len(batch)} priority traces to session {session_name}")
-
-    remaining = _MAX_SESSION_TRACES - traces_added
-    if remaining > 0 and len(other_traces) > 0:
-        backfill = other_traces.head(remaining)
-        session.add_traces(backfill)
-        traces_added += len(backfill)
-        print(f"[Labeling] Added {len(backfill)} backfill traces to session {session_name}")
-
-    if traces_added == 0:
-        print(f"[Labeling] No traces to add to labeling session {session_name}")
-        logger.warning("No traces to add to labeling session %s", session_name)
-        return 0
-
-    logger.info(
-        "Added %d traces to labeling session %s (%d priority + %d backfill)",
-        traces_added, session_name,
-        min(len(priority_traces), _MAX_SESSION_TRACES),
-        traces_added - min(len(priority_traces), _MAX_SESSION_TRACES),
-    )
-    return traces_added
+    # No question-level filtering provided — session should not have been created
+    print(f"[Labeling] No failure_question_ids provided — session {session_name} will be empty")
+    return 0
 
 
 def _find_session_by_name(session_name: str) -> Any | None:
@@ -489,34 +453,49 @@ def ingest_human_feedback(
             a_value = getattr(a, "value", None) or (a.get("value") if isinstance(a, dict) else None)
             a_rationale = getattr(a, "rationale", None) or (a.get("rationale") if isinstance(a, dict) else None)
 
-            if a_name == SCHEMA_JUDGE_VERDICT and a_value and (
-                "Wrong" in str(a_value)
-                or "Ambiguous" in str(a_value)
-                or "Correct" in str(a_value)
-                or "Both" in str(a_value)
-            ):
-                _jq = ""
-                _jqid = ""
-                try:
-                    _jreq = row.get("request") or ""
-                    if isinstance(_jreq, str):
-                        import json as _json
-                        _jq = _json.loads(_jreq).get("messages", [{}])[-1].get("content", "")
-                    _jqid = row.get("request_id", "") or ""
-                    if not _jqid:
-                        _a_meta = getattr(a, "metadata", None) or (a.get("metadata") if isinstance(a, dict) else None)
-                        if isinstance(_a_meta, dict):
-                            _jqid = _a_meta.get("question_id", "")
-                except Exception:
-                    pass
-                corrections.append({
-                    "type": "judge_override",
-                    "trace_id": trace_id,
-                    "feedback": a_value,
-                    "comment": a_rationale or "",
-                    "question": _jq,
-                    "question_id": _jqid,
-                })
+            if a_name == SCHEMA_JUDGE_VERDICT and a_value:
+                _val = str(a_value)
+                _feedback_code: str | None = None
+                # New schema: "Is this question truly failing?"
+                if "No" in _val and "correct" in _val.lower():
+                    _feedback_code = "genie_correct"
+                elif "Benchmark" in _val:
+                    _feedback_code = "benchmark_wrong"
+                elif "Ambiguous" in _val:
+                    _feedback_code = "ambiguous"
+                elif "Yes" in _val and "wrong" in _val.lower():
+                    pass  # Confirms failure — no override needed
+                # Legacy schema options (pre-update)
+                elif "Wrong" in _val and "fine" in _val.lower():
+                    _feedback_code = "genie_correct"
+                elif "Wrong" in _val and "both" in _val.lower():
+                    _feedback_code = "benchmark_wrong"
+
+                if _feedback_code:
+                    _jq = ""
+                    _jqid = ""
+                    try:
+                        _jreq = row.get("request") or ""
+                        if isinstance(_jreq, str):
+                            import json as _json
+                            _jq = _json.loads(_jreq).get("messages", [{}])[-1].get("content", "")
+                        _jqid = _extract_question_id(row.get("request"))
+                        if not _jqid:
+                            _jqid = row.get("request_id", "") or ""
+                        if not _jqid:
+                            _a_meta = getattr(a, "metadata", None) or (a.get("metadata") if isinstance(a, dict) else None)
+                            if isinstance(_a_meta, dict):
+                                _jqid = _a_meta.get("question_id", "")
+                    except Exception:
+                        pass
+                    corrections.append({
+                        "type": "judge_override",
+                        "trace_id": trace_id,
+                        "feedback": _feedback_code,
+                        "comment": a_rationale or "",
+                        "question": _jq,
+                        "question_id": _jqid,
+                    })
             elif a_name == SCHEMA_CORRECTED_SQL and a_value:
                 _q = ""
                 try:

@@ -671,3 +671,79 @@ class TestAcceptanceGateGuard:
         )
         assert len(regressions) >= 1
         assert regressions[0]["judge"] == "schema_accuracy"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TVF removal — force_apply bypass and config constants
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestTvfRemovalWiring:
+    """Tests for the force_apply bypass that allows escalation-approved
+    TVF removal patches to skip the high-risk queue in apply_patch_set."""
+
+    def _make_tvf_config(self) -> dict:
+        """Minimal Genie Space config with one TVF."""
+        return {
+            "instructions": {
+                "sql_functions": [
+                    {"id": "fn1", "identifier": "catalog.schema.get_payment_analysis"},
+                ],
+            },
+        }
+
+    def _make_remove_tvf_patch(self) -> dict:
+        return {
+            "type": "remove_tvf",
+            "target": "catalog.schema.get_payment_analysis",
+            "new_text": "",
+            "old_text": "",
+            "previous_tvf_asset": {
+                "id": "fn1",
+                "identifier": "catalog.schema.get_payment_analysis",
+            },
+            "lever": 3,
+            "risk_level": "high",
+        }
+
+    def test_force_apply_bypasses_high_risk_queue(self):
+        """With force_apply=True, a remove_tvf patch should be applied
+        directly instead of being queued."""
+        from genie_space_optimizer.optimization.applier import apply_patch_set
+
+        config = self._make_tvf_config()
+        patch = self._make_remove_tvf_patch()
+
+        result = apply_patch_set(
+            None, "space123", [patch], config,
+            apply_mode="genie_config",
+            force_apply=True,
+        )
+        assert len(result["queued_high"]) == 0
+        assert len(result["applied"]) == 1
+        funcs = result["post_snapshot"].get("instructions", {}).get("sql_functions", [])
+        assert len(funcs) == 0, "TVF should be removed from config"
+
+    def test_without_force_apply_queues_high_risk(self):
+        """Without force_apply, a remove_tvf patch should be queued
+        (not applied)."""
+        from genie_space_optimizer.optimization.applier import apply_patch_set
+
+        config = self._make_tvf_config()
+        patch = self._make_remove_tvf_patch()
+
+        result = apply_patch_set(
+            None, "space123", [patch], config,
+            apply_mode="genie_config",
+            force_apply=False,
+        )
+        assert len(result["queued_high"]) == 1
+        assert len(result["applied"]) == 0
+        funcs = result["post_snapshot"].get("instructions", {}).get("sql_functions", [])
+        assert len(funcs) == 1, "TVF should still be in config"
+
+    def test_tvf_removal_min_iterations_is_conservative(self):
+        """TVF_REMOVAL_MIN_ITERATIONS must stay at 2 — TVF removal is
+        destructive and requires evidence from multiple iterations."""
+        from genie_space_optimizer.common.config import TVF_REMOVAL_MIN_ITERATIONS
+        assert TVF_REMOVAL_MIN_ITERATIONS == 2

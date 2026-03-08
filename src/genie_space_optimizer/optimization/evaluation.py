@@ -1636,6 +1636,45 @@ def make_predict_fn(
                                         except Exception:
                                             tied_subset = False
 
+                                    cosmetic_match = False
+                                    if (
+                                        not exact_match
+                                        and not hash_match
+                                        and not subset_match
+                                        and not approx_match
+                                        and not tied_subset
+                                        and len(gt_df) == len(genie_df)
+                                        and len(gt_df.columns) == len(genie_df.columns)
+                                        and len(gt_df) > 0
+                                    ):
+                                        try:
+                                            _cg = mapped_genie_df if mapped_genie_df is not genie_df else genie_df
+                                            _gt_vals = gt_df.values.tolist()
+                                            _ge_vals = _cg.values.tolist()
+                                            _gt_sorted = sorted(_gt_vals, key=lambda r: [str(v) for v in r])
+                                            _ge_sorted = sorted(_ge_vals, key=lambda r: [str(v) for v in r])
+                                            if _gt_sorted == _ge_sorted:
+                                                cosmetic_match = True
+                                            elif not cosmetic_match:
+                                                import numpy as np
+                                                _match_all = True
+                                                for _row_g, _row_e in zip(_gt_sorted, _ge_sorted):
+                                                    for _vg, _ve in zip(_row_g, _row_e):
+                                                        if _vg == _ve or (str(_vg) == str(_ve)):
+                                                            continue
+                                                        try:
+                                                            if np.isclose(float(_vg), float(_ve), rtol=1e-4, atol=1e-4):
+                                                                continue
+                                                        except (ValueError, TypeError):
+                                                            pass
+                                                        _match_all = False
+                                                        break
+                                                    if not _match_all:
+                                                        break
+                                                cosmetic_match = _match_all
+                                        except Exception:
+                                            cosmetic_match = False
+
                                     if exact_match:
                                         match_type = "exact"
                                     elif hash_match:
@@ -1646,6 +1685,8 @@ def make_predict_fn(
                                         match_type = "approx"
                                     elif tied_subset:
                                         match_type = "tied_subset"
+                                    elif cosmetic_match:
+                                        match_type = "cosmetic"
                                     elif sig_match:
                                         match_type = "signature"
                                     else:
@@ -1663,7 +1704,7 @@ def make_predict_fn(
                                     gt_col_list = sorted(gt_df.columns.tolist())
                                     genie_col_list = sorted(genie_df.columns.tolist())
                                     comparison = {
-                                        "match": exact_match or hash_match or subset_match or approx_match or tied_subset or sig_match,
+                                        "match": exact_match or hash_match or subset_match or approx_match or tied_subset or cosmetic_match or sig_match,
                                         "match_type": match_type,
                                         "gt_rows": len(gt_df),
                                         "genie_rows": len(genie_df),
@@ -3935,6 +3976,7 @@ def run_repeatability_evaluation(
         repeatability_exact_pct,
     )
 
+    _n_ref_hashes = sum(1 for v in _ref_hashes.values() if v)
     _rep_lines = [
         f"\n-- REPEATABILITY EVALUATION: {run_name} " + "-" * 30,
         f"  |  Repeatability (headline):    {repeatability_pct:.1f}%",
@@ -3943,11 +3985,16 @@ def run_repeatability_evaluation(
         f"  |  Exact SQL match:             {repeatability_exact_pct:.1f}%",
         f"  |  Questions:                   {len(benchmarks)}",
         f"  |  Reference SQLs:              {sum(1 for v in reference_sqls.values() if v)}",
-        f"  |  Reference result hashes:     {sum(1 for v in _ref_hashes.values() if v)}",
+        f"  |  Reference result hashes:     {_n_ref_hashes}",
     ]
+    if _n_ref_hashes < len(benchmarks) * 0.5:
+        _rep_lines.append(
+            f"  |  Note: Only {_n_ref_hashes}/{len(benchmarks)} questions have reference hashes"
+            " — re-eval scores below have limited coverage"
+        )
     for _judge, _score in per_judge.items():
         _disp = _score * 100 if _score <= 1.0 else _score
-        _rep_lines.append(f"  |  {_judge}: {_disp:.1f}")
+        _rep_lines.append(f"  |  {_judge} (re-eval): {_disp:.1f}")
     _rep_lines.append("-" * 60)
     print("\n".join(_rep_lines))
 

@@ -151,6 +151,14 @@ _log = partial(_log_base, _TASK_LABEL)
 w = WorkspaceClient()
 spark = SparkSession.builder.getOrCreate()
 
+from genie_space_optimizer.common.genie_client import (
+    configure_connection_pool,
+    configure_mlflow_connection_pool,
+)
+from genie_space_optimizer.common.config import CONNECTION_POOL_SIZE
+configure_connection_pool(w, CONNECTION_POOL_SIZE)
+configure_mlflow_connection_pool(CONNECTION_POOL_SIZE)
+
 # Read task values from upstream
 run_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="run_id")
 space_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="space_id")

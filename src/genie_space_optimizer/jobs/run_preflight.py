@@ -229,6 +229,14 @@ _log(
 w = WorkspaceClient()
 spark = SparkSession.builder.getOrCreate()
 
+from genie_space_optimizer.common.genie_client import (
+    configure_connection_pool,
+    configure_mlflow_connection_pool,
+)
+from genie_space_optimizer.common.config import CONNECTION_POOL_SIZE
+configure_connection_pool(w, CONNECTION_POOL_SIZE)
+configure_mlflow_connection_pool(CONNECTION_POOL_SIZE)
+
 _banner("Ensuring Delta State Tables")
 ensure_optimization_tables(spark, catalog, schema)
 _log("State tables verified", catalog=catalog, schema=schema)

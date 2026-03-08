@@ -1451,11 +1451,14 @@ def apply_patch_set(
     *,
     apply_mode: str = APPLY_MODE,
     deploy_target: str | None = None,
+    force_apply: bool = False,
 ) -> dict:
     """Apply a patch set to a Genie Space (and optionally UC artifacts).
 
     Applies in risk order: LOW -> MEDIUM -> HIGH.
-    High-risk patches are queued for manual review.
+    High-risk patches are queued for manual review unless *force_apply*
+    is ``True``, in which case all patches are applied regardless of risk
+    (used by the escalation pipeline after confidence-model approval).
 
     Returns an ``apply_log`` dict with pre/post snapshots and rollback info.
     """
@@ -1480,7 +1483,7 @@ def apply_patch_set(
 
         rendered = render_patch(patch, space_id, config)
 
-        if risk == "high":
+        if risk == "high" and not force_apply:
             queued_high.append({"index": idx, "patch": patch, "action": rendered})
             continue
 

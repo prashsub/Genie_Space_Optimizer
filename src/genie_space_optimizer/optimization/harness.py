@@ -3818,6 +3818,7 @@ def _run_lever_loop(
                     _tvf_apply_log = apply_patch_set(
                         w, space_id, [_synthetic_patch], metadata_snapshot,
                         apply_mode=apply_mode,
+                        force_apply=True,
                     )
                     for idx, entry in enumerate(_tvf_apply_log.get("applied", [])):
                         write_patch(
@@ -4351,9 +4352,10 @@ def _run_lever_loop(
 
     # Lever loop changes
     _summary.append("|  --- Lever Loop Changes ---")
-    _summary.append(_kv("Action groups attempted", len(levers_attempted)))
+    _summary.append(_kv("Action groups attempted", len(ags_attempted)))
     _summary.append(_kv("Action groups accepted", len(ags_accepted)))
     _summary.append(_kv("Action groups rolled back", len(ags_rolled_back)))
+    _summary.append(_kv("Levers used", sorted(set(levers_attempted)) if levers_attempted else "none"))
     if lever_changes:
         _summary.append("|")
         for lc in lever_changes:
@@ -4503,6 +4505,34 @@ def _run_finalize(
     all_failure_trace_ids = list(all_failure_trace_ids or [])
     all_regression_trace_ids = list(all_regression_trace_ids or [])
     all_failure_question_ids = list(all_failure_question_ids or [])
+
+    # Pre-seed question_trace_map from ALL eval runs (incl. baseline) so that
+    # persistent-failure questions always have trace IDs for tagging and session
+    # population, even when the lever loop never re-evaluated them.
+    if all_eval_mlflow_run_ids:
+        try:
+            import mlflow
+            from genie_space_optimizer.optimization.labeling import _extract_question_id
+            for _seed_rid in dict.fromkeys(all_eval_mlflow_run_ids):
+                try:
+                    _seed_traces = mlflow.search_traces(run_id=_seed_rid)
+                    if _seed_traces is not None and len(_seed_traces) > 0 and "request" in _seed_traces.columns:
+                        for _, row in _seed_traces.iterrows():
+                            _qid = _extract_question_id(row.get("request"))
+                            _tid = row.get("trace_id", "")
+                            if _qid and _tid:
+                                question_trace_map.setdefault(_qid, []).append(_tid)
+                except Exception as _seed_exc:
+                    logger.debug("Failed to seed trace map from eval run %s: %s", _seed_rid, _seed_exc)
+            # Deduplicate trace IDs per question
+            for _qid in question_trace_map:
+                question_trace_map[_qid] = list(dict.fromkeys(question_trace_map[_qid]))
+            logger.info(
+                "Pre-seeded question_trace_map with %d questions from %d eval runs",
+                len(question_trace_map), len(all_eval_mlflow_run_ids),
+            )
+        except Exception as _seed_err:
+            logger.warning("Failed to pre-seed question_trace_map: %s", _seed_err, exc_info=True)
 
     terminal_reason = ""
     repeatability_pct = 0.0
@@ -4686,37 +4716,16 @@ def _run_finalize(
                     qid for qid in _persistent_qids if qid not in set(all_failure_question_ids)
                 )
 
-            if persistent_question_ids:
-                _session_trace_ids = [
-                    question_trace_map[qid][-1]
-                    for qid in persistent_question_ids
-                    if qid in question_trace_map
-                ]
-                _session_question_ids = [
-                    qid for qid in persistent_question_ids if qid in question_trace_map
-                ]
-            elif all_failure_trace_ids or all_failure_question_ids:
-                _session_trace_ids = list(dict.fromkeys(all_failure_trace_ids))
-                _session_question_ids = list(dict.fromkeys(all_failure_question_ids))
-            else:
-                _session_trace_ids = []
-                _session_question_ids = []
+            _session_trace_ids = [
+                question_trace_map[qid][-1]
+                for qid in persistent_question_ids
+                if qid in question_trace_map
+            ] if persistent_question_ids else []
+            _session_question_ids = [
+                qid for qid in persistent_question_ids if qid in question_trace_map
+            ] if persistent_question_ids else []
 
-            _flagged_tids: list[str] = []
-            if persistent_question_ids:
-                _flagged_tids = [
-                    question_trace_map[qid][-1]
-                    for qid in persistent_question_ids
-                    if qid in question_trace_map
-                ]
-            from genie_space_optimizer.optimization.state import get_queued_patches
-            _pending_queued = get_queued_patches(spark, catalog, schema, status="pending")
-            for _qp in _pending_queued:
-                _qp_target = _qp.get("target_identifier", "")
-                if _qp_target and _qp_target in question_trace_map:
-                    _flagged_tids.append(question_trace_map[_qp_target][-1])
-
-            if _session_trace_ids or all_eval_mlflow_run_ids or _session_question_ids:
+            if _session_question_ids:
                 from genie_space_optimizer.optimization.labeling import create_review_session
                 session_info = create_review_session(
                     run_id=run_id,
@@ -4724,10 +4733,10 @@ def _run_finalize(
                     experiment_name=exp_name,
                     uc_schema=f"{catalog}.{schema}",
                     failure_trace_ids=list(dict.fromkeys(_session_trace_ids)),
-                    regression_trace_ids=list(dict.fromkeys(all_regression_trace_ids)),
+                    regression_trace_ids=[],
                     eval_mlflow_run_ids=list(dict.fromkeys(all_eval_mlflow_run_ids)),
                     failure_question_ids=list(dict.fromkeys(_session_question_ids)),
-                    flagged_trace_ids=list(dict.fromkeys(_flagged_tids)),
+                    flagged_trace_ids=list(dict.fromkeys(_session_trace_ids)),
                 )
                 _sname = session_info.get("session_name", "")
                 _srun = session_info.get("session_run_id", "")
@@ -4737,6 +4746,7 @@ def _run_finalize(
                         f"\n[MLflow Review] Labeling session created for human review:\n"
                         f"  Name: {_sname}\n"
                         f"  Traces: {session_info.get('trace_count', 0)}\n"
+                        f"  Persistent questions: {len(_session_question_ids)}\n"
                     )
                     if _surl:
                         print(f"  URL: {_surl}\n")
@@ -4747,6 +4757,8 @@ def _run_finalize(
                         labeling_session_run_id=_srun,
                         labeling_session_url=_surl,
                     )
+            else:
+                print("\n[MLflow Review] No persistent failures — skipping labeling session creation\n")
         except Exception as exc:
             print(f"[Labeling] Failed to create post-repeatability review session: {exc}")
             logger.warning("Failed to create post-repeatability review session", exc_info=True)
