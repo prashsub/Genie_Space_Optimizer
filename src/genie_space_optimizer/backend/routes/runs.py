@@ -653,7 +653,7 @@ def _build_step_io(
         baseline_iter = next(
             (
                 r for r in iterations_rows
-                if int(r.get("iteration", -1)) == 0
+                if (_safe_int(r.get("iteration")) or -1) == 0
                 and str(r.get("eval_scope", "")).lower() == "full"
             ),
             None,
@@ -1190,7 +1190,7 @@ def _get_baseline_and_best_accuracy(iters_rows: list[dict]) -> tuple[float | Non
     if not full_rows:
         return None, None
 
-    baseline_row = next((r for r in full_rows if int(r.get("iteration", -1)) == 0), None)
+    baseline_row = next((r for r in full_rows if (_safe_int(r.get("iteration")) or -1) == 0), None)
     baseline = _safe_float(baseline_row.get("overall_accuracy")) if baseline_row else None
 
     scores = [_safe_float(r.get("overall_accuracy")) for r in full_rows]
@@ -1631,12 +1631,12 @@ def get_iterations(run_id: str, config: Dependencies.Config):
 
         results.append(
             IterationSummary(
-                iteration=int(row.get("iteration", 0)),
+                iteration=_safe_int(row.get("iteration")) or 0,
                 lever=_safe_int(row.get("lever")),
                 evalScope=str(row.get("eval_scope", "full")),
                 overallAccuracy=_finite(row.get("overall_accuracy", 0)),
-                totalQuestions=int(row.get("total_questions", 0)),
-                correctCount=int(row.get("correct_count", 0)),
+                totalQuestions=_safe_int(row.get("total_questions")) or 0,
+                correctCount=_safe_int(row.get("correct_count")) or 0,
                 repeatabilityPct=_safe_float(row.get("repeatability_pct")),
                 thresholdsMet=bool(row.get("thresholds_met", False)),
                 judgeScores={str(k): _safe_float(v) for k, v in scores.items()},
@@ -1776,7 +1776,7 @@ def get_provenance(
 
     groups: dict[tuple[int, int], list[dict]] = {}
     for row in df.to_dict("records"):
-        key = (int(row.get("iteration", 0)), int(row.get("lever", 0)))
+        key = (_safe_int(row.get("iteration")) or 0, _safe_int(row.get("lever")) or 0)
         groups.setdefault(key, []).append(row)
 
     summaries: list[ProvenanceSummary] = []
@@ -1901,6 +1901,18 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
                 entry.setdefault("iteration", iteration)
                 if isinstance(detail, dict):
                     entry["rollback_detail"] = detail
+        elif stage_name.startswith("AG_") and "_ESCALATION" in stage_name:
+            ag_id = stage_name.replace("AG_", "").replace("_ESCALATION", "")
+            detail = safe_json_parse(s.get("detail_json"))
+            entry = ag_stages.setdefault(ag_id, {})
+            entry.setdefault("iteration", s.get("iteration"))
+            if isinstance(detail, dict):
+                entry["escalation"] = {
+                    "type": detail.get("escalation_type", ""),
+                    "handled": detail.get("handled", False),
+                    "detail": detail.get("detail", {}),
+                    "affectedQuestions": detail.get("affected_questions", []),
+                }
 
     full_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "full"]
     slice_rows = [r for r in iters_rows if str(r.get("eval_scope", "")).lower() == "slice"]
@@ -1908,15 +1920,15 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
 
     by_iter: dict[int, dict] = {}
     for row in full_rows:
-        it = int(row.get("iteration", 0))
+        it = _safe_int(row.get("iteration")) or 0
         by_iter.setdefault(it, {"full": row})
         by_iter[it]["full"] = row
     for row in slice_rows:
-        it = int(row.get("iteration", 0))
+        it = _safe_int(row.get("iteration")) or 0
         by_iter.setdefault(it, {})
         by_iter[it]["slice"] = row
     for row in p0_rows:
-        it = int(row.get("iteration", 0))
+        it = _safe_int(row.get("iteration")) or 0
         by_iter.setdefault(it, {})
         by_iter[it]["p0"] = row
 
@@ -1928,9 +1940,9 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
 
     ag_iter_map: dict[int, str] = {}
     for ag_id, ag_data in ag_stages.items():
-        it = ag_data.get("iteration")
+        it = _safe_int(ag_data.get("iteration"))
         if it is not None:
-            ag_iter_map[int(it)] = ag_id
+            ag_iter_map[it] = ag_id
 
     iterations: list[IterationDetail] = []
     for it_num in sorted(by_iter.keys()):
@@ -1941,8 +1953,8 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
 
         scores = _iteration_scores(full_row)
         accuracy = _finite(full_row.get("overall_accuracy", 0))
-        total_q = int(full_row.get("total_questions", 0))
-        correct_c = int(full_row.get("correct_count", 0))
+        total_q = _safe_int(full_row.get("total_questions")) or 0
+        correct_c = _safe_int(full_row.get("correct_count")) or 0
         mlflow_rid = full_row.get("mlflow_run_id")
         model_id = full_row.get("model_id")
         timestamp = str(full_row.get("timestamp", ""))
@@ -1950,6 +1962,8 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
         ag_id = ag_iter_map.get(it_num)
         ag_info = ag_stages.get(ag_id, {}) if ag_id else {}
         cluster_info = ag_info.get("cluster_info") if ag_info else None
+        if cluster_info and ag_info.get("escalation"):
+            cluster_info["escalation"] = ag_info["escalation"]
 
         if it_num == 0:
             status = "baseline"

@@ -106,6 +106,62 @@ This provisions:
 
 Wait for the deployment to complete (~2-3 minutes).
 
+### What to Expect During Deploy
+
+Each step produces visible output:
+
+1. **clean-wheels** -- `Removing stale wheels from workspace...` followed by `Cleanup done.`
+2. **bundle deploy** -- `apx build` compiles the wheel, then `databricks bundle deploy` syncs files. Look for `Bundle deployed successfully` (or similar) at the end.
+3. **apps deploy** -- `databricks apps deploy genie-space-optimizer` creates a new snapshot. Look for `Deployment started` in the output.
+4. **verify** -- Prints the `.whl` filename on the workspace and `Verification passed.`
+
+### First-Time Deploy: UC Grants Require a Second Deploy
+
+The `make deploy` pipeline automatically runs `resources/grant_app_uc_permissions.py` as part of the build step to grant the app's service principal access to the operational schema (the schema where Delta state tables, MLflow experiments, and benchmarks are stored).
+
+**On a brand-new deployment** (the app does not exist yet), the grant script detects this, prints a warning, and exits cleanly:
+
+```
+[grant-app-sp] App 'genie-space-optimizer' not found yet, skipping grants for now.
+```
+
+After this first deploy creates the app, **run `make deploy` a second time** so the grant script can resolve the app's service principal and apply the required UC privileges:
+
+```bash
+# First deploy: creates the app (grants are skipped)
+make deploy PROFILE=<your-profile>
+
+# Second deploy: grants are now applied to the SP
+make deploy PROFILE=<your-profile>
+```
+
+Alternatively, run the grant script manually after the first deploy:
+
+```bash
+python resources/grant_app_uc_permissions.py \
+  --profile <your-profile> \
+  --app-name genie-space-optimizer \
+  --catalog <your-catalog> \
+  --schema <your-schema>
+```
+
+### Verify Deployment
+
+After deploy completes, confirm everything is healthy:
+
+```bash
+# 1. Confirm the app exists and is RUNNING
+databricks apps get genie-space-optimizer -p <your-profile> -o json
+
+# 2. Check the wheel was synced
+make verify PROFILE=<your-profile>
+
+# 3. Check app startup logs (look for "App wheel: genie_space_optimizer-x.y.z.whl")
+databricks apps logs genie-space-optimizer -p <your-profile>
+```
+
+If the app status shows `DEPLOYING`, wait a minute and re-check. If it shows `ERROR`, inspect the logs for details.
+
 ### Grant Data Access
 
 After deployment, the app's service principal needs access to your Unity Catalog schemas. The app operates as an **advisor** -- it shows you exactly what permissions are missing and provides **copyable SQL commands** on the Settings page. Run those commands in a SQL editor or use the grant script:
@@ -140,6 +196,74 @@ Navigate to the **Settings** page (gear icon in the navbar). The app is an **adv
 - **Space Permissions** — shows whether the SP has CAN_MANAGE on each Genie Space. Use the provided sharing instructions to grant access from the Genie Space UI.
 
 If you prefer using `apply_mode = both` (writes UC artifacts), ensure MODIFY is granted on the relevant schemas — the preflight stage will fail fast with a clear error if it's missing.
+
+#### Complete Permission Setup Guide
+
+There are **three separate permission categories** that must be satisfied before the optimizer can run. Each targets a different scope:
+
+**A. Operational Schema Grants (automatic on deploy)**
+
+These grants give the app's service principal access to its own state schema (`{catalog}.{schema}`, e.g. `main.genie_optimization`) where Delta state tables, MLflow experiments, and benchmark data are stored. They are applied automatically by `resources/grant_app_uc_permissions.py` during `make deploy`.
+
+The 8 privileges granted:
+
+| Privilege | Purpose |
+|-----------|---------|
+| `USE_CATALOG` | Access the catalog |
+| `USE_SCHEMA` | Access the schema |
+| `SELECT` | Read state tables |
+| `MODIFY` | Write state tables |
+| `CREATE_TABLE` | Create state tables on first run |
+| `CREATE_FUNCTION` | Create UDFs if needed |
+| `CREATE_MODEL` | Create MLflow models |
+| `EXECUTE` | Execute stored procedures |
+
+> If you see grant errors on the first deploy, this is expected -- see [First-Time Deploy](#first-time-deploy-uc-grants-require-a-second-deploy) above.
+
+**B. Data Schema Grants (manual, per Genie Space)**
+
+Your Genie Space references tables in one or more data schemas (e.g. `analytics.sales`, `finance.revenue`). The app's SP needs read access to every such schema. If you use `apply_mode = both` (writing UC artifacts like table/column descriptions), it also needs write access.
+
+The easiest way: open the app's **Settings** page -- it detects which schemas are missing access and provides **copyable SQL** you can paste into a query editor:
+
+```sql
+-- Read access (required for all spaces)
+GRANT USE CATALOG ON CATALOG `<catalog>` TO `<sp_application_id>`;
+GRANT USE SCHEMA ON SCHEMA `<catalog>`.`<schema>` TO `<sp_application_id>`;
+GRANT SELECT ON SCHEMA `<catalog>`.`<schema>` TO `<sp_application_id>`;
+GRANT EXECUTE ON SCHEMA `<catalog>`.`<schema>` TO `<sp_application_id>`;
+
+-- Write access (only needed if apply_mode = both)
+GRANT MODIFY ON SCHEMA `<catalog>`.`<schema>` TO `<sp_application_id>`;
+```
+
+Repeat for every catalog/schema referenced by your Genie Space tables.
+
+**C. Genie Space CAN_MANAGE (manual, per Space)**
+
+The SP needs `CAN_MANAGE` permission on each Genie Space it will optimize. This allows it to read and modify the space configuration (instructions, sample questions, table descriptions, join specs).
+
+To grant:
+
+1. Open the Genie Space in the Databricks workspace
+2. Click the **Share** button (or permissions icon)
+3. Search for the service principal by name
+4. Set the permission level to **CAN_MANAGE**
+
+The Settings page shows which spaces are missing this permission and provides the exact SP name to search for.
+
+**D. How to Find the Service Principal Name**
+
+You need the SP identity to run SQL GRANT commands and to share Genie Spaces. Two ways to find it:
+
+```bash
+# Via CLI: look for "service_principal_client_id" in the output
+databricks apps get genie-space-optimizer -p <your-profile> -o json
+```
+
+Or open the app's **Settings** page -- the SP identity (display name and application ID) is shown at the top.
+
+> For SQL GRANT commands, use the `application_id` (a UUID). For Genie Space sharing dialogs, search by the SP's `display_name`.
 
 ### Step 1: Browse Your Spaces
 
@@ -196,6 +320,51 @@ When the pipeline completes (status: `CONVERGED`, `STALLED`, or `MAX_ITERATIONS`
   - **Apply** -- Keep the optimized configuration (marks run as `APPLIED`)
   - **Discard** -- Roll back all patches to the original configuration (marks run as `DISCARDED`)
 
+### Step 6: Verify Optimization Quality
+
+After the pipeline completes, use the following to evaluate whether the optimization was successful:
+
+#### Understanding Convergence Reasons
+
+The pipeline terminates with one of these statuses:
+
+| Status | Meaning | What to Do |
+|--------|---------|------------|
+| `CONVERGED` | All 7 quality dimensions met their target thresholds | Review the comparison and **Apply** -- this is the best outcome |
+| `STALLED` | No meaningful score improvement for 2+ consecutive iterations | Review the comparison -- partial improvements may still be valuable |
+| `MAX_ITERATIONS` | Hit the iteration limit (default 3) without converging | Review what was improved; consider re-running with tuned thresholds |
+| `FAILED` | A pipeline error occurred | Check the job logs for the error and fix the root cause |
+
+#### Interpreting Scores
+
+The comparison view shows before/after scores across 7 quality dimensions. Each dimension has a target threshold:
+
+| Dimension | Target | What It Tells You |
+|-----------|--------|-------------------|
+| Syntax Validity | 98% | Are generated SQL queries syntactically correct? |
+| Schema Accuracy | 95% | Does the SQL reference the right tables/columns? |
+| Logical Accuracy | 90% | Are aggregations, filters, and GROUP BY correct? |
+| Semantic Equivalence | 90% | Does the query answer the same business question? |
+| Completeness | 90% | Are all requested dimensions/measures included? |
+| Result Correctness | 85% | Do the query results match the expected values? |
+| Asset Routing | 95% | Is the right asset type (table, metric view, TVF) selected? |
+
+A score increase of 5%+ in any dimension is generally meaningful. Scores below the threshold are highlighted in the comparison view.
+
+#### Apply vs. Discard
+
+- **Apply**: The optimized instructions, sample questions, and table descriptions are already live in the Genie Space (they were patched during the lever loop). Clicking Apply marks the run as `APPLIED` and preserves the changes. If `apply_mode = both` was used, deferred UC artifact writes (table/column descriptions in Unity Catalog) are also applied at this point using your OBO credentials.
+- **Discard**: Every patch applied during the lever loop is **rolled back** to restore the original Genie Space configuration. The run is marked as `DISCARDED`.
+
+#### After Applying
+
+Once you apply an optimization:
+
+1. Open the Genie Space in the Databricks workspace
+2. Ask the same questions you used as benchmarks (or new questions)
+3. Compare the quality of responses before and after -- you should see improvements in the dimensions that were scored low at baseline
+4. The optimization is idempotent: you can re-run the optimizer on the same space at any time to further improve quality
+
 ---
 
 ## 7. Deploy & Run (Quick Reference)
@@ -237,16 +406,91 @@ curl -s "${APP_URL}/api/genie/trigger/status/<RUN_ID>" \
 
 You can trigger optimization runs programmatically without the UI, using the `/trigger` endpoint. See [07 -- API Reference](docs/genie-space-optimizer-design/07-api-reference.md) for the complete endpoint reference with request/response schemas and CI/CD integration patterns.
 
-```bash
-# Trigger optimization
-curl -X POST https://<app-url>/api/genie/trigger \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"space_id": "<genie-space-id>"}'
+### Three Ways to Initiate an Optimization
 
-# Poll status
-curl https://<app-url>/api/genie/trigger/status/<run_id> \
-  -H "Authorization: Bearer $TOKEN"
+**Method 1: Via the Web UI**
+
+1. Open the app at `https://<workspace>/apps/genie-space-optimizer`
+2. Click a **Space card** on the Dashboard
+3. Click the **Optimize** button on the Space detail page
+4. The run detail page opens automatically -- monitor progress there
+
+**Method 2: Via curl / CLI**
+
+Step-by-step for shell-based triggering:
+
+```bash
+# Step 1: Get the app URL
+APP_URL=$(databricks apps get genie-space-optimizer -p <your-profile> -o json \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
+echo "App URL: ${APP_URL}"
+
+# Step 2: Get an access token
+TOKEN=$(databricks auth token -p <your-profile> \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# Step 3: Trigger optimization (returns runId and jobUrl)
+RESPONSE=$(curl -s -X POST "${APP_URL}/api/genie/trigger" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"space_id": "<GENIE_SPACE_ID>"}')
+echo "${RESPONSE}" | python3 -m json.tool
+
+# Step 4: Extract the run ID from the response
+RUN_ID=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['runId'])")
+
+# Step 5: Poll until completion (CONVERGED, STALLED, MAX_ITERATIONS, or FAILED)
+curl -s "${APP_URL}/api/genie/trigger/status/${RUN_ID}" \
+  -H "Authorization: Bearer ${TOKEN}" | python3 -m json.tool
+```
+
+The trigger response includes:
+
+| Field | Description |
+|-------|-------------|
+| `runId` | Unique optimization run ID (UUID) |
+| `jobRunId` | Databricks Job run ID (for viewing in the Jobs UI) |
+| `jobUrl` | Direct link to the running job |
+| `status` | Initial status (`IN_PROGRESS`) |
+
+The status response includes `baselineScore`, `optimizedScore`, and `convergenceReason` once available.
+
+**Method 3: Via Python (requests)**
+
+```python
+import requests
+import subprocess
+import json
+import time
+
+profile = "<your-profile>"
+space_id = "<GENIE_SPACE_ID>"
+
+# Get app URL and token
+app_info = json.loads(subprocess.check_output(
+    ["databricks", "apps", "get", "genie-space-optimizer", "-p", profile, "-o", "json"]
+))
+app_url = app_info["url"]
+
+token_info = json.loads(subprocess.check_output(
+    ["databricks", "auth", "token", "-p", profile]
+))
+token = token_info["access_token"]
+
+headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+# Trigger
+resp = requests.post(f"{app_url}/api/genie/trigger", json={"space_id": space_id}, headers=headers)
+run_id = resp.json()["runId"]
+print(f"Started run: {run_id}")
+
+# Poll until done
+while True:
+    status = requests.get(f"{app_url}/api/genie/trigger/status/{run_id}", headers=headers).json()
+    print(f"Status: {status['status']} | Baseline: {status.get('baselineScore')} | Optimized: {status.get('optimizedScore')}")
+    if status["status"] in ("CONVERGED", "STALLED", "MAX_ITERATIONS", "FAILED"):
+        break
+    time.sleep(30)
 ```
 
 This is useful for CI/CD pipelines or scheduled optimization workflows.
@@ -351,6 +595,91 @@ These can also be overridden via environment variables (`GENIE_SPACE_OPTIMIZER_P
 LLM_ENDPOINT = "databricks-claude-opus-4-6"  # Foundation Model API endpoint
 LLM_TEMPERATURE = 0                           # Deterministic output
 ```
+
+---
+
+## 11. Reviewing Results in MLflow
+
+Every optimization run is tracked in MLflow with full traceability -- from benchmark questions to judge verdicts to applied patches. This section explains how to navigate the MLflow experiment, inspect traces, and use labeling sessions for human review.
+
+### Finding the MLflow Experiment
+
+Each Genie Space gets its own MLflow experiment at a predictable path:
+
+```
+/Shared/genie-space-optimizer/<space_id>/<domain>
+```
+
+For example: `/Shared/genie-space-optimizer/01f10e84df3b14d993c30773abde7f44/revenue_property`
+
+Three ways to navigate to it:
+
+1. **From the app**: On the run detail page, click the **"MLflow Experiment"** link in the Resource Links section at the bottom of the page.
+2. **From the workspace sidebar**: Navigate to **Machine Learning** > **Experiments** > browse to `/Shared/genie-space-optimizer/`.
+3. **Direct URL**: `https://<workspace>/ml/experiments/<experiment_id>` (the experiment ID is shown in the run detail page).
+
+### What's Inside the Experiment
+
+Each evaluation iteration (baseline, lever loop iterations, repeatability) creates an **MLflow run** within the experiment. Each run contains:
+
+| Artifact | Description |
+|----------|-------------|
+| **Traces** | One trace per benchmark question -- contains the question, Genie-generated SQL, expected SQL, and all judge verdicts |
+| **Metrics** | Per-dimension accuracy scores (syntax_validity, schema_accuracy, etc.) |
+| **Model Versions** | A `LoggedModel` snapshot of the Genie Space config at each iteration |
+| **Assessments** | Scorer feedback (rationale, failure type, blame set, counterfactual fix) attached to each trace |
+
+The baseline run (iteration 0) establishes the "before" scores. Subsequent runs from the lever loop show how scores changed with each optimization iteration. The **best model** (highest overall accuracy) is promoted at the end of the pipeline.
+
+### Navigating Traces
+
+To inspect individual benchmark evaluations:
+
+1. Open the MLflow experiment
+2. Click an MLflow run (e.g. `genie_eval_iter0_...` for baseline, `genie_eval_iter1_...` for first iteration)
+3. Go to the **Traces** tab
+4. Each trace shows:
+   - **Input**: The benchmark question
+   - **Output**: The Genie-generated SQL and results
+   - **Assessments**: All 9 judge verdicts with pass/fail, rationale, failure type, and blame set
+
+Assessments follow a structured format: each judge returns `failure_type` (e.g. `WRONG_TABLE`, `MISSING_FILTER`), `blame_set` (which metadata element caused the failure), and `counterfactual_fix` (what change would fix it). This metadata feeds directly into the adaptive strategist's next iteration.
+
+### Labeling Sessions (Human Review)
+
+When the lever loop completes and persistent failures remain (questions that failed across multiple iterations despite optimization attempts), the optimizer automatically creates an **MLflow Labeling Session** for human review.
+
+**Where to find it:**
+
+- The labeling session URL is displayed on the **run detail page** in the app (in the Resource Links section).
+- It is also printed in the job logs: `[MLflow Review] Labeling session created for human review`.
+- In MLflow, labeling sessions appear under the experiment's **Labeling** tab.
+
+**What you can review:**
+
+The labeling session includes three review schemas:
+
+| Schema | What You Review |
+|--------|-----------------|
+| `judge_verdict_accuracy` | Were the LLM judges correct? Mark verdicts as accurate or inaccurate |
+| `corrected_expected_sql` | Is the benchmark's expected SQL correct? Provide corrected SQL if not |
+| `improvement_suggestions` | Free-form suggestions for improving the Genie Space |
+
+**How to use it:**
+
+1. Click the labeling session link from the run detail page
+2. Review each flagged trace -- the session pre-loads traces for questions with persistent failures
+3. Add your labels (verdict corrections, SQL fixes, suggestions)
+4. On the next optimization run, the optimizer ingests your human feedback and uses it to improve benchmark accuracy and optimization strategy
+
+### Cross-Run Comparison
+
+To compare results across multiple optimization runs on the same space:
+
+1. Open the MLflow experiment
+2. Select multiple runs (checkboxes)
+3. Use the **Compare** view to see how scores evolved over time
+4. The app's **Iteration Chart** (on the run detail page) also visualizes score progression across iterations within a single run
 
 ---
 

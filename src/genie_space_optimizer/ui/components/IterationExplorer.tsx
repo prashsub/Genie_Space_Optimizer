@@ -190,6 +190,52 @@ function IterationView({
                   </span>
                 </div>
               )}
+              {iteration.clusterInfo.rationale && (
+                <div className="mt-1.5 rounded border border-blue-200 bg-blue-50/50 p-2">
+                  <p className="mb-1 text-[10px] font-medium text-blue-700">Strategist Rationale</p>
+                  <p className="text-[11px] leading-relaxed">{String(iteration.clusterInfo.rationale)}</p>
+                </div>
+              )}
+              {iteration.clusterInfo.escalation && (
+                <div className="mt-1.5 rounded border border-amber-200 bg-amber-50/50 p-2">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <AlertTriangle className="h-3 w-3 text-amber-600" />
+                    <p className="text-[10px] font-medium text-amber-700">
+                      Escalation: {String(iteration.clusterInfo.escalation.type || "unknown")}
+                    </p>
+                    <Badge
+                      variant="outline"
+                      className={`ml-auto text-[9px] px-1.5 py-0 ${
+                        iteration.clusterInfo.escalation.handled
+                          ? "border-green-300 text-green-700"
+                          : "border-red-300 text-red-700"
+                      }`}
+                    >
+                      {iteration.clusterInfo.escalation.handled ? "Handled" : "Pending"}
+                    </Badge>
+                  </div>
+                  {iteration.clusterInfo.escalation.detail && (
+                    <details className="text-[11px]">
+                      <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                        Escalation details
+                      </summary>
+                      <pre className="mt-1 rounded bg-muted p-1.5 text-[10px] overflow-x-auto">
+                        {JSON.stringify(iteration.clusterInfo.escalation.detail, null, 2)}
+                      </pre>
+                    </details>
+                  )}
+                </div>
+              )}
+              {iteration.clusterInfo.instruction_rewrite_preview && (
+                <details className="mt-1">
+                  <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
+                    Instruction rewrite preview
+                  </summary>
+                  <pre className="mt-1 rounded bg-muted p-2 text-[10px] whitespace-pre-wrap">
+                    {String(iteration.clusterInfo.instruction_rewrite_preview)}
+                  </pre>
+                </details>
+              )}
             </>
           )}
           {iteration.reflection && (

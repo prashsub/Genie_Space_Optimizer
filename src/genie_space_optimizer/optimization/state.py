@@ -259,6 +259,7 @@ _ALL_DDL: dict[str, str] = {
 
 def ensure_optimization_tables(spark: SparkSession, catalog: str, schema: str) -> None:
     """Create all optimization Delta tables if they don't exist (idempotent)."""
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
     for name, ddl in _ALL_DDL.items():
         resolved = ddl.replace("{catalog}", catalog).replace("{schema}", schema)
         spark.sql(resolved)

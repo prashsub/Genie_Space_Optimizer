@@ -1572,8 +1572,8 @@ def _build_reflection_entry(
     patch_summary_parts: list[str] = []
     do_not_retry: list[str] = []
     for p in patches:
-        ptype = p.get("patch_type", "?")
-        target = p.get("target_object", "?")
+        ptype = p.get("type", p.get("patch_type", "?"))
+        target = p.get("target", p.get("target_object", "?"))
         patch_summary_parts.append(f"{ptype} on {target}")
         if not accepted:
             do_not_retry.append(f"{ptype} on {target}")
@@ -3715,6 +3715,12 @@ def _run_lever_loop(
                 "affected_questions": _rc.get("question_ids", [])[:20],
             }
             break
+
+        _ag_cluster_info["rationale"] = ag.get("rationale", strategy.get("rationale", "") if strategy else "")
+        _ag_cluster_info["escalation"] = ag.get("escalation") or None
+        _global_rewrite = strategy.get("global_instruction_rewrite", "") if strategy else ""
+        _ag_cluster_info["instruction_rewrite_preview"] = str(_global_rewrite)[:500] if _global_rewrite else ""
+
         write_stage(
             spark, run_id, f"AG_{ag_id}_STARTED", "STARTED",
             task_key="lever_loop", iteration=iteration_counter,
@@ -3742,6 +3748,19 @@ def _run_lever_loop(
                 metadata_snapshot=metadata_snapshot,
             )
             logger.info("Escalation result: %s", _esc_result)
+
+            write_stage(
+                spark, run_id, f"AG_{ag_id}_ESCALATION", "COMPLETE",
+                task_key="lever_loop", iteration=iteration_counter,
+                detail={
+                    "escalation_type": _escalation,
+                    "handled": _esc_result.get("handled", False),
+                    "detail": _esc_result.get("detail", {}),
+                    "affected_questions": ag.get("affected_questions", [])[:20],
+                },
+                catalog=catalog, schema=schema,
+            )
+
             _esc_tier = _esc_result.get("detail", {}).get("tier_action", "")
 
             if _escalation == "flag_for_review" or (

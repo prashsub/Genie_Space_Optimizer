@@ -202,6 +202,31 @@ function ReviewBanner({ spaceId }: { spaceId: string }) {
   if (reviews.queuedPatches)
     parts.push(`${reviews.queuedPatches} queued patch${reviews.queuedPatches > 1 ? "es" : ""}`);
 
+  const categorized = useMemo(() => {
+    const groups = { persistence: 0, tvf: 0, strategist: 0, other: 0 };
+    for (const item of reviews.items ?? []) {
+      const r = (item.reason ?? "").toLowerCase();
+      if (r.includes("persistent") || r.includes("additive_levers_exhausted") || r.includes("consecutive")) {
+        groups.persistence++;
+      } else if (r.includes("tvf removal") || r.includes("remove_tvf") || r.includes("remove tvf")) {
+        groups.tvf++;
+      } else if (r.includes("strategist") || r.includes("flag_for_review")) {
+        groups.strategist++;
+      } else {
+        groups.other++;
+      }
+    }
+    return groups;
+  }, [reviews.items]);
+
+  const details: string[] = [];
+  if (categorized.persistence > 0)
+    details.push(`${categorized.persistence} persistently failing`);
+  if (categorized.tvf > 0)
+    details.push(`${categorized.tvf} TVF removal review${categorized.tvf > 1 ? "s" : ""}`);
+  if (categorized.strategist > 0)
+    details.push(`${categorized.strategist} strategist-flagged`);
+
   return (
     <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
       <div className="flex items-start gap-3">
@@ -212,6 +237,9 @@ function ReviewBanner({ spaceId }: { spaceId: string }) {
             your review
           </h3>
           <p className="mt-0.5 text-xs text-amber-700">{parts.join(", ")}</p>
+          {details.length > 0 && (
+            <p className="mt-1 text-xs text-amber-600">{details.join(" · ")}</p>
+          )}
         </div>
         {reviews.labelingSessionUrl && (
           <Button

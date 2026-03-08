@@ -157,3 +157,239 @@ class TestGetComparison:
         assert "perDimensionScores" in data
         assert "original" in data
         assert "optimized" in data
+
+
+class TestIterationDetailFlaggedQuestions:
+    """Verify iteration-detail includes flag_reason and related fields."""
+
+    @patch("genie_space_optimizer.backend.routes.runs.get_spark")
+    def test_flagged_questions_with_flag_reason(self, mock_get_spark, api_client):
+        import json as _json
+
+        mock_get_spark.return_value = MagicMock()
+        rows_json = _json.dumps([
+            {
+                "request_id": "q1",
+                "inputs": {"question": "What is revenue?"},
+                "result_correctness/value": "no",
+            },
+        ])
+
+        with patch(
+            "genie_space_optimizer.optimization.state.load_run",
+            return_value={
+                "run_id": "run-flag",
+                "space_id": "sp-1",
+                "domain": "test",
+                "status": "CONVERGED",
+                "started_at": "2025-01-01T00:00:00Z",
+                "triggered_by": "t@t.com",
+            },
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_iterations",
+            return_value=pd.DataFrame([
+                {
+                    "iteration": 0,
+                    "eval_scope": "full",
+                    "overall_accuracy": 50.0,
+                    "total_questions": 1,
+                    "correct_count": 0,
+                    "rows_json": rows_json,
+                },
+            ]),
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_stages",
+            return_value=pd.DataFrame(),
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_patches",
+            return_value=pd.DataFrame(),
+        ), patch(
+            "genie_space_optimizer.optimization.labeling.get_flagged_questions",
+            return_value=[
+                {
+                    "question_id": "q1",
+                    "question_text": "What is revenue?",
+                    "flag_reason": "PERSISTENT: failed 3/5 evals, 3 consecutive",
+                    "iterations_failed": 3,
+                    "patches_tried": "example_sql, instruction_edit",
+                },
+            ],
+        ):
+            response = api_client.get("/api/genie/runs/run-flag/iteration-detail")
+
+        assert response.status_code == 200
+        data = response.json()
+        flagged = data.get("flaggedQuestions", [])
+        assert len(flagged) >= 1
+        fq = flagged[0]
+        assert fq["question_id"] == "q1"
+        assert "PERSISTENT" in fq.get("flag_reason", "")
+        assert fq.get("iterations_failed") == 3
+
+    @patch("genie_space_optimizer.backend.routes.runs.get_spark")
+    def test_no_flagged_questions(self, mock_get_spark, api_client):
+        mock_get_spark.return_value = MagicMock()
+
+        with patch(
+            "genie_space_optimizer.optimization.state.load_run",
+            return_value={
+                "run_id": "run-noflag",
+                "space_id": "sp-1",
+                "domain": "test",
+                "status": "CONVERGED",
+                "started_at": "2025-01-01T00:00:00Z",
+                "triggered_by": "t@t.com",
+            },
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_iterations",
+            return_value=pd.DataFrame([
+                {"iteration": 0, "eval_scope": "full", "overall_accuracy": 100.0, "total_questions": 1, "correct_count": 1},
+            ]),
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_stages",
+            return_value=pd.DataFrame(),
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_patches",
+            return_value=pd.DataFrame(),
+        ), patch(
+            "genie_space_optimizer.optimization.labeling.get_flagged_questions",
+            return_value=[],
+        ):
+            response = api_client.get("/api/genie/runs/run-noflag/iteration-detail")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data.get("flaggedQuestions", []) == []
+
+
+class TestIterationDetailNanHandling:
+    """Regression: NaN values in pandas DataFrames must not crash the endpoint."""
+
+    @patch("genie_space_optimizer.backend.routes.runs.get_spark")
+    def test_nan_numeric_columns_do_not_crash(self, mock_get_spark, api_client):
+        """Spark NULL → pandas NaN in iteration/total_questions/correct_count."""
+        import json as _json
+        import numpy as np
+
+        mock_get_spark.return_value = MagicMock()
+
+        rows_json = _json.dumps([
+            {
+                "request_id": "q1",
+                "inputs": {"question": "What is revenue?"},
+                "result_correctness/value": "yes",
+            },
+        ])
+
+        iters_df = pd.DataFrame([
+            {
+                "iteration": 0,
+                "eval_scope": "full",
+                "overall_accuracy": 75.0,
+                "total_questions": np.nan,
+                "correct_count": np.nan,
+                "rows_json": rows_json,
+                "scores_json": '{"result_correctness": 75.0}',
+            },
+            {
+                "iteration": 1,
+                "eval_scope": "full",
+                "overall_accuracy": 85.0,
+                "total_questions": 10.0,
+                "correct_count": np.nan,
+                "rows_json": rows_json,
+                "scores_json": '{"result_correctness": 85.0}',
+            },
+        ])
+
+        with patch(
+            "genie_space_optimizer.optimization.state.load_run",
+            return_value={
+                "run_id": "run-nan",
+                "space_id": "sp-1",
+                "domain": "test",
+                "status": "CONVERGED",
+                "started_at": "2025-01-01T00:00:00Z",
+                "triggered_by": "t@t.com",
+            },
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_iterations",
+            return_value=iters_df,
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_stages",
+            return_value=pd.DataFrame(),
+        ), patch(
+            "genie_space_optimizer.optimization.state.load_patches",
+            return_value=pd.DataFrame(),
+        ), patch(
+            "genie_space_optimizer.optimization.labeling.get_flagged_questions",
+            return_value=[],
+        ):
+            response = api_client.get("/api/genie/runs/run-nan/iteration-detail")
+
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
+        data = response.json()
+        assert len(data["iterations"]) == 2
+        assert data["iterations"][0]["totalQuestions"] == 0
+        assert data["iterations"][0]["correctCount"] == 0
+        assert data["iterations"][1]["totalQuestions"] == 10
+        assert data["iterations"][1]["correctCount"] == 0
+
+
+class TestPendingReviewsFlagReason:
+    """Verify pending-reviews passes through flag_reason patterns."""
+
+    @patch("genie_space_optimizer.backend.routes.runs.get_spark")
+    def test_persistence_reason_passed_through(self, mock_get_spark, api_client):
+        mock_get_spark.return_value = MagicMock()
+
+        with patch(
+            "genie_space_optimizer.optimization.labeling.get_flagged_questions",
+            return_value=[
+                {
+                    "question_id": "q1",
+                    "question_text": "Revenue last month?",
+                    "flag_reason": "PERSISTENT: failed 3/5 evals, 3 consecutive",
+                },
+            ],
+        ), patch(
+            "genie_space_optimizer.optimization.state.get_queued_patches",
+            return_value=[],
+        ), patch(
+            "genie_space_optimizer.optimization.state.run_query",
+            return_value=pd.DataFrame(),
+        ):
+            response = api_client.get("/api/genie/pending-reviews/sp-1")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["flaggedQuestions"] == 1
+        assert len(data["items"]) >= 1
+        assert "PERSISTENT" in data["items"][0]["reason"]
+
+    @patch("genie_space_optimizer.backend.routes.runs.get_spark")
+    def test_tvf_removal_reason_passed_through(self, mock_get_spark, api_client):
+        mock_get_spark.return_value = MagicMock()
+
+        with patch(
+            "genie_space_optimizer.optimization.labeling.get_flagged_questions",
+            return_value=[
+                {
+                    "question_id": "q2",
+                    "question_text": "Amenity impact?",
+                    "flag_reason": "Low-confidence TVF removal recommended: get_amenity_imp",
+                },
+            ],
+        ), patch(
+            "genie_space_optimizer.optimization.state.get_queued_patches",
+            return_value=[],
+        ), patch(
+            "genie_space_optimizer.optimization.state.run_query",
+            return_value=pd.DataFrame(),
+        ):
+            response = api_client.get("/api/genie/pending-reviews/sp-2")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["items"]) >= 1
+        assert "TVF removal" in data["items"][0]["reason"]

@@ -253,6 +253,47 @@ Run statuses: `QUEUED` → `IN_PROGRESS` → `CONVERGED` | `STALLED` | `MAX_ITER
 
 ---
 
+## Reviewing Results in MLflow
+
+Every optimization run is fully tracked in MLflow for transparency and auditability.
+
+### Experiment Location
+
+Each Genie Space gets its own MLflow experiment at:
+
+```
+/Shared/genie-space-optimizer/<space_id>/<domain>
+```
+
+Navigate to it from the workspace sidebar (**Machine Learning** > **Experiments**), or click the **MLflow Experiment** link on the run detail page in the app.
+
+### What's Tracked
+
+| Artifact | Description |
+|----------|-------------|
+| **Traces** | One per benchmark question -- includes question, Genie SQL, expected SQL, and all 9 judge verdicts |
+| **Metrics** | Per-dimension accuracy scores for each evaluation iteration |
+| **Model Versions** | `LoggedModel` snapshots of the Genie Space config at each iteration; best model is promoted |
+| **Assessments** | Structured scorer feedback (failure type, blame set, counterfactual fix) on each trace |
+
+### Labeling Sessions (Human Review)
+
+When persistent failures remain after the lever loop, an **MLflow Labeling Session** is auto-created with three review schemas: `judge_verdict_accuracy`, `corrected_expected_sql`, and `improvement_suggestions`. The session URL is displayed on the run detail page and printed in job logs. Human labels from the session are ingested on the next optimization run.
+
+### Verifying Results
+
+After an optimization completes:
+
+1. **In the app**: Open the run detail page > **Comparison** view for side-by-side score diffs and config changes
+2. **In MLflow**: Compare baseline (iteration 0) vs. final iteration traces to see which benchmark questions improved
+3. **In the Genie Space**: Ask the same benchmark questions and compare response quality before/after
+
+Terminal statuses: `CONVERGED` (all thresholds met), `STALLED` (no improvement), `MAX_ITERATIONS` (hit limit). After reviewing, **Apply** keeps changes live; **Discard** rolls back every patch.
+
+> **Full guide:** See [Quickstart -- Reviewing Results in MLflow](QUICKSTART.md#11-reviewing-results-in-mlflow) for detailed navigation instructions, trace inspection, and labeling session workflows.
+
+---
+
 ## Databricks Resources
 
 The `databricks.yml` bundle provisions:
@@ -293,7 +334,17 @@ All optimization parameters (thresholds, rate limits, iterations, LLM config, co
 
 ### Permissions
 
-The app requires OBO API scopes, UC grants for the service principal, and CAN_MANAGE on each Genie Space. The app operates as an **advisor** -- it shows what permissions are missing with copyable grant commands on the Settings page but never executes GRANT/REVOKE itself. See [08 -- Permissions and Security](docs/genie-space-optimizer-design/08-permissions-and-security.md) for the full permissions model.
+The app requires three categories of permissions to run optimizations:
+
+| Category | Scope | How to Grant |
+|----------|-------|--------------|
+| **Operational Schema** | SP needs 8 privileges (`USE_CATALOG`, `USE_SCHEMA`, `SELECT`, `MODIFY`, `CREATE_TABLE`, `CREATE_FUNCTION`, `CREATE_MODEL`, `EXECUTE`) on the optimizer's own schema (e.g. `main.genie_optimization`) | **Automatic** -- applied by `resources/grant_app_uc_permissions.py` during `make deploy` |
+| **Data Schema** | SP needs `USE_CATALOG`, `USE_SCHEMA`, `SELECT` (and `MODIFY` if `apply_mode=both`) on every catalog/schema referenced by your Genie Space tables | **Manual** -- open the app's Settings page for copyable SQL GRANT commands |
+| **Genie Space** | SP needs `CAN_MANAGE` on each Genie Space to read/modify its configuration | **Manual** -- share the Space with the SP from the Genie Space UI |
+
+The app operates as an **advisor** -- it shows what permissions are missing with copyable grant commands on the Settings page but never executes GRANT/REVOKE itself. To find the SP identity, run `databricks apps get genie-space-optimizer -p <profile> -o json` and look for `service_principal_client_id`, or check the Settings page.
+
+See [Quickstart -- Permission Setup Guide](QUICKSTART.md#complete-permission-setup-guide) for step-by-step instructions, or [08 -- Permissions and Security](docs/genie-space-optimizer-design/08-permissions-and-security.md) for the full permissions model.
 
 ---
 
@@ -346,6 +397,8 @@ You can also run individual targets:
 make clean-wheels PROFILE=<your-profile>   # Remove stale wheels
 make verify PROFILE=<your-profile>         # Confirm wheel on workspace
 ```
+
+> **First-time deploy:** On a brand-new deployment, the UC grant script (`resources/grant_app_uc_permissions.py`) runs during build but the app doesn't exist yet, so grants are skipped. **Run `make deploy` a second time** after the app is created to apply the operational schema grants. See the [Quickstart Guide](QUICKSTART.md#first-time-deploy-uc-grants-require-a-second-deploy) for the full walkthrough.
 
 ---
 

@@ -24,7 +24,16 @@ import {
   ChevronRight,
   Layers,
   RotateCcw,
+  AlertTriangle,
+  Trash2,
+  Info,
 } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type {
   IterationDetailResponse,
   ProactiveChanges,
@@ -42,6 +51,27 @@ interface InsightTabsProps {
 }
 
 type QuestionFilter = "all" | "failing" | "fixed" | "regressed" | "persistent";
+
+export type FlagCategory = "persistence" | "tvf_removal" | "strategist" | "other";
+
+export function categorizeFlagReason(reason: string): FlagCategory {
+  if (!reason) return "other";
+  const r = reason.toLowerCase();
+  if (r.includes("persistent") || r.includes("additive_levers_exhausted") || r.includes("consecutive"))
+    return "persistence";
+  if (r.includes("tvf removal") || r.includes("remove_tvf") || r.includes("remove tvf"))
+    return "tvf_removal";
+  if (r.includes("strategist") || r.includes("flag_for_review"))
+    return "strategist";
+  return "other";
+}
+
+interface FlaggedInfo {
+  flag_reason: string;
+  iterations_failed: number | null;
+  patches_tried: string | null;
+  category: FlagCategory;
+}
 
 export function InsightTabs({
   runId,
@@ -77,8 +107,9 @@ export function InsightTabs({
       <TabsContent value="overview" className="mt-4">
         <OverviewTab runId={runId} detail={detail} stageEvents={stageEvents} />
       </TabsContent>
-      <TabsContent value="questions" className="mt-4">
+      <TabsContent value="questions" className="mt-4 space-y-4">
         <QuestionsTab detail={detail} />
+        <RecommendationsCard detail={detail} />
       </TabsContent>
       <TabsContent value="patches" className="mt-4">
         <PatchesTab detail={detail} />
@@ -315,15 +346,25 @@ function OverviewTab({
 function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
   const [filter, setFilter] = useState<QuestionFilter>("all");
 
-  const flaggedIds = useMemo(
-    () => new Set(detail.flaggedQuestions.map((f) => String(f.question_id || ""))),
-    [detail.flaggedQuestions],
-  );
+  const flaggedMap = useMemo(() => {
+    const m = new Map<string, FlaggedInfo>();
+    for (const f of detail.flaggedQuestions) {
+      const qid = String(f.question_id || "");
+      const reason = String(f.flag_reason || "");
+      m.set(qid, {
+        flag_reason: reason,
+        iterations_failed: f.iterations_failed ?? null,
+        patches_tried: f.patches_tried ? String(f.patches_tried) : null,
+        category: categorizeFlagReason(reason),
+      });
+    }
+    return m;
+  }, [detail.flaggedQuestions]);
 
   const questionJourney = useMemo(() => {
     const qMap = new Map<
       string,
-      { question: string; results: Map<number, QuestionResult>; persistentFail: boolean; flagged: boolean }
+      { question: string; results: Map<number, QuestionResult>; persistentFail: boolean; flagged: boolean; flagInfo: FlaggedInfo | null }
     >();
 
     for (const iter of detail.iterations) {
@@ -333,7 +374,8 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
             question: q.question,
             results: new Map(),
             persistentFail: false,
-            flagged: flaggedIds.has(q.questionId),
+            flagged: flaggedMap.has(q.questionId),
+            flagInfo: flaggedMap.get(q.questionId) ?? null,
           });
         }
         qMap.get(q.questionId)!.results.set(iter.iteration, q);
@@ -348,7 +390,7 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
     }
 
     return qMap;
-  }, [detail.iterations, flaggedIds]);
+  }, [detail.iterations, flaggedMap]);
 
   const iters = detail.iterations.map((i) => i.iteration);
 
@@ -434,13 +476,46 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
                   })}
                   <TableCell className="text-center">
                     <div className="flex items-center justify-center gap-1">
-                      {data.persistentFail && (
+                      {data.persistentFail && !data.flagInfo && (
                         <Badge variant="destructive" className="text-[10px]">
                           Persistent
                         </Badge>
                       )}
-                      {data.flagged && (
-                        <Badge className="bg-amber-500 text-[10px]">Flagged</Badge>
+                      {data.flagInfo && (
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Badge
+                                className={`text-[10px] cursor-help ${
+                                  data.flagInfo.category === "tvf_removal"
+                                    ? "bg-orange-500"
+                                    : data.flagInfo.category === "persistence"
+                                      ? "bg-red-500"
+                                      : "bg-amber-500"
+                                }`}
+                              >
+                                {data.flagInfo.category === "tvf_removal"
+                                  ? "TVF Issue"
+                                  : data.flagInfo.category === "persistence"
+                                    ? "Persistent"
+                                    : "Flagged"}
+                              </Badge>
+                            </TooltipTrigger>
+                            <TooltipContent side="left" className="max-w-xs text-xs space-y-1">
+                              <p className="font-medium">{data.flagInfo.flag_reason}</p>
+                              {data.flagInfo.iterations_failed != null && (
+                                <p className="text-muted-foreground">
+                                  Failed in {data.flagInfo.iterations_failed} iteration(s)
+                                </p>
+                              )}
+                              {data.flagInfo.patches_tried && (
+                                <p className="text-muted-foreground">
+                                  Patches tried: {data.flagInfo.patches_tried}
+                                </p>
+                              )}
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
                       )}
                     </div>
                   </TableCell>
@@ -454,6 +529,136 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
             </p>
           )}
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function RecommendationsCard({ detail }: { detail: IterationDetailResponse }) {
+  const recommendations = useMemo(() => {
+    const items: {
+      category: FlagCategory;
+      title: string;
+      description: string;
+      questions: string[];
+      icon: "tvf" | "persistence" | "strategist";
+    }[] = [];
+
+    const byCategory = new Map<FlagCategory, { reasons: string[]; questions: string[] }>();
+    for (const fq of detail.flaggedQuestions) {
+      const reason = String(fq.flag_reason || "");
+      const cat = categorizeFlagReason(reason);
+      if (cat === "other") continue;
+      const entry = byCategory.get(cat) ?? { reasons: [], questions: [] };
+      entry.reasons.push(reason);
+      entry.questions.push(String(fq.question_id || fq.question_text || ""));
+      byCategory.set(cat, entry);
+    }
+
+    const tvf = byCategory.get("tvf_removal");
+    if (tvf) {
+      const tvfNames = tvf.reasons
+        .map((r) => {
+          const match = r.match(/(?:removal[^:]*:\s*)(\S+)/i);
+          return match?.[1];
+        })
+        .filter(Boolean);
+      items.push({
+        category: "tvf_removal",
+        title: `TVF Review Required${tvfNames.length ? `: ${tvfNames.join(", ")}` : ""}`,
+        description:
+          "One or more table-valued functions were flagged for removal but require manual review. " +
+          "Consider verifying whether these TVFs are still needed, and add them back or confirm removal.",
+        questions: tvf.questions,
+        icon: "tvf",
+      });
+    }
+
+    const persistence = byCategory.get("persistence");
+    if (persistence) {
+      items.push({
+        category: "persistence",
+        title: `${persistence.questions.length} Persistently Failing Question${persistence.questions.length > 1 ? "s" : ""}`,
+        description:
+          "These questions failed across multiple iterations despite optimization attempts. " +
+          "Review the questions — they may need benchmark corrections, additional instructions, or domain-specific guidance.",
+        questions: persistence.questions,
+        icon: "persistence",
+      });
+    }
+
+    const strat = byCategory.get("strategist");
+    if (strat) {
+      items.push({
+        category: "strategist",
+        title: "Strategist-Flagged Items",
+        description:
+          "The adaptive strategist flagged these questions for human review. " +
+          "The optimization engine determined automated fixes were insufficient.",
+        questions: strat.questions,
+        icon: "strategist",
+      });
+    }
+
+    return items;
+  }, [detail.flaggedQuestions]);
+
+  if (recommendations.length === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <AlertTriangle className="h-4 w-4 text-amber-500" />
+          Recommended Actions
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {recommendations.map((rec, idx) => (
+          <div
+            key={idx}
+            className={`rounded-lg border px-4 py-3 ${
+              rec.icon === "tvf"
+                ? "border-orange-200 bg-orange-50/50"
+                : rec.icon === "persistence"
+                  ? "border-red-200 bg-red-50/50"
+                  : "border-amber-200 bg-amber-50/50"
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              {rec.icon === "tvf" ? (
+                <Trash2 className="mt-0.5 h-4 w-4 shrink-0 text-orange-600" />
+              ) : rec.icon === "persistence" ? (
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
+              ) : (
+                <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              )}
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-semibold">{rec.title}</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">{rec.description}</p>
+                {rec.questions.length > 0 && (
+                  <details className="mt-1.5">
+                    <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
+                      {rec.questions.length} affected question{rec.questions.length > 1 ? "s" : ""}
+                    </summary>
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {rec.questions.slice(0, 10).map((q, i) => (
+                        <Badge key={i} variant="secondary" className="text-[9px] max-w-[200px] truncate">
+                          {q}
+                        </Badge>
+                      ))}
+                      {rec.questions.length > 10 && (
+                        <Badge variant="outline" className="text-[9px]">
+                          +{rec.questions.length - 10} more
+                        </Badge>
+                      )}
+                    </div>
+                  </details>
+                )}
+              </div>
+            </div>
+          </div>
+        ))}
       </CardContent>
     </Card>
   );

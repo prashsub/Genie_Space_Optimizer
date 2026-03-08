@@ -5,7 +5,7 @@ variables:
   app_name:
     default: "genie-space-optimizer"
   catalog:
-    default: "main"
+    default: "prashanth_subrahmanyam_catalog"
   gold_schema:
     default: "genie_optimization"
   warehouse_id:
