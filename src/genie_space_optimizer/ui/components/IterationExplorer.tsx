@@ -145,6 +145,47 @@ function IterationView({
   }
 
   return (
+    <div className="space-y-4">
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Card>
+          <CardHeader className="pb-1">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+              Accuracy
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <span className="text-2xl font-bold">
+              {iteration.overallAccuracy.toFixed(1)}%
+            </span>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-1">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+              Questions
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <span className="text-2xl font-bold">
+              {iteration.correctCount}/{iteration.totalQuestions}
+            </span>
+            <span className="ml-1 text-sm text-muted-foreground">correct</span>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-1">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+              Judges
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <span className="text-2xl font-bold">
+              {Object.keys(iteration.judgeScores).length}
+            </span>
+          </CardContent>
+        </Card>
+      </div>
+
     <div className="grid gap-4 lg:grid-cols-2">
       {/* Strategist Decision Card */}
       <Card className={iteration.status === "rolled_back" ? "border-red-200" : ""}>
@@ -417,6 +458,7 @@ function IterationView({
 
       {/* MLflow & Human Review Links */}
       <MLflowLinks iteration={iteration} experimentLink={experimentLink} detail={detail} />
+    </div>
     </div>
   );
 }

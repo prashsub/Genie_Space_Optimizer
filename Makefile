@@ -4,8 +4,9 @@
 #   make verify          Check that workspace has the expected wheel
 #   make clean-wheels    Remove stale wheels from the workspace
 
-PROFILE       ?= genie-test
-APP_NAME      ?= genie-space-optimizer
+PROFILE       ?= DEFAULT
+APP_NAME      ?= do-not-delete-genie-optimizer
+CATALOG       ?= main
 WS_BUILD_PATH  = /Workspace/Users/prashanth.subrahmanyam@databricks.com/.bundle/genie-space-optimizer/dev/files/.build
 
 .PHONY: deploy verify clean-wheels
@@ -21,7 +22,7 @@ deploy: clean-wheels _bundle_deploy _app_deploy verify
 # ── Bundle Deploy (build + sync files to workspace) ────────────────────
 
 _bundle_deploy:
-	databricks bundle deploy --profile $(PROFILE)
+	databricks bundle deploy --profile $(PROFILE) --var "catalog=$(CATALOG)" --var "deploy_profile=$(PROFILE)"
 
 # ── App Deploy (create snapshot + restart app) ─────────────────────────
 

@@ -207,19 +207,37 @@ def main() -> int:
         principal=principal,
         add=sorted(SP_CATALOG_PRIVILEGES),
     )
-    _update_grants(
-        profile=args.profile,
-        securable_type="schema",
-        full_name=schema_fqn,
-        principal=principal,
-        add=sorted(SP_SCHEMA_PRIVILEGES),
-    )
-    _verify_required_privileges(
-        profile=args.profile,
-        principal=principal,
-        catalog=args.catalog,
-        schema=args.schema,
-    )
+    try:
+        _update_grants(
+            profile=args.profile,
+            securable_type="schema",
+            full_name=schema_fqn,
+            principal=principal,
+            add=sorted(SP_SCHEMA_PRIVILEGES),
+        )
+    except Exception as err:
+        if "does not exist" in str(err).lower():
+            print(
+                f"[grant-app-sp] Schema '{schema_fqn}' does not exist yet — "
+                "skipping schema grants. The app will create the schema on first startup.",
+            )
+            return 0
+        raise
+    try:
+        _verify_required_privileges(
+            profile=args.profile,
+            principal=principal,
+            catalog=args.catalog,
+            schema=args.schema,
+        )
+    except Exception as err:
+        if "does not exist" in str(err).lower():
+            print(
+                f"[grant-app-sp] Schema '{schema_fqn}' does not exist yet — "
+                "skipping grant verification.",
+            )
+            return 0
+        raise
     print(
         f"[grant-app-sp] SP grants applied: principal={principal} "
         f"on {schema_fqn}",

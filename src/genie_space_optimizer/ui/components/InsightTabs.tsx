@@ -27,6 +27,7 @@ import {
   AlertTriangle,
   Trash2,
   Info,
+  UserCheck,
 } from "lucide-react";
 import {
   Tooltip,
@@ -578,10 +579,12 @@ function RecommendationsCard({ detail }: { detail: IterationDetailResponse }) {
     if (persistence) {
       items.push({
         category: "persistence",
-        title: `${persistence.questions.length} Persistently Failing Question${persistence.questions.length > 1 ? "s" : ""}`,
-        description:
-          "These questions failed across multiple iterations despite optimization attempts. " +
-          "Review the questions — they may need benchmark corrections, additional instructions, or domain-specific guidance.",
+        title: `${persistence.questions.length} Persistently Failing Question${persistence.questions.length > 1 ? "s" : ""} — Human Review Required`,
+        description: detail.labelingSessionUrl
+          ? "These questions failed across multiple iterations despite optimization attempts. " +
+            "A labeling session has been created for human review."
+          : "These questions failed across multiple iterations despite optimization attempts. " +
+            "Review the questions — they may need benchmark corrections, additional instructions, or domain-specific guidance.",
         questions: persistence.questions,
         icon: "persistence",
       });
@@ -601,7 +604,7 @@ function RecommendationsCard({ detail }: { detail: IterationDetailResponse }) {
     }
 
     return items;
-  }, [detail.flaggedQuestions]);
+  }, [detail.flaggedQuestions, detail.labelingSessionUrl]);
 
   if (recommendations.length === 0) return null;
 
@@ -654,6 +657,21 @@ function RecommendationsCard({ detail }: { detail: IterationDetailResponse }) {
                       )}
                     </div>
                   </details>
+                )}
+                {rec.icon === "persistence" && detail.labelingSessionUrl && (
+                  <div className="mt-2">
+                    <Button variant="outline" size="sm" className="border-amber-300" asChild>
+                      <a
+                        href={detail.labelingSessionUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        <UserCheck className="mr-1.5 h-3.5 w-3.5 text-amber-600" />
+                        Open Labeling Session
+                        <ExternalLink className="ml-1.5 h-3.5 w-3.5" />
+                      </a>
+                    </Button>
+                  </div>
                 )}
               </div>
             </div>

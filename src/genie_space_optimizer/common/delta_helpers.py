@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MISSING_OBJECT_ERRORS = ("TABLE_OR_VIEW_NOT_FOUND", "SCHEMA_NOT_FOUND")
+
 _REFRESH_SKIP: bool | None = None
 
 
@@ -39,6 +41,19 @@ def _safe_refresh(spark: "SparkSession", table_name: str) -> None:
         spark.sql(f"REFRESH TABLE {table_name}")
     except Exception:
         pass
+
+
+def _native_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert all numpy dtypes to Python-native object columns.
+
+    Pandas ``toPandas()`` returns numpy scalar types (``numpy.float64``,
+    ``numpy.int64``) which Pydantic's C-level serializer cannot handle
+    in ``int``-typed model fields.  Converting to ``object`` dtype forces
+    native Python ``int`` / ``float`` / ``None`` values.
+    """
+    if df.empty:
+        return df
+    return df.astype(object).where(df.notna(), None)
 
 
 def _fqn(catalog: str, schema: str, table: str) -> str:
@@ -80,9 +95,10 @@ def read_table(
         try:
             _safe_refresh(spark, fqn)
             logger.debug("read_table: %s", query)
-            return spark.sql(query).toPandas()
+            return _native_df(spark.sql(query).toPandas())
         except Exception as exc:
-            if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in str(exc) and attempt < _max_retries - 1:
+            exc_str = str(exc)
+            if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in exc_str and attempt < _max_retries - 1:
                 import time as _time
                 wait = 5 * (attempt + 1)
                 logger.warning(
@@ -91,6 +107,9 @@ def read_table(
                 )
                 _time.sleep(wait)
                 continue
+            if any(code in exc_str for code in _MISSING_OBJECT_ERRORS):
+                logger.debug("Table/schema not found, returning empty DataFrame: %s", exc_str[:120])
+                return pd.DataFrame()
             raise
     return pd.DataFrame()
 
@@ -161,9 +180,10 @@ def run_query(spark: SparkSession, sql: str, _max_retries: int = 3) -> pd.DataFr
     for attempt in range(_max_retries):
         try:
             logger.debug("run_query: %s", sql)
-            return spark.sql(sql).toPandas()
+            return _native_df(spark.sql(sql).toPandas())
         except Exception as exc:
-            if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in str(exc) and attempt < _max_retries - 1:
+            exc_str = str(exc)
+            if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in exc_str and attempt < _max_retries - 1:
                 import re as _re
                 import time as _time
                 tables = _re.findall(r"FROM\s+([\w.]+)", sql, _re.IGNORECASE)
@@ -176,5 +196,8 @@ def run_query(spark: SparkSession, sql: str, _max_retries: int = 3) -> pd.DataFr
                 )
                 _time.sleep(wait)
                 continue
+            if any(code in exc_str for code in _MISSING_OBJECT_ERRORS):
+                logger.debug("Table/schema not found, returning empty DataFrame: %s", exc_str[:120])
+                return pd.DataFrame()
             raise
     return pd.DataFrame()

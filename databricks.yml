@@ -3,15 +3,15 @@ bundle:
 
 variables:
   app_name:
-    default: "genie-space-optimizer"
+    default: "do-not-delete-genie-optimizer"
   catalog:
     default: "prashanth_subrahmanyam_catalog"
   gold_schema:
     default: "genie_optimization"
   warehouse_id:
-    default: "02c1885622661afa"
+    default: "4b9b953939869799"
   deploy_profile:
-    default: "genie-test"
+    default: "DEFAULT"
 
 sync:
   include:

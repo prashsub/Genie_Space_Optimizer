@@ -19,7 +19,7 @@ import { useIterations } from "@/lib/transparency-api";
 import type { IterationSummary } from "@/lib/transparency-api";
 
 const chartConfig = {
-  accuracy: { label: "Accuracy", color: "hsl(var(--chart-1))" },
+  accuracy: { label: "Accuracy", color: "var(--chart-1)" },
 } satisfies ChartConfig;
 
 type ChartPoint = {
@@ -32,8 +32,8 @@ type ChartPoint = {
 
 function buildChartData(iterations: IterationSummary[]): ChartPoint[] {
   const full = iterations
-    .filter((it) => it.evalScope === "full")
-    .filter((it) => it.iteration === 0 || it.overallAccuracy > 0)
+    .filter((it) => (it.evalScope ?? "").toLowerCase() === "full")
+    .filter((it) => it.totalQuestions > 0 || it.iteration === 0)
     .sort((a, b) => a.iteration - b.iteration);
 
   return full.map((it) => ({
@@ -128,7 +128,7 @@ export function IterationChart({ runId }: { runId: string }) {
             <YAxis domain={[yMin, yMax]} tickFormatter={(v) => `${v}%`} />
             <ReferenceLine
               y={80}
-              stroke="hsl(var(--muted-foreground))"
+              stroke="var(--muted-foreground)"
               strokeDasharray="4 4"
               label={{ value: "Target", position: "right" }}
             />
@@ -173,7 +173,7 @@ export function IterationChart({ runId }: { runId: string }) {
             <Line
               type="monotone"
               dataKey="accuracy"
-              stroke="hsl(var(--chart-1))"
+              stroke="var(--chart-1)"
               strokeWidth={2}
               dot={{ r: 4 }}
               activeDot={{ r: 6 }}

@@ -10,12 +10,43 @@ from .. import __version__
 from .utils import scrub_nan_inf
 
 
-class SafeModel(BaseModel):
-    """BaseModel that converts NaN/Inf to None during serialization."""
+def _safe_model_dict(model: BaseModel) -> dict:
+    """Recursively convert a model to a plain dict, bypassing Pydantic's
+    type-strict serializer.  Every leaf value is passed through
+    ``scrub_nan_inf`` to coerce numpy scalars and replace NaN/Inf."""
+    out: dict[str, Any] = {}
+    for key in model.model_fields:
+        val = getattr(model, key, None)
+        if isinstance(val, BaseModel):
+            out[key] = _safe_model_dict(val)
+        elif isinstance(val, list):
+            out[key] = [
+                _safe_model_dict(item) if isinstance(item, BaseModel)
+                else scrub_nan_inf(item)
+                for item in val
+            ]
+        elif isinstance(val, dict):
+            out[key] = {
+                dk: _safe_model_dict(dv) if isinstance(dv, BaseModel)
+                else scrub_nan_inf(dv)
+                for dk, dv in val.items()
+            }
+        else:
+            out[key] = scrub_nan_inf(val)
+    return out
 
-    @model_serializer(mode="wrap")
-    def _nan_safe_serialize(self, handler: Any) -> Any:
-        return scrub_nan_inf(handler(self))
+
+class SafeModel(BaseModel):
+    """BaseModel that converts NaN/Inf to None during serialization.
+
+    Uses ``mode="plain"`` so pydantic_core's C serializer does NOT
+    re-validate the returned dict — avoiding TypeError when numpy
+    float values sit in int-typed fields.
+    """
+
+    @model_serializer(mode="plain")
+    def _nan_safe_serialize(self) -> dict:
+        return scrub_nan_inf(_safe_model_dict(self))
 
 
 class VersionOut(BaseModel):

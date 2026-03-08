@@ -17,10 +17,10 @@ export interface ActionResponse {
     runId: string;
     status: string;
 }
-export type ActivityItem = unknown;
-export type AsiResult = unknown;
-export type AsiSummary = unknown;
-export type ComparisonData = unknown;
+export type ActivityItem = Record<string, unknown>;
+export type AsiResult = Record<string, unknown>;
+export type AsiSummary = Record<string, unknown>;
+export type ComparisonData = Record<string, unknown>;
 export interface ComplexValue {
     display?: string | null;
     primary?: boolean | null;
@@ -28,26 +28,26 @@ export interface ComplexValue {
     type?: string | null;
     value?: string | null;
 }
-export type DimensionScore = unknown;
+export type DimensionScore = Record<string, unknown>;
 export interface FunctionInfo {
     catalog: string;
     name: string;
     schema_name: string;
 }
-export type GateResult = unknown;
+export type GateResult = Record<string, unknown>;
 export interface HTTPValidationError {
     detail?: ValidationError[];
 }
-export type IterationDetail = unknown;
-export type IterationDetailResponse = unknown;
-export type IterationSummary = unknown;
+export type IterationDetail = Record<string, unknown>;
+export type IterationDetailResponse = Record<string, unknown>;
+export type IterationSummary = Record<string, unknown>;
 export interface JoinInfo {
     joinColumns?: string[];
     leftTable: string;
     relationshipType?: string | null;
     rightTable: string;
 }
-export type LeverStatus = unknown;
+export type LeverStatus = Record<string, unknown>;
 export interface Name {
     family_name?: string | null;
     given_name?: string | null;
@@ -82,14 +82,14 @@ export interface PipelineLink {
     label: string;
     url: string;
 }
-export type PipelineRun = unknown;
-export type PipelineStep = unknown;
-export type ProvenanceRecord = unknown;
-export type ProvenanceSummary = unknown;
-export type QuestionResult = unknown;
-export type ReflectionEntry = unknown;
-export type RunStatusResponse = unknown;
-export type RunSummary = unknown;
+export type PipelineRun = Record<string, unknown>;
+export type PipelineStep = Record<string, unknown>;
+export type ProvenanceRecord = Record<string, unknown>;
+export type ProvenanceSummary = Record<string, unknown>;
+export type QuestionResult = Record<string, unknown>;
+export type ReflectionEntry = Record<string, unknown>;
+export type RunStatusResponse = Record<string, unknown>;
+export type RunSummary = Record<string, unknown>;
 export interface SchemaPermission {
     catalog: string;
     readGrantCommand?: string | null;
@@ -124,7 +124,7 @@ export interface SpacePermissions {
     status: string;
     title: string;
 }
-export type SpaceSummary = unknown;
+export type SpaceSummary = Record<string, unknown>;
 export interface TableDescription {
     description: string;
     tableName: string;

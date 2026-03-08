@@ -1633,7 +1633,7 @@ def get_iterations(run_id: str, config: Dependencies.Config):
             IterationSummary(
                 iteration=_safe_int(row.get("iteration")) or 0,
                 lever=_safe_int(row.get("lever")),
-                evalScope=str(row.get("eval_scope", "full")),
+                evalScope=str(row.get("eval_scope", "full")).lower(),
                 overallAccuracy=_finite(row.get("overall_accuracy", 0)),
                 totalQuestions=_safe_int(row.get("total_questions")) or 0,
                 correctCount=_safe_int(row.get("correct_count")) or 0,
@@ -2033,13 +2033,38 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
             for row in rows_json:
                 if not isinstance(row, dict):
                     continue
-                q_text = ""
-                if isinstance(row.get("inputs"), dict):
-                    q_text = str(row["inputs"].get("question", "")).strip()
-                if not q_text:
-                    q_text = str(row.get("inputs/question", "")).strip()
+                q_text = str(
+                    row.get("inputs/question")
+                    or (row.get("inputs") or {}).get("question", "")
+                    or row.get("question")
+                    or row.get("question_text")
+                    or ""
+                ).strip()
 
-                q_id = str(row.get("request_id", "") or row.get("question_id", ""))
+                _rq = row.get("request") or {}
+                if isinstance(_rq, str):
+                    try:
+                        _rq = json.loads(_rq)
+                    except (json.JSONDecodeError, TypeError):
+                        _rq = {}
+                _rqk = _rq.get("kwargs", {}) if isinstance(_rq, dict) else {}
+
+                if not q_text:
+                    q_text = str(
+                        _rqk.get("question")
+                        or (_rq.get("question") if isinstance(_rq, dict) else None)
+                        or ""
+                    ).strip()
+
+                q_id = str(
+                    row.get("inputs/question_id")
+                    or (row.get("inputs") or {}).get("question_id", "")
+                    or row.get("question_id")
+                    or row.get("request_id")
+                    or _rqk.get("question_id")
+                    or (_rq.get("question_id") if isinstance(_rq, dict) else None)
+                    or ""
+                )
                 if not q_id and q_text:
                     q_id = q_text[:80]
 

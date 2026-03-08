@@ -12,13 +12,18 @@ from fastapi import HTTPException
 
 
 def scrub_nan_inf(obj: Any) -> Any:
-    """Recursively replace NaN / Inf floats with None."""
+    """Recursively replace NaN / Inf floats with None and coerce numpy scalars."""
     if isinstance(obj, float):
         return None if not math.isfinite(obj) else obj
     if isinstance(obj, dict):
         return {k: scrub_nan_inf(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [scrub_nan_inf(v) for v in obj]
+    if hasattr(obj, "item"):
+        try:
+            return scrub_nan_inf(obj.item())
+        except Exception:
+            pass
     return obj
 
 
