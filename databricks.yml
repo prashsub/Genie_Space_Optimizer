@@ -3,13 +3,16 @@ bundle:
 
 variables:
   app_name:
-    default: "do-not-delete-genie-optimizer"
+    description: "Databricks App name (must be unique in your workspace)"
+    default: "genie-space-optimizer"
   catalog:
-    default: "prashanth_subrahmanyam_catalog"
+    description: "Unity Catalog name for storing optimization state tables"
+    default: "main"
   gold_schema:
+    description: "Schema within the catalog for optimization tables"
     default: "genie_optimization"
   warehouse_id:
-    default: "4b9b953939869799"
+    description: "SQL Warehouse ID for query execution"
   deploy_profile:
     default: "DEFAULT"
 

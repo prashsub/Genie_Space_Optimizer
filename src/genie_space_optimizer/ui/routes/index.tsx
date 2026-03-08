@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import {
   useListSpacesSuspense,
+  useGetActivity,
   useGetActivitySuspense,
   useCheckSpaceAccess,
 } from "@/lib/api";
@@ -278,6 +279,11 @@ function Dashboard({
     return sum / scored.length;
   }, [spaces]);
 
+  const { data: activityData } = useGetActivity({ query: {} });
+  const recentRunsCount = toActivityItemArray(
+    (activityData as Record<string, unknown> | undefined)?.data,
+  ).length;
+
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
@@ -306,7 +312,9 @@ function Dashboard({
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <span className="text-2xl font-bold">{"\u2014"}</span>
+            <span className="text-2xl font-bold">
+              {recentRunsCount > 0 ? recentRunsCount : "\u2014"}
+            </span>
           </CardContent>
         </Card>
 
