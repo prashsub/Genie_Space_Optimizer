@@ -118,6 +118,7 @@ from typing import Any, cast
 from databricks.sdk import WorkspaceClient
 from pyspark.sql import SparkSession
 
+from genie_space_optimizer.common.config import MAX_ITERATIONS
 from genie_space_optimizer.jobs._helpers import _banner as _banner_base
 from genie_space_optimizer.jobs._helpers import _log as _log_base
 from genie_space_optimizer.optimization.harness import _run_preflight
@@ -144,7 +145,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # MAGIC | `schema` | text | `""` | UC schema for state tables and gold data |
 # MAGIC | `domain` | text | `""` | Domain name (e.g. `revenue_property`) for experiment path and prompts |
 # MAGIC | `experiment_name` | text | `""` | Optional MLflow experiment path; auto-resolved if empty |
-# MAGIC | `max_iterations` | text | `"5"` | Max lever iterations before stopping |
+# MAGIC | `max_iterations` | text | `str(MAX_ITERATIONS)` | Max lever iterations before stopping |
 # MAGIC | `levers` | text | `"[1,2,3,4,5]"` | JSON array of lever numbers to try |
 # MAGIC | `apply_mode` | text | `"genie_config"` | Where patches apply: `genie_config` \| `uc_artifact` \| `both` |
 # MAGIC | `deploy_target` | text | `""` | DABs target for post-optimization deploy (optional) |
@@ -160,7 +161,7 @@ dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("schema", "")
 dbutils.widgets.text("domain", "")
 dbutils.widgets.text("experiment_name", "")
-dbutils.widgets.text("max_iterations", "5")
+dbutils.widgets.text("max_iterations", str(MAX_ITERATIONS))
 dbutils.widgets.text("levers", "[1,2,3,4,5]")
 dbutils.widgets.text("apply_mode", "genie_config")
 dbutils.widgets.text("deploy_target", "")
@@ -172,7 +173,7 @@ catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 domain = dbutils.widgets.get("domain")
 experiment_name = dbutils.widgets.get("experiment_name") or None
-max_iterations = int(dbutils.widgets.get("max_iterations") or "5")
+max_iterations = int(dbutils.widgets.get("max_iterations") or str(MAX_ITERATIONS))
 levers = json.loads(dbutils.widgets.get("levers") or "[1,2,3,4,5]")
 apply_mode = dbutils.widgets.get("apply_mode") or "genie_config"
 deploy_target = dbutils.widgets.get("deploy_target") or None

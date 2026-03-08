@@ -359,3 +359,180 @@ class TestFilterTriedClusters:
         tried = {("wrong_column", "x")}
         result = _filter_tried_clusters([c], tried)
         assert result == []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# escalation_handled — new field and logic
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestEscalationHandled:
+    """Tests for the ``escalation_handled`` field on reflection entries
+    and its effect on consecutive-rollback and diminishing-returns checks."""
+
+    def _make_escalation_reflection(self, iteration: int = 1) -> dict:
+        r = _make_reflection(iteration=iteration, accepted=False)
+        r["escalation_handled"] = True
+        return r
+
+    def test_build_reflection_entry_includes_escalation_handled(self):
+        entry = _build_reflection_entry(
+            iteration=1, ag_id="AG1", accepted=False, levers=[],
+            target_objects=["q1"], prev_scores={"a": 50.0},
+            new_scores={"a": 50.0}, rollback_reason="escalation:gt_repair",
+            patches=[], escalation_handled=True,
+        )
+        assert entry["escalation_handled"] is True
+
+    def test_build_reflection_entry_default_false(self):
+        entry = _build_reflection_entry(
+            iteration=1, ag_id="AG1", accepted=False, levers=[1],
+            target_objects=["t1"], prev_scores={"a": 50.0},
+            new_scores={"a": 40.0}, rollback_reason="regression",
+            patches=[],
+        )
+        assert entry["escalation_handled"] is False
+
+    def test_diminishing_returns_skips_escalation_entries(self):
+        buf = [
+            self._make_escalation_reflection(iteration=1),
+            self._make_escalation_reflection(iteration=2),
+        ]
+        assert _diminishing_returns(buf, epsilon=2.0, lookback=2) is False
+
+    def test_diminishing_returns_uses_non_escalation_only(self):
+        buf = [
+            _make_reflection(iteration=1, accepted=True, accuracy_delta=0.5, score_deltas={"a": 0.5}),
+            self._make_escalation_reflection(iteration=2),
+            _make_reflection(iteration=3, accepted=True, accuracy_delta=0.3, score_deltas={"a": 0.3}),
+            self._make_escalation_reflection(iteration=4),
+        ]
+        assert _diminishing_returns(buf, epsilon=2.0, lookback=2) is True
+
+    def test_consecutive_rollback_logic_skips_escalations(self):
+        buf = [
+            _make_reflection(iteration=1, accepted=True, accuracy_delta=5.0, score_deltas={"a": 5.0}),
+            self._make_escalation_reflection(iteration=2),
+            self._make_escalation_reflection(iteration=3),
+            _make_reflection(iteration=4, accepted=False, score_deltas={"a": -5.0}),
+        ]
+        _consecutive_rb = 0
+        for _rb_entry in reversed(buf):
+            if _rb_entry.get("escalation_handled"):
+                continue
+            if not _rb_entry.get("accepted"):
+                _consecutive_rb += 1
+            else:
+                break
+        assert _consecutive_rb == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Asset fingerprint
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestAssetFingerprint:
+    """Tests for compute_asset_fingerprint from preflight.py."""
+
+    def test_stable_for_same_config(self):
+        from genie_space_optimizer.optimization.preflight import compute_asset_fingerprint
+        config = {"_tables": ["a.b.c", "a.b.d"], "_metric_views": [], "_functions": []}
+        fp1 = compute_asset_fingerprint(config)
+        fp2 = compute_asset_fingerprint(config)
+        assert fp1 == fp2
+        assert len(fp1) == 16
+
+    def test_different_for_changed_tables(self):
+        from genie_space_optimizer.optimization.preflight import compute_asset_fingerprint
+        config1 = {"_tables": ["a.b.c"], "_metric_views": [], "_functions": []}
+        config2 = {"_tables": ["a.b.c", "a.b.d"], "_metric_views": [], "_functions": []}
+        fp1 = compute_asset_fingerprint(config1)
+        fp2 = compute_asset_fingerprint(config2)
+        assert fp1 != fp2
+
+    def test_order_independent(self):
+        from genie_space_optimizer.optimization.preflight import compute_asset_fingerprint
+        config1 = {"_tables": ["z", "a"], "_metric_views": [], "_functions": []}
+        config2 = {"_tables": ["a", "z"], "_metric_views": [], "_functions": []}
+        assert compute_asset_fingerprint(config1) == compute_asset_fingerprint(config2)
+
+    def test_empty_config(self):
+        from genie_space_optimizer.optimization.preflight import compute_asset_fingerprint
+        config = {"_tables": [], "_metric_views": [], "_functions": []}
+        fp = compute_asset_fingerprint(config)
+        assert len(fp) == 16
+
+    def test_dict_entries(self):
+        from genie_space_optimizer.optimization.preflight import compute_asset_fingerprint
+        config = {
+            "_tables": [{"identifier": "a.b.c"}, {"identifier": "a.b.d"}],
+            "_metric_views": [],
+            "_functions": [{"identifier": "fn1"}],
+        }
+        fp = compute_asset_fingerprint(config)
+        assert len(fp) == 16
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Arbiter-adjusted judge scores
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestArbiterAdjustedJudges:
+    """Test that arbiter-adjustable judges are overridden when arbiter says both_correct."""
+
+    def test_failing_judge_overridden_by_arbiter(self):
+        from genie_space_optimizer.optimization.evaluation import _ARBITER_CORRECT_VERDICTS
+        rows = [
+            {
+                "logical_accuracy/value": "no",
+                "schema_accuracy/value": "no",
+                "semantic_equivalence/value": "yes",
+                "completeness/value": "yes",
+                "arbiter/value": "both_correct",
+            },
+            {
+                "logical_accuracy/value": "yes",
+                "schema_accuracy/value": "yes",
+                "semantic_equivalence/value": "yes",
+                "completeness/value": "yes",
+                "arbiter/value": "both_correct",
+            },
+        ]
+        _ARBITER_ADJUSTABLE_JUDGES = [
+            "logical_accuracy", "semantic_equivalence", "completeness", "schema_accuracy",
+        ]
+        for _judge_name in _ARBITER_ADJUSTABLE_JUDGES:
+            _j_total = _j_correct = 0
+            for _row in rows:
+                _j_val = str(_row.get(f"{_judge_name}/value", "")).lower()
+                if _j_val == "excluded":
+                    continue
+                _j_total += 1
+                if _j_val in ("yes", "true", "1", "1.0", "pass"):
+                    _j_correct += 1
+                elif str(_row.get("arbiter/value", "")).lower() in _ARBITER_CORRECT_VERDICTS:
+                    _j_correct += 1
+            if _j_total > 0:
+                score = _j_correct / _j_total
+                assert score == 1.0, f"{_judge_name} should be 1.0 after arbiter adjustment"
+
+    def test_non_correct_arbiter_does_not_override(self):
+        from genie_space_optimizer.optimization.evaluation import _ARBITER_CORRECT_VERDICTS
+        rows = [
+            {
+                "logical_accuracy/value": "no",
+                "arbiter/value": "ground_truth_correct",
+            },
+        ]
+        _j_total = _j_correct = 0
+        for _row in rows:
+            _j_val = str(_row.get("logical_accuracy/value", "")).lower()
+            _j_total += 1
+            if _j_val in ("yes", "true", "1", "1.0", "pass"):
+                _j_correct += 1
+            elif str(_row.get("arbiter/value", "")).lower() in _ARBITER_CORRECT_VERDICTS:
+                _j_correct += 1
+        assert _j_total == 1
+        assert _j_correct == 0

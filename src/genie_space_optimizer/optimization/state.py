@@ -322,7 +322,7 @@ def create_run(
     schema: str,
     *,
     uc_schema: str | None = None,
-    max_iterations: int = 5,
+    max_iterations: int | None = None,
     levers: list[int] | None = None,
     apply_mode: str = "genie_config",
     deploy_target: str | None = None,
@@ -382,6 +382,7 @@ def update_run_status(
     labeling_session_name: str | None = None,
     labeling_session_run_id: str | None = None,
     labeling_session_url: str | None = None,
+    config_snapshot: dict | None = None,
 ) -> None:
     """Update ``genie_opt_runs`` — only sets non-None fields."""
     now = datetime.now(timezone.utc).isoformat()
@@ -417,6 +418,8 @@ def update_run_status(
         updates["labeling_session_run_id"] = labeling_session_run_id
     if labeling_session_url is not None:
         updates["labeling_session_url"] = labeling_session_url
+    if config_snapshot is not None:
+        updates["config_snapshot"] = json.dumps(config_snapshot)
 
     update_row(spark, catalog, schema, TABLE_RUNS, {"run_id": run_id}, updates)
 

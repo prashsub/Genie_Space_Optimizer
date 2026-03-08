@@ -158,6 +158,7 @@ domain = dbutils.jobs.taskValues.get(taskKey="preflight", key="domain")
 catalog = dbutils.jobs.taskValues.get(taskKey="preflight", key="catalog")
 schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
+max_iterations = int(dbutils.jobs.taskValues.get(taskKey="preflight", key="max_iterations"))
 
 # Read from lever_loop (or baseline if lever_loop was skipped)
 lever_skipped_raw = dbutils.jobs.taskValues.get(taskKey="lever_loop", key="skipped")
@@ -236,6 +237,7 @@ try:
         catalog, schema,
         run_repeatability=True,
         benchmarks=benchmarks,
+        max_iterations=max_iterations,
     )
     _log(
         "Finalize finished",

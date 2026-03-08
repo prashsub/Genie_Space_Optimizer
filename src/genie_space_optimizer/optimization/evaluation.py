@@ -2664,6 +2664,7 @@ def create_evaluation_dataset(
                 "required_tables": b.get("required_tables", []),
                 "required_columns": b.get("required_columns", []),
                 "temporal_stale": b.get("temporal_stale", False),
+                "asset_fingerprint": b.get("asset_fingerprint", ""),
             }
             expectations = {k: v for k, v in expectations.items() if v is not None}
             records.append(
@@ -2757,9 +2758,8 @@ def _print_eval_summary(
     lines.append(header)
     lines.append("=" * width)
 
-    if rows:
-        first_keys = sorted(rows[0].keys())
-        lines.append(f"[DEBUG] First row keys: {first_keys[:30]}")
+    _pass_count = 0
+    _fail_count = 0
 
     for qi, row in enumerate(rows, 1):
         _request = row.get("request", {})
@@ -2790,6 +2790,30 @@ def _print_eval_summary(
             or _get_nested(row, "inputs/question", "question")
             or ""
         )
+
+        _any_judge_fail = False
+        for judge in _JUDGE_ORDER:
+            val = str(row.get(f"{judge}/value", row.get(judge, ""))).lower()
+            if val in ("no", "false", "0", "0.0"):
+                if judge == "arbiter":
+                    if val not in ("genie_correct", "both_correct"):
+                        _any_judge_fail = True
+                else:
+                    _any_judge_fail = True
+
+        arbiter_val = str(
+            row.get("arbiter/value", row.get("arbiter", ""))
+        ).lower()
+        if arbiter_val in ("ground_truth_correct", "neither_correct"):
+            _any_judge_fail = True
+
+        if not _any_judge_fail:
+            _pass_count += 1
+            lines.append(f"  Q{qi}: [{qid}] \"{question[:80]}\" — ALL PASS ({arbiter_val})")
+            continue
+
+        _fail_count += 1
+
         genie_sql = (
             _response.get("response")
             or _get_nested(row, "outputs/response")
@@ -2889,6 +2913,8 @@ def _print_eval_summary(
             lines.append(f"|   {judge:<24s} {verdict_label}{rat_suffix}")
 
         lines.append("-" * width)
+
+    lines.insert(3, f"  {total_questions} questions: {_pass_count} all-pass, {_fail_count} with failures (details below)")
 
     lines.append("")
     lines.append("--- SCORE SUMMARY " + "-" * max(0, width - 19))
@@ -3459,8 +3485,27 @@ def run_evaluation(
                     _rc_correct += 1
             if _rc_total > 0:
                 per_judge["result_correctness"] = _rc_correct / _rc_total
-                scores_100 = normalize_scores(per_judge)
-                thresholds_passed = all_thresholds_met(scores_100)
+
+            _ARBITER_ADJUSTABLE_JUDGES = [
+                "logical_accuracy", "semantic_equivalence",
+                "completeness", "schema_accuracy",
+            ]
+            for _judge_name in _ARBITER_ADJUSTABLE_JUDGES:
+                _j_total = _j_correct = 0
+                for _row in rows_for_output:
+                    _j_val = str(_row.get(f"{_judge_name}/value", "")).lower()
+                    if _j_val == "excluded":
+                        continue
+                    _j_total += 1
+                    if _j_val in ("yes", "true", "1", "1.0", "pass"):
+                        _j_correct += 1
+                    elif str(_row.get("arbiter/value", "")).lower() in _ARBITER_CORRECT_VERDICTS:
+                        _j_correct += 1
+                if _j_total > 0:
+                    per_judge[_judge_name] = _j_correct / _j_total
+
+            scores_100 = normalize_scores(per_judge)
+            thresholds_passed = all_thresholds_met(scores_100)
 
         row_unresolved_column_count = sum(
             1
@@ -3858,8 +3903,15 @@ def run_repeatability_evaluation(
             repeatability_structural_pct = repeatability_pct
             repeatability_exact_pct = repeatability_pct
 
+        _scorer_repeatability_pct = repeatability_pct
+        repeatability_pct = max(
+            repeatability_execution_pct,
+            repeatability_pct,
+        )
+
         mlflow.log_metrics({
             "repeatability_pct": repeatability_pct,
+            "repeatability_scorer_pct": _scorer_repeatability_pct,
             "repeatability_execution_pct": repeatability_execution_pct,
             "repeatability_structural_pct": repeatability_structural_pct,
             "repeatability_exact_pct": repeatability_exact_pct,
@@ -5109,14 +5161,32 @@ def generate_benchmarks(
         alignment_targets = [b for b in valid_benchmarks if b.get("expected_sql")]
         if alignment_targets:
             alignment_results = validate_question_sql_alignment(alignment_targets)
+            _newly_invalid: list[dict] = []
             for b, ar in zip(alignment_targets, alignment_results):
                 if not ar.get("aligned", True):
                     b["alignment_issues"] = ar.get("issues", [])
-                    logger.info(
-                        "Alignment issue in benchmark: %s — %s",
+                    b["validation_status"] = "invalid"
+                    b["validation_reason_code"] = "alignment_mismatch"
+                    b["validation_error"] = "; ".join(ar.get("issues", []))
+                    _newly_invalid.append(b)
+                    logger.warning(
+                        "Benchmark REJECTED (alignment): %s -- %s",
                         b.get("question", "")[:80],
                         "; ".join(ar.get("issues", [])),
                     )
+            if _newly_invalid:
+                valid_benchmarks = [b for b in valid_benchmarks if b not in _newly_invalid]
+                _alignment_corrected = _attempt_benchmark_correction(
+                    w, config, uc_columns, uc_routines,
+                    _newly_invalid, catalog, schema, spark, allowlist,
+                )
+                for c in _alignment_corrected:
+                    _register_valid(c)
+                logger.info(
+                    "Alignment check: %d rejected, %d corrected, %d discarded",
+                    len(_newly_invalid), len(_alignment_corrected),
+                    len(_newly_invalid) - len(_alignment_corrected),
+                )
     except Exception as _align_err:
         logger.warning("Alignment validation skipped: %s", _align_err)
 

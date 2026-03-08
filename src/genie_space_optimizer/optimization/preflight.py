@@ -59,6 +59,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def compute_asset_fingerprint(config: dict) -> str:
+    """Compute a short hash over the sorted table/view/function refs in the Genie Space config.
+
+    Used to detect when the Genie Space schema has changed (tables added or
+    removed) between benchmark runs so stale benchmarks are regenerated.
+    """
+    import hashlib
+    import json as _json
+
+    refs: list[str] = []
+    for t in config.get("_tables", []):
+        if isinstance(t, str):
+            refs.append(t)
+        elif isinstance(t, dict):
+            refs.append(t.get("identifier", t.get("name", "")))
+    for mv in config.get("_metric_views", []):
+        if isinstance(mv, str):
+            refs.append(mv)
+        elif isinstance(mv, dict):
+            refs.append(mv.get("identifier", mv.get("name", "")))
+    for fn in config.get("_functions", []):
+        if isinstance(fn, str):
+            refs.append(fn)
+        elif isinstance(fn, dict):
+            refs.append(fn.get("identifier", fn.get("name", "")))
+    refs = sorted(set(r for r in refs if r))
+    return hashlib.sha256(_json.dumps(refs).encode()).hexdigest()[:16]
+
+
 def _collect_or_empty(fetch_fn: Any, label: str) -> tuple[list[dict], str | None]:
     """Best-effort metadata fetch; continue if catalog permissions are limited.
 
@@ -484,6 +513,17 @@ def run_preflight(
         )
         config = fetch_space_config(w, space_id)
         logger.info("Fetched config for space %s", space_id)
+        try:
+            from genie_space_optimizer.optimization.state import update_run_status
+            update_run_status(
+                spark, run_id, catalog, schema,
+                config_snapshot=config,
+            )
+            logger.info("Back-filled config_snapshot into run row for %s", run_id)
+        except Exception:
+            logger.warning(
+                "Could not back-fill config_snapshot for %s", run_id, exc_info=True,
+            )
 
     # ── Schema validation (lenient: structural checks only) ────
     _parsed = config.get("_parsed_space", config)
@@ -994,11 +1034,15 @@ def run_preflight(
 
     _flag_stale_temporal_benchmarks(benchmarks, spark)
 
+    _asset_fp = compute_asset_fingerprint(config)
+    for _b in benchmarks:
+        _b["asset_fingerprint"] = _asset_fp
+
     _uc_table = f"{uc_schema}.genie_benchmarks_{domain}"
     logger.info(
         "Dropping benchmark table %s before persist to eliminate stale duplicates "
-        "(regenerated=%s, benchmarks=%d)",
-        _uc_table, _benchmarks_regenerated, len(benchmarks),
+        "(regenerated=%s, benchmarks=%d, asset_fingerprint=%s)",
+        _uc_table, _benchmarks_regenerated, len(benchmarks), _asset_fp,
     )
     _drop_benchmark_table(spark, _uc_table)
 
@@ -1173,13 +1217,70 @@ def _load_or_generate_benchmarks(
             print("  Rejected reasons:\n" + "\n".join(_rejected_lines[:10]))
 
         if len(valid_existing) >= 5:
+            # ── Schema fingerprint check ─────────────────────────────
+            current_fp = compute_asset_fingerprint(config)
+            stored_fp = ""
+            for _bm in valid_existing:
+                _sfp = (_bm.get("asset_fingerprint") or "")
+                if _sfp:
+                    stored_fp = _sfp
+                    break
+            if stored_fp and stored_fp != current_fp:
+                _cur_refs = sorted(set(
+                    (t if isinstance(t, str) else t.get("identifier", ""))
+                    for t in config.get("_tables", [])
+                ))
+                print(
+                    f"  Schema fingerprint CHANGED: stored={stored_fp}, current={current_fp}\n"
+                    f"  Current tables: {_cur_refs[:10]}\n"
+                    f"  Decision: RE-GENERATE (schema changed)\n"
+                    + "-" * 52
+                )
+                logger.info(
+                    "Asset fingerprint mismatch (%s vs %s) — forcing benchmark regeneration",
+                    stored_fp, current_fp,
+                )
+                valid_existing = []
+
+            # ── Semantic alignment check on reuse ──────────────────────
+            if valid_existing:
+                try:
+                    from genie_space_optimizer.optimization.benchmarks import (
+                        validate_question_sql_alignment,
+                    )
+                    _align_targets = [b for b in valid_existing if b.get("expected_sql")]
+                    if _align_targets:
+                        _align_results = validate_question_sql_alignment(_align_targets)
+                        _align_rejected = 0
+                        for _ab, _ar in zip(_align_targets, _align_results):
+                            if not _ar.get("aligned", True):
+                                _align_rejected += 1
+                                logger.warning(
+                                    "Benchmark REJECTED on reuse (alignment): %s -- %s",
+                                    _ab.get("question", "")[:80],
+                                    "; ".join(_ar.get("issues", [])),
+                                )
+                        if _align_rejected:
+                            _rejected_ids = {
+                                id(_ab)
+                                for _ab, _ar in zip(_align_targets, _align_results)
+                                if not _ar.get("aligned", True)
+                            }
+                            valid_existing = [b for b in valid_existing if id(b) not in _rejected_ids]
+                            print(
+                                f"  Alignment check: {_align_rejected} rejected "
+                                f"({len(valid_existing)} remain)"
+                            )
+                except Exception as _align_err:
+                    logger.warning("Alignment check on reuse skipped: %s", _align_err)
+
             curated_questions = {b.get("question", "").lower().strip() for b in genie_benchmarks}
             existing_questions = {b.get("question", "").lower().strip() for b in valid_existing}
             missing_curated = curated_questions - existing_questions
 
             print(f"  Missing curated: {len(missing_curated)}")
 
-            if not missing_curated:
+            if not missing_curated and valid_existing:
                 if len(valid_existing) >= TARGET_BENCHMARK_COUNT:
                     print(
                         f"  Decision: REUSE ({len(valid_existing)} valid, target {TARGET_BENCHMARK_COUNT} met)\n"

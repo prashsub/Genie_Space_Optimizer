@@ -1551,6 +1551,7 @@ def _build_reflection_entry(
     new_failure_qids: set[str] | None = None,
     reflection_text: str = "",
     refinement_mode: str = "",
+    escalation_handled: bool = False,
 ) -> dict:
     """Build a structured reflection dict for the adaptive loop memory.
 
@@ -1608,6 +1609,7 @@ def _build_reflection_entry(
         "new_regressions": sorted(_new - _prev),
         "reflection_text": reflection_text,
         "refinement_mode": refinement_mode,
+        "escalation_handled": escalation_handled,
     }
 
 
@@ -1616,18 +1618,20 @@ def _diminishing_returns(
     epsilon: float | None = None,
     lookback: int | None = None,
 ) -> bool:
-    """Return True if none of the last *lookback* iterations (accepted or
-    rolled back) achieved a mean accuracy improvement >= *epsilon*.
+    """Return True if none of the last *lookback* non-escalation iterations
+    achieved a mean accuracy improvement >= *epsilon*.
 
     Rolled-back iterations count as zero improvement, which correctly
-    signals the optimizer is stuck.
+    signals the optimizer is stuck.  Escalation-handled entries are skipped
+    so they don't pollute the lookback window.
     """
     if epsilon is None:
         epsilon = DIMINISHING_RETURNS_EPSILON
     if lookback is None:
         lookback = DIMINISHING_RETURNS_LOOKBACK
 
-    recent = reflection_buffer[-lookback:]
+    non_escalation = [r for r in reflection_buffer if not r.get("escalation_handled")]
+    recent = non_escalation[-lookback:]
     if len(recent) < lookback:
         return False
 
@@ -2281,11 +2285,23 @@ def _handle_escalation(
 
     elif escalation == "gt_repair":
         logger.info(
-            "Escalation gt_repair for questions %s — handled by arbiter correction pipeline",
+            "Escalation gt_repair for questions %s — running inline arbiter corrections",
             affected,
         )
+        _corr_result = _run_arbiter_corrections(
+            w, spark, run_id, catalog, schema, domain,
+            force_adopt_qids=set(affected) if affected else None,
+        )
+        _total_corrections = (
+            _corr_result.get("gc_applied", 0)
+            + _corr_result.get("nc_repaired", 0)
+        )
         result["handled"] = True
-        result["detail"]["note"] = "Delegated to _run_arbiter_corrections"
+        result["detail"]["corrections_applied"] = _total_corrections
+        result["detail"]["gc_applied"] = _corr_result.get("gc_applied", 0)
+        result["detail"]["nc_repaired"] = _corr_result.get("nc_repaired", 0)
+        result["detail"]["corrected_qids"] = sorted(_corr_result.get("corrected_qids", set()))
+        result["detail"]["quarantined_qids"] = sorted(_corr_result.get("quarantined_qids", set()))
 
     elif escalation == "flag_for_review":
         flag_for_human_review(
@@ -2313,15 +2329,20 @@ def _extract_confirmed_corrections(
     schema: str,
     *,
     already_corrected: set[str] | None = None,
+    force_adopt_qids: set[str] | None = None,
 ) -> list[dict]:
     """Return benchmark corrections for questions with cross-iteration ``genie_correct`` confirmation.
 
     A question qualifies when it received ``genie_correct`` in at least
     ``GENIE_CORRECT_CONFIRMATION_THRESHOLD`` independent evaluations.
+    Questions in *force_adopt_qids* bypass this threshold and are adopted
+    with a single ``genie_correct`` evaluation.
+
     Uses the most recent Genie SQL as the corrected expected SQL.
     """
     history = _build_verdict_history(spark, run_id, catalog, schema)
     corrected = already_corrected or set()
+    force = force_adopt_qids or set()
     actions: list[dict] = []
 
     for qid, entries in history.items():
@@ -2329,7 +2350,8 @@ def _extract_confirmed_corrections(
             continue
         gc_entries = [e for e in entries if e.verdict == "genie_correct"]
         gc_iterations = {e.iteration for e in gc_entries}
-        if len(gc_iterations) < GENIE_CORRECT_CONFIRMATION_THRESHOLD:
+        threshold = 1 if qid in force else GENIE_CORRECT_CONFIRMATION_THRESHOLD
+        if len(gc_iterations) < threshold:
             continue
         latest = max(gc_entries, key=lambda e: e.iteration)
         if latest.genie_sql:
@@ -2458,11 +2480,17 @@ def _run_arbiter_corrections(
     already_corrected: set[str] | None = None,
     already_repaired: set[str] | None = None,
     quarantined_qids: set[str] | None = None,
+    force_adopt_qids: set[str] | None = None,
 ) -> dict:
     """Run the full cross-iteration arbiter correction pipeline.
 
     1. ``genie_correct`` confirmations → benchmark corrections
     2. ``neither_correct`` repairs → LLM-assisted GT repair or quarantine
+
+    When *force_adopt_qids* is provided, questions in that set bypass the
+    normal ``GENIE_CORRECT_CONFIRMATION_THRESHOLD`` and are adopted with a
+    single ``genie_correct`` evaluation.  This is used when the strategist
+    explicitly escalates ``gt_repair`` for specific questions.
 
     Returns ``{gc_applied, gc_skipped, nc_repaired, nc_quarantined, corrected_qids, quarantined_qids}``.
     """
@@ -2485,6 +2513,7 @@ def _run_arbiter_corrections(
     gc_actions = _extract_confirmed_corrections(
         spark, run_id, catalog, schema,
         already_corrected=corrected,
+        force_adopt_qids=force_adopt_qids,
     )
 
     if gc_actions:
@@ -3474,6 +3503,8 @@ def _run_lever_loop(
             break
         _consecutive_rb = 0
         for _rb_entry in reversed(reflection_buffer):
+            if _rb_entry.get("escalation_handled"):
+                continue
             if not _rb_entry.get("accepted"):
                 _consecutive_rb += 1
             else:
@@ -3705,20 +3736,37 @@ def _run_lever_loop(
                     affected_question_ids=ag.get("affected_questions", []),
                     prev_failure_qids=prev_failure_qids,
                     new_failure_qids=prev_failure_qids,
+                    escalation_handled=True,
                 ))
                 continue
 
             if _escalation == "gt_repair":
-                reflection_buffer.append(_build_reflection_entry(
-                    iteration=iteration_counter, ag_id=ag_id, accepted=False,
-                    levers=[], target_objects=ag.get("affected_questions", []),
-                    prev_scores=best_scores, new_scores=best_scores,
-                    rollback_reason="escalation:gt_repair (delegated to arbiter)",
-                    patches=[],
-                    affected_question_ids=ag.get("affected_questions", []),
-                    prev_failure_qids=prev_failure_qids,
-                    new_failure_qids=prev_failure_qids,
-                ))
+                _gt_repair_corrections = _esc_result.get("detail", {}).get("corrections_applied", 0)
+                if _gt_repair_corrections > 0:
+                    reflection_buffer.append(_build_reflection_entry(
+                        iteration=iteration_counter, ag_id=ag_id, accepted=True,
+                        levers=[], target_objects=ag.get("affected_questions", []),
+                        prev_scores=best_scores, new_scores=best_scores,
+                        rollback_reason=None,
+                        patches=[],
+                        affected_question_ids=ag.get("affected_questions", []),
+                        prev_failure_qids=prev_failure_qids,
+                        new_failure_qids=prev_failure_qids,
+                        reflection_text=f"GT repair applied {_gt_repair_corrections} benchmark correction(s)",
+                        escalation_handled=True,
+                    ))
+                else:
+                    reflection_buffer.append(_build_reflection_entry(
+                        iteration=iteration_counter, ag_id=ag_id, accepted=False,
+                        levers=[], target_objects=ag.get("affected_questions", []),
+                        prev_scores=best_scores, new_scores=best_scores,
+                        rollback_reason="escalation:gt_repair (delegated to arbiter)",
+                        patches=[],
+                        affected_question_ids=ag.get("affected_questions", []),
+                        prev_failure_qids=prev_failure_qids,
+                        new_failure_qids=prev_failure_qids,
+                        escalation_handled=True,
+                    ))
                 continue
 
             if _escalation == "remove_tvf" and _esc_tier in ("auto_apply", "apply_and_flag"):
@@ -4352,6 +4400,7 @@ def _run_finalize(
     all_failure_trace_ids: list[str] | None = None,
     all_regression_trace_ids: list[str] | None = None,
     all_failure_question_ids: list[str] | None = None,
+    max_iterations: int | None = None,
 ) -> dict:
     """Stage 4: Repeatability test, promote model, generate report.
 
@@ -4359,6 +4408,7 @@ def _run_finalize(
     remains observable and fails with an explicit terminal reason.
     """
     thresholds = thresholds or DEFAULT_THRESHOLDS
+    max_iterations = max_iterations or MAX_ITERATIONS
     finalize_timeout_seconds = max(1, int(finalize_timeout_seconds))
     heartbeat_interval_seconds = max(5, int(heartbeat_interval_seconds))
     started_monotonic = time.monotonic()
@@ -4735,7 +4785,7 @@ def _run_finalize(
         if converged:
             status = "CONVERGED"
             reason = "threshold_met"
-        elif iteration_counter >= MAX_ITERATIONS:
+        elif iteration_counter >= max_iterations:
             status = "MAX_ITERATIONS"
             reason = "max_iterations"
         else:
@@ -5081,9 +5131,13 @@ def optimize_genie_space(
     ``create_run`` to avoid duplicating the row.
     """
     w = WorkspaceClient()
-    from genie_space_optimizer.common.genie_client import configure_connection_pool
+    from genie_space_optimizer.common.genie_client import (
+        configure_connection_pool,
+        configure_mlflow_connection_pool,
+    )
     from genie_space_optimizer.common.config import CONNECTION_POOL_SIZE
     configure_connection_pool(w, CONNECTION_POOL_SIZE)
+    configure_mlflow_connection_pool(CONNECTION_POOL_SIZE)
 
     from pyspark.sql import SparkSession
     spark = SparkSession.builder.getOrCreate()
@@ -5189,6 +5243,7 @@ def optimize_genie_space(
                 all_failure_trace_ids=loop_out.get("all_failure_trace_ids"),
                 all_regression_trace_ids=loop_out.get("all_regression_trace_ids"),
                 all_failure_question_ids=loop_out.get("all_failure_question_ids"),
+                max_iterations=max_iterations,
             )
             result.status = str(finalize_out["status"])
             result.convergence_reason = str(finalize_out["convergence_reason"])

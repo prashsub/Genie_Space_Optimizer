@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, PropertyMock
 import pandas as pd
 import pytest
 
+from genie_space_optimizer.common.config import MAX_ITERATIONS
+
 
 @pytest.fixture
 def mock_spark():
@@ -78,7 +80,7 @@ def sample_run():
         "started_at": now,
         "completed_at": now,
         "job_run_id": "67890",
-        "max_iterations": 5,
+        "max_iterations": MAX_ITERATIONS,
         "levers": [1, 2, 3, 4, 5],
         "apply_mode": "genie_config",
         "best_iteration": 3,

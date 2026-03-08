@@ -366,7 +366,13 @@ class TestHandleEscalation:
         assert result["detail"]["flagged_count"] == 2
         mock_flag.assert_called_once()
 
-    def test_gt_repair_delegated(self):
+    @patch("genie_space_optimizer.optimization.harness._run_arbiter_corrections")
+    def test_gt_repair_delegated(self, mock_arbiter):
+        mock_arbiter.return_value = {
+            "gc_applied": 1, "gc_skipped": 0,
+            "nc_repaired": 0, "nc_quarantined": 0,
+            "corrected_qids": {"q1"}, "quarantined_qids": set(),
+        }
         result = _handle_escalation(
             "gt_repair",
             {"affected_questions": ["q1"]},
@@ -376,7 +382,8 @@ class TestHandleEscalation:
             reflection_buffer=[], metadata_snapshot={},
         )
         assert result["handled"] is True
-        assert "arbiter" in result["detail"]["note"].lower()
+        assert result["detail"]["corrections_applied"] == 1
+        mock_arbiter.assert_called_once()
 
     def test_remove_tvf_no_identifier_returns_unhandled(self):
         ag = {

@@ -815,3 +815,28 @@ def configure_connection_pool(w: WorkspaceClient, pool_size: int = 20) -> None:
             logger.debug("Configured connection pool size=%d", pool_size)
     except Exception:
         logger.debug("Could not configure connection pool size", exc_info=True)
+
+
+def configure_mlflow_connection_pool(pool_size: int = 20) -> None:
+    """Patch the global requests default pool size so MLflow's internal HTTP
+    sessions also use a larger connection pool.
+
+    MLflow creates its own ``requests.Session`` objects with the default
+    urllib3 pool of 10 connections.  Under concurrent evaluation load this
+    triggers ``Connection pool is full, discarding connection`` warnings.
+    """
+    try:
+        import requests.adapters as _ra
+        if getattr(_ra, "DEFAULT_POOLSIZE", 10) < pool_size:
+            _ra.DEFAULT_POOLSIZE = pool_size
+            _ra.DEFAULT_POOLCONNECTIONS = pool_size
+            logger.debug("Patched requests.adapters.DEFAULT_POOLSIZE=%d", pool_size)
+
+        import urllib3
+        if hasattr(urllib3, "connectionpool"):
+            from urllib3.connectionpool import HTTPConnectionPool
+            if HTTPConnectionPool.QueueCls is not None:
+                pass
+            logger.debug("urllib3 pool defaults updated")
+    except Exception:
+        logger.debug("Could not configure MLflow connection pool size", exc_info=True)

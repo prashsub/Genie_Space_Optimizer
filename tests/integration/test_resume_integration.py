@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+from genie_space_optimizer.common.config import MAX_ITERATIONS
 from genie_space_optimizer.optimization.state import (
     load_latest_full_iteration,
     load_run,
@@ -28,7 +29,7 @@ def populated_spark(mock_spark):
                 "status": "IN_PROGRESS",
                 "levers": "[1,2,3,4,5]",
                 "config_snapshot": '{"tables": []}',
-                "max_iterations": 5,
+                "max_iterations": MAX_ITERATIONS,
                 "best_iteration": 1,
                 "best_accuracy": 78.0,
             }
