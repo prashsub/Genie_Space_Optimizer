@@ -28,7 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { ErrorBoundary } from "react-error-boundary";
 import {
   Shield,
@@ -43,6 +43,8 @@ import {
   Search,
   ChevronLeft,
   ChevronRight,
+  Loader2,
+  Filter,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -130,6 +132,7 @@ function SettingsContent() {
   const [searchInput, setSearchInput] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [page, setPage] = useState(0);
+  const [editableOnly, setEditableOnly] = useState(false);
 
   useEffect(() => {
     if (deepLinkedSpaceId && allSpaces.length > 0 && !searchInput) {
@@ -139,7 +142,6 @@ function SettingsContent() {
         setDebouncedSearch(match.name.toLowerCase());
       }
     }
-    // Only run when deep link and spaces are first available
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deepLinkedSpaceId, allSpaces.length]);
 
@@ -150,7 +152,7 @@ function SettingsContent() {
 
   useEffect(() => {
     setPage(0);
-  }, [debouncedSearch]);
+  }, [debouncedSearch, editableOnly]);
 
   const filtered = useMemo(() => {
     const q = debouncedSearch.toLowerCase();
@@ -167,32 +169,35 @@ function SettingsContent() {
   const [accessMap, setAccessMap] = useState<
     Record<string, string | null>
   >({});
+  const accessMapRef = React.useRef(accessMap);
+  accessMapRef.current = accessMap;
 
-  const editableSpaces = useMemo(() => {
+  const displaySpaces = useMemo(() => {
+    if (!editableOnly) return filtered;
     return filtered.filter((s) => {
       const level = accessMap[s.id];
       return level === "CAN_EDIT" || level === "CAN_MANAGE";
     });
-  }, [filtered, accessMap]);
+  }, [filtered, accessMap, editableOnly]);
 
   const totalPages = Math.max(
     1,
-    Math.ceil(editableSpaces.length / SETTINGS_PAGE_SIZE),
+    Math.ceil(displaySpaces.length / SETTINGS_PAGE_SIZE),
   );
   const safePage = Math.min(page, totalPages - 1);
   const paged = useMemo(
     () =>
-      editableSpaces.slice(
+      displaySpaces.slice(
         safePage * SETTINGS_PAGE_SIZE,
         (safePage + 1) * SETTINGS_PAGE_SIZE,
       ),
-    [editableSpaces, safePage],
+    [displaySpaces, safePage],
   );
 
   const fetchAccessForIds = useCallback(
     async (ids: string[]) => {
       if (ids.length === 0) return;
-      const unchecked = ids.filter((id) => !(id in accessMap));
+      const unchecked = ids.filter((id) => !(id in accessMapRef.current));
       if (unchecked.length === 0) return;
       try {
         const result = await checkAccess({
@@ -208,26 +213,37 @@ function SettingsContent() {
           return next;
         });
       } catch {
-        // silently ignore — spaces without access info won't be shown
+        setAccessMap((prev) => {
+          const next = { ...prev };
+          for (const id of unchecked) {
+            if (!(id in next)) next[id] = null;
+          }
+          return next;
+        });
       }
     },
-    [checkAccess, accessMap],
+    [checkAccess],
   );
 
+  const pagedKey = paged.map((s) => s.id).join(",");
   useEffect(() => {
-    const ids = filtered.map((s) => s.id);
+    const ids = paged.map((s) => s.id);
     void fetchAccessForIds(ids);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtered.map((s) => s.id).join(",")]);
+  }, [pagedKey]);
 
   const [expandedItems, setExpandedItems] = useState<string[]>(
     deepLinkedSpaceId ? [deepLinkedSpaceId] : [],
   );
 
-  const accessChecked = filtered.length > 0 && filtered.every((s) => s.id in accessMap);
   const isLoading = metaLoading || spacesLoading;
-
   if (isLoading) return <SettingsSkeleton />;
+
+  const checkedCount = filtered.filter((s) => s.id in accessMap).length;
+  const editableCount = filtered.filter((s) => {
+    const l = accessMap[s.id];
+    return l === "CAN_EDIT" || l === "CAN_MANAGE";
+  }).length;
 
   return (
     <Tabs defaultValue="permissions" className="space-y-6">
@@ -260,31 +276,42 @@ function SettingsContent() {
             spDisplayName={spPrincipalDisplayName}
           />
 
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              placeholder="Search spaces by name, description, or space ID..."
-              value={searchInput}
-              onChange={(e) => setSearchInput(e.target.value)}
-              className="pl-9"
-            />
+          <div className="flex items-center gap-3">
+            <div className="relative flex-1">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                placeholder="Search spaces by name, description, or space ID..."
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                className="pl-9"
+              />
+            </div>
+            <Button
+              variant={editableOnly ? "default" : "outline"}
+              size="sm"
+              className="shrink-0 gap-1.5"
+              onClick={() => setEditableOnly((v) => !v)}
+            >
+              <Filter className="h-3.5 w-3.5" />
+              Editable only
+            </Button>
           </div>
 
-          {!accessChecked ? (
-            <div className="space-y-3">
-              {[1, 2, 3].map((i) => (
-                <Skeleton key={i} className="h-16 w-full rounded-lg" />
-              ))}
-              <p className="text-center text-xs text-muted-foreground">
-                Checking space permissions…
-              </p>
-            </div>
-          ) : editableSpaces.length === 0 ? (
+          {checkedCount < filtered.length && (
+            <p className="text-center text-xs text-muted-foreground">
+              Checked {checkedCount} of {filtered.length} spaces
+              {editableCount > 0 && ` · ${editableCount} editable`}
+            </p>
+          )}
+
+          {paged.length === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-sm text-muted-foreground">
                 {debouncedSearch
-                  ? "No editable spaces match your search."
-                  : "No Genie Spaces found where you have Can Edit or Can Manage access."}
+                  ? "No spaces match your search."
+                  : editableOnly
+                    ? "No editable spaces found yet. Try disabling the filter."
+                    : "No Genie Spaces found."}
               </CardContent>
             </Card>
           ) : (
@@ -302,6 +329,7 @@ function SettingsContent() {
                     title={space.name}
                     workspaceHost={workspaceHost}
                     isExpanded={expandedItems.includes(space.id)}
+                    accessLevel={accessMap[space.id]}
                   />
                 ))}
               </Accordion>
@@ -464,20 +492,63 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+function AccessLevelBadge({ level }: { level: string | null | undefined }) {
+  if (level === undefined) {
+    return (
+      <Badge variant="outline" className="gap-1 text-muted-foreground">
+        <Loader2 className="h-3 w-3 animate-spin" />
+        Checking
+      </Badge>
+    );
+  }
+  if (level === "CAN_MANAGE") {
+    return (
+      <Badge variant="outline" className="border-green-200 bg-green-50 text-green-700">
+        <CheckCircle2 className="mr-1 h-3 w-3" />
+        Can Manage
+      </Badge>
+    );
+  }
+  if (level === "CAN_EDIT") {
+    return (
+      <Badge variant="outline" className="border-blue-200 bg-blue-50 text-blue-700">
+        <CheckCircle2 className="mr-1 h-3 w-3" />
+        Can Edit
+      </Badge>
+    );
+  }
+  if (level === "CAN_VIEW") {
+    return (
+      <Badge variant="outline" className="text-muted-foreground">
+        View Only
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="text-muted-foreground">
+      No Access
+    </Badge>
+  );
+}
+
 function LazySpacePermissionCard({
   spaceId,
   title,
   workspaceHost,
   isExpanded,
+  accessLevel,
 }: {
   spaceId: string;
   title: string;
   workspaceHost?: string | null;
   isExpanded: boolean;
+  accessLevel?: string | null;
 }) {
+  const isEditable = accessLevel === "CAN_EDIT" || accessLevel === "CAN_MANAGE";
+
   const { data: permData, isLoading } = useGetPermissionDashboard({
     params: { space_id: spaceId },
-    query: { enabled: isExpanded },
+    query: { enabled: isExpanded && isEditable },
   });
   const permResp = (permData as any)?.data ?? permData;
   const space: SpacePermissions | undefined = (
@@ -488,9 +559,11 @@ function LazySpacePermissionCard({
     ? `${workspaceHost.split("?")[0]}/genie/rooms/${spaceId}${workspaceHost.includes("?") ? `?${workspaceHost.split("?")[1]}` : ""}`
     : null;
 
+  const isMuted = accessLevel !== undefined && !isEditable;
+
   return (
-    <AccordionItem value={spaceId} className="rounded-lg border bg-card">
-      <AccordionTrigger className="px-4 hover:no-underline">
+    <AccordionItem value={spaceId} className={`rounded-lg border bg-card ${isMuted ? "opacity-50" : ""}`}>
+      <AccordionTrigger className="px-4 hover:no-underline" disabled={isMuted}>
         <div className="flex flex-1 items-center justify-between pr-2">
           <div className="text-left">
             <div className="flex items-center gap-1.5">
@@ -509,11 +582,18 @@ function LazySpacePermissionCard({
             </div>
             <p className="text-xs text-muted-foreground">{spaceId}</p>
           </div>
-          {space && <StatusBadge status={space.status} />}
+          <div className="flex items-center gap-2">
+            <AccessLevelBadge level={accessLevel} />
+            {space && <StatusBadge status={space.status} />}
+          </div>
         </div>
       </AccordionTrigger>
       <AccordionContent className="px-4">
-        {isLoading || !space ? (
+        {isMuted ? (
+          <p className="py-2 text-sm text-muted-foreground">
+            You need Can Edit or Can Manage access to configure this space.
+          </p>
+        ) : isLoading || !space ? (
           <div className="space-y-3 py-2">
             <Skeleton className="h-16 w-full" />
             <Skeleton className="h-24 w-full" />

@@ -473,15 +473,25 @@ def check_space_access(
             pass
     user_groups = user_groups or set()
 
-    results: list[AccessLevelEntry] = []
-    for sid in ids:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _check_one(sid: str) -> AccessLevelEntry:
         level = get_user_access_level(
             ws, sid,
             user_email=user_email,
             user_groups=user_groups,
             acl_client=sp_ws,
         )
-        results.append(AccessLevelEntry(spaceId=sid, accessLevel=level))
+        return AccessLevelEntry(spaceId=sid, accessLevel=level)
+
+    results: list[AccessLevelEntry] = []
+    with ThreadPoolExecutor(max_workers=min(len(ids), 5)) as pool:
+        futures = {pool.submit(_check_one, sid): sid for sid in ids}
+        for f in as_completed(futures):
+            try:
+                results.append(f.result())
+            except Exception:
+                results.append(AccessLevelEntry(spaceId=futures[f], accessLevel=None))
     return results
 
 

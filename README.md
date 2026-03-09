@@ -4,7 +4,7 @@ A full-stack Databricks App that automatically optimizes [Genie Spaces](https://
 
 Built with [apx](https://github.com/databricks-solutions/apx) (React + FastAPI).
 
-> **Quick links:** [Quickstart Guide](QUICKSTART.md) | [E2E Testing Guide](E2E_TESTING_GUIDE.md) | [Detailed Documentation](docs/genie-space-optimizer-design/00-index.md) | [Changelog](CHANGELOG.md)
+> **Quick links:** [Deployment Guide](DEPLOYMENT.md) | [Quickstart Guide](QUICKSTART.md) | [E2E Testing Guide](E2E_TESTING_GUIDE.md) | [Detailed Documentation](docs/genie-space-optimizer-design/00-index.md) | [Changelog](CHANGELOG.md)
 
 ---
 
@@ -86,10 +86,11 @@ Plus **Response Quality** (LLM analysis accuracy), **Repeatability** (variance d
 Genie_Space_Optimizer/
 ├── pyproject.toml                    # Python project config & apx metadata
 ├── databricks.yml                    # Databricks Asset Bundle definition
-├── Makefile                          # Deployment helpers (build → clean → deploy → verify)
+├── Makefile                          # Deployment helpers (setup, deploy, verify, clean-wheels, help)
 ├── app.yml                           # Databricks App entry point (uvicorn)
 ├── resources/
-│   └── grant_app_uc_permissions.py   # Script to grant app SP access to UC schemas
+│   ├── grant_app_uc_permissions.py   # Script to grant app SP access to UC schemas
+│   └── patch_app_yml.py             # Injects deploy-time env vars into .build/app.yml
 ├── docs/                             # Reference documentation & config samples
 │
 ├── src/genie_space_optimizer/
@@ -379,26 +380,23 @@ apx build            # Create production build
 
 ### Deploy to Databricks
 
-The recommended deployment method uses `make deploy`, which orchestrates the full pipeline:
+> **Full walkthrough:** See the [Deployment Guide](DEPLOYMENT.md) for prerequisites, first-time setup, and troubleshooting.
+
+**First-time install** (single command -- only `WAREHOUSE_ID` is required):
 
 ```bash
-make deploy PROFILE=<your-profile>
+make setup WAREHOUSE_ID=<your-warehouse-id>
 ```
 
-This runs four steps:
-1. **clean-wheels** -- Removes stale `.whl` files from the workspace
-2. **bundle deploy** -- Builds the wheel, removes `.build/.gitignore`, syncs files to workspace
-3. **apps deploy** -- Creates a new deployment snapshot and restarts the app
-4. **verify** -- Confirms the wheel is present on the workspace
-
-You can also run individual targets:
+**Subsequent deploys** after code changes:
 
 ```bash
-make clean-wheels PROFILE=<your-profile>   # Remove stale wheels
-make verify PROFILE=<your-profile>         # Confirm wheel on workspace
+make deploy WAREHOUSE_ID=<your-warehouse-id>
 ```
 
-> **First-time deploy:** On a brand-new deployment, the UC grant script (`resources/grant_app_uc_permissions.py`) runs during build but the app doesn't exist yet, so grants are skipped. **Run `make deploy` a second time** after the app is created to apply the operational schema grants. See the [Quickstart Guide](QUICKSTART.md#first-time-deploy-uc-grants-require-a-second-deploy) for the full walkthrough.
+Run `make help` to see all available targets and current variable values. Optional overrides: `CATALOG` (default `main`), `PROFILE` (default `DEFAULT`).
+
+> **First-time deploy note:** On a brand-new deployment, the UC grant script skips because the app doesn't exist yet. Run `make deploy WAREHOUSE_ID=...` a second time to apply the operational schema grants. See the [Deployment Guide](DEPLOYMENT.md#6-complete-uc-grants-second-deploy) for details.
 
 ---
 

@@ -2,7 +2,7 @@
 
 Get the Genie Space Optimizer running in your Databricks workspace in under 15 minutes.
 
-> **Detailed docs:** [Full Documentation](docs/genie-space-optimizer-design/00-index.md) | [Permissions Guide](docs/genie-space-optimizer-design/08-permissions-and-security.md) | [API Reference](docs/genie-space-optimizer-design/07-api-reference.md) | [Troubleshooting](docs/genie-space-optimizer-design/appendices/B-troubleshooting.md)
+> **Detailed docs:** [Deployment Guide](DEPLOYMENT.md) | [Full Documentation](docs/genie-space-optimizer-design/00-index.md) | [Permissions Guide](docs/genie-space-optimizer-design/08-permissions-and-security.md) | [API Reference](docs/genie-space-optimizer-design/07-api-reference.md) | [Troubleshooting](docs/genie-space-optimizer-design/appendices/B-troubleshooting.md)
 
 ---
 
@@ -64,38 +64,37 @@ apx bun install
 
 ## 3. Configure Your Workspace
 
-Edit `databricks.yml` to point to your workspace resources:
+No manual editing of `databricks.yml` is needed. All configuration is passed via `make` command variables at deploy time. The only required variable is `WAREHOUSE_ID`.
 
-```yaml
-variables:
-  catalog:
-    default: "your_catalog_name"        # Unity Catalog with your Genie Space tables
-  gold_schema:
-    default: "genie_optimization"        # Schema for optimizer state tables (will be created)
-  warehouse_id:
-    default: "your_warehouse_id"         # SQL Warehouse ID
+**Finding your Warehouse ID:** Navigate to SQL Warehouses in your workspace. The ID is the last segment of the URL: `https://<workspace>/sql/warehouses/<WAREHOUSE_ID>`.
+
+Run `make help` to see current variable values and all available overrides:
+
+```bash
+make help
 ```
 
-**Finding your Warehouse ID:** Navigate to SQL Warehouses in your workspace. The warehouse ID is in the URL: `https://<workspace>/sql/warehouses/<warehouse_id>`.
+The defaults (`CATALOG=main`, `SCHEMA=genie_optimization`) work for most workspaces. Override only if your optimizer tables need to live elsewhere. See the [Deployment Guide](DEPLOYMENT.md#9-advanced-options) for the full list.
 
 ---
 
 ## 4. Deploy to Databricks
 
-The recommended deployment method uses `make deploy`, which orchestrates the full pipeline:
+**First-time install** (single command):
 
 ```bash
-make deploy PROFILE=<your-profile>
+make setup WAREHOUSE_ID=<your-warehouse-id>
 ```
 
-This runs four steps automatically:
+**Subsequent deploys** after code changes:
 
-1. **clean-wheels** -- Removes stale `.whl` files from the workspace to prevent cache issues
-2. **bundle deploy** -- Builds the wheel via `apx build`, removes `.build/.gitignore`, syncs files to workspace
-3. **apps deploy** -- Creates a new deployment snapshot and restarts the app with the synced code
-4. **verify** -- Confirms the new wheel is present on the workspace
+```bash
+make deploy WAREHOUSE_ID=<your-warehouse-id>
+```
 
-Both `databricks bundle deploy` (file sync) and `databricks apps deploy` (snapshot + restart) are required. The bundle deploy syncs files but does not restart the app; the apps deploy creates an immutable snapshot from the synced files and restarts.
+The `setup` target handles everything: clean stale wheels, build the bundle, start the app compute (if stopped), deploy a snapshot, and verify. The `deploy` target does the same but skips the app-start step (for existing installs).
+
+> See the [Deployment Guide](DEPLOYMENT.md) for the complete walkthrough including prerequisites, UC grants, and troubleshooting.
 
 This provisions:
 
@@ -129,10 +128,10 @@ After this first deploy creates the app, **run `make deploy` a second time** so 
 
 ```bash
 # First deploy: creates the app (grants are skipped)
-make deploy PROFILE=<your-profile>
+make setup WAREHOUSE_ID=<your-warehouse-id>
 
 # Second deploy: grants are now applied to the SP
-make deploy PROFILE=<your-profile>
+make deploy WAREHOUSE_ID=<your-warehouse-id>
 ```
 
 Alternatively, run the grant script manually after the first deploy:
@@ -151,13 +150,13 @@ After deploy completes, confirm everything is healthy:
 
 ```bash
 # 1. Confirm the app exists and is RUNNING
-databricks apps get genie-space-optimizer -p <your-profile> -o json
+databricks apps get genie-space-optimizer -o json
 
 # 2. Check the wheel was synced
-make verify PROFILE=<your-profile>
+make verify WAREHOUSE_ID=<your-warehouse-id>
 
 # 3. Check app startup logs (look for "App wheel: genie_space_optimizer-x.y.z.whl")
-databricks apps logs genie-space-optimizer -p <your-profile>
+databricks apps logs genie-space-optimizer
 ```
 
 If the app status shows `DEPLOYING`, wait a minute and re-check. If it shows `ERROR`, inspect the logs for details.
@@ -373,11 +372,11 @@ One-liner to build, deploy, and trigger an optimization run:
 
 ```bash
 # 1. Deploy (build wheel + sync + restart app)
-make deploy PROFILE=genie-test
+make deploy WAREHOUSE_ID=<your-warehouse-id>
 
 # 2. Trigger optimization for a Genie Space
-APP_URL=$(databricks apps get genie-space-optimizer -p genie-test -o json | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
-TOKEN=$(databricks auth token -p genie-test | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+APP_URL=$(databricks apps get genie-space-optimizer -o json | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
+TOKEN=$(databricks auth token | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
 curl -s -X POST "${APP_URL}/api/genie/trigger" \
   -H "Authorization: Bearer ${TOKEN}" \
@@ -385,13 +384,7 @@ curl -s -X POST "${APP_URL}/api/genie/trigger" \
   -d '{"space_id": "<GENIE_SPACE_ID>"}' | python3 -m json.tool
 ```
 
-**Known Space IDs (genie-test profile):**
-
-
-| Space                           | ID                                 |
-| ------------------------------- | ---------------------------------- |
-| Revenue & Property Intelligence | `01f10e84df3b14d993c30773abde7f44` |
-
+> Replace `<GENIE_SPACE_ID>` with the UUID of your Genie Space. Find it in the Genie Space URL or on the app's Dashboard.
 
 **Poll run status:**
 
@@ -727,16 +720,16 @@ The `apx build` step generates a `.build/.gitignore` with `*` that blocks wheel 
 
 ```bash
 # Full redeploy (clean + bundle deploy + app deploy + verify)
-make deploy PROFILE=<your-profile>
+make deploy WAREHOUSE_ID=<your-warehouse-id>
 
 # Or just verify the current state
-make verify PROFILE=<your-profile>
+make verify WAREHOUSE_ID=<your-warehouse-id>
 ```
 
 The app logs the resolved wheel at startup (`App wheel: genie_space_optimizer-x.y.z.whl (size=... bytes)`). Check app logs to confirm the correct wheel is loaded:
 
 ```bash
-databricks apps logs genie-space-optimizer -p <your-profile>
+databricks apps logs genie-space-optimizer
 ```
 
 ### Many benchmarks flagged as "temporal-stale"

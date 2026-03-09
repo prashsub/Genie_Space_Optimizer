@@ -2,7 +2,7 @@
 
 This guide is written for an LLM agent that will execute a full end-to-end test of the Genie Space Optimizer. It describes every API call, UI interaction, expected response, failure mode, and diagnostic step. Follow the journeys sequentially -- each builds on the prior.
 
-> **Related documentation:** [Architecture Overview](docs/genie-space-optimizer-design/02-architecture-overview.md) | [API Reference](docs/genie-space-optimizer-design/07-api-reference.md) | [Permissions Guide](docs/genie-space-optimizer-design/08-permissions-and-security.md) | [Troubleshooting](docs/genie-space-optimizer-design/appendices/B-troubleshooting.md) | [Full Documentation Index](docs/genie-space-optimizer-design/00-index.md)
+> **Related documentation:** [Deployment Guide](DEPLOYMENT.md) | [Architecture Overview](docs/genie-space-optimizer-design/02-architecture-overview.md) | [API Reference](docs/genie-space-optimizer-design/07-api-reference.md) | [Permissions Guide](docs/genie-space-optimizer-design/08-permissions-and-security.md) | [Troubleshooting](docs/genie-space-optimizer-design/appendices/B-troubleshooting.md) | [Full Documentation Index](docs/genie-space-optimizer-design/00-index.md)
 
 ---
 
@@ -65,13 +65,15 @@ At app startup, a `_WheelHealthCheck` logs the resolved wheel name and size for 
 
 ### State Management
 
-6 Delta tables in `{catalog}.{schema}`:
+8 Delta tables in `{catalog}.{schema}`:
 - `genie_opt_runs` -- one row per optimization run (status, scores, config snapshot)
 - `genie_opt_stages` -- per-stage transitions (PREFLIGHT_STARTED, LEVER_1_EVAL_DONE, etc.)
 - `genie_opt_iterations` -- per-iteration evaluation results (9 judges: 7 quality dimensions + response quality + arbiter)
 - `genie_opt_patches` -- individual patches (type, lever, old/new values, rolled_back flag, provenance chain)
 - `genie_eval_asi_results` -- failure assessments from LLM judges (with `mlflow_run_id` for trace linking)
 - `genie_opt_provenance` -- end-to-end provenance linking patches to judge verdicts, clusters, and gate outcomes
+- `genie_opt_queued_patches` -- high-risk patches pending human approval
+- `genie_opt_flagged_questions` -- questions flagged for human review after exhausting automated approaches
 
 ### UC Permissions Grant
 
@@ -92,16 +94,16 @@ Before starting the test, verify each item programmatically.
 
 ```bash
 # Confirm the app is deployed
-databricks apps get genie-space-optimizer -p <profile> -o json
+databricks apps get genie-space-optimizer -o json
 
 # Confirm the app is running (status should be "RUNNING")
-databricks apps get genie-space-optimizer -p <profile> -o json | jq '.status'
+databricks apps get genie-space-optimizer -o json | jq '.status'
 
 # Get the app URL
-databricks apps get genie-space-optimizer -p <profile> -o json | jq -r '.url'
+databricks apps get genie-space-optimizer -o json | jq -r '.url'
 
 # Verify the correct wheel is deployed (via Makefile)
-make verify PROFILE=<profile>
+make verify WAREHOUSE_ID=<warehouse-id>
 ```
 
 ### Wheel Health Check
@@ -116,7 +118,7 @@ databricks apps logs genie-space-optimizer -p <profile> | grep "App wheel:"
 If the wheel size is unexpectedly small or the log line is missing, redeploy:
 
 ```bash
-make deploy PROFILE=<profile>
+make deploy WAREHOUSE_ID=<warehouse-id>
 ```
 
 ### SQL Warehouse Check
@@ -583,9 +585,9 @@ After apply or discard, verify:
 
 ---
 
-## 12. Journey 10: Settings & Data Access
+## 12. Journey 10: Settings & Data Access (Advisor-Only)
 
-> **Reference:** For the complete permissions model, see [08 -- Permissions and Security](docs/genie-space-optimizer-design/08-permissions-and-security.md).
+> **Reference:** For the complete permissions model, see [08 -- Permissions and Security](docs/genie-space-optimizer-design/08-permissions-and-security.md). For deployment configuration, see the [Deployment Guide](DEPLOYMENT.md).
 
 ### Navigation
 
@@ -595,58 +597,90 @@ Click the **gear icon** in the navbar → navigates to `/settings`.
 
 | Request | Endpoint | Expected Status |
 |---------|----------|----------------|
-| List grants | `GET /api/genie/settings/data-access` | 200 |
-| Grant access | `POST /api/genie/settings/data-access` | 200 |
-| Revoke access | `DELETE /api/genie/settings/data-access/{grant_id}` | 200 |
+| Permission metadata (fast) | `GET /api/genie/settings/permissions?metadata_only=true` | 200 |
+| Per-page access check (lazy) | `POST /api/genie/spaces/check-access` | 200 |
 
-### `GET /api/genie/settings/data-access` Response
+The Settings page is **advisor-only** -- it reads permissions and displays what's missing with copyable SQL commands and sharing instructions, but never executes GRANT/REVOKE on the user's behalf.
+
+### `GET /api/genie/settings/permissions` Response
 
 ```json
 {
-  "grants": [
+  "spIdentity": {
+    "displayName": "string",
+    "applicationId": "string (UUID)"
+  },
+  "frameworkCatalog": "string (e.g. main)",
+  "frameworkSchema": "string (e.g. genie_optimization)",
+  "workspaceHost": "string (URL)",
+  "jobUrl": "string | null",
+  "schemaPermissions": [
     {
-      "grantId": "string",
       "catalog": "string",
       "schema": "string",
-      "status": "active",
-      "grantedAt": "ISO timestamp"
+      "hasRead": true,
+      "hasWrite": false,
+      "readGrantCommand": "GRANT USE CATALOG ON CATALOG ...",
+      "writeGrantCommand": "GRANT MODIFY ON SCHEMA ..."
     }
   ],
-  "detectedSchemas": [
-    {"catalog": "string", "schema": "string", "tableCount": 5}
-  ],
-  "spPrincipalId": "string (app service principal ID)",
-  "spPrincipalDisplayName": "string | null"
+  "spacePermissions": [
+    {
+      "spaceId": "string",
+      "spaceName": "string",
+      "spHasManage": false,
+      "spGrantInstructions": "Open the Genie Space > Share > add ..."
+    }
+  ]
 }
 ```
 
+### `POST /api/genie/spaces/check-access` Request/Response
+
+```json
+// Request body
+{"ids": ["space-id-1", "space-id-2"]}
+
+// Response
+[
+  {"spaceId": "space-id-1", "accessLevel": "CAN_MANAGE"},
+  {"spaceId": "space-id-2", "accessLevel": "CAN_EDIT"}
+]
+```
+
+Access checks are performed **lazily per page** -- only the spaces visible on the current page are checked, not all spaces at once.
+
 ### Test Actions
 
-1. Navigate to Settings page → verify grants table loads
-2. Check `detectedSchemas` shows schemas referenced by Genie Spaces
-3. Click **Grant Access** on an ungranted schema → verify grant appears in table
-4. Click **Revoke** on an existing grant → verify grant removed
+1. Navigate to Settings page → verify SP identity card loads (display name + application ID)
+2. Verify **Framework Resources** shows the correct `frameworkCatalog` and `frameworkSchema` matching deploy-time config
+3. Verify per-space access badges load lazily (spinner → resolved badge) as you paginate
+4. Verify copyable SQL `GRANT` commands appear for schemas with missing read/write access
+5. Verify sharing instructions appear for spaces where SP lacks `CAN_MANAGE`
+6. Verify **no** GRANT/REVOKE buttons exist -- the page is read-only (advisor model)
+7. Filter by "Editable Only" → verify only spaces with CAN_MANAGE/CAN_EDIT remain visible
 
 ### What the Backend Does
 
-**Grant (`POST`):**
+**Permissions metadata (`GET`):**
 1. Resolves the app's service principal from `Dependencies.Client`
-2. Executes UC SQL grants via `Dependencies.UserClient` (OBO): `USE CATALOG`, `USE SCHEMA`, `SELECT`, `MODIFY`, etc.
-3. Records the grant in the Delta ledger table
-4. Returns the created grant
+2. Reads the deploy-time `catalog` and `schema_name` from `AppConfig` (environment variables injected by `patch_app_yml.py`)
+3. Checks UC effective grants on each detected schema
+4. Generates copyable SQL strings for missing grants
+5. Returns the full permission dashboard as read-only data
 
-**Revoke (`DELETE`):**
-1. Executes `REVOKE` SQL statements via OBO user client
-2. Removes the grant from the Delta ledger
-3. Returns the revoked grant
+**Access check (`POST`):**
+1. Receives a list of space IDs (typically the current page)
+2. Parallelizes access checks via `ThreadPoolExecutor` (max 5 workers)
+3. Returns the access level per space (`CAN_MANAGE`, `CAN_EDIT`, `VIEW_ONLY`, or `null`)
 
 ### Failure Scenarios
 
 | Status | Body | Root Cause |
 |--------|------|------------|
-| **403** | Permission denied | OBO user lacks `MANAGE` on the target schema |
-| **404** | Grant not found | Invalid `grant_id` |
-| **500** | SQL execution error | Warehouse unavailable or UC permission issue |
+| **200** with stale `frameworkCatalog` | Config shows `main` instead of deployed catalog | Environment variables not injected -- redeploy with `make deploy WAREHOUSE_ID=...` |
+| **500** | SQL execution error | Warehouse unavailable or SP lacks UC access |
+| Access badges stuck on "Checking..." | `check-access` call timing out | Too many spaces; verify pagination is limiting the batch size |
 
 ---
 
@@ -1088,10 +1122,10 @@ databricks apps logs genie-space-optimizer -p <profile>
 
 ### Pre-deployment
 
-- [ ] `make deploy PROFILE=<profile>` succeeds (runs bundle deploy + apps deploy)
+- [ ] `make setup WAREHOUSE_ID=<warehouse-id>` succeeds for first-time install (or `make deploy WAREHOUSE_ID=<warehouse-id>` for updates)
 - [ ] Grant script ran (check output for `[grant-app-sp] Ensured UC grants for principal=...`)
-- [ ] `make verify PROFILE=<profile>` confirms wheel is on workspace
-- [ ] App is RUNNING: `databricks apps get genie-space-optimizer -p <profile>`
+- [ ] `make verify WAREHOUSE_ID=<warehouse-id>` confirms wheel is on workspace
+- [ ] App is RUNNING: `databricks apps get genie-space-optimizer -o json`
 - [ ] App startup logs show `App wheel: genie_space_optimizer-x.y.z.whl (size=... bytes)`
 - [ ] SQL Warehouse is RUNNING
 - [ ] At least one Genie Space exists and is accessible
@@ -1230,12 +1264,15 @@ databricks apps logs genie-space-optimizer -p <profile>
 
 ### Settings & Permission Dashboard (Advisor-Only)
 
-- [ ] `GET /api/genie/settings/permissions` returns 200 with schema read/write, space ACLs, and copyable grant commands
-- [ ] Service principal ID and display name shown
+- [ ] `GET /api/genie/settings/permissions?metadata_only=true` returns 200 with SP identity, framework config, schema permissions, and space permissions
+- [ ] Service principal ID and display name shown in SP identity card
+- [ ] `frameworkCatalog` and `frameworkSchema` match deploy-time config (not hardcoded defaults)
 - [ ] `workspaceHost` and `jobUrl` fields populated
-- [ ] Schema permissions show read/write status per schema with `readGrantCommand`/`writeGrantCommand`
+- [ ] Schema permissions show read/write status per schema with copyable `readGrantCommand`/`writeGrantCommand`
 - [ ] Space permissions show `spHasManage` status and `spGrantInstructions`
+- [ ] Per-space access badges load lazily via `POST /api/genie/spaces/check-access` (per page, not all at once)
 - [ ] No GRANT/REVOKE buttons — advisor model provides copyable SQL and sharing instructions only
+- [ ] "Editable Only" filter toggle works (hides View Only / No Access spaces)
 - [ ] Activity feed filtered: only shows runs for spaces user has CAN_MANAGE or CAN_EDIT on
 
 ### Programmatic Trigger API
