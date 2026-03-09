@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from databricks.sdk.service.iam import AccessControlRequest, PermissionLevel
 from databricks.sdk.service.jobs import (
     JobEnvironment,
     JobParameterDefinition,
+    JobRunAs,
     JobSettings,
     NotebookTask,
     QueueSettings,
@@ -241,12 +243,17 @@ def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
     return ws_wheel_path, wheel_hash
 
 
-def _job_settings(ws_wheel_path: str, wheel_hash: str = "") -> JobSettings:
+def _job_settings(
+    ws_wheel_path: str, wheel_hash: str = "", sp_client_id: str = "",
+) -> JobSettings:
     def _job_param_ref(name: str) -> str:
         return f"{{{{job.parameters.{name}}}}}"
 
+    run_as = JobRunAs(service_principal_name=sp_client_id) if sp_client_id else None
+
     return JobSettings(
         name=_PERSISTENT_JOB_NAME,
+        run_as=run_as,
         description=(
             "Persistent DAG optimization runner managed by Genie Space Optimizer app "
             "(preflight → baseline_eval → lever_loop → finalize → deploy). "
@@ -369,20 +376,35 @@ def _ensure_job_visibility(ws: WorkspaceClient, job_id: int) -> None:
         )
 
 
+def _resolve_sp_client_id(ws: WorkspaceClient) -> str:
+    return ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
+
+
+def _is_owner_current(owner_ref: str, sp_client_id: str) -> bool:
+    """True if *owner_ref* matches the current SP."""
+    return bool(sp_client_id) and sp_client_id in owner_ref
+
+
 def _ensure_persistent_job(
-    ws: WorkspaceClient, ws_wheel_path: str, wheel_hash: str = ""
+    ws: WorkspaceClient,
+    ws_wheel_path: str,
+    wheel_hash: str = "",
+    sp_client_id: str = "",
 ) -> int:
     """Find or create the persistent optimization job and return job_id.
 
-    Does NOT set ``run_as`` here — that is applied per-submission in
-    ``submit_optimization`` so each run uses the correct user identity.
+    If an existing job is found but its owner is orphaned or belongs to a
+    stale service principal, the job is deleted and recreated so the current
+    SP owns it.  ``run_as`` is always set explicitly.
     """
     global _cached_job_id, _cached_job_wheel_path
 
     if _cached_job_id is not None and _cached_job_wheel_path == ws_wheel_path:
         return _cached_job_id
 
-    settings = _job_settings(ws_wheel_path, wheel_hash=wheel_hash)
+    settings = _job_settings(
+        ws_wheel_path, wheel_hash=wheel_hash, sp_client_id=sp_client_id,
+    )
 
     if _cached_job_id is not None:
         try:
@@ -401,6 +423,34 @@ def _ensure_persistent_job(
         if job.job_id is not None:
             existing_job_id = int(job.job_id)
             break
+
+    if existing_job_id is not None and sp_client_id:
+        try:
+            job_detail = ws.jobs.get(existing_job_id)
+            creator = job_detail.creator_user_name or ""
+            run_as_name = job_detail.run_as_user_name or ""
+            owner_ref = run_as_name or creator
+            owner_is_orphaned = not owner_ref
+
+            if owner_is_orphaned or not _is_owner_current(owner_ref, sp_client_id):
+                logger.warning(
+                    "Job %s owned by '%s' (current SP: %s) — "
+                    "deleting orphaned/stale job and recreating.",
+                    existing_job_id, owner_ref, sp_client_id,
+                )
+                try:
+                    ws.jobs.delete(existing_job_id)
+                except Exception as del_exc:
+                    logger.warning(
+                        "Could not delete orphaned job %s: %s",
+                        existing_job_id, del_exc,
+                    )
+                existing_job_id = None
+        except Exception:
+            logger.warning(
+                "Could not inspect job %s ownership — will try reset",
+                existing_job_id,
+            )
 
     if existing_job_id is not None:
         try:
@@ -423,6 +473,7 @@ def _ensure_persistent_job(
                 tasks=settings.tasks,
                 environments=settings.environments,
                 tags=settings.tags,
+                run_as=settings.run_as,
             )
             if created.job_id is None:
                 raise RuntimeError("Job creation returned no job_id")
@@ -438,6 +489,7 @@ def _ensure_persistent_job(
             tasks=settings.tasks,
             environments=settings.environments,
             tags=settings.tags,
+            run_as=settings.run_as,
         )
         if created.job_id is None:
             raise RuntimeError("Job creation returned no job_id")
@@ -469,8 +521,11 @@ def submit_optimization(
     The job runs as the SP which has been granted SELECT/EXECUTE on user
     schemas via the Data Access Settings page.
     """
+    sp_client_id = _resolve_sp_client_id(ws)
     ws_wheel_path, wheel_hash = _ensure_artifacts(ws)
-    job_id = _ensure_persistent_job(ws, ws_wheel_path, wheel_hash=wheel_hash)
+    job_id = _ensure_persistent_job(
+        ws, ws_wheel_path, wheel_hash=wheel_hash, sp_client_id=sp_client_id,
+    )
 
     with _job_submit_lock:
         waiter = ws.jobs.run_now(
@@ -522,3 +577,32 @@ def get_job_url(ws: WorkspaceClient) -> str | None:
     if not host:
         return None
     return f"{host}/jobs/{job_id}"
+
+
+def check_job_health(ws: WorkspaceClient, sp_client_id: str) -> tuple[bool, str]:
+    """Check if the persistent runner job exists and is owned by the current SP.
+
+    Returns ``(is_healthy, message)``.  Never raises.
+    """
+    try:
+        for job in ws.jobs.list(name=_PERSISTENT_JOB_NAME, limit=1):
+            if job.job_id is None:
+                continue
+            detail = ws.jobs.get(int(job.job_id))
+            owner = detail.run_as_user_name or detail.creator_user_name or ""
+            if not owner:
+                return False, (
+                    f"Runner job {job.job_id} has no owner (orphaned). "
+                    f"Start an optimization run to auto-repair it, "
+                    f"or restart the app."
+                )
+            if sp_client_id and not _is_owner_current(owner, sp_client_id):
+                return False, (
+                    f"Runner job {job.job_id} is owned by '{owner}' but the "
+                    f"current app SP is '{sp_client_id}'. Start an optimization "
+                    f"run to auto-repair it, or restart the app."
+                )
+            return True, ""
+        return True, ""
+    except Exception:
+        return True, ""

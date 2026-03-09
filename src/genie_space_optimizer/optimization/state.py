@@ -259,11 +259,41 @@ _ALL_DDL: dict[str, str] = {
 
 def ensure_optimization_tables(spark: SparkSession, catalog: str, schema: str) -> None:
     """Create all optimization Delta tables if they don't exist (idempotent)."""
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+    try:
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+    except Exception as exc:
+        exc_str = str(exc)
+        if "PERMISSION_DENIED" in exc_str or "ACCESS_DENIED" in exc_str:
+            logger.warning(
+                "Cannot CREATE SCHEMA %s.%s (permission denied) — "
+                "assuming it already exists and continuing with table creation.",
+                catalog, schema,
+            )
+        else:
+            raise
+
     for name, ddl in _ALL_DDL.items():
         resolved = ddl.replace("{catalog}", catalog).replace("{schema}", schema)
-        spark.sql(resolved)
-        logger.info("  [OK] %s.%s.%s", catalog, schema, name)
+        try:
+            spark.sql(resolved)
+            logger.info("  [OK] %s.%s.%s", catalog, schema, name)
+        except Exception as exc:
+            exc_str = str(exc)
+            if "PERMISSION_DENIED" in exc_str or "ACCESS_DENIED" in exc_str:
+                logger.warning(
+                    "Cannot create table %s.%s.%s (permission denied) — "
+                    "it may already exist or SP lacks CREATE_TABLE.",
+                    catalog, schema, name,
+                )
+            elif "SCHEMA_NOT_FOUND" in exc_str:
+                logger.error(
+                    "Schema %s.%s does not exist and could not be created. "
+                    "Create it manually: CREATE SCHEMA %s.%s",
+                    catalog, schema, catalog, schema,
+                )
+                raise
+            else:
+                raise
 
     _migrate_add_columns(spark, catalog, schema)
 

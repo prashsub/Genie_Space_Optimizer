@@ -39,7 +39,7 @@ help:
 
 # ── First-time setup (handles app-not-running) ──────────────────────
 
-setup: _check_vars clean-wheels _bundle_deploy _ensure_app_running _app_deploy verify
+setup: _check_vars clean-wheels _bundle_deploy _ensure_app_running _apply_grants _app_deploy verify
 	@echo ""
 	@echo "Setup complete! App URL:"
 	@databricks apps get $(APP_NAME) --profile $(PROFILE) -o json 2>/dev/null \
@@ -48,7 +48,7 @@ setup: _check_vars clean-wheels _bundle_deploy _ensure_app_running _app_deploy v
 
 # ── Default deploy target ────────────────────────────────────────────
 
-deploy: _check_vars clean-wheels _bundle_deploy _app_deploy verify
+deploy: _check_vars clean-wheels _bundle_deploy _apply_grants _app_deploy verify
 
 # ── Internal targets ─────────────────────────────────────────────────
 
@@ -70,6 +70,15 @@ _bundle_deploy:
 		--var "gold_schema=$(SCHEMA)" \
 		--var "warehouse_id=$(WAREHOUSE_ID)" \
 		--var "deploy_profile=$(PROFILE)"
+
+_apply_grants:
+	@echo "Applying UC grants to app service principal..."
+	@uv run python resources/grant_app_uc_permissions.py \
+		--profile $(PROFILE) \
+		--app-name $(APP_NAME) \
+		--catalog $(CATALOG) \
+		--schema $(SCHEMA) \
+		|| echo "[grant-app-sp] Grants deferred — will retry at app startup."
 
 _app_deploy:
 	databricks apps deploy $(APP_NAME) \

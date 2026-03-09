@@ -45,6 +45,21 @@ export type GateResult = Record<string, unknown>;
 export interface HTTPValidationError {
     detail?: ValidationError[];
 }
+export interface HealthStatus {
+    catalog: string;
+    catalogExists?: boolean;
+    createSchemaCommand?: string | null;
+    grantCommand?: string | null;
+    healthy: boolean;
+    jobHealthy?: boolean;
+    jobMessage?: string | null;
+    message?: string | null;
+    schema: string;
+    schemaExists: boolean;
+    spClientId?: string | null;
+    tablesAccessible: boolean;
+    tablesReady: boolean;
+}
 export type IterationDetail = Record<string, unknown>;
 export type IterationDetailResponse = Record<string, unknown>;
 export type IterationSummary = Record<string, unknown>;
@@ -355,6 +370,58 @@ export function useCurrentUserSuspense<TData = {
     return useSuspenseQuery({
         queryKey: currentUserKey(options?.params),
         queryFn: ()=>currentUser(options?.params),
+        ...options?.query
+    });
+}
+export const getHealth = async (options?: RequestInit): Promise<{
+    data: HealthStatus;
+}> =>{
+    const res = await fetch("/api/genie/health", {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const getHealthKey = ()=>{
+    return [
+        "/api/genie/health"
+    ] as const;
+};
+export function useGetHealth<TData = {
+    data: HealthStatus;
+}>(options?: {
+    query?: Omit<UseQueryOptions<{
+        data: HealthStatus;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: getHealthKey(),
+        queryFn: ()=>getHealth(),
+        ...options?.query
+    });
+}
+export function useGetHealthSuspense<TData = {
+    data: HealthStatus;
+}>(options?: {
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: HealthStatus;
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: getHealthKey(),
+        queryFn: ()=>getHealth(),
         ...options?.query
     });
 }

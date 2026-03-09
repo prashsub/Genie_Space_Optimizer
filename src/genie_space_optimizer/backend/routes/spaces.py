@@ -801,9 +801,36 @@ def do_start_optimization(
         _df = load_runs_for_space(_spark, space_id, config.catalog, config.schema_name)
         return _spark, _df
 
+    def _actionable_setup_error(exc: Exception) -> HTTPException | None:
+        """Convert schema/permission errors into user-friendly 503 responses."""
+        exc_str = str(exc)
+        fqn = f"{config.catalog}.{config.schema_name}"
+        if "SCHEMA_NOT_FOUND" in exc_str:
+            return HTTPException(
+                status_code=503,
+                detail=(
+                    f"Schema '{fqn}' does not exist. "
+                    f"Create it with: CREATE SCHEMA IF NOT EXISTS {fqn} — "
+                    f"then re-deploy the app."
+                ),
+            )
+        if "PERMISSION_DENIED" in exc_str and "CREATE" in exc_str:
+            return HTTPException(
+                status_code=503,
+                detail=(
+                    f"Service principal lacks permission to create objects in '{fqn}'. "
+                    f"Run 'make deploy WAREHOUSE_ID=...' again to apply UC grants, "
+                    f"or grant permissions manually."
+                ),
+            )
+        return None
+
     try:
         spark, runs_df = _init_spark_state()
     except Exception as _spark_err:
+        setup_err = _actionable_setup_error(_spark_err)
+        if setup_err:
+            raise setup_err
         if _is_credential_error(_spark_err):
             logger.warning(
                 "Spark credential error — resetting session: %s", str(_spark_err)[:200],
@@ -812,6 +839,9 @@ def do_start_optimization(
                 reset_spark()
                 spark, runs_df = _init_spark_state()
             except Exception as _retry_err:
+                setup_err = _actionable_setup_error(_retry_err)
+                if setup_err:
+                    raise setup_err
                 if _is_credential_error(_retry_err):
                     logger.warning(
                         "Spark credentials still broken after reset — "

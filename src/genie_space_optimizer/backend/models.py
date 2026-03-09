@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, model_serializer
+from pydantic import BaseModel, Field, model_serializer
 
 from .. import __version__
 from .utils import scrub_nan_inf
@@ -296,6 +296,27 @@ class PermissionDashboard(BaseModel):
     jobName: str
     workspaceHost: str | None = None
     jobUrl: str | None = None
+
+
+# ── Health Check Model ────────────────────────────────────────────────
+
+
+class HealthStatus(BaseModel):
+    healthy: bool
+    catalogExists: bool = True
+    schemaExists: bool
+    tablesReady: bool
+    tablesAccessible: bool
+    jobHealthy: bool = True
+    catalog: str
+    schema_: str = Field(alias="schema")
+    message: str | None = None
+    createSchemaCommand: str | None = None
+    grantCommand: str | None = None
+    jobMessage: str | None = None
+    spClientId: str | None = None
+
+    model_config = {"populate_by_name": True}
 
 
 # ── ASI (Judge Feedback) Models ───────────────────────────────────────

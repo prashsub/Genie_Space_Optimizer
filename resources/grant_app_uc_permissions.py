@@ -16,6 +16,7 @@ SP_SCHEMA_PRIVILEGES = {
     "CREATE_FUNCTION",
     "CREATE_MODEL",
     "EXECUTE",
+    "MANAGE",
 }
 
 CATALOG_PRIVILEGES = SP_CATALOG_PRIVILEGES
@@ -178,11 +179,11 @@ def main() -> int:
         )
     except Exception as err:
         if _is_app_missing(err):
-            # First deploy can create the app after this build step.
             print(
-                f"[grant-app-sp] App '{args.app_name}' not found yet, skipping grants for now. "
-                "This is expected on first deployment. Re-run deploy once app is created so "
-                "UC + Prompt Registry grants can be applied.",
+                f"[grant-app-sp] WARNING: App '{args.app_name}' not found yet — "
+                "grants NOT applied. They will be applied automatically at app "
+                "startup, or on the next 'make deploy'.",
+                file=sys.stderr,
             )
             return 0
         raise
@@ -218,8 +219,11 @@ def main() -> int:
     except Exception as err:
         if "does not exist" in str(err).lower():
             print(
-                f"[grant-app-sp] Schema '{schema_fqn}' does not exist yet — "
-                "skipping schema grants. The app will create the schema on first startup.",
+                f"[grant-app-sp] WARNING: Schema '{schema_fqn}' does not exist yet — "
+                "schema grants NOT applied. The app will create the schema on first "
+                "startup and self-grant via _UCGrantBootstrap. Alternatively, run "
+                "'make deploy' again after the schema exists.",
+                file=sys.stderr,
             )
             return 0
         raise
@@ -233,8 +237,9 @@ def main() -> int:
     except Exception as err:
         if "does not exist" in str(err).lower():
             print(
-                f"[grant-app-sp] Schema '{schema_fqn}' does not exist yet — "
-                "skipping grant verification.",
+                f"[grant-app-sp] WARNING: Schema '{schema_fqn}' does not exist yet — "
+                "skipping grant verification. Grants will be applied at app startup.",
+                file=sys.stderr,
             )
             return 0
         raise

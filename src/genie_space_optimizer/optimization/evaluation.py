@@ -1800,6 +1800,32 @@ def make_predict_fn(
 PROMPT_REGISTRY_REQUIRED_PRIVILEGES = ("CREATE FUNCTION", "EXECUTE", "MANAGE")
 
 
+def _is_ownership_conflict(err_msg: str) -> bool:
+    """True when MLflow can't update an existing prompt due to ownership mismatch."""
+    lowered = (err_msg or "").lower()
+    return "permission_denied" in lowered and "update prompt" in lowered
+
+
+def _try_drop_prompt(fqn: str) -> bool:
+    """Best-effort drop of a stale prompt (UC function) so it can be re-created.
+
+    Returns True if the drop succeeded (or the function didn't exist).
+    """
+    if "." not in fqn:
+        return False
+    try:
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession()
+        if spark is None:
+            return False
+        spark.sql(f"DROP FUNCTION IF EXISTS {fqn}")
+        logger.info("Dropped stale prompt function %s for re-creation", fqn)
+        return True
+    except Exception:
+        logger.debug("Could not drop stale prompt %s", fqn, exc_info=True)
+        return False
+
+
 def _classify_prompt_registration_error(message: str, uc_schema: str) -> dict[str, Any]:
     """Classify prompt registration failure into actionable root-cause buckets."""
     lowered = (message or "").lower()
@@ -1898,8 +1924,8 @@ def register_instruction_version(
         "type": "genie_instructions",
     }
 
-    try:
-        version = mlflow.genai.register_prompt(
+    def _do_register():
+        v = mlflow.genai.register_prompt(
             name=prompt_name,
             template=instruction_text,
             commit_message=commit_msg,
@@ -1908,14 +1934,28 @@ def register_instruction_version(
         mlflow.genai.set_prompt_alias(
             name=prompt_name,
             alias=INSTRUCTION_PROMPT_ALIAS,
-            version=version.version,
+            version=v.version,
         )
+        return v
+
+    try:
+        version = _do_register()
         logger.info(
             "[Instruction Registry] %s v%s (lever=%d, iter=%d, acc=%.3f)",
             prompt_name, version.version, lever, iteration, accuracy,
         )
         return {"prompt_name": prompt_name, "version": version.version}
     except Exception as exc:
+        if _is_ownership_conflict(str(exc)) and _try_drop_prompt(prompt_name):
+            try:
+                version = _do_register()
+                logger.info(
+                    "[Instruction Registry] %s v%s (re-created after drop)",
+                    prompt_name, version.version,
+                )
+                return {"prompt_name": prompt_name, "version": version.version}
+            except Exception:
+                pass
         classification = _classify_prompt_registration_error(
             str(exc), uc_schema=uc_schema,
         )
@@ -1981,6 +2021,28 @@ def register_judge_prompts(
                     break
                 except Exception as exc:
                     err_msg = str(exc).strip()
+                    if _is_ownership_conflict(err_msg) and _try_drop_prompt(prompt_name):
+                        try:
+                            version = mlflow.genai.register_prompt(
+                                name=prompt_name,
+                                template=template,
+                                commit_message=f"Genie eval judge: {name} (domain: {domain})",
+                                tags={"domain": domain, "type": "judge"},
+                            )
+                            mlflow.genai.set_prompt_alias(
+                                name=prompt_name,
+                                alias=PROMPT_ALIAS,
+                                version=version.version,
+                            )
+                            registered[name] = {
+                                "prompt_name": prompt_name,
+                                "version": version.version,
+                            }
+                            _REGISTERED_PROMPT_NAMES[name] = prompt_name
+                            logger.info("[Prompt Registry] %s v%s (re-created after drop)", prompt_name, version.version)
+                            break
+                        except Exception:
+                            pass
                     classification = _classify_prompt_registration_error(
                         err_msg,
                         uc_schema=uc_schema,
@@ -2042,7 +2104,30 @@ def register_judge_prompts(
                         _REGISTERED_PROMPT_NAMES[name] = prompt_name
                         logger.info("[Prompt Registry] %s %s v%s", category_label, prompt_name, version.version)
                         break
-                    except Exception:
+                    except Exception as exc:
+                        err_msg = str(exc).strip()
+                        if _is_ownership_conflict(err_msg) and _try_drop_prompt(prompt_name):
+                            try:
+                                version = mlflow.genai.register_prompt(
+                                    name=prompt_name,
+                                    template=template,
+                                    commit_message=f"Genie {category_label}: {name} (domain: {domain})",
+                                    tags={"domain": domain, "type": tag_type},
+                                )
+                                mlflow.genai.set_prompt_alias(
+                                    name=prompt_name,
+                                    alias=PROMPT_ALIAS,
+                                    version=version.version,
+                                )
+                                _all_extra[name] = {
+                                    "prompt_name": prompt_name,
+                                    "version": str(version.version),
+                                }
+                                _REGISTERED_PROMPT_NAMES[name] = prompt_name
+                                logger.info("[Prompt Registry] %s %s v%s (re-created after drop)", category_label, prompt_name, version.version)
+                                break
+                            except Exception:
+                                pass
                         logger.debug(
                             "Prompt registration attempt failed for %s=%s name=%s",
                             category_label, name, prompt_name, exc_info=True,
