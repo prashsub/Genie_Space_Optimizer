@@ -255,7 +255,11 @@ function SpaceDetail() {
           {!canStartOptimization && !permsLoading && (
             <p className="text-xs text-amber-600">
               Missing permissions.{" "}
-              <Link to="/settings" className="underline hover:text-amber-800">
+              <Link
+                to="/settings"
+                search={{ spaceId }}
+                className="underline hover:text-amber-800"
+              >
                 Go to Settings
               </Link>{" "}
               to grant access.
@@ -273,6 +277,7 @@ function SpaceDetail() {
                 Write (MODIFY) access missing for some schemas.{" "}
                 <Link
                   to="/settings"
+                  search={{ spaceId }}
                   className="underline hover:text-amber-800"
                 >
                   Grant in Settings

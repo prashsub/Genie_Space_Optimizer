@@ -49,6 +49,7 @@ function RootLayout() {
                 </Link>
                 <Link
                   to="/settings"
+                  search={{ spaceId: undefined }}
                   className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
                     pathname === "/settings"
                       ? "bg-white/15 text-white"

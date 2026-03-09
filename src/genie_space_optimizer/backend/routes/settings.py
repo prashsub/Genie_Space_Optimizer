@@ -207,13 +207,46 @@ def get_permission_dashboard(
     config: Dependencies.Config,
     headers: Dependencies.Headers,
     space_id: str | None = None,
+    metadata_only: bool = False,
 ):
     """Per-space permission overview — detect status and advise on missing grants.
 
+    When *metadata_only* is ``True``, return only SP identity and framework
+    resource metadata with an empty ``spaces`` list (used for fast initial
+    Settings page load).
+
     When *space_id* is supplied, only that single space is checked (fast path
-    used by the detail page).  Without it the full list of visible spaces is
-    scanned (used by the Settings page).
+    used by the detail page and lazy accordion expand).
+
+    Without either parameter the full list of visible spaces is scanned.
     """
+    sp_aliases = _get_sp_principal_aliases(sp_ws)
+    sp_display = _get_sp_display_name(sp_ws)
+    sp_app_id = _get_sp_application_id(sp_ws)
+
+    if metadata_only:
+        sp_id = _get_sp_principal(sp_ws)
+        from ..job_launcher import get_job_url
+        job_url = get_job_url(sp_ws)
+        host = (sp_ws.config.host or "").rstrip("/")
+        workspace_id: int | str | None = None
+        try:
+            workspace_id = sp_ws.get_workspace_id()
+        except Exception:
+            workspace_id = None
+        ws_host_with_o = f"{host}?o={workspace_id}" if host and workspace_id else host or None
+        return PermissionDashboard(
+            spaces=[],
+            spPrincipalId=sp_id,
+            spPrincipalDisplayName=sp_display or None,
+            frameworkCatalog=config.catalog,
+            frameworkSchema=config.schema_name,
+            experimentBasePath="/Shared/genie-space-optimizer/",
+            jobName="genie-space-optimizer-runner",
+            jobUrl=job_url,
+            workspaceHost=ws_host_with_o,
+        )
+
     from genie_space_optimizer.common.genie_client import (
         list_spaces, fetch_space_config, user_can_edit_space,
         get_space_permissions_rest,
@@ -222,10 +255,6 @@ def get_permission_dashboard(
         extract_genie_space_table_refs,
         get_unique_schemas,
     )
-
-    sp_aliases = _get_sp_principal_aliases(sp_ws)
-    sp_display = _get_sp_display_name(sp_ws)
-    sp_app_id = _get_sp_application_id(sp_ws)
 
     caller_email = headers.user_email or headers.user_name or ""
 
