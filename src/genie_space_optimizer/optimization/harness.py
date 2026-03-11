@@ -120,6 +120,7 @@ from genie_space_optimizer.optimization.state import (
     write_patch,
     write_provenance,
     write_stage,
+    write_suggestion,
 )
 
 if TYPE_CHECKING:
@@ -3875,6 +3876,30 @@ def _run_lever_loop(
             detail=_ag_cluster_info if _ag_cluster_info else None,
             catalog=catalog, schema=schema,
         )
+
+        # ── 3B.4a+: Persist improvement proposals from strategist ───
+        _ag_proposals = ag.get("proposals", [])
+        if _ag_proposals and isinstance(_ag_proposals, list):
+            for _prop in _ag_proposals:
+                if not isinstance(_prop, dict):
+                    continue
+                try:
+                    write_suggestion(spark, catalog, schema, {
+                        "run_id": run_id,
+                        "space_id": space_id,
+                        "iteration": iteration_counter,
+                        "lever": None,
+                        "type": _prop.get("type", "METRIC_VIEW"),
+                        "title": _prop.get("title", "Untitled proposal"),
+                        "rationale": _prop.get("rationale"),
+                        "definition": _prop.get("definition"),
+                        "affected_questions": _prop.get("affected_questions", []),
+                        "estimated_impact": _prop.get("estimated_impact"),
+                    })
+                except Exception:
+                    logger.debug("Failed to write suggestion from AG %s", ag_id, exc_info=True)
+            if _ag_proposals:
+                logger.info("Wrote %d improvement proposals from AG %s", len(_ag_proposals), ag_id)
 
         # ── 3B.4b: Handle escalation if present ─────────────────────
         _escalation = ag.get("escalation", "")

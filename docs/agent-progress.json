@@ -27,7 +27,7 @@
     "3b": { "title": "Integrate stepper into space detail page", "feature": "start-optimization-loading-animation", "status": "done", "passes": true, "depends_on": ["3a"] },
     "4a": { "title": "Create improvement_suggestions Delta state table", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": [] },
     "4b": { "title": "Extend strategist output schema for proposals", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": [] },
-    "4c": { "title": "Write proposals to state table during lever loop", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4a", "4b"] },
+    "4c": { "title": "Write proposals to state table during lever loop", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4a", "4b"] },
     "4d": { "title": "Add backend API endpoints for suggestions", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4a"] },
     "4e": { "title": "Add suggestions UI to run detail page", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] },
     "4f": { "title": "Implement metric view creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] },
@@ -191,6 +191,17 @@
       ],
       "blockers": [],
       "next_task": "4c"
+    },
+    {
+      "session_id": "2026-03-12T09:00:00Z",
+      "task_id": "4c",
+      "feature": "strategist-improvement-suggestions",
+      "summary": "Added write_suggestion import to harness.py. After AG_STARTED stage is written in _run_lever_loop, added block that extracts proposals from the selected action group and writes each to the genie_opt_suggestions Delta table via write_suggestion(). Each proposal is tagged with run_id, space_id, iteration, and fields from the strategist (type, title, rationale, definition, affected_questions, estimated_impact). Failures are caught per-proposal to avoid breaking the lever loop.",
+      "files_changed": [
+        "src/genie_space_optimizer/optimization/harness.py"
+      ],
+      "blockers": [],
+      "next_task": "4d"
     }
   ]
 }
