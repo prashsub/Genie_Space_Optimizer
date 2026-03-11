@@ -1,0 +1,735 @@
+# Genie Space Optimizer — Feature Backlog
+# ═══════════════════════════════════════════════════════════════════════
+#
+# AGENT HARNESS
+# ─────────────
+# This file is the source of truth for what to build. It is paired with:
+#
+#   docs/agent-progress.json   — machine-readable task status & session log
+#   .cursor/rules/backlog-agent.mdc — session protocol (Orient → Pick →
+#                                     Execute → Verify → Close)
+#
+# Any agent (AI or human) starting a new session MUST:
+#   1. Read docs/agent-progress.json to see what is done / blocked.
+#   2. Read git log --oneline -15 for recent commit context.
+#   3. Pick exactly ONE task from this file (highest-priority, first pending).
+#   4. Implement, verify against acceptance_criteria, commit, update progress.
+#   5. End the session cleanly — no half-finished work.
+#
+# See the Anthropic article on long-running agent harnesses for background:
+# https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
+#
+# FEATURE SCHEMA
+# ──────────────
+# Each feature is a self-contained specification with enough context for
+# an agent or developer to implement it without guesswork.
+#
+# Structure per feature:
+#   id             – stable slug (used for branch names, commit prefixes)
+#   title          – human-readable name
+#   priority       – P0 (critical) / P1 (high) / P2 (medium) / P3 (low)
+#   status         – backlog | ready | in_progress | review | done
+#   effort         – XS / S / M / L / XL (t-shirt sizing)
+#   depends_on     – list of feature ids that must land first
+#   description    – what and why (business context)
+#   references     – external docs, Figma links, prior chat IDs
+#   current_state  – how the system works today (code pointers)
+#   target_state   – how it should work after implementation
+#   tasks          – ordered implementation steps with file-level detail
+#   acceptance_criteria – testable conditions for "done"
+#   risks          – known unknowns, edge cases, blockers
+# ═══════════════════════════════════════════════════════════════════════
+
+features:
+
+  # ───────────────────────────────────────────────────────────────────
+  # FEATURE 1: UC Model Registration + Deployment Job
+  # ───────────────────────────────────────────────────────────────────
+  - id: uc-model-registration-and-deployment-job
+    title: "Register optimized model to Unity Catalog and link a deployment job"
+    priority: P0
+    status: backlog
+    effort: XL
+    depends_on: []
+
+    description: |
+      After the optimization workflow reaches the **finalize** stage and the
+      repeatability test passes, the champion model should be registered as a
+      proper Unity Catalog **Registered Model** (not just an MLflow LoggedModel).
+      The registered model must carry the `@champion` alias and be linked to a
+      **Deployment Job** that takes the model and deploys the optimized Genie
+      Space configuration to a target environment (UAT or Prod). The target
+      workspace is specified as a job parameter.
+
+    references:
+      - label: "Train & register UC-compatible models"
+        url: "https://docs.databricks.com/aws/en/machine-learning/manage-model-lifecycle/#train-and-register-unity-catalog-compatible-models"
+      - label: "Use model aliases"
+        url: "https://docs.databricks.com/aws/en/machine-learning/manage-model-lifecycle/#use-model-aliases"
+      - label: "MLflow 3 Deployment Jobs"
+        url: "https://docs.databricks.com/aws/en/mlflow/deployment-job"
+
+    current_state:
+      summary: |
+        `create_genie_model_version()` creates MLflow LoggedModel snapshots per
+        iteration. `promote_best_model()` sets the `champion` alias on the best
+        LoggedModel via `mlflow.set_logged_model_alias()`. The `deploy` task in
+        the DAG applies the config back to the **same** Genie Space — there is
+        no cross-environment deployment, no UC Registered Model, and no
+        Deployment Job linkage.
+      files:
+        - path: src/genie_space_optimizer/optimization/models.py
+          detail: |
+            `create_genie_model_version()` (line 33) — creates LoggedModel with
+            params/artifacts. `promote_best_model()` (line 130) — finds best
+            iteration, sets `champion` alias. Uses `MODEL_NAME_TEMPLATE` =
+            `genie-space-{{ space_id }}`.
+        - path: src/genie_space_optimizer/optimization/harness.py
+          detail: |
+            `_run_finalize()` calls `promote_best_model()` after repeatability
+            test and human review session. Then `generate_report()` and
+            benchmark publish.
+        - path: src/genie_space_optimizer/backend/job_launcher.py
+          detail: |
+            DAG has 5 tasks: preflight → baseline_eval → lever_loop → finalize
+            → deploy. `deploy_target` param exists but is empty string default.
+            Job param `_JOB_PARAM_DEFAULTS` already includes `deploy_target`.
+        - path: src/genie_space_optimizer/common/config.py
+          detail: |
+            `MODEL_NAME_TEMPLATE = "genie-space-{{ space_id }}"` (line 2077).
+            Already has `format_mlflow_template()` for the double-brace syntax.
+
+    target_state:
+      summary: |
+        After finalize passes repeatability test:
+        1. Register the champion LoggedModel as a UC Registered Model version
+           at `<catalog>.<schema>.genie_space_<space_id>`.
+        2. Set the `@champion` alias on the new model version.
+        3. Create/connect a Deployment Job to the registered model. The job
+           accepts `target_workspace_url` as a parameter and re-applies the
+           optimized Genie Space config in that workspace.
+        4. Expose deployment job status in the frontend run detail page.
+
+      uc_model:
+        name_pattern: "<catalog>.<schema>.genie_space_<space_id>"
+        aliases: ["champion"]
+        tags:
+          domain: "from run params"
+          space_id: "from run params"
+          optimization_run_id: "from run params"
+          traceability: "genie_space_optimizer"
+        artifacts:
+          - space_config.json
+          - metadata_snapshot.json
+          - eval_scores.json
+
+      deployment_job:
+        name_pattern: "genie-optimizer-deploy-<space_id>"
+        parameters:
+          - name: model_name
+            description: "UC 3-level model name"
+          - name: model_version
+            description: "Version number to deploy"
+          - name: target_workspace_url
+            description: "Databricks workspace URL to deploy the Genie Space to"
+          - name: target_space_id
+            description: "Genie Space ID in the target workspace (optional, same space_id if omitted)"
+        tasks:
+          - name: validate
+            description: "Load model version, verify champion alias, run smoke test"
+          - name: deploy
+            description: "Apply config to target workspace via cross-workspace SDK client"
+        trigger: "Auto-triggered on new model version registration"
+        run_as: "Service principal (least privilege)"
+
+    tasks:
+      - id: 1a
+        title: "Add UC Registered Model creation to finalize stage"
+        status: pending
+        files:
+          - src/genie_space_optimizer/optimization/models.py
+          - src/genie_space_optimizer/optimization/harness.py
+        detail: |
+          Add `register_uc_model()` function that:
+          - Calls `mlflow.register_model(model_uri, "<catalog>.<schema>.genie_space_<space_id>")`
+            using the champion LoggedModel's URI.
+          - Sets alias via `MlflowClient().set_registered_model_alias(name, "champion", version)`.
+          - Logs model signature with input_example (space config dict).
+          Call from `_run_finalize()` after `promote_best_model()` succeeds.
+
+      - id: 1b
+        title: "Add config for UC model registration"
+        status: pending
+        files:
+          - src/genie_space_optimizer/common/config.py
+        detail: |
+          Add `UC_MODEL_NAME_TEMPLATE = "<catalog>.<schema>.genie_space_{{ space_id }}"`.
+          Add `ENABLE_UC_MODEL_REGISTRATION = True` flag.
+          Add `DEPLOYMENT_JOB_NAME_TEMPLATE`.
+
+      - id: 1c
+        title: "Create deployment job notebook"
+        status: pending
+        files:
+          - src/genie_space_optimizer/jobs/run_cross_env_deploy.py (new)
+        detail: |
+          Notebook that:
+          - Accepts `model_name`, `model_version`, `target_workspace_url`,
+            `target_space_id` from job params.
+          - Loads model version by alias or version number.
+          - Creates a WorkspaceClient for the target workspace.
+          - Applies the space config via `patch_space_config()`.
+          - Logs deployment status back to the model version tags.
+
+      - id: 1d
+        title: "Create and link deployment job programmatically"
+        status: pending
+        files:
+          - src/genie_space_optimizer/optimization/models.py
+          - src/genie_space_optimizer/backend/job_launcher.py
+        detail: |
+          After registering the UC model, create or ensure a Deployment Job
+          exists (similar to `_ensure_persistent_job()` pattern). Link it via
+          `MlflowClient().update_registered_model(name, deployment_job_id=job_id)`.
+
+      - id: 1e
+        title: "Add deploy_target parameter to frontend trigger flow"
+        status: pending
+        files:
+          - src/genie_space_optimizer/backend/models.py
+          - src/genie_space_optimizer/backend/router.py
+          - src/genie_space_optimizer/ui/routes/spaces/$spaceId.tsx
+          - src/genie_space_optimizer/ui/lib/api.ts (auto-generated)
+        detail: |
+          Extend `TriggerRequest` with optional `deploy_target: str | None`.
+          Add a "Deployment Target" selector in the space detail page (dropdown
+          of known workspace URLs from config). Pass through to job params.
+
+      - id: 1f
+        title: "Show deployment job status in run detail page"
+        status: pending
+        files:
+          - src/genie_space_optimizer/ui/routes/runs/$runId.tsx
+          - src/genie_space_optimizer/backend/models.py
+          - src/genie_space_optimizer/backend/router.py
+        detail: |
+          Add `deploymentJobStatus` and `deploymentJobUrl` fields to
+          `PipelineRun` model. Show deployment job link and status badge
+          in the run detail page after finalize completes.
+
+    acceptance_criteria:
+      - "After finalize with passing repeatability test, a UC Registered Model version exists at the expected 3-level name"
+      - "The `@champion` alias points to the latest successful model version"
+      - "A Deployment Job is linked to the registered model in the UC UI"
+      - "The deployment job can be triggered manually and accepts target_workspace_url"
+      - "The deployment job applies the space config to the target workspace successfully"
+      - "Run detail page shows deployment job status and link when available"
+      - "If finalize fails repeatability test, no UC model is registered"
+
+    risks:
+      - "Cross-workspace authentication — service principal must have permissions in both workspaces"
+      - "MLflow registry_uri must be set to `databricks-uc` — verify this in notebook environment"
+      - "Model signature requirement — LoggedModel snapshots may not have signatures today"
+      - "Deployment job auto-trigger on model version creation — could cause unintended deploys"
+      - "UC model name uniqueness if space_id contains special characters"
+
+  # ───────────────────────────────────────────────────────────────────
+  # FEATURE 2: Lever Acknowledgement Checkboxes
+  # ───────────────────────────────────────────────────────────────────
+  - id: lever-acknowledgement-ui
+    title: "Add lever acknowledgement checkboxes before starting optimization"
+    priority: P1
+    status: backlog
+    effort: M
+    depends_on: []
+
+    description: |
+      Before the user can press "Start Optimization", they must acknowledge
+      what the optimization will modify. A series of checkboxes maps 1:1 to the
+      optimization levers. Unchecked levers are sent as disabled (false) in the
+      trigger request, and the workflow skips those levers entirely. All levers
+      are checked by default.
+
+    references: []
+
+    current_state:
+      summary: |
+        The frontend has an apply_mode toggle ("Config Only" vs "Config + UC
+        Write Backs") and a confirmation dialog for UC writes. There are no
+        per-lever controls. The `TriggerRequest` sends `{ space_id, apply_mode }`
+        and the backend defaults `levers` to `[1,2,3,4,5]`.
+      files:
+        - path: src/genie_space_optimizer/ui/routes/spaces/$spaceId.tsx
+          detail: |
+            Start Optimization button with apply_mode toggle. Uses
+            `useTriggerOptimization` mutation. No lever selection UI.
+        - path: src/genie_space_optimizer/backend/models.py
+          detail: |
+            `TriggerRequest` has only `space_id` and `apply_mode` fields
+            (lines 141-143).
+        - path: src/genie_space_optimizer/backend/job_launcher.py
+          detail: |
+            `submit_optimization()` (line ~567) accepts `levers` param as
+            string, defaults to `"[1,2,3,4,5]"`. Already wired to job params.
+        - path: src/genie_space_optimizer/common/config.py
+          detail: |
+            `LEVER_NAMES` (line 2023): {1: "Tables & Columns", 2: "Metric Views",
+            3: "Table-Valued Functions", 4: "Join Specifications",
+            5: "Genie Space Instructions"}.
+            `DEFAULT_LEVER_ORDER = [1, 2, 3, 4, 5]` (line 2031).
+
+    target_state:
+      summary: |
+        A collapsible "Optimization Scope" section appears above the Start
+        Optimization button. Each lever is a labeled checkbox with a brief
+        description of what it will modify. All are checked by default. The
+        user must leave at least one checked. Unchecked levers produce a
+        filtered `levers` array in the trigger request.
+
+      lever_checkboxes:
+        - lever: 1
+          label: "Tables & Columns"
+          description: "Update table descriptions, column descriptions, column visibility, and synonyms"
+          default: true
+        - lever: 2
+          label: "Metric Views"
+          description: "Update metric view column descriptions"
+          default: true
+        - lever: 3
+          label: "Table-Valued Functions"
+          description: "Modify function descriptions, routing logic, and remove underperforming TVFs"
+          default: true
+        - lever: 4
+          label: "Join Specifications"
+          description: "Add, update, or remove join relationships between tables"
+          default: true
+        - lever: 5
+          label: "Genie Space Instructions"
+          description: "Rewrite global routing instructions and add domain-specific guidance"
+          default: true
+
+      api_change: |
+        `TriggerRequest` gains `levers: list[int] | None = None` (None = all).
+        Backend maps to JSON string and passes to `submit_optimization()`.
+
+    tasks:
+      - id: 2a
+        title: "Extend TriggerRequest with levers field"
+        status: pending
+        files:
+          - src/genie_space_optimizer/backend/models.py
+        detail: |
+          Add `levers: list[int] | None = None` to `TriggerRequest`.
+          When None, backend substitutes `[1,2,3,4,5]`.
+
+      - id: 2b
+        title: "Pass levers from trigger route to job_launcher"
+        status: pending
+        files:
+          - src/genie_space_optimizer/backend/router.py
+          - src/genie_space_optimizer/backend/routes/spaces.py
+        detail: |
+          Thread `levers` from `TriggerRequest` through `do_start_optimization()`
+          into `submit_optimization()`. Serialize as JSON string.
+
+      - id: 2c
+        title: "Add lever acknowledgement UI component"
+        status: pending
+        files:
+          - src/genie_space_optimizer/ui/routes/spaces/$spaceId.tsx
+        detail: |
+          Add a "What will be optimized" section with 5 Checkbox components
+          (shadcn/ui). Each shows lever name + short description. State tracked
+          as `Set<number>`. At least one must be checked to enable the button.
+          Pass `levers: Array.from(selectedLevers)` in the trigger mutation.
+
+      - id: 2d
+        title: "Add lever metadata endpoint (optional)"
+        status: pending
+        files:
+          - src/genie_space_optimizer/backend/router.py
+          - src/genie_space_optimizer/backend/models.py
+        detail: |
+          Optional: `GET /api/genie/levers` returns the lever list with names
+          and descriptions, so the frontend isn't hardcoded. Alternatively,
+          hardcode in frontend (simpler, levers rarely change).
+
+    acceptance_criteria:
+      - "All 5 lever checkboxes are visible and checked by default"
+      - "Unchecking a lever excludes it from the `levers` array in the API request"
+      - "Start Optimization button is disabled if zero levers are selected"
+      - "Backend correctly passes the filtered levers list to the job"
+      - "The optimization workflow skips unchecked levers (existing behavior when lever not in list)"
+      - "UC write-backs confirmation dialog still works alongside lever checkboxes"
+
+    risks:
+      - "Lever descriptions must be kept in sync with config.py LEVER_NAMES"
+      - "If lever 5 (instructions) is skipped but lever 1-4 changes need new instructions, quality may regress"
+      - "Users may not understand the implications of disabling specific levers — consider tooltip or info icon"
+
+  # ───────────────────────────────────────────────────────────────────
+  # FEATURE 3: Animated Loading Steps on Start Optimization
+  # ───────────────────────────────────────────────────────────────────
+  - id: start-optimization-loading-animation
+    title: "Show animated step-by-step loading when starting optimization"
+    priority: P2
+    status: backlog
+    effort: S
+    depends_on: []
+
+    description: |
+      When the user clicks "Start Optimization", the button currently shows
+      "Starting…" with a spinner until the API returns and the user is
+      redirected. This can take several seconds and feels frozen. Instead,
+      show an animated sequence of steps (like Vercel's or Linear's deploy
+      animations) that describe the background work happening.
+
+    references:
+      - label: "Vercel deploy animation pattern"
+        url: "https://vercel.com"
+      - label: "Linear loading state pattern"
+        url: "https://linear.app"
+
+    current_state:
+      summary: |
+        The "Start Optimization" button enters a loading state with
+        `triggerOpt.isPending` → shows `<Loader2 className="animate-spin" />`
+        and "Starting…". On success, a toast appears and the user is navigated
+        to `/runs/$runId`. There is no intermediate progress feedback.
+      files:
+        - path: src/genie_space_optimizer/ui/routes/spaces/$spaceId.tsx
+          detail: |
+            Button disabled with spinner when `triggerOpt.isPending`.
+            `onSuccess`: toast + navigate. `onError`: error toast.
+
+    target_state:
+      summary: |
+        Replace the simple spinner with a modal or inline animated stepper
+        that shows progress through simulated steps. Steps auto-advance on
+        a timer and the final step resolves when the API responds.
+
+      animation_steps:
+        - label: "Validating permissions"
+          icon: "Shield"
+          duration_ms: 800
+        - label: "Preparing benchmark suite"
+          icon: "FileText"
+          duration_ms: 1200
+        - label: "Uploading optimization artifacts"
+          icon: "Upload"
+          duration_ms: 1000
+        - label: "Launching optimization workflow"
+          icon: "Rocket"
+          duration_ms: 1500
+        - label: "Confirming run started"
+          icon: "CheckCircle"
+          duration_ms: 0  # resolves on API response
+
+      behavior: |
+        - Steps auto-advance on timer while API call is pending.
+        - If API responds before all steps complete, fast-forward to final step.
+        - If API errors, show error state on the current step.
+        - Use `framer-motion` or CSS transitions for step entrance animations.
+        - Each step: icon + label + animated check mark on completion.
+        - Can be a Dialog/Sheet overlay or an inline expansion below the button.
+
+    tasks:
+      - id: 3a
+        title: "Create OptimizationLoadingStepper component"
+        status: pending
+        files:
+          - src/genie_space_optimizer/ui/components/OptimizationLoadingStepper.tsx (new)
+        detail: |
+          Animated stepper component. Props: `steps[]`, `isComplete: boolean`,
+          `error: string | null`. Uses framer-motion `AnimatePresence` or CSS
+          keyframes. Each step shows: icon → spinning → check animation.
+
+      - id: 3b
+        title: "Integrate stepper into space detail page"
+        status: pending
+        files:
+          - src/genie_space_optimizer/ui/routes/spaces/$spaceId.tsx
+        detail: |
+          When `triggerOpt.isPending`, render `OptimizationLoadingStepper`
+          in a Dialog overlay. On success, show final check + brief delay,
+          then navigate. On error, show error state + dismiss option.
+
+      - id: 3c
+        title: "Add framer-motion dependency (if needed)"
+        status: pending
+        files:
+          - pyproject.toml or package.json (frontend deps)
+        detail: |
+          If not already present, `apx bun add framer-motion`. Alternatively,
+          implement with pure CSS `@keyframes` and Tailwind `animate-*` to
+          avoid the dependency.
+
+    acceptance_criteria:
+      - "Clicking Start Optimization shows animated step progression"
+      - "Steps advance smoothly with icon transitions"
+      - "Final step resolves when the API call returns success"
+      - "API errors display an error state on the current step with retry option"
+      - "After success, user is navigated to the run detail page"
+      - "Animation feels snappy — total simulated duration < 5s"
+      - "Accessible: steps are announced to screen readers via aria-live"
+
+    risks:
+      - "If API responds very quickly (<500ms), animation may feel artificial — consider minimum display time"
+      - "framer-motion adds ~30KB to bundle — CSS-only alternative may be preferred"
+      - "Timer-based steps are cosmetic, not real progress — label as such or keep vague"
+
+  # ───────────────────────────────────────────────────────────────────
+  # FEATURE 4: Strategist Improvement Suggestions (Metric Views & Functions)
+  # ───────────────────────────────────────────────────────────────────
+  - id: strategist-improvement-suggestions
+    title: "Strategist proposes new Metric Views and Functions via a suggestions state table"
+    priority: P1
+    status: backlog
+    effort: XL
+    depends_on: []
+
+    description: |
+      Extend the Adaptive Strategist to propose **structural improvements**
+      beyond patch-level fixes: new Metric Views and new SQL Functions that
+      would improve the Genie Space. These proposals are captured in a Delta
+      state table (`improvement_suggestions`) for human review. Users can
+      accept/reject proposals from the frontend. Accepted proposals become
+      actionable in future optimization runs or can be applied directly.
+
+    references:
+      - label: "Unity Catalog Metric Views"
+        url: "https://docs.databricks.com/aws/en/metric-views/"
+      - label: "Metric View YAML definition"
+        url: "https://docs.databricks.com/aws/en/metric-views/"
+
+    current_state:
+      summary: |
+        The strategist produces Action Groups with `lever_directives` (patch
+        table/column descriptions, join specs, instructions) and optional
+        `global_instruction_rewrite`. It does NOT propose new objects like
+        Metric Views or SQL Functions. There is no suggestions/proposals
+        state table.
+      files:
+        - path: src/genie_space_optimizer/optimization/optimizer.py
+          detail: |
+            `AdaptiveStrategist` class. Triage → Detail phases produce Action
+            Groups. Output schema has `lever_directives` per lever (1-5).
+            No provision for new-object proposals.
+        - path: src/genie_space_optimizer/common/config.py
+          detail: |
+            `LEVER_NAMES` = {1: "Tables & Columns", 2: "Metric Views",
+            3: "Table-Valued Functions", 4: "Join Specifications",
+            5: "Genie Space Instructions"}. Lever 2 already covers metric view
+            column descriptions but not metric view creation.
+        - path: src/genie_space_optimizer/optimization/harness.py
+          detail: |
+            Lever loop iterates: strategist → apply patches → evaluate →
+            accept/rollback. No side-channel for structural proposals.
+        - path: src/genie_space_optimizer/optimization/state.py
+          detail: |
+            Delta tables: `optimization_runs`, `optimization_iterations`,
+            `optimization_benchmarks`, `optimization_eval_results`. No
+            `improvement_suggestions` table.
+
+    target_state:
+      summary: |
+        1. Add `improvement_suggestions` Delta state table.
+        2. Extend strategist output schema to include a `proposals` array.
+        3. After each strategist iteration, write proposals to state table.
+        4. Add backend API for listing/accepting/rejecting proposals.
+        5. Add frontend UI for reviewing proposals on the run detail page.
+        6. Accepted metric view proposals generate YAML definitions.
+        7. Accepted function proposals generate SQL CREATE FUNCTION stubs.
+
+      state_table:
+        name: "improvement_suggestions"
+        location: "<catalog>.<schema>.improvement_suggestions"
+        schema:
+          - name: suggestion_id
+            type: STRING
+            description: "UUID primary key"
+          - name: run_id
+            type: STRING
+            description: "Optimization run that generated this suggestion"
+          - name: space_id
+            type: STRING
+            description: "Genie Space ID"
+          - name: iteration
+            type: INT
+            description: "Iteration number when suggested"
+          - name: suggestion_type
+            type: STRING
+            description: "METRIC_VIEW | FUNCTION | TABLE | VIEW"
+          - name: title
+            type: STRING
+            description: "Human-readable title"
+          - name: rationale
+            type: STRING
+            description: "Why the strategist recommends this"
+          - name: definition_yaml
+            type: STRING
+            description: "YAML definition for metric views or SQL for functions"
+          - name: affected_questions
+            type: STRING
+            description: "JSON array of benchmark question IDs this would help"
+          - name: estimated_impact
+            type: STRING
+            description: "HIGH | MEDIUM | LOW"
+          - name: status
+            type: STRING
+            description: "PROPOSED | ACCEPTED | REJECTED | APPLIED"
+          - name: reviewed_by
+            type: STRING
+            description: "User who reviewed"
+          - name: reviewed_at
+            type: TIMESTAMP
+            description: "When reviewed"
+          - name: created_at
+            type: TIMESTAMP
+            description: "When proposed"
+
+      strategist_output_extension:
+        new_field: "proposals"
+        schema_example: |
+          proposals:
+            - type: "METRIC_VIEW"
+              title: "Revenue per Customer"
+              rationale: "Multiple questions require revenue/customer ratio across geographies..."
+              definition_yaml: |
+                source:
+                  table: sales.orders
+                measures:
+                  - name: revenue_per_customer
+                    expr: "SUM(revenue) / COUNT(DISTINCT customer_id)"
+                dimensions:
+                  - name: region
+                    expr: region
+              affected_questions: ["q3", "q7", "q12"]
+              estimated_impact: "HIGH"
+            - type: "FUNCTION"
+              title: "get_fiscal_quarter"
+              rationale: "Date-to-fiscal-quarter mapping is inconsistent across queries..."
+              definition_sql: |
+                CREATE FUNCTION get_fiscal_quarter(d DATE)
+                RETURNS STRING
+                RETURN CASE WHEN MONTH(d) <= 3 THEN 'Q3' ... END
+              affected_questions: ["q5", "q9"]
+              estimated_impact: "MEDIUM"
+
+      api_endpoints:
+        - method: GET
+          path: "/api/genie/runs/{run_id}/suggestions"
+          operation_id: "getImprovementSuggestions"
+          description: "List all improvement suggestions for a run"
+        - method: POST
+          path: "/api/genie/suggestions/{suggestion_id}/review"
+          operation_id: "reviewSuggestion"
+          body: "{ status: 'ACCEPTED' | 'REJECTED', comment?: string }"
+          description: "Accept or reject a suggestion"
+        - method: POST
+          path: "/api/genie/suggestions/{suggestion_id}/apply"
+          operation_id: "applySuggestion"
+          description: "Apply an accepted suggestion (create metric view / function)"
+
+    tasks:
+      - id: 4a
+        title: "Create improvement_suggestions Delta state table"
+        status: pending
+        files:
+          - src/genie_space_optimizer/optimization/state.py
+        detail: |
+          Add `create_improvement_suggestions_table()` with the schema above.
+          Add `write_suggestion()`, `load_suggestions()`,
+          `update_suggestion_status()` functions. Follow existing patterns
+          from `create_optimization_runs_table()`.
+
+      - id: 4b
+        title: "Extend strategist output schema for proposals"
+        status: pending
+        files:
+          - src/genie_space_optimizer/optimization/optimizer.py
+          - src/genie_space_optimizer/common/config.py
+        detail: |
+          Add `proposals` field to strategist output schema in the prompt
+          templates. Add `STRATEGIST_PROPOSALS_PROMPT` section that teaches
+          the LLM to identify when a new metric view or function would help
+          vs. when patches suffice. Parse proposals from LLM response.
+
+      - id: 4c
+        title: "Write proposals to state table during lever loop"
+        status: pending
+        files:
+          - src/genie_space_optimizer/optimization/harness.py
+        detail: |
+          After each strategist call, if `action_group.proposals` is non-empty,
+          write each to `improvement_suggestions` via `write_suggestion()`.
+          Tag with run_id, iteration, space_id.
+
+      - id: 4d
+        title: "Add backend API endpoints for suggestions"
+        status: pending
+        files:
+          - src/genie_space_optimizer/backend/router.py
+          - src/genie_space_optimizer/backend/models.py
+          - src/genie_space_optimizer/backend/routes/suggestions.py (new)
+        detail: |
+          Add `SuggestionOut`, `SuggestionReviewRequest` models.
+          Add GET/POST routes per target_state.api_endpoints.
+          For `applySuggestion`: use Databricks SDK to create metric view
+          (`CREATE METRIC VIEW` SQL) or function (`CREATE FUNCTION` SQL)
+          via Statement Execution API.
+
+      - id: 4e
+        title: "Add suggestions UI to run detail page"
+        status: pending
+        files:
+          - src/genie_space_optimizer/ui/routes/runs/$runId.tsx
+          - src/genie_space_optimizer/ui/components/SuggestionsPanel.tsx (new)
+        detail: |
+          Add "Improvement Suggestions" tab/section to run detail page.
+          Show each suggestion as a card with: type badge, title, rationale,
+          estimated impact, affected questions count, YAML/SQL preview in
+          code block. Actions: Accept / Reject / Apply (post-accept).
+          Use `useGetImprovementSuggestionsSuspense` hook.
+
+      - id: 4f
+        title: "Implement metric view creation from accepted suggestion"
+        status: pending
+        files:
+          - src/genie_space_optimizer/backend/routes/suggestions.py
+        detail: |
+          When applying a METRIC_VIEW suggestion:
+          - Validate the YAML definition
+          - Execute `CREATE METRIC VIEW` via Statement Execution API
+          - Add the metric view to the Genie Space configuration
+          - Update suggestion status to APPLIED
+
+      - id: 4g
+        title: "Implement function creation from accepted suggestion"
+        status: pending
+        files:
+          - src/genie_space_optimizer/backend/routes/suggestions.py
+        detail: |
+          When applying a FUNCTION suggestion:
+          - Validate the SQL definition
+          - Execute `CREATE FUNCTION` via Statement Execution API
+          - Register the function in the Genie Space configuration
+          - Update suggestion status to APPLIED
+
+    acceptance_criteria:
+      - "Strategist generates at least one metric view or function proposal when pattern warrants it"
+      - "Proposals are persisted in the improvement_suggestions Delta table"
+      - "Run detail page shows proposals with type, rationale, and definition preview"
+      - "User can accept or reject each proposal"
+      - "Accepted metric view proposals can be applied, creating actual metric views in UC"
+      - "Accepted function proposals can be applied, creating actual functions in UC"
+      - "Applied suggestions update the Genie Space configuration"
+      - "Suggestion status transitions: PROPOSED → ACCEPTED/REJECTED → APPLIED"
+
+    risks:
+      - "Metric view YAML syntax correctness — LLM may generate invalid YAML; needs validation layer"
+      - "UC permissions — user must have CREATE METRIC VIEW / CREATE FUNCTION privileges"
+      - "Strategist may over-propose — need quality threshold or max proposals per iteration"
+      - "Metric views are a newer Databricks feature — runtime/SQL warehouse version compatibility"
+      - "Function creation may require specific compute access mode"
+      - "Proposals without human review could suggest schema changes that violate data governance"

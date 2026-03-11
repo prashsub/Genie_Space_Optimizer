@@ -1,0 +1,31 @@
+{
+  "_schema": "Agent progress log — DO NOT delete entries, only append or update status fields.",
+  "_instructions": "Each session appends one entry to `sessions`. Each task completion updates the corresponding task in `task_status`. Read this file FIRST in every session.",
+  "project": "genie-space-optimizer",
+  "backlog_file": "docs/backlog.yml",
+
+  "task_status": {
+    "1a": { "title": "Add UC Registered Model creation to finalize stage", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false },
+    "1b": { "title": "Add config for UC model registration", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false },
+    "1c": { "title": "Create deployment job notebook", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false },
+    "1d": { "title": "Create and link deployment job programmatically", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false },
+    "1e": { "title": "Add deploy_target parameter to frontend trigger flow", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false },
+    "1f": { "title": "Show deployment job status in run detail page", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false },
+    "2a": { "title": "Extend TriggerRequest with levers field", "feature": "lever-acknowledgement-ui", "status": "pending", "passes": false },
+    "2b": { "title": "Pass levers from trigger route to job_launcher", "feature": "lever-acknowledgement-ui", "status": "pending", "passes": false },
+    "2c": { "title": "Add lever acknowledgement UI component", "feature": "lever-acknowledgement-ui", "status": "pending", "passes": false },
+    "2d": { "title": "Add lever metadata endpoint (optional)", "feature": "lever-acknowledgement-ui", "status": "pending", "passes": false },
+    "3a": { "title": "Create OptimizationLoadingStepper component", "feature": "start-optimization-loading-animation", "status": "pending", "passes": false },
+    "3b": { "title": "Integrate stepper into space detail page", "feature": "start-optimization-loading-animation", "status": "pending", "passes": false },
+    "3c": { "title": "Add framer-motion dependency (if needed)", "feature": "start-optimization-loading-animation", "status": "pending", "passes": false },
+    "4a": { "title": "Create improvement_suggestions Delta state table", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false },
+    "4b": { "title": "Extend strategist output schema for proposals", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false },
+    "4c": { "title": "Write proposals to state table during lever loop", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false },
+    "4d": { "title": "Add backend API endpoints for suggestions", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false },
+    "4e": { "title": "Add suggestions UI to run detail page", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false },
+    "4f": { "title": "Implement metric view creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false },
+    "4g": { "title": "Implement function creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false }
+  },
+
+  "sessions": []
+}

@@ -84,6 +84,18 @@ CLI equivalents (use MCP tools above when available):
 | `apx dev logs -f` | Follow/stream logs live |
 | `apx build` | Build for production |
 
+## Backlog-Driven Development
+
+This project uses an incremental, multi-session agent workflow:
+
+| File | Purpose |
+|------|---------|
+| `docs/backlog.yml` | Feature specs with tasks, acceptance criteria, file pointers |
+| `docs/agent-progress.json` | Machine-readable task status + session log |
+| `.cursor/rules/backlog-agent.mdc` | Full session protocol (Orient → Pick → Execute → Verify → Close) |
+
+**Before starting feature work**, read `docs/agent-progress.json` and `git log --oneline -15` to understand current state. Pick exactly one task, implement it, verify against acceptance criteria, commit with the task ID prefix (e.g. `[2a] ...`), and update the progress file. See `.cursor/rules/backlog-agent.mdc` for the full protocol.
+
 ## Detailed Patterns
 
 For backend patterns (DI, CRUD routers, AppConfig, lifespan) and frontend patterns (Suspense, mutations, selector, components), see `.claude/skills/apx/`.
