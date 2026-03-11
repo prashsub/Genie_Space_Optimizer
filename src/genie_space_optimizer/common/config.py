@@ -270,6 +270,8 @@ BENCHMARK_CORRECTION_PROMPT = (
     '- Wrong table/view name: find closest matching valid asset, rewrite SQL.\n'
     '- Field drift (e.g., property_name vs property): map to closest valid column.\n'
     '- Metric views: use MEASURE() syntax for aggregates in SELECT/ORDER BY.\n'
+    '- Metric view alias collision: NEVER use ORDER BY alias when alias == source column\n'
+    '  for MEASURE() expressions. Use ORDER BY MEASURE(column) directly.\n'
     '- TVFs: use correct function call signature.\n'
     '- If error says "Query returns 0 rows", the SQL is syntactically valid but\n'
     '  references impossible filter values. Use the Data Profile to pick realistic values.\n'

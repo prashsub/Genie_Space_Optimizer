@@ -101,6 +101,7 @@ def _apply_uc_grants(ws, sp: str, catalog: str, schema: str) -> None:
                         Privilege.CREATE_TABLE,
                         Privilege.CREATE_FUNCTION,
                         Privilege.CREATE_MODEL,
+                        Privilege.CREATE_VOLUME,
                         Privilege.EXECUTE,
                         Privilege.MANAGE,
                     ],
@@ -110,6 +111,22 @@ def _apply_uc_grants(ws, sp: str, catalog: str, schema: str) -> None:
         logger.info("UC grants applied: SP=%s on %s", sp, fqn)
     except Exception as exc:
         logger.warning("UC grant on schema %s failed: %s", fqn, str(exc)[:200])
+
+    vol_fqn = f"{fqn}.app_artifacts"
+    try:
+        ws.grants.update(
+            securable_type=SecurableType.VOLUME,
+            full_name=vol_fqn,
+            changes=[
+                PermissionsChange(
+                    principal=sp,
+                    add=[Privilege.READ_VOLUME, Privilege.WRITE_VOLUME],
+                )
+            ],
+        )
+        logger.info("UC volume grants applied: SP=%s on %s", sp, vol_fqn)
+    except Exception as exc:
+        logger.debug("UC grant on volume %s: %s", vol_fqn, str(exc)[:200])
 
 
 class _UCGrantBootstrap(LifespanDependency):

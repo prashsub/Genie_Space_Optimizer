@@ -307,6 +307,7 @@ class HealthStatus(BaseModel):
     schemaExists: bool
     tablesReady: bool
     tablesAccessible: bool
+    volumeReady: bool = True
     jobHealthy: bool = True
     catalog: str
     schema_: str = Field(alias="schema")

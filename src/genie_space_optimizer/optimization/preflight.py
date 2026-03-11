@@ -198,6 +198,7 @@ def _collect_data_profile(
         "float", "double", "decimal", "numeric", "long", "short",
     })
     _DATE_TYPES = frozenset({"date", "timestamp", "timestamp_ntz"})
+    _COMPLEX_TYPES = frozenset({"map", "array", "struct", "binary"})
 
     cols_by_table: dict[str, list[dict]] = {}
     for c in uc_columns:
@@ -288,6 +289,7 @@ def _collect_data_profile(
                 and col_info["cardinality"] <= low_cardinality_threshold
                 and dtype not in _NUMERIC_TYPES
                 and dtype not in _DATE_TYPES
+                and not any(dtype.startswith(ct) for ct in _COMPLEX_TYPES)
             ):
                 low_card_cols.append((col_name, dtype))
 

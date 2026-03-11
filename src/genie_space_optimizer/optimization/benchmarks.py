@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+import re as _re
 from typing import Any
 
 from genie_space_optimizer.common.config import TEMPLATE_VARIABLES
@@ -36,6 +37,72 @@ def resolve_sql(sql: str, **kwargs: str) -> str:
         if param_name in kwargs:
             sql = sql.replace(tmpl_var, kwargs[param_name])
     return sql
+
+
+# ── MV alias collision detection / auto-fix ──────────────────────────
+
+
+def detect_mv_alias_sort_collision(sql: str) -> str | None:
+    """Return a warning if MEASURE(col) AS col is followed by ORDER BY col.
+
+    Spark's Catalyst planner re-wraps the output alias in a second MEASURE()
+    when the alias matches the source column name, causing
+    MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION.
+    Returns None if no collision detected.
+    """
+    if not sql:
+        return None
+    measure_aliases = _re.findall(
+        r'MEASURE\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)', sql, _re.IGNORECASE,
+    )
+    if not measure_aliases:
+        return None
+    order_clause = _re.search(
+        r'ORDER\s+BY\s+(.*?)(?:LIMIT|$)', sql, _re.IGNORECASE | _re.DOTALL,
+    )
+    if not order_clause:
+        return None
+    bare_order_cols: set[str] = set()
+    for token in _re.split(r'[,\s]+', order_clause.group(1)):
+        clean = token.strip().rstrip(';').lower()
+        if clean and clean not in ('asc', 'desc', 'nulls', 'last', 'first', ''):
+            bare_order_cols.add(clean)
+    for source_col, alias in measure_aliases:
+        if source_col.lower() == alias.lower() and alias.lower() in bare_order_cols:
+            return (
+                f"MEASURE({source_col}) aliased as '{alias}' with ORDER BY '{alias}'"
+            )
+    return None
+
+
+def fix_mv_alias_sort_collision(sql: str) -> str:
+    """Rewrite ORDER BY alias to ORDER BY MEASURE(col) when collision detected."""
+    if not sql or not detect_mv_alias_sort_collision(sql):
+        return sql
+    measure_aliases = _re.findall(
+        r'MEASURE\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)', sql, _re.IGNORECASE,
+    )
+    colliding = {
+        alias.lower(): source_col
+        for source_col, alias in measure_aliases
+        if source_col.lower() == alias.lower()
+    }
+
+    def _rewrite_order(m: _re.Match) -> str:
+        order_body = m.group(1)
+        for alias_lower, source_col in colliding.items():
+            order_body = _re.sub(
+                rf'\b{_re.escape(alias_lower)}\b(?!\s*\()',
+                f'MEASURE({source_col})',
+                order_body,
+                flags=_re.IGNORECASE,
+            )
+        return f'ORDER BY {order_body}'
+
+    return _re.sub(
+        r'ORDER\s+BY\s+(.*?)(?=\bLIMIT\b|$)',
+        _rewrite_order, sql, flags=_re.IGNORECASE | _re.DOTALL,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -226,6 +293,7 @@ def validate_ground_truth_sql(
     resolved = resolve_sql(sql, catalog=catalog, gold_schema=gold_schema)
     if not resolved or not resolved.strip():
         return False, "Empty SQL"
+    resolved = fix_mv_alias_sort_collision(resolved)
 
     from genie_space_optimizer.optimization.evaluation import _extract_sql_params
 

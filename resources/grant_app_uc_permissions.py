@@ -15,6 +15,7 @@ SP_SCHEMA_PRIVILEGES = {
     "CREATE_TABLE",
     "CREATE_FUNCTION",
     "CREATE_MODEL",
+    "CREATE_VOLUME",
     "EXECUTE",
     "MANAGE",
 }
@@ -62,6 +63,30 @@ def _ensure_schema(*, profile: str, catalog: str, schema: str, warehouse_id: str
         err_msg = (result.get("status") or {}).get("error", {}).get("message", "unknown")
         raise RuntimeError(f"Schema creation failed ({state}): {err_msg}")
     print(f"[grant-app-sp] Schema ensured: {schema_fqn}")
+
+
+_VOLUME_NAME = "app_artifacts"
+
+
+def _ensure_volume(*, profile: str, catalog: str, schema: str, warehouse_id: str) -> None:
+    """Create the managed artifact volume if it doesn't exist (deployer credentials)."""
+    vol_fqn = f"{catalog}.{schema}.{_VOLUME_NAME}"
+    stmt = f"CREATE VOLUME IF NOT EXISTS {vol_fqn}"
+    payload = json.dumps({
+        "warehouse_id": warehouse_id,
+        "statement": stmt,
+        "wait_timeout": "30s",
+    })
+    result = _run_json([
+        "databricks", "api", "post", "/api/2.0/sql/statements",
+        "--profile", profile,
+        "--json", payload,
+    ])
+    state = (result.get("status") or {}).get("state", "")
+    if state != "SUCCEEDED":
+        err_msg = (result.get("status") or {}).get("error", {}).get("message", "unknown")
+        raise RuntimeError(f"Volume creation failed ({state}): {err_msg}")
+    print(f"[grant-app-sp] Volume ensured: {vol_fqn}")
 
 
 def _is_app_missing(err: Exception) -> bool:
@@ -196,10 +221,16 @@ def main() -> int:
             schema=args.schema,
             warehouse_id=args.warehouse_id,
         )
+        _ensure_volume(
+            profile=args.profile,
+            catalog=args.catalog,
+            schema=args.schema,
+            warehouse_id=args.warehouse_id,
+        )
     else:
         print(
             "[grant-app-sp] WARNING: --warehouse-id not provided, "
-            "skipping schema creation",
+            "skipping schema and volume creation",
             file=sys.stderr,
         )
 
@@ -282,6 +313,29 @@ def main() -> int:
             )
             return 0
         raise
+    vol_fqn = f"{schema_fqn}.app_artifacts"
+    try:
+        _update_grants(
+            profile=args.profile,
+            securable_type="volume",
+            full_name=vol_fqn,
+            principal=principal,
+            add=["READ_VOLUME", "WRITE_VOLUME"],
+        )
+    except Exception as err:
+        if "does not exist" in str(err).lower():
+            print(
+                f"[grant-app-sp] WARNING: Volume '{vol_fqn}' does not exist yet — "
+                "volume grants NOT applied. They will be applied at app startup.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[grant-app-sp] WARNING: Could not grant volume privileges on "
+                f"'{vol_fqn}': {err}",
+                file=sys.stderr,
+            )
+
     print(
         f"[grant-app-sp] SP grants applied: principal={principal} "
         f"on {schema_fqn}",

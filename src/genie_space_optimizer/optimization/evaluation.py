@@ -4266,6 +4266,8 @@ def extract_genie_space_benchmarks(
         expected_sql = str(sql_raw).strip()
 
         if expected_sql:
+            from genie_space_optimizer.optimization.benchmarks import fix_mv_alias_sort_collision
+            expected_sql = fix_mv_alias_sort_collision(expected_sql)
             is_valid, err = validate_ground_truth_sql(
                 expected_sql, spark, catalog=catalog, gold_schema=schema,
             )
@@ -4318,6 +4320,8 @@ def extract_genie_space_benchmarks(
                     break
 
         if expected_sql:
+            from genie_space_optimizer.optimization.benchmarks import fix_mv_alias_sort_collision
+            expected_sql = fix_mv_alias_sort_collision(expected_sql)
             is_valid, err = validate_ground_truth_sql(
                 expected_sql, spark, catalog=catalog, gold_schema=schema,
             )
@@ -4498,6 +4502,14 @@ def _attempt_benchmark_correction(
                 "execution_note": (
                     "Query returns 0 rows — pick realistic filter values from the Data Profile"
                     if b.get("validation_error") == "Query returns 0 rows"
+                    else ""
+                ),
+                "mv_hint": (
+                    "METRIC VIEW ALIAS COLLISION: Replace 'ORDER BY alias' with "
+                    "'ORDER BY MEASURE(column)' for any MEASURE() expression. "
+                    "Do NOT alias MEASURE(col) AS col (same name as source column)."
+                    if "MISSING_ATTRIBUTES" in str(b.get("validation_error", ""))
+                    or "RESOLVED_ATTRIBUTE" in str(b.get("validation_error", ""))
                     else ""
                 ),
             }
@@ -5469,6 +5481,16 @@ def load_benchmarks_from_dataset(
 
         quoted_table_name = f"{_q(catalog)}.{_q(schema)}.{_q(table)}"
 
+        try:
+            _exists_df = spark.sql(
+                f"SHOW TABLES IN {_q(catalog)}.{_q(schema)} LIKE '{table}'"
+            )
+            if _exists_df.count() == 0:
+                logger.info("Benchmark table %s does not exist yet — skipping load", table_name)
+                return []
+        except Exception:
+            pass
+
         df = None
         last_err: Exception | None = None
         for attempt in range(_max_retries):
@@ -5546,8 +5568,11 @@ def load_benchmarks_from_dataset(
 
         logger.info("Loaded %d benchmarks from %s", len(benchmarks), table_name)
         return benchmarks
-    except Exception:
-        logger.exception("Failed to load benchmarks from %s", table_name)
+    except Exception as exc:
+        if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
+            logger.info("Benchmark table %s does not exist yet — will generate", table_name)
+        else:
+            logger.exception("Failed to load benchmarks from %s", table_name)
         return []
 
 

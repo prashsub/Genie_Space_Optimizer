@@ -146,8 +146,10 @@ def health_check(config: Dependencies.Config, ws: Dependencies.Client):
                 f"CREATE TABLE permission on the schema."
             ),
             grantCommand=(
-                f"GRANT CREATE TABLE, USE SCHEMA, SELECT, MODIFY "
-                f"ON SCHEMA {fqn} TO `{sp_ref}`"
+                f"GRANT CREATE TABLE, CREATE VOLUME, USE SCHEMA, SELECT, MODIFY "
+                f"ON SCHEMA {fqn} TO `{sp_ref}`; "
+                f"GRANT READ_VOLUME, WRITE_VOLUME "
+                f"ON VOLUME {fqn}.app_artifacts TO `{sp_ref}`"
             ),
             **base,
         )
@@ -173,12 +175,56 @@ def health_check(config: Dependencies.Config, ws: Dependencies.Client):
                 ),
                 grantCommand=(
                     f"GRANT USE CATALOG ON CATALOG `{cat}` TO `{sp_ref}`; "
-                    f"GRANT USE SCHEMA, SELECT, MODIFY ON SCHEMA {fqn} TO `{sp_ref}`"
+                    f"GRANT USE SCHEMA, SELECT, MODIFY ON SCHEMA {fqn} TO `{sp_ref}`; "
+                    f"GRANT READ_VOLUME, WRITE_VOLUME ON VOLUME {fqn}.app_artifacts TO `{sp_ref}`"
                 ),
                 **base,
             )
         if "TABLE_OR_VIEW_NOT_FOUND" in exc_str:
             tables_accessible = True
+
+    # ── Volume readiness ──────────────────────────────────────────────
+    volume_ready = False
+    try:
+        spark.sql(f"DESCRIBE VOLUME {fqn}.app_artifacts")
+        volume_ready = True
+    except Exception as exc:
+        exc_str = str(exc)
+        if "VOLUME_NOT_FOUND" in exc_str or "VOLUME_DOES_NOT_EXIST" in exc_str:
+            return HealthStatus(
+                healthy=False,
+                catalogExists=catalog_exists,
+                schemaExists=True,
+                tablesReady=tables_ready,
+                tablesAccessible=tables_accessible,
+                volumeReady=False,
+                message=(
+                    f"The artifact volume {fqn}.app_artifacts does not exist. "
+                    f"It is required for storing optimization job wheels. "
+                    f"Create it with the SQL command below, or re-run "
+                    f"'make deploy WAREHOUSE_ID=...' which creates it automatically."
+                ),
+                grantCommand=f"CREATE VOLUME IF NOT EXISTS {fqn}.app_artifacts",
+                **base,
+            )
+        if "PERMISSION_DENIED" in exc_str or "ACCESS_DENIED" in exc_str:
+            return HealthStatus(
+                healthy=False,
+                catalogExists=catalog_exists,
+                schemaExists=True,
+                tablesReady=tables_ready,
+                tablesAccessible=tables_accessible,
+                volumeReady=False,
+                message=(
+                    f"The service principal cannot access the artifact volume "
+                    f"in {fqn}. Grant CREATE VOLUME permission, or create the "
+                    f"volume manually with the command below."
+                ),
+                grantCommand=f"CREATE VOLUME IF NOT EXISTS {fqn}.app_artifacts",
+                **base,
+            )
+        _logger.debug("Health check: DESCRIBE VOLUME error: %s", exc_str[:200])
+        volume_ready = True
 
     # ── Function/Prompt permission probe ────────────────────────────
     try:
@@ -225,6 +271,7 @@ def health_check(config: Dependencies.Config, ws: Dependencies.Client):
         schemaExists=True,
         tablesReady=True,
         tablesAccessible=tables_accessible,
+        volumeReady=volume_ready,
         jobHealthy=True,
         **base,
     )

@@ -59,6 +59,7 @@ export interface HealthStatus {
     spClientId?: string | null;
     tablesAccessible: boolean;
     tablesReady: boolean;
+    volumeReady?: boolean;
 }
 export type IterationDetail = Record<string, unknown>;
 export type IterationDetailResponse = Record<string, unknown>;

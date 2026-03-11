@@ -101,10 +101,14 @@ def _ensure_volume(ws: WorkspaceClient, catalog: str, schema: str) -> None:
         )
         logger.info("Created managed volume %s.%s.%s", catalog, schema, _VOLUME_NAME)
     except Exception as exc:
-        if "ALREADY_EXISTS" in str(exc):
+        if "already_exists" in str(exc).lower() or "already exists" in str(exc).lower():
             logger.debug("Volume %s.%s.%s already exists", catalog, schema, _VOLUME_NAME)
         else:
-            logger.warning("Could not create volume %s.%s.%s: %s", catalog, schema, _VOLUME_NAME, exc)
+            raise RuntimeError(
+                f"Could not create volume {catalog}.{schema}.{_VOLUME_NAME}: {exc}. "
+                f"Create it manually with: CREATE VOLUME IF NOT EXISTS "
+                f"{catalog}.{schema}.{_VOLUME_NAME}"
+            ) from exc
     _volume_ensured = True
 
 
