@@ -31,8 +31,15 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Suspense, useState } from "react";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   ArrowLeft,
+  ChevronDown,
   Rocket,
 } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
@@ -75,6 +82,14 @@ function SpaceDetailSkeleton() {
   );
 }
 
+const LEVERS = [
+  { id: 1, label: "Tables & Columns", desc: "Update table descriptions, column descriptions, column visibility, and synonyms" },
+  { id: 2, label: "Metric Views", desc: "Update metric view column descriptions" },
+  { id: 3, label: "Table-Valued Functions", desc: "Modify function descriptions, routing logic, and remove underperforming TVFs" },
+  { id: 4, label: "Join Specifications", desc: "Add, update, or remove join relationships between tables" },
+  { id: 5, label: "Genie Space Instructions", desc: "Rewrite global routing instructions and add domain-specific guidance" },
+] as const;
+
 function SpaceDetail() {
   const { spaceId } = Route.useParams();
   const navigate = useNavigate();
@@ -91,6 +106,18 @@ function SpaceDetail() {
   );
   const [ucConfirmOpen, setUcConfirmOpen] = useState(false);
   const [ucAcknowledged, setUcAcknowledged] = useState(false);
+  const [selectedLevers, setSelectedLevers] = useState<Set<number>>(
+    new Set(LEVERS.map((l) => l.id)),
+  );
+
+  const toggleLever = (id: number) => {
+    setSelectedLevers((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const hasActiveRun = space?.hasActiveRun ?? false;
 
@@ -136,7 +163,13 @@ function SpaceDetail() {
     triggerOpt.mutate(
       {
         params: {},
-        data: { space_id: spaceId, apply_mode: applyMode },
+        data: {
+          space_id: spaceId,
+          apply_mode: applyMode,
+          levers: selectedLevers.size === LEVERS.length
+            ? undefined
+            : Array.from(selectedLevers).sort(),
+        },
       },
       {
         onSuccess: (res) => {
@@ -226,6 +259,30 @@ function SpaceDetail() {
               Config + UC Write Backs
             </Button>
           </div>
+          <Collapsible defaultOpen className="w-64 text-left">
+            <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+              <ChevronDown className="h-3 w-3" />
+              What will be optimized
+            </CollapsibleTrigger>
+            <CollapsibleContent className="mt-2 space-y-2">
+              {LEVERS.map((lever) => (
+                <label
+                  key={lever.id}
+                  className="flex items-start gap-2 cursor-pointer"
+                >
+                  <Checkbox
+                    checked={selectedLevers.has(lever.id)}
+                    onCheckedChange={() => toggleLever(lever.id)}
+                    className="mt-0.5"
+                  />
+                  <div>
+                    <span className="text-sm font-medium">{lever.label}</span>
+                    <p className="text-xs text-muted-foreground">{lever.desc}</p>
+                  </div>
+                </label>
+              ))}
+            </CollapsibleContent>
+          </Collapsible>
           <div>
             <Button
               onClick={handleOptimize}
@@ -233,6 +290,7 @@ function SpaceDetail() {
                 triggerOpt.isPending ||
                 hasActiveRun ||
                 !canStartOptimization ||
+                selectedLevers.size === 0 ||
                 (applyMode === "both" && !canStartWithWrites)
               }
               className="bg-db-red hover:bg-db-red/90"
