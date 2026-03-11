@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC | Quick Reference | |
 # MAGIC |---|---|
-# MAGIC | **Task** | 1 of 5 — Preflight |
+# MAGIC | **Task** | 1 of 6 — Preflight |
 # MAGIC | **Harness function** | `_run_preflight()` → `run_preflight()` in `optimization/preflight.py` |
 # MAGIC | **Reads from** | Job widgets (set by app backend) |
 # MAGIC | **Publishes to** | All downstream tasks (baseline, lever_loop, finalize, deploy) |
@@ -13,7 +13,7 @@
 # MAGIC
 # MAGIC ## 🎯 Purpose
 # MAGIC
-# MAGIC **Preflight** is the first stage of the Genie Space Optimizer's 5-task DAG. It runs *before* any optimization iterations and prepares everything downstream tasks need:
+# MAGIC **Preflight** is the first stage of the Genie Space Optimizer's 6-task DAG. It runs *before* any optimization iterations and prepares everything downstream tasks need:
 # MAGIC
 # MAGIC | Responsibility | Why It Matters |
 # MAGIC |----------------|----------------|
@@ -26,7 +26,7 @@
 # MAGIC
 # MAGIC ## ⚠️ What Happens If Preflight Fails?
 # MAGIC
-# MAGIC > **⚠️ Warning:** If preflight fails, **the entire DAG stops.** Tasks 2–5 (baseline, lever_loop, finalize, deploy) never run.
+# MAGIC > **⚠️ Warning:** If preflight fails, **the entire DAG stops.** Tasks 2–6 (baseline, enrichment, lever_loop, finalize, deploy) never run.
 # MAGIC
 # MAGIC - **Run status** is written as `FAILED` in `genie_opt_runs` (via `_safe_stage` in the harness).
 # MAGIC - **Error details** are logged and re-raised; the Databricks Job run fails.
@@ -43,10 +43,11 @@
 # MAGIC | Step | Task | Status | Reads From | Publishes To |
 # MAGIC |:----:|------|:------:|------------|--------------|
 # MAGIC | 1 | **preflight** | **⬅️ THIS TASK** | widgets | all tasks |
-# MAGIC | 2 | baseline_eval | Next | preflight | lever_loop |
-# MAGIC | 3 | lever_loop | Pending | preflight + baseline | finalize |
-# MAGIC | 4 | finalize | Pending | lever_loop | deploy |
-# MAGIC | 5 | deploy | Pending | preflight + finalize | *(terminal)* |
+# MAGIC | 2 | baseline_eval | Next | preflight | enrichment |
+# MAGIC | 3 | enrichment | Pending | preflight + baseline | lever_loop |
+# MAGIC | 4 | lever_loop | Pending | preflight + baseline + enrichment | finalize |
+# MAGIC | 5 | finalize | Pending | lever_loop | deploy |
+# MAGIC | 6 | deploy | Pending | preflight + finalize | *(terminal)* |
 # MAGIC
 # MAGIC ### Task Value Flow
 # MAGIC

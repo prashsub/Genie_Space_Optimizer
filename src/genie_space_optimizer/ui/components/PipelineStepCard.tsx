@@ -17,10 +17,11 @@ import {
   XCircle,
   ChevronDown,
   Settings2,
-  Database,
   FlaskConical,
+  Sparkles,
   Wrench,
   BarChart3,
+  Rocket,
 } from "lucide-react";
 
 interface PipelineStepCardProps {
@@ -35,10 +36,11 @@ interface PipelineStepCardProps {
 
 const stepIcons: Record<number, React.ReactNode> = {
   1: <Settings2 className="h-4 w-4" />,
-  2: <Database className="h-4 w-4" />,
-  3: <FlaskConical className="h-4 w-4" />,
+  2: <FlaskConical className="h-4 w-4" />,
+  3: <Sparkles className="h-4 w-4" />,
   4: <Wrench className="h-4 w-4" />,
   5: <BarChart3 className="h-4 w-4" />,
+  6: <Rocket className="h-4 w-4" />,
 };
 
 const statusConfig: Record<

@@ -63,7 +63,7 @@ function PipelineSkeleton() {
       <Skeleton className="h-8 w-48" />
       <Skeleton className="h-4 w-full" />
       <div className="space-y-3">
-        {[1, 2, 3, 4, 5].map((i) => (
+        {Array.from({length: 6}, (_, i) => i + 1).map((i) => (
           <Skeleton key={i} className="h-24 rounded-lg" />
         ))}
       </div>
@@ -77,11 +77,12 @@ const TERMINAL_STATUSES = [
 ];
 
 const STEP_DESCRIPTIONS: Record<number, string> = {
-  1: "Reads the Genie Space configuration — tables, instructions, sample questions, and functions — to understand the current setup.",
-  2: "Queries Unity Catalog for column-level metadata, tags, descriptions, and data profiles used to inform optimization decisions.",
-  3: "Runs all benchmark questions through the Genie API with 9 evaluation judges to establish the current accuracy baseline.",
+  1: "Reads the Genie Space configuration and queries Unity Catalog for column metadata, tags, and descriptions.",
+  2: "Runs all benchmark questions through the Genie API with 9 evaluation judges to establish the current accuracy baseline.",
+  3: "Proactively enriches the Genie Space with descriptions, join paths, metadata, instructions, and example SQLs.",
   4: "Applies 5 optimization levers (table/column metadata, metric views, TVFs, join specs, instructions) and evaluates each change.",
   5: "Final evaluation pass on the optimized configuration with repeatability checks to confirm stable improvements.",
+  6: "Deploys the optimized configuration to the target environment.",
 };
 
 function useElapsedTime(startedAt: string | undefined, isActive: boolean) {
@@ -134,10 +135,12 @@ function StatusBanner({
   status,
   elapsed,
   completedSteps,
+  totalSteps,
 }: {
   status: string;
   elapsed: number;
   completedSteps: number;
+  totalSteps: number;
 }) {
   if (status === "QUEUED") {
     return (
@@ -176,7 +179,7 @@ function StatusBanner({
               Optimization In Progress
             </h3>
             <p className="text-xs text-db-blue/70">
-              Step {completedSteps + 1} of 5 &middot; Polling for updates every 5 seconds
+              Step {completedSteps + 1} of {totalSteps} &middot; Polling for updates every 5 seconds
             </p>
           </div>
           <Badge variant="outline" className="shrink-0 border-db-blue/30 text-db-blue">
@@ -403,9 +406,10 @@ function PipelineView() {
     (s) => s.status === "completed",
   ).length;
   const runningStep = run.steps.find((s) => s.status === "running");
+  const stepWeight = Math.round(100 / run.steps.length);
   const progressPct = run.steps.reduce((acc, s) => {
-    if (s.status === "completed") return acc + 20;
-    if (s.status === "running") return acc + 10;
+    if (s.status === "completed") return acc + stepWeight;
+    if (s.status === "running") return acc + Math.round(stepWeight / 2);
     return acc;
   }, 0);
   const isCompleted = ["COMPLETED", "CONVERGED", "STALLED", "MAX_ITERATIONS"].includes(run.status);
@@ -475,6 +479,7 @@ function PipelineView() {
         status={run.status}
         elapsed={elapsed}
         completedSteps={completedSteps}
+        totalSteps={run.steps.length}
       />
 
       {/* Review Banner (only for terminal runs) */}
@@ -494,7 +499,7 @@ function PipelineView() {
                 : "Progress"}
           </span>
           <span className="tabular-nums font-medium">
-            {completedSteps}/5 steps
+            {completedSteps}/{run.steps.length} steps
           </span>
         </div>
         <div className="relative">
@@ -593,7 +598,7 @@ function PipelineView() {
             summary={step.summary}
           >
             <StepInsights step={step} links={run.links ?? []} />
-            {step.stepNumber === 4 &&
+            {step.name === "Adaptive Optimization" &&
               run.levers.length > 0 && (
                 <LeverProgress levers={run.levers} links={run.links ?? []} runId={run.runId} />
               )}
@@ -771,6 +776,7 @@ function StepInsights({
 }: {
   step: {
     stepNumber: number;
+    name: string;
     outputs?: Record<string, unknown> | null;
   };
   links: { label: string; url: string; category: string }[];
@@ -778,13 +784,16 @@ function StepInsights({
   const outputs = step.outputs ?? {};
   if (!Object.keys(outputs).length) return null;
 
-  if (step.stepNumber === 1) {
+  if (step.name === "Preflight") {
     const tableCount = outputs.tableCount as number | undefined;
     const tables = (outputs.tables as string[] | undefined) ?? [];
     const functionCount = outputs.functionCount as number | undefined;
     const instructionCount = outputs.instructionCount as number | undefined;
     const sampleQuestionCount = outputs.sampleQuestionCount as number | undefined;
     const sampleQuestionsPreview = (outputs.sampleQuestionsPreview as string[] | undefined) ?? [];
+    const columnsCollected = outputs.columnsCollected as number | undefined;
+    const tagsCollected = outputs.tagsCollected as number | undefined;
+    const columnSamples = (outputs.columnSamples as string[] | undefined) ?? [];
 
     return (
       <div className="space-y-2 text-xs">
@@ -793,9 +802,14 @@ function StepInsights({
           {functionCount != null && <Badge variant="secondary">Functions: {functionCount}</Badge>}
           {instructionCount != null && <Badge variant="secondary">Instructions: {instructionCount}</Badge>}
           {sampleQuestionCount != null && <Badge variant="secondary">Sample questions: {sampleQuestionCount}</Badge>}
+          {columnsCollected != null && <Badge variant="secondary">Columns: {columnsCollected}</Badge>}
+          {tagsCollected != null && <Badge variant="secondary">Tags: {tagsCollected}</Badge>}
         </div>
         {tables.length > 0 && (
           <p className="text-muted-foreground">Tables: {tables.slice(0, 8).join(", ")}</p>
+        )}
+        {columnSamples.length > 0 && (
+          <p className="text-muted-foreground">Sample columns: {columnSamples.slice(0, 8).join(", ")}</p>
         )}
         {sampleQuestionsPreview.length > 0 && (
           <div className="space-y-1">
@@ -809,63 +823,7 @@ function StepInsights({
     );
   }
 
-  if (step.stepNumber === 2) {
-    const columnsCollected = outputs.columnsCollected as number | undefined;
-    const tagsCollected = outputs.tagsCollected as number | undefined;
-    const routinesCollected = outputs.routinesCollected as number | undefined;
-    const columnSamples = (outputs.columnSamples as string[] | undefined) ?? [];
-    const tagSamples = (outputs.tagSamples as string[] | undefined) ?? [];
-    const routineSamples = (outputs.routineSamples as string[] | undefined) ?? [];
-    const tableRefCount = outputs.tableRefCount as number | undefined;
-    const referencedSchemaCount = outputs.referencedSchemaCount as number | undefined;
-    const referencedSchemas = (outputs.referencedSchemas as string[] | undefined) ?? [];
-    const collectionScope = outputs.collectionScope as string | undefined;
-    const metadataSource = outputs.metadataSource as
-      | { columns?: string; tags?: string; routines?: string }
-      | undefined;
-
-    return (
-      <div className="space-y-2 text-xs">
-        <div className="flex flex-wrap gap-2">
-          <Badge variant="secondary">Columns: {columnsCollected ?? "?"}</Badge>
-          <Badge variant="secondary">Tags: {tagsCollected ?? "?"}</Badge>
-          <Badge variant="secondary">Routines: {routinesCollected ?? "?"}</Badge>
-          {tableRefCount != null && (
-            <Badge variant="secondary">Referenced assets: {tableRefCount}</Badge>
-          )}
-          {referencedSchemaCount != null && (
-            <Badge variant="secondary">Referenced schemas: {referencedSchemaCount}</Badge>
-          )}
-        </div>
-        {collectionScope && (
-          <p className="text-muted-foreground">
-            Collection scope: {collectionScope === "genie_assets" ? "Genie referenced assets" : "Catalog/schema fallback"}
-          </p>
-        )}
-        {metadataSource && (
-          <p className="text-muted-foreground">
-            Source - columns: {metadataSource.columns ?? "unknown"}, tags: {metadataSource.tags ?? "unknown"}, routines: {metadataSource.routines ?? "unknown"}
-          </p>
-        )}
-        {referencedSchemas.length > 0 && (
-          <p className="text-muted-foreground">
-            Schemas: {referencedSchemas.slice(0, 6).join(", ")}
-          </p>
-        )}
-        {columnSamples.length > 0 && (
-          <p className="text-muted-foreground">Sample columns: {columnSamples.slice(0, 8).join(", ")}</p>
-        )}
-        {tagSamples.length > 0 && (
-          <p className="text-muted-foreground">Sample tags: {tagSamples.slice(0, 5).join(", ")}</p>
-        )}
-        {routineSamples.length > 0 && (
-          <p className="text-muted-foreground">Sample routines: {routineSamples.slice(0, 5).join(", ")}</p>
-        )}
-      </div>
-    );
-  }
-
-  if (step.stepNumber === 3) {
+  if (step.name === "Baseline Evaluation") {
     const judgeScores = (outputs.judgeScores as Record<string, number | null> | undefined) ?? {};
     const sampleQuestions = (outputs.sampleQuestions as Record<string, unknown>[] | undefined) ?? [];
     const invalidBenchmarkCount = outputs.invalidBenchmarkCount as number | undefined;
@@ -937,60 +895,73 @@ function StepInsights({
     );
   }
 
-  if (step.stepNumber === 4) {
+  if (step.name === "Proactive Enrichment") {
+    const proactive = outputs.proactiveChanges as Record<string, unknown> | undefined;
+    const totalEnrichments = outputs.totalEnrichments as number | undefined;
+    const enrichmentSkipped = outputs.enrichmentSkipped as boolean | undefined;
+
+    return (
+      <div className="space-y-2 text-xs">
+        {enrichmentSkipped && (
+          <p className="text-muted-foreground">Enrichment skipped (baseline already meets thresholds)</p>
+        )}
+        {totalEnrichments != null && (
+          <Badge variant="secondary">Total enrichments: {totalEnrichments}</Badge>
+        )}
+        {proactive && Object.keys(proactive).length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {(proactive.descriptionsEnriched as number) > 0 && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                Descriptions: {proactive.descriptionsEnriched as number} cols
+              </Badge>
+            )}
+            {(proactive.tablesEnriched as number) > 0 && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                Tables described: {proactive.tablesEnriched as number}
+              </Badge>
+            )}
+            {(proactive.joinSpecsDiscovered as number) > 0 && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                Joins discovered: {proactive.joinSpecsDiscovered as number}
+              </Badge>
+            )}
+            {!!proactive.spaceDescriptionGenerated && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">Space description generated</Badge>
+            )}
+            {(proactive.sampleQuestionsGenerated as number) > 0 && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                Sample questions: {proactive.sampleQuestionsGenerated as number}
+              </Badge>
+            )}
+            {!!proactive.instructionsSeeded && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">Instructions seeded</Badge>
+            )}
+            {(proactive.promptsMatched as number) > 0 && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                Prompts matched: {proactive.promptsMatched as number}
+              </Badge>
+            )}
+            {(proactive.exampleSqlsMined as number) > 0 && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                Example SQLs: {proactive.exampleSqlsMined as number}
+              </Badge>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (step.name === "Adaptive Optimization") {
     const patchesApplied = outputs.patchesApplied as number | undefined;
     const leversAccepted = (outputs.leversAccepted as unknown[] | undefined) ?? [];
     const leversRolledBack = (outputs.leversRolledBack as unknown[] | undefined) ?? [];
     const iterationCounter = outputs.iterationCounter as number | undefined;
     const baselineAccuracy = outputs.baselineAccuracy as number | undefined;
     const bestAccuracy = outputs.bestAccuracy as number | undefined;
-    const proactive = outputs.proactiveChanges as Record<string, unknown> | undefined;
 
     return (
       <div className="space-y-2 text-xs">
-        {proactive && Object.keys(proactive).length > 0 && (
-          <div className="space-y-1">
-            <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Pre-loop enrichment</p>
-            <div className="flex flex-wrap gap-1.5">
-              {(proactive.descriptionsEnriched as number) > 0 && (
-                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
-                  Descriptions: {proactive.descriptionsEnriched as number} cols
-                </Badge>
-              )}
-              {(proactive.tablesEnriched as number) > 0 && (
-                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
-                  Tables described: {proactive.tablesEnriched as number}
-                </Badge>
-              )}
-              {(proactive.joinSpecsDiscovered as number) > 0 && (
-                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
-                  Joins discovered: {proactive.joinSpecsDiscovered as number}
-                </Badge>
-              )}
-              {!!proactive.spaceDescriptionGenerated && (
-                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">Space description generated</Badge>
-              )}
-              {(proactive.sampleQuestionsGenerated as number) > 0 && (
-                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
-                  Sample questions: {proactive.sampleQuestionsGenerated as number}
-                </Badge>
-              )}
-              {!!proactive.instructionsSeeded && (
-                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">Instructions seeded</Badge>
-              )}
-              {(proactive.promptsMatched as number) > 0 && (
-                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
-                  Prompts matched: {proactive.promptsMatched as number}
-                </Badge>
-              )}
-              {(proactive.exampleSqlsMined as number) > 0 && (
-                <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
-                  Example SQLs: {proactive.exampleSqlsMined as number}
-                </Badge>
-              )}
-            </div>
-          </div>
-        )}
         <div className="flex flex-wrap gap-2">
           {patchesApplied != null && <Badge variant="secondary">Patches applied: {patchesApplied}</Badge>}
           <Badge variant="secondary">Levers accepted: {leversAccepted.length}</Badge>
@@ -1009,7 +980,7 @@ function StepInsights({
     );
   }
 
-  if (step.stepNumber === 5) {
+  if (step.name === "Finalization") {
     const bestAccuracy = outputs.bestAccuracy as number | undefined;
     const repeatability = outputs.repeatability as number | undefined;
     const convergenceReason = outputs.convergenceReason as string | undefined;
@@ -1020,6 +991,18 @@ function StepInsights({
           {bestAccuracy != null && <Badge variant="secondary">Best accuracy: {bestAccuracy.toFixed(1)}%</Badge>}
           {repeatability != null && <Badge variant="secondary">Repeatability: {repeatability.toFixed(1)}%</Badge>}
           {convergenceReason && <Badge variant="secondary">Convergence: {convergenceReason}</Badge>}
+        </div>
+      </div>
+    );
+  }
+
+  if (step.name === "Deploy") {
+    const deployStatus = outputs.deployStatus as string | undefined;
+
+    return (
+      <div className="space-y-2 text-xs">
+        <div className="flex flex-wrap gap-2">
+          {deployStatus && <Badge variant="secondary">Deploy: {deployStatus}</Badge>}
         </div>
       </div>
     );

@@ -1,7 +1,7 @@
 """
-Optimization Harness — stage functions for the 5-task Databricks Job.
+Optimization Harness — stage functions for the 6-task Databricks Job.
 
-The canonical execution path is the **5-task DAG** launched via
+The canonical execution path is the **6-task DAG** launched via
 ``submit_optimization()`` in ``job_launcher.py``.  Each DAG notebook is a
 thin wrapper that deserializes task values, calls a single harness function,
 and publishes outputs.
@@ -10,7 +10,7 @@ Each ``_run_*`` / ``_prepare_*`` function encapsulates all business logic
 for its stage so that both the DAG notebooks and the ``optimize_genie_space()``
 convenience function (used for dev/test only) share identical code paths.
 
-Architecture: ``preflight`` → ``baseline_eval`` → ``prepare_lever_loop`` +
+Architecture: ``preflight`` → ``baseline_eval`` → ``enrichment`` →
 ``lever_loop`` → ``finalize`` → ``deploy``.  Inter-task data flows via
 ``dbutils.jobs.taskValues``.  Detailed state goes to Delta.
 """
@@ -1638,6 +1638,200 @@ def _prepare_lever_loop(
             )
 
     return config
+
+
+def _run_enrichment(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    domain: str,
+    benchmarks: list[dict],
+    exp_name: str,
+    catalog: str,
+    schema: str,
+    baseline_model_id: str = "",
+    optimization_run_id: str = "",
+) -> dict:
+    """Stage 2.5: Config preparation + proactive enrichment + LoggedModel snapshot.
+
+    Combines ``_prepare_lever_loop()`` (config loading, UC metadata, prompt
+    matching) with the Phase 1 proactive enrichment steps previously embedded
+    in ``_run_lever_loop()`` (descriptions, joins, metadata, instructions,
+    example SQLs).
+
+    Side effects:
+      - Patches the Genie Space with enrichments via the API
+      - Creates an MLflow LoggedModel snapshot of the enriched state
+      - Writes Delta stage records (ENRICHMENT_STARTED, ENRICHMENT_COMPLETE)
+
+    Returns dict with:
+      - enrichment_model_id: str
+      - enrichment_skipped: bool
+      - config: dict (enriched config)
+      - summary: dict (counts of each enrichment type)
+    """
+    from genie_space_optimizer.common.genie_client import fetch_space_config
+
+    write_stage(
+        spark, run_id, "ENRICHMENT_STARTED", "STARTED",
+        task_key="enrichment", catalog=catalog, schema=schema,
+    )
+
+    try:
+        # ── 1. Load config (delegates to _prepare_lever_loop) ─────────────
+        config = _prepare_lever_loop(w, spark, run_id, space_id, catalog, schema)
+
+        uc_columns = config.get("_uc_columns", [])
+        metadata_snapshot = config.get("_parsed_space", config)
+        if uc_columns:
+            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        # ── 2. Proactive Enrichment sub-steps ─────────────────────────────
+        _pe_lines = [_section("ENRICHMENT — PROACTIVE ENRICHMENT", "-")]
+        _pe_lines.append(_kv("Space ID", space_id))
+        _pe_lines.append(_kv("UC columns", len(uc_columns)))
+        _pe_lines.append(_bar("-"))
+        print("\n".join(_pe_lines))
+
+        enrichment_result = _run_description_enrichment(
+            w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+        )
+        if enrichment_result.get("total_enriched", 0) > 0 or enrichment_result.get("tables_enriched", 0) > 0:
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        join_result = _run_proactive_join_discovery(
+            w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+        )
+        if join_result.get("total_applied", 0) > 0:
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        meta_result = _run_space_metadata_enrichment(
+            w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+        )
+        if meta_result.get("description_generated") or meta_result.get("questions_generated"):
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        instruction_result = _run_proactive_instruction_seeding(
+            w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+        )
+        if instruction_result.get("instructions_seeded"):
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        # Mine and apply example SQLs
+        mined_example_proposals = _mine_benchmark_example_sqls(
+            benchmarks, metadata_snapshot,
+            spark=spark, catalog=catalog, gold_schema=schema,
+        )
+        if mined_example_proposals:
+            _apply_proactive_example_sqls(
+                w, spark, run_id, space_id, mined_example_proposals,
+                metadata_snapshot, config, catalog, schema,
+            )
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        # ── Summary ───────────────────────────────────────────────────────
+        total_enrichments = (
+            enrichment_result.get("total_enriched", 0)
+            + join_result.get("total_applied", 0)
+            + (1 if meta_result.get("description_generated") else 0)
+            + (1 if meta_result.get("questions_generated") else 0)
+            + (1 if instruction_result.get("instructions_seeded") else 0)
+            + len(mined_example_proposals)
+        )
+
+        _enr_summary = [_section("PROACTIVE ENRICHMENT — SUMMARY", "-")]
+        _enr_summary.append(_kv("Descriptions enriched", enrichment_result.get("total_enriched", 0)))
+        _enr_summary.append(_kv("Joins discovered", join_result.get("total_applied", 0)))
+        _enr_summary.append(_kv("Space metadata", "description=%s, questions=%s" % (
+            "generated" if meta_result.get("description_generated") else "unchanged",
+            "generated" if meta_result.get("questions_generated") else "unchanged",
+        )))
+        _enr_summary.append(_kv("Instructions seeded", "yes" if instruction_result.get("instructions_seeded") else "no"))
+        _enr_summary.append(_kv("Example SQLs mined", len(mined_example_proposals)))
+        _enr_summary.append(_kv("Total enrichments", total_enrichments))
+        _enr_summary.append(_bar("-"))
+        print("\n".join(_enr_summary))
+
+        enrichment_skipped = total_enrichments == 0
+
+        # ── 3. LoggedModel snapshot of enriched state ─────────────────────
+        uc_schema = f"{catalog}.{schema}"
+        enrichment_model_id = create_genie_model_version(
+            w,
+            space_id,
+            config,
+            iteration=-1,
+            domain=domain,
+            experiment_name=exp_name,
+            uc_schema=uc_schema,
+            uc_columns=uc_columns,
+            parent_model_id=baseline_model_id or None,
+            optimization_run_id=optimization_run_id or run_id,
+        )
+
+        write_stage(
+            spark, run_id, "ENRICHMENT_COMPLETE", "COMPLETE",
+            task_key="enrichment", catalog=catalog, schema=schema,
+            detail={
+                "enrichment_model_id": enrichment_model_id,
+                "total_enrichments": total_enrichments,
+                "enrichment_skipped": enrichment_skipped,
+                "descriptions_enriched": enrichment_result.get("total_enriched", 0),
+                "joins_discovered": join_result.get("total_applied", 0),
+                "instructions_seeded": bool(instruction_result.get("instructions_seeded")),
+                "examples_mined": len(mined_example_proposals),
+            },
+        )
+
+        return {
+            "enrichment_model_id": enrichment_model_id,
+            "enrichment_skipped": enrichment_skipped,
+            "config": config,
+            "summary": {
+                "descriptions_enriched": enrichment_result.get("total_enriched", 0),
+                "joins_discovered": join_result.get("total_applied", 0),
+                "description_generated": bool(meta_result.get("description_generated")),
+                "questions_generated": bool(meta_result.get("questions_generated")),
+                "instructions_seeded": bool(instruction_result.get("instructions_seeded")),
+                "examples_mined": len(mined_example_proposals),
+                "total_enrichments": total_enrichments,
+            },
+        }
+
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("ENRICHMENT FAILED for run %s", run_id)
+        try:
+            write_stage(
+                spark, run_id, "ENRICHMENT_STARTED", "FAILED",
+                task_key="enrichment",
+                error_message=err_msg[:500],
+                catalog=catalog, schema=schema,
+            )
+        except Exception:
+            logger.warning("Failed to write ENRICHMENT FAILED stage", exc_info=True)
+        raise
 
 
 # ── Stage 3: LEVER LOOP ─────────────────────────────────────────────
@@ -3391,10 +3585,16 @@ def _run_lever_loop(
     apply_mode: str = APPLY_MODE,
     triggered_by: str = "",
     human_corrections: list[dict] | None = None,
+    enrichment_done: bool = False,
+    enrichment_model_id: str = "",
 ) -> dict:
     """Stage 3: Iterate levers with convergence checking.
 
     Internal Python loop over levers. Supports resume on task retry.
+
+    When *enrichment_done* is True, Phase 1 (proactive enrichment) is skipped
+    because it was already executed by the standalone enrichment task. The
+    enriched config is loaded from the Genie Space API instead.
 
     Returns dict with best scores, model_id, iteration_counter, levers lists.
     """
@@ -3503,70 +3703,91 @@ def _run_lever_loop(
     if uc_columns:
         enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
-    # ── Phase 1: Proactive Enrichment ──
-    _pe_lines = [_section("LEVER LOOP — PROACTIVE ENRICHMENT", "-")]
-    _pe_lines.append(_kv("Space ID", space_id))
-    _pe_lines.append(_kv("UC columns", len(uc_columns)))
-    _pe_lines.append(_bar("-"))
-    print("\n".join(_pe_lines))
+    if not enrichment_done:
+        # ── Phase 1: Proactive Enrichment (inline, legacy path) ──
+        _pe_lines = [_section("LEVER LOOP — PROACTIVE ENRICHMENT", "-")]
+        _pe_lines.append(_kv("Space ID", space_id))
+        _pe_lines.append(_kv("UC columns", len(uc_columns)))
+        _pe_lines.append(_bar("-"))
+        print("\n".join(_pe_lines))
 
-    enrichment_result = _run_description_enrichment(
-        w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
-    )
-    if enrichment_result.get("total_enriched", 0) > 0 or enrichment_result.get("tables_enriched", 0) > 0:
+        enrichment_result = _run_description_enrichment(
+            w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+        )
+        if enrichment_result.get("total_enriched", 0) > 0 or enrichment_result.get("tables_enriched", 0) > 0:
+            from genie_space_optimizer.common.genie_client import fetch_space_config
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        join_result = _run_proactive_join_discovery(
+            w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+        )
+        if join_result.get("total_applied", 0) > 0:
+            from genie_space_optimizer.common.genie_client import fetch_space_config
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        meta_result = _run_space_metadata_enrichment(
+            w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+        )
+        if meta_result.get("description_generated") or meta_result.get("questions_generated"):
+            from genie_space_optimizer.common.genie_client import fetch_space_config
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        instruction_result = _run_proactive_instruction_seeding(
+            w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
+        )
+        if instruction_result.get("instructions_seeded"):
+            from genie_space_optimizer.common.genie_client import fetch_space_config
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+        _enr_summary = [_section("PROACTIVE ENRICHMENT — SUMMARY", "-")]
+        _enr_summary.append(_kv("Descriptions enriched", enrichment_result.get("total_enriched", 0)))
+        _enr_summary.append(_kv("Joins discovered", join_result.get("total_applied", 0)))
+        _enr_summary.append(_kv("Space metadata", "description=%s, questions=%s" % (
+            "generated" if meta_result.get("description_generated") else "unchanged",
+            "generated" if meta_result.get("questions_generated") else "unchanged",
+        )))
+        _enr_summary.append(_kv("Instructions seeded", "yes" if instruction_result.get("instructions_seeded") else "no"))
+        _enr_summary.append(_bar("-"))
+        print("\n".join(_enr_summary))
+    else:
+        # Enrichment already handled by the enrichment task -- reload fresh
+        # config from API (enrichment patches are already applied).
         from genie_space_optimizer.common.genie_client import fetch_space_config
+        from genie_space_optimizer.common.uc_metadata import (
+            extract_genie_space_table_refs,
+            get_columns_for_tables_rest,
+        )
         config = fetch_space_config(w, space_id)
+        table_refs = extract_genie_space_table_refs(config)
+        uc_columns = get_columns_for_tables_rest(w, table_refs) if table_refs else []
         config["_uc_columns"] = uc_columns
         metadata_snapshot = config.get("_parsed_space", config)
         if uc_columns:
             enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
-
-    # Stage 2.85: Proactive join discovery from baseline eval
-    join_result = _run_proactive_join_discovery(
-        w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
-    )
-    if join_result.get("total_applied", 0) > 0:
-        from genie_space_optimizer.common.genie_client import fetch_space_config
-        config = fetch_space_config(w, space_id)
-        config["_uc_columns"] = uc_columns
-        metadata_snapshot = config.get("_parsed_space", config)
-        if uc_columns:
-            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
-
-    # Stage 2.9: Proactive space metadata enrichment
-    meta_result = _run_space_metadata_enrichment(
-        w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
-    )
-    if meta_result.get("description_generated") or meta_result.get("questions_generated"):
-        from genie_space_optimizer.common.genie_client import fetch_space_config
-        config = fetch_space_config(w, space_id)
-        config["_uc_columns"] = uc_columns
-        metadata_snapshot = config.get("_parsed_space", config)
-        if uc_columns:
-            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
-
-    # Stage 2.95: Proactive instruction seeding for empty spaces
-    instruction_result = _run_proactive_instruction_seeding(
-        w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
-    )
-    if instruction_result.get("instructions_seeded"):
-        from genie_space_optimizer.common.genie_client import fetch_space_config
-        config = fetch_space_config(w, space_id)
-        config["_uc_columns"] = uc_columns
-        metadata_snapshot = config.get("_parsed_space", config)
-        if uc_columns:
-            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
-
-    _enr_summary = [_section("PROACTIVE ENRICHMENT — SUMMARY", "-")]
-    _enr_summary.append(_kv("Descriptions enriched", enrichment_result.get("total_enriched", 0)))
-    _enr_summary.append(_kv("Joins discovered", join_result.get("total_applied", 0)))
-    _enr_summary.append(_kv("Space metadata", "description=%s, questions=%s" % (
-        "generated" if meta_result.get("description_generated") else "unchanged",
-        "generated" if meta_result.get("questions_generated") else "unchanged",
-    )))
-    _enr_summary.append(_kv("Instructions seeded", "yes" if instruction_result.get("instructions_seeded") else "no"))
-    _enr_summary.append(_bar("-"))
-    print("\n".join(_enr_summary))
+        if enrichment_model_id:
+            prev_model_id = enrichment_model_id
+        print("\n".join([
+            _section("LEVER LOOP — ENRICHMENT ALREADY DONE", "-"),
+            _kv("Enrichment model", enrichment_model_id or "(none)"),
+            _kv("Config loaded from", "Genie Space API (post-enrichment)"),
+            _bar("-"),
+        ]))
 
     # ── Phase 2: Pre-Loop Setup ──
     _pls_lines = [_section("LEVER LOOP — PRE-LOOP SETUP", "-")]
@@ -3610,21 +3831,23 @@ def _run_lever_loop(
     _correction_state["quarantined_qids"] = _pre_loop_corr["quarantined_qids"]
 
     # ── Mine benchmark examples once (proactive, before loop) ──────────
-    mined_example_proposals = _mine_benchmark_example_sqls(
-        benchmarks, metadata_snapshot,
-        spark=spark, catalog=catalog, gold_schema=schema,
-    )
-    if mined_example_proposals:
-        _apply_proactive_example_sqls(
-            w, spark, run_id, space_id, mined_example_proposals,
-            metadata_snapshot, config, catalog, schema,
+    mined_example_proposals: list = []
+    if not enrichment_done:
+        mined_example_proposals = _mine_benchmark_example_sqls(
+            benchmarks, metadata_snapshot,
+            spark=spark, catalog=catalog, gold_schema=schema,
         )
-        from genie_space_optimizer.common.genie_client import fetch_space_config
-        config = fetch_space_config(w, space_id)
-        config["_uc_columns"] = uc_columns
-        metadata_snapshot = config.get("_parsed_space", config)
-        if uc_columns:
-            enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+        if mined_example_proposals:
+            _apply_proactive_example_sqls(
+                w, spark, run_id, space_id, mined_example_proposals,
+                metadata_snapshot, config, catalog, schema,
+            )
+            from genie_space_optimizer.common.genie_client import fetch_space_config
+            config = fetch_space_config(w, space_id)
+            config["_uc_columns"] = uc_columns
+            metadata_snapshot = config.get("_parsed_space", config)
+            if uc_columns:
+                enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
     _setup_lines = [_section("PRE-LOOP SETUP — COMPLETE", "-")]
     _setup_lines.append(_kv("Reference SQLs", len(reference_sqls)))
@@ -5454,7 +5677,7 @@ def optimize_genie_space(
     run_repeat: bool = True,
     triggered_by: str | None = None,
 ) -> OptimizationResult:
-    """Run all 5 stages in a single process.
+    """Run all 6 stages in a single process.
 
     When *run_id* is supplied the caller has already created the Delta row
     (e.g. the backend ``start_optimization`` endpoint), so we skip
@@ -5537,18 +5760,23 @@ def optimize_genie_space(
                 convergence_reason="baseline_meets_thresholds",
             )
         else:
-            # Stage 2.5 + config prep (unified path for DAG and convenience)
-            config = _prepare_lever_loop(
-                w, spark, run_id_str, space_id, catalog, schema,
+            # Stage 2.5: Proactive Enrichment
+            enrichment_out = _run_enrichment(
+                w, spark, run_id_str, space_id, domain, benchmarks, exp_name,
+                catalog, schema,
+                baseline_model_id=model_id,
             )
 
-            # Stage 3: Lever Loop
+            # Stage 3: Lever Loop (enrichment already done)
             loop_out = _run_lever_loop(
                 w, spark, run_id_str, space_id, domain, benchmarks, exp_name,
-                prev_scores, prev_accuracy, model_id, config,
+                prev_scores, prev_accuracy, model_id,
+                enrichment_out["config"],
                 catalog, schema, levers, max_iterations, thresholds, apply_mode,
                 triggered_by=triggered_by or "",
                 human_corrections=human_corrections,
+                enrichment_done=True,
+                enrichment_model_id=enrichment_out["enrichment_model_id"],
             )
             result.levers_attempted = cast(list[int], loop_out["levers_attempted"])
             result.levers_accepted = cast(list[int], loop_out["levers_accepted"])

@@ -1,29 +1,30 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Task 3: Lever Loop — Training Guide
+# MAGIC # Task 4: Lever Loop — Training Guide
 # MAGIC
 # MAGIC | Quick Reference | |
 # MAGIC |---|---|
-# MAGIC | **Task** | 3 of 5 — Lever Loop (Adaptive Optimization Engine) |
-# MAGIC | **Harness functions** | `_prepare_lever_loop()` + `_run_lever_loop()` in `optimization/harness.py` |
-# MAGIC | **Reads from** | `preflight` (run context, levers, max_iterations) + `baseline_eval` (scores, thresholds_met, model_id) |
+# MAGIC | **Task** | 4 of 6 — Lever Loop (Adaptive Optimization Engine) |
+# MAGIC | **Harness functions** | `_run_lever_loop()` in `optimization/harness.py` |
+# MAGIC | **Reads from** | `preflight` (run context, levers, max_iterations) + `baseline_eval` (scores, thresholds_met, model_id) + `enrichment` (enrichment_model_id, enrichment_skipped) |
 # MAGIC | **Publishes to** | `finalize` (scores, accuracy, model_id, iteration_counter, debug_info) |
 # MAGIC | **Typical duration** | 15–90 min (depends on iteration count and benchmark size) |
-# MAGIC | **Log label** | `[TASK-3 LEVER_LOOP]` |
+# MAGIC | **Log label** | `[TASK-4 LEVER_LOOP]` |
 # MAGIC
 # MAGIC ## 🎯 Purpose
 # MAGIC
-# MAGIC Task 3 is the **adaptive optimization engine** of the Genie Space Optimizer. Each iteration it re-diagnoses failures from the latest evaluation, re-strategizes by generating a single targeted action group, applies patches through a 3-gate pattern, and reflects on the outcome to guide the next iteration.
+# MAGIC Task 4 is the **adaptive optimization engine** of the Genie Space Optimizer. Proactive enrichment has already been applied by Task 3. Each iteration it re-diagnoses failures from the latest evaluation, re-strategizes by generating a single targeted action group, applies patches through a 3-gate pattern, and reflects on the outcome to guide the next iteration.
 # MAGIC
 # MAGIC ## 🏗️ DAG Position
 # MAGIC
 # MAGIC | Step | Task | Status | Reads From | Publishes To |
 # MAGIC |:----:|------|:------:|------------|--------------|
 # MAGIC | 1 | preflight | Done | widgets | all tasks |
-# MAGIC | 2 | baseline_eval | Done | preflight | lever_loop |
-# MAGIC | 3 | **lever_loop** | **⬅️ THIS TASK** | preflight + baseline | finalize |
-# MAGIC | 4 | finalize | Next | lever_loop | deploy |
-# MAGIC | 5 | deploy | Pending | preflight + finalize | *(terminal)* |
+# MAGIC | 2 | baseline_eval | Done | preflight | enrichment |
+# MAGIC | 3 | enrichment | Done | preflight + baseline | lever_loop |
+# MAGIC | 4 | **lever_loop** | **⬅️ THIS TASK** | preflight + baseline + enrichment | finalize |
+# MAGIC | 5 | finalize | Next | lever_loop | deploy |
+# MAGIC | 6 | deploy | Pending | preflight + finalize | *(terminal)* |
 # MAGIC
 # MAGIC > **📝 Note:** This task runs only when baseline does *not* meet thresholds (`run_if: !thresholds_met`). An internal baseline gate provides a safety check even if the job configuration allows the task to run.
 # MAGIC
@@ -171,14 +172,11 @@ from pyspark.sql import SparkSession
 from genie_space_optimizer.jobs._helpers import _banner as _banner_base
 from genie_space_optimizer.jobs._helpers import _log as _log_base
 from genie_space_optimizer.optimization.evaluation import load_benchmarks_from_dataset
-from genie_space_optimizer.optimization.harness import (
-    _prepare_lever_loop,
-    _run_lever_loop,
-)
+from genie_space_optimizer.optimization.harness import _run_lever_loop
 
 dbutils = cast(Any, globals().get("dbutils"))
 
-_TASK_LABEL = "TASK-3 LEVER_LOOP"
+_TASK_LABEL = "TASK-4 LEVER_LOOP"
 _banner = partial(_banner_base, _TASK_LABEL)
 _log = partial(_log_base, _TASK_LABEL)
 
@@ -187,7 +185,7 @@ _log = partial(_log_base, _TASK_LABEL)
 # MAGIC %md
 # MAGIC ## ⚙️ Reading Upstream Task Values
 # MAGIC
-# MAGIC Task 3 reads from two upstream tasks:
+# MAGIC Task 4 reads from three upstream tasks:
 # MAGIC
 # MAGIC | Source | Keys | Purpose |
 # MAGIC |--------|------|---------|
@@ -200,6 +198,8 @@ _log = partial(_log_base, _TASK_LABEL)
 # MAGIC | `baseline_eval` | `overall_accuracy` | Aggregate accuracy |
 # MAGIC | `baseline_eval` | `thresholds_met` | `True` if baseline already meets all quality thresholds |
 # MAGIC | `baseline_eval` | `model_id` | Genie model version ID for iteration 0 |
+# MAGIC | `enrichment` | `enrichment_model_id` | LoggedModel snapshot of enriched Genie Space |
+# MAGIC | `enrichment` | `enrichment_skipped` | Whether enrichment was skipped (baseline met thresholds) |
 
 # COMMAND ----------
 
@@ -227,6 +227,10 @@ thresholds_met_raw = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="t
 thresholds_met = str(thresholds_met_raw).lower() in ("true", "1")
 prev_model_id = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="model_id")
 
+enrichment_model_id = dbutils.jobs.taskValues.get(taskKey="enrichment", key="enrichment_model_id")
+enrichment_skipped_raw = dbutils.jobs.taskValues.get(taskKey="enrichment", key="enrichment_skipped")
+enrichment_skipped = str(enrichment_skipped_raw).lower() in ("true", "1")
+
 _banner("Resolved Upstream Task Values")
 _log(
     "Inputs",
@@ -242,6 +246,8 @@ _log(
     baseline_accuracy=prev_accuracy,
     baseline_thresholds_met=thresholds_met,
     baseline_model_id=prev_model_id,
+    enrichment_model_id=enrichment_model_id,
+    enrichment_skipped=enrichment_skipped,
     triggered_by=triggered_by,
 )
 
@@ -267,12 +273,11 @@ if thresholds_met:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🔄 Loading Benchmarks and Preparing Config
+# MAGIC ## 🔄 Loading Benchmarks
 # MAGIC
 # MAGIC - **Benchmarks:** Loaded from `{catalog}.{schema}.genie_benchmarks_{domain}`.
-# MAGIC - **Config:** `_prepare_lever_loop()` handles config loading from Delta snapshot (API fetch fallback), UC column metadata enrichment, Stage 2.5 prompt matching auto-config (format assistance + entity matching), entity-matching-aware propagation wait, and post-wait config refresh.
 # MAGIC
-# MAGIC > **📝 Note:** All business logic lives in the harness — this notebook is a thin wrapper.
+# MAGIC > **📝 Note:** Proactive enrichment (descriptions, joins, metadata, instructions, example SQLs) has already been applied by Task 3 (enrichment). The lever loop loads the enriched config directly from the Genie Space API.
 
 # COMMAND ----------
 
@@ -286,57 +291,7 @@ if not benchmarks:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🔧 Prepare Config (Stage 2.5 included)
-# MAGIC
-# MAGIC `_prepare_lever_loop()` is the single unified function that:
-# MAGIC
-# MAGIC | Step | Action | Fallback |
-# MAGIC |:----:|--------|----------|
-# MAGIC | 1 | Load config from Delta snapshot | API fetch fallback |
-# MAGIC | 2 | Fetch UC column metadata via REST API | Non-fatal: continues if fails |
-# MAGIC | 3 | Run Stage 2.5 prompt matching auto-config (format assistance + entity matching) | Non-fatal: continues if fails |
-# MAGIC | 4 | Apply entity-matching-aware propagation wait (extended for value dictionary rebuild) | — |
-# MAGIC | 5 | Refresh config from API after wait | — |
-# MAGIC
-# MAGIC > **📝 Note:** Steps 2–3 are non-fatal: if UC metadata or prompt matching fails, the lever loop proceeds anyway.
-
-# COMMAND ----------
-
-_banner("Preparing Lever Loop Config (Stage 2.5)")
-config = _prepare_lever_loop(w, spark, run_id, space_id, catalog, schema)
-_log(
-    "Config prepared",
-    config_keys=sorted(list(config.keys()))[:20] if isinstance(config, dict) else [],
-    uc_columns_count=len(config.get("_uc_columns", [])),
-)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 3a: Proactive Enrichment
-# MAGIC
-# MAGIC Before iterating, the optimizer proactively improves the Genie Space configuration:
-# MAGIC - **Description enrichment:** LLM-generated column descriptions for blank columns
-# MAGIC - **Join discovery:** Cross-table join path detection from baseline failures
-# MAGIC - **Space metadata:** Auto-generate space description and sample questions if missing
-# MAGIC - **Instruction seeding:** Seed initial instructions for empty instruction sets
-# MAGIC
-# MAGIC Each enrichment phase that modifies the space triggers a config refresh.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 3b: Pre-Loop Setup
-# MAGIC
-# MAGIC Extract reference SQLs and result hashes from the baseline iteration for
-# MAGIC cross-iteration consistency scoring. Run arbiter corrections to identify
-# MAGIC questions where the baseline Genie answer was actually correct. Mine
-# MAGIC benchmark example SQLs to seed the space with reference queries.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 3c: Adaptive Lever Loop
+# MAGIC ## 🔧 Adaptive Lever Loop
 # MAGIC
 # MAGIC The core optimization loop. Each iteration:
 # MAGIC 1. Re-cluster failures from the latest evaluation
@@ -350,23 +305,24 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 3d: Optimization Summary
+# MAGIC ## Optimization Summary
 # MAGIC
 # MAGIC After the loop completes, print a comprehensive summary comparing baseline
-# MAGIC vs. final accuracy, listing all iterations, accepted/rolled-back levers,
-# MAGIC and proactive changes applied.
+# MAGIC vs. final accuracy, listing all iterations, and accepted/rolled-back levers.
 
 # COMMAND ----------
 
 try:
-    _banner("Running _run_lever_loop (4 phases print below)")
+    _banner("Running _run_lever_loop (enrichment already done by Task 3)")
     loop_out = _run_lever_loop(
         w, spark, run_id, space_id, domain, benchmarks, exp_name,
-        prev_scores, prev_accuracy, prev_model_id, config,
+        prev_scores, prev_accuracy, prev_model_id, {},
         catalog, schema, levers, max_iterations,
         apply_mode=apply_mode,
         triggered_by=triggered_by,
         human_corrections=human_corrections,
+        enrichment_done=True,
+        enrichment_model_id=enrichment_model_id,
     )
     _log(
         "Lever loop finished",
@@ -392,7 +348,7 @@ except Exception as exc:
 # MAGIC %md
 # MAGIC ## 📤 Publishing Task Values
 # MAGIC
-# MAGIC Task 4 (finalize) and Task 5 (deploy) consume these values. The keys must match what downstream notebooks expect.
+# MAGIC Task 5 (finalize) and Task 6 (deploy) consume these values. The keys must match what downstream notebooks expect.
 
 # COMMAND ----------
 
@@ -417,7 +373,7 @@ _log(
     iteration_counter=loop_out["iteration_counter"],
     debug_info=debug_info,
 )
-_banner("Task 3 Completed")
+_banner("Task 4 Completed")
 dbutils.notebook.exit(json.dumps(debug_info, default=str))
 
 # COMMAND ----------
@@ -429,31 +385,31 @@ dbutils.notebook.exit(json.dumps(debug_info, default=str))
 # MAGIC
 # MAGIC ```
 # MAGIC ════════════════════════════════════════════════════════════════
-# MAGIC [TASK-3 LEVER_LOOP] Running _run_lever_loop
+# MAGIC [TASK-4 LEVER_LOOP] Running _run_lever_loop
 # MAGIC ════════════════════════════════════════════════════════════════
-# MAGIC [TASK-3 LEVER_LOOP] ADAPTIVE STRATEGIST -- Iteration 1
+# MAGIC [TASK-4 LEVER_LOOP] ADAPTIVE STRATEGIST -- Iteration 1
 # MAGIC   Clusters: 5 hard failures, 2 soft signals
 # MAGIC   Top cluster: wrong_table (impact 12.5, 3 questions)
-# MAGIC [TASK-3 LEVER_LOOP] AG applied: 3 patches (Lever 1: 2, Lever 5: 1)
-# MAGIC [TASK-3 LEVER_LOOP] Slice gate: PASSED
-# MAGIC [TASK-3 LEVER_LOOP] Full eval: PASSED (accuracy 72.5% -> 78.0%)
-# MAGIC [TASK-3 LEVER_LOOP] Iteration 1: ACCEPTED
-# MAGIC [TASK-3 LEVER_LOOP] ADAPTIVE STRATEGIST -- Iteration 2
+# MAGIC [TASK-4 LEVER_LOOP] AG applied: 3 patches (Lever 1: 2, Lever 5: 1)
+# MAGIC [TASK-4 LEVER_LOOP] Slice gate: PASSED
+# MAGIC [TASK-4 LEVER_LOOP] Full eval: PASSED (accuracy 72.5% -> 78.0%)
+# MAGIC [TASK-4 LEVER_LOOP] Iteration 1: ACCEPTED
+# MAGIC [TASK-4 LEVER_LOOP] ADAPTIVE STRATEGIST -- Iteration 2
 # MAGIC   Reflection: Iter 1 accepted +5.5%, wrong_table fixed
 # MAGIC   Clusters: 3 hard failures remaining
-# MAGIC [TASK-3 LEVER_LOOP] AG applied: 2 patches (Lever 5: 2)
-# MAGIC [TASK-3 LEVER_LOOP] Slice gate: FAILED (regression -1.2%)
-# MAGIC [TASK-3 LEVER_LOOP] Iteration 2: ROLLED BACK
-# MAGIC [TASK-3 LEVER_LOOP] ADAPTIVE STRATEGIST -- Iteration 3
+# MAGIC [TASK-4 LEVER_LOOP] AG applied: 2 patches (Lever 5: 2)
+# MAGIC [TASK-4 LEVER_LOOP] Slice gate: FAILED (regression -1.2%)
+# MAGIC [TASK-4 LEVER_LOOP] Iteration 2: ROLLED BACK
+# MAGIC [TASK-4 LEVER_LOOP] ADAPTIVE STRATEGIST -- Iteration 3
 # MAGIC   Reflection: Iter 2 rolled back, avoid example_sql for ambiguous questions
 # MAGIC   Clusters: 3 hard failures remaining
 # MAGIC ...
-# MAGIC [TASK-3 LEVER_LOOP] OPTIMIZATION RUN SUMMARY
+# MAGIC [TASK-4 LEVER_LOOP] OPTIMIZATION RUN SUMMARY
 # MAGIC   Baseline accuracy: 72.5%
 # MAGIC   Final accuracy: 85.0%
 # MAGIC   Iterations: 3 attempted, 2 accepted, 1 rolled back
 # MAGIC ════════════════════════════════════════════════════════════════
-# MAGIC [TASK-3 LEVER_LOOP] Task 3 Completed
+# MAGIC [TASK-4 LEVER_LOOP] Task 4 Completed
 # MAGIC ════════════════════════════════════════════════════════════════
 # MAGIC ```
 # MAGIC
@@ -461,23 +417,20 @@ dbutils.notebook.exit(json.dumps(debug_info, default=str))
 # MAGIC
 # MAGIC ```
 # MAGIC ════════════════════════════════════════════════════════════════
-# MAGIC [TASK-3 LEVER_LOOP] Baseline Gate: SKIP Lever Loop
+# MAGIC [TASK-4 LEVER_LOOP] Baseline Gate: SKIP Lever Loop
 # MAGIC ════════════════════════════════════════════════════════════════
-# MAGIC [TASK-3 LEVER_LOOP] Skip reason
+# MAGIC [TASK-4 LEVER_LOOP] Skip reason
 # MAGIC   {"reason": "baseline_meets_thresholds", "baseline_accuracy": 95.2}
 # MAGIC ```
 # MAGIC
 # MAGIC ## 📋 Summary
 # MAGIC
-# MAGIC Task 3 (Lever Loop) is a **thin wrapper** around two harness functions:
-# MAGIC
-# MAGIC 1. **`_prepare_lever_loop()`** — loads config from Delta snapshot, enriches UC column metadata,
-# MAGIC    runs Stage 2.5 prompt matching (format assistance + entity matching) with entity-matching-aware
-# MAGIC    propagation wait, and refreshes config from the API.
-# MAGIC 2. **`_run_lever_loop()`** — the adaptive optimization engine that re-clusters failures from
-# MAGIC    the latest eval, scores clusters by impact, calls the strategist for 1 action group per
-# MAGIC    iteration, applies patches via 3-gate evaluation (slice → P0 → full), and reflects on
-# MAGIC    outcomes to guide future iterations.
+# MAGIC Task 4 (Lever Loop) is a **thin wrapper** around `_run_lever_loop()` with `enrichment_done=True`.
+# MAGIC Proactive enrichment (descriptions, joins, metadata, instructions, example SQLs) is handled by
+# MAGIC Task 3 (enrichment). The lever loop loads the enriched config from the Genie Space API and runs
+# MAGIC the adaptive optimization engine: re-clustering failures, scoring by impact, calling the strategist
+# MAGIC for 1 action group per iteration, applying patches via 3-gate evaluation (slice → P0 → full),
+# MAGIC and reflecting on outcomes to guide future iterations.
 # MAGIC
 # MAGIC All business logic lives in the harness (`optimization/harness.py`), shared identically by
 # MAGIC the DAG notebooks and the `optimize_genie_space()` convenience function.

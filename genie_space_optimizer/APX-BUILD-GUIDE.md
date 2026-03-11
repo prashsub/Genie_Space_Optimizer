@@ -343,10 +343,10 @@ Core predict function + MLflow integration + shared helpers.
 
 ### `optimization/harness.py`
 
-A library of stage functions powering the 5-task Databricks Job, plus a convenience `optimize_genie_space()` for testing. This is a deterministic 5-stage pipeline:
+A library of stage functions powering the 6-task Databricks Job, plus a convenience `optimize_genie_space()` for testing. This is a deterministic 6-stage pipeline:
 
 ```
-PREFLIGHT → BASELINE EVAL → LEVER LOOP (1-6) → FINALIZE → DEPLOY (optional)
+PREFLIGHT → BASELINE EVAL → ENRICHMENT → LEVER LOOP (1-6) → FINALIZE → DEPLOY (optional)
 ```
 
 **Key functions:**

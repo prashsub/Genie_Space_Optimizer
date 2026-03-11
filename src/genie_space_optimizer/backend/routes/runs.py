@@ -251,33 +251,39 @@ def _apply_deferred_uc_writes_obo(
 _STEP_DEFINITIONS: list[_StepDefinition] = [
     {
         "stepNumber": 1,
-        "name": "Configuration Analysis",
+        "name": "Preflight",
         "stage_prefixes": ["PREFLIGHT"],
-        "summary_template": "Analyzed {tables} tables, {instructions} instructions, {questions} sample questions",
+        "summary_template": "Analyzed {tables} tables, {columns} columns, {instructions} instructions, {questions} sample questions",
     },
     {
         "stepNumber": 2,
-        "name": "Metadata Collection",
-        "stage_prefixes": ["PREFLIGHT"],
-        "summary_template": "Collected metadata for {columns} columns, {tags} tags from Unity Catalog",
-    },
-    {
-        "stepNumber": 3,
         "name": "Baseline Evaluation",
         "stage_prefixes": ["BASELINE_EVAL"],
         "summary_template": "Evaluated {questions} benchmark questions with 9 judges. Baseline score: {score}%",
     },
     {
+        "stepNumber": 3,
+        "name": "Proactive Enrichment",
+        "stage_prefixes": ["ENRICHMENT", "PROMPT_MATCH", "DESCRIPTION_ENRICHMENT", "JOIN_DISCOVERY", "SPACE_METADATA", "INSTRUCTION_SEED", "PROACTIVE_INSTRUCTION", "EXAMPLE_SQL"],
+        "summary_template": "Applied {total} proactive enrichments: {descriptions} descriptions, {joins} joins, {examples} example SQLs",
+    },
+    {
         "stepNumber": 4,
-        "name": "Configuration Generation",
-        "stage_prefixes": ["LEVER_", "AG_", "DESCRIPTION_ENRICHMENT", "JOIN_DISCOVERY", "SPACE_METADATA", "INSTRUCTION_SEED", "PROMPT_MATCH", "EXAMPLE_SQL"],
+        "name": "Adaptive Optimization",
+        "stage_prefixes": ["LEVER_", "AG_"],
         "summary_template": "Applied {patches} optimizations across {levers} categories. Score improved from {before}% to {after}%",
     },
     {
         "stepNumber": 5,
-        "name": "Optimized Evaluation",
-        "stage_prefixes": ["FINALIZE", "REPEATABILITY", "DEPLOY", "COMPLETE", _UC_WRITE_STAGE],
+        "name": "Finalization",
+        "stage_prefixes": ["FINALIZE", "REPEATABILITY"],
         "summary_template": "Final evaluation complete. Optimized score: {score}%. Repeatability: {repeatability}%",
+    },
+    {
+        "stepNumber": 6,
+        "name": "Deploy",
+        "stage_prefixes": ["DEPLOY", "COMPLETE", _UC_WRITE_STAGE],
+        "summary_template": "Deployment {status}",
     },
 ]
 
@@ -361,16 +367,11 @@ def map_stages_to_steps(
     iterations_rows: list[dict],
     run_data: dict,
 ) -> list[PipelineStep]:
-    """Map internal harness stages to 5 user-facing pipeline steps.
-
-    Steps 1-2 both map to PREFLIGHT stages but split by the detail_json:
-    Step 1 covers config analysis, Step 2 covers UC metadata collection.
-    """
+    """Map internal harness stages to 6 user-facing pipeline steps."""
     steps: list[PipelineStep] = []
 
     for defn in _STEP_DEFINITIONS:
         prefixes = defn["stage_prefixes"]
-        step_num = defn["stepNumber"]
 
         matching = []
         for s in stages_rows:
@@ -380,21 +381,7 @@ def map_stages_to_steps(
                     matching.append(s)
                     break
 
-        # Steps 1 and 2 split PREFLIGHT stages.
-        # Stage order: PREFLIGHT_STARTED(STARTED) → PREFLIGHT_METADATA_COLLECTION(COMPLETE) → PREFLIGHT_STARTED(COMPLETE).
-        # Step 1 (Config Analysis) is done once metadata collection has started/completed.
-        # Step 2 (Metadata Collection) only uses the PREFLIGHT_METADATA_COLLECTION stage.
-        has_metadata_stage = any(
-            "METADATA" in str(s.get("stage", "")) for s in stages_rows
-        )
-        if step_num == 1:
-            matching = [s for s in matching if "STARTED" in str(s.get("stage", ""))]
-        elif step_num == 2:
-            matching = [s for s in matching if "METADATA" in str(s.get("stage", ""))]
-
         status = _derive_step_status(matching)
-        if step_num == 1 and status == "running" and has_metadata_stage:
-            status = "completed"
         status = _normalize_step_status_for_terminal_run(
             status=status,
             run_status=str(run_data.get("status", "")),
@@ -406,7 +393,7 @@ def map_stages_to_steps(
 
         steps.append(
             PipelineStep(
-                stepNumber=step_num,
+                stepNumber=defn["stepNumber"],
                 name=defn["name"],
                 status=status,
                 durationSeconds=duration,
@@ -456,7 +443,7 @@ def _build_step_io(
     if not matching:
         return None, None
 
-    step_num = defn["stepNumber"]
+    step_name = defn["name"]
     detail: dict[str, Any] = {}
     for s in matching:
         detail.update(_parse_detail(s))
@@ -471,7 +458,7 @@ def _build_step_io(
     else:
         config_snapshot = {}
 
-    if step_num == 1:
+    if step_name == "Preflight":
         all_pf = _collect_all_preflight_detail(stages_rows or [])
         parsed = _resolve_parsed_space(config_snapshot)
         ds = parsed.get("data_sources", {}) if isinstance(parsed, dict) else {}
@@ -517,31 +504,14 @@ def _build_step_io(
             or len(sample_questions)
         )
 
-        return (
-            {
-                "spaceId": run_data.get("space_id"),
-                "domain": run_data.get("domain"),
-            },
-            {
-                "tableCount": table_count,
-                "tables": [str(t.get("identifier") or "") for t in tables[:12] if isinstance(t, dict)],
-                "functionCount": function_count,
-                "instructionCount": instruction_count,
-                "sampleQuestionCount": sample_q_count,
-                "sampleQuestionsPreview": sample_questions[:5],
-                "stageEvents": timeline,
-            },
-        )
-
-    if step_num == 2:
         def _to_int(value: Any) -> int | None:
             if value is None:
                 return None
             try:
-                parsed = int(value)
+                p = int(value)
             except (TypeError, ValueError):
                 return None
-            return parsed if parsed >= 0 else None
+            return p if p >= 0 else None
 
         def _to_list_of_str(value: Any) -> list[str]:
             if not isinstance(value, list):
@@ -566,30 +536,12 @@ def _build_step_io(
         for col in uc_columns[:12]:
             if not isinstance(col, dict):
                 continue
-            table_name = str(col.get("table_name") or col.get("table") or "").strip()
-            col_name = str(col.get("column_name") or col.get("column") or "").strip()
-            if table_name and col_name:
-                column_samples.append(f"{table_name}.{col_name}")
-            elif col_name:
-                column_samples.append(col_name)
-
-        tag_samples: list[str] = []
-        for tag in uc_tags[:8]:
-            if not isinstance(tag, dict):
-                continue
-            table_name = str(tag.get("table_name") or "").strip()
-            col_name = str(tag.get("column_name") or "").strip()
-            tag_name = str(tag.get("tag_name") or tag.get("name") or "").strip()
-            tag_value = str(tag.get("tag_value") or tag.get("value") or "").strip()
-            target = ".".join(p for p in [table_name, col_name] if p)
-            if tag_name:
-                tag_samples.append(f"{target}: {tag_name}={tag_value}" if target else f"{tag_name}={tag_value}")
-
-        routine_samples: list[str] = []
-        for r in uc_routines[:8]:
-            if not isinstance(r, dict):
-                continue
-            routine_samples.append(str(r.get("routine_name") or r.get("name") or "").strip())
+            t_name = str(col.get("table_name") or col.get("table") or "").strip()
+            c_name = str(col.get("column_name") or col.get("column") or "").strip()
+            if t_name and c_name:
+                column_samples.append(f"{t_name}.{c_name}")
+            elif c_name:
+                column_samples.append(c_name)
 
         columns_collected = _to_int(detail.get("columns_collected"))
         if columns_collected is None:
@@ -603,53 +555,28 @@ def _build_step_io(
         if tags_collected is None:
             tags_collected = len(uc_tags) if isinstance(uc_tags, list) else 0
 
-        routines_collected = _to_int(detail.get("routines_collected"))
-        if routines_collected is None:
-            routines_collected = _to_int(detail.get("routinesCollected"))
-        if routines_collected is None:
-            routines_collected = len(uc_routines) if isinstance(uc_routines, list) else 0
-
-        detail_column_samples = _to_list_of_str(detail.get("column_samples"))
-        if not detail_column_samples:
-            detail_column_samples = _to_list_of_str(detail.get("columnSamples"))
-        detail_tag_samples = _to_list_of_str(detail.get("tag_samples"))
-        if not detail_tag_samples:
-            detail_tag_samples = _to_list_of_str(detail.get("tagSamples"))
-        detail_routine_samples = _to_list_of_str(detail.get("routine_samples"))
-        if not detail_routine_samples:
-            detail_routine_samples = _to_list_of_str(detail.get("routineSamples"))
-
-        referenced_schemas = _to_list_of_str(detail.get("referenced_schemas"))
-        if not referenced_schemas:
-            referenced_schemas = _to_list_of_str(detail.get("referencedSchemas"))
-        referenced_schema_count = _to_int(detail.get("referenced_schema_count"))
-        if referenced_schema_count is None:
-            referenced_schema_count = _to_int(detail.get("referencedSchemaCount"))
-        if referenced_schema_count is None:
-            referenced_schema_count = len(referenced_schemas)
-
         return (
             {
+                "spaceId": run_data.get("space_id"),
+                "domain": run_data.get("domain"),
                 "catalog": run_data.get("catalog"),
                 "schema": run_data.get("uc_schema"),
             },
             {
+                "tableCount": table_count,
+                "tables": [str(t.get("identifier") or "") for t in tables[:12] if isinstance(t, dict)],
+                "functionCount": function_count,
+                "instructionCount": instruction_count,
+                "sampleQuestionCount": sample_q_count,
+                "sampleQuestionsPreview": sample_questions[:5],
                 "columnsCollected": columns_collected,
                 "tagsCollected": tags_collected,
-                "routinesCollected": routines_collected,
-                "columnSamples": detail_column_samples or [s for s in column_samples if s],
-                "tagSamples": detail_tag_samples or [s for s in tag_samples if s],
-                "routineSamples": detail_routine_samples or [s for s in routine_samples if s],
-                "tableRefCount": _to_int(detail.get("table_ref_count")),
-                "referencedSchemaCount": referenced_schema_count,
-                "referencedSchemas": referenced_schemas,
-                "collectionScope": detail.get("collection_scope"),
-                "metadataSource": detail.get("metadata_source"),
+                "columnSamples": _to_list_of_str(detail.get("column_samples")) or _to_list_of_str(detail.get("columnSamples")) or [s for s in column_samples if s],
                 "stageEvents": timeline,
             },
         )
 
-    if step_num == 3:
+    if step_name == "Baseline Evaluation":
         baseline_iter = next(
             (
                 r for r in iterations_rows
@@ -730,7 +657,22 @@ def _build_step_io(
             },
         )
 
-    if step_num == 4:
+    if step_name == "Proactive Enrichment":
+        proactive = _extract_proactive_changes(matching)
+        return (
+            {
+                "spaceId": run_data.get("space_id"),
+            },
+            {
+                "proactiveChanges": proactive if proactive else None,
+                "enrichmentModelId": detail.get("enrichment_model_id"),
+                "totalEnrichments": detail.get("total_enrichments", 0),
+                "enrichmentSkipped": detail.get("enrichment_skipped", False),
+                "stageEvents": timeline,
+            },
+        )
+
+    if step_name == "Adaptive Optimization":
         patches_applied = detail.get("patches_applied")
         if patches_applied is None:
             patches_applied = detail.get("patches_count")
@@ -739,8 +681,6 @@ def _build_step_io(
             iteration_counter = run_data.get("best_iteration")
         levers_accepted = detail.get("levers_accepted", [])
         levers_rolled_back = detail.get("levers_rolled_back", [])
-
-        proactive = _extract_proactive_changes(matching)
 
         return (
             {
@@ -756,12 +696,11 @@ def _build_step_io(
                 "iterationCounter": iteration_counter,
                 "baselineAccuracy": run_data.get("baseline_accuracy"),
                 "bestAccuracy": _safe_float(run_data.get("best_accuracy")),
-                "proactiveChanges": proactive if proactive else None,
                 "stageEvents": timeline,
             },
         )
 
-    if step_num == 5:
+    if step_name == "Finalization":
         return (
             {
                 "bestIteration": run_data.get("best_iteration"),
@@ -770,6 +709,17 @@ def _build_step_io(
                 "bestAccuracy": _safe_float(run_data.get("best_accuracy")),
                 "repeatability": _safe_float(run_data.get("best_repeatability")),
                 "convergenceReason": run_data.get("convergence_reason"),
+                "stageEvents": timeline,
+            },
+        )
+
+    if step_name == "Deploy":
+        return (
+            {
+                "deployTarget": run_data.get("deploy_target"),
+            },
+            {
+                "deployStatus": detail.get("status"),
                 "stageEvents": timeline,
             },
         )
@@ -806,17 +756,22 @@ def _build_step_summary(
     if not matching:
         return None
 
-    step_num = defn["stepNumber"]
+    step_name = defn["name"]
     detail = {}
     for s in matching:
         detail.update(_parse_detail(s))
 
-    if step_num == 1:
+    if step_name == "Preflight":
         all_pf = _collect_all_preflight_detail(stages_rows or [])
         tables_val = (
             _safe_int(detail.get("table_count"))
             or _safe_int(all_pf.get("table_count"))
             or _safe_int(all_pf.get("table_ref_count"))
+        )
+        columns_val = (
+            _safe_int(detail.get("columns_collected"))
+            or _safe_int(detail.get("columnsCollected"))
+            or _safe_int(all_pf.get("columns_collected"))
         )
         instr_val = (
             _safe_int(detail.get("instruction_count"))
@@ -829,18 +784,11 @@ def _build_step_summary(
         )
         return defn["summary_template"].format(
             tables=tables_val if tables_val else "?",
+            columns=columns_val if columns_val else "?",
             instructions=instr_val if instr_val else "?",
             questions=bench_val if bench_val else "?",
         )
-    if step_num == 2:
-        columns = detail.get("columns_collected", detail.get("columnsCollected", "?"))
-        tags = detail.get("tags_collected", detail.get("tagsCollected", "?"))
-        routines = detail.get("routines_collected", detail.get("routinesCollected", "?"))
-        return (
-            f"Collected metadata for {columns} columns, {tags} tags, "
-            f"{routines} routines from Unity Catalog"
-        )
-    if step_num == 3:
+    if step_name == "Baseline Evaluation":
         baseline_iter = next(
             (r for r in iterations_rows if r.get("iteration") == 0),
             None,
@@ -851,7 +799,18 @@ def _build_step_summary(
             score = f"{_finite(baseline_iter.get('overall_accuracy', 0)):.1f}"
             questions = str(baseline_iter.get("total_questions", "?"))
         return defn["summary_template"].format(questions=questions, score=score)
-    if step_num == 4:
+    if step_name == "Proactive Enrichment":
+        descriptions = _safe_int(detail.get("descriptions_enriched")) or 0
+        joins = _safe_int(detail.get("joins_discovered")) or 0
+        examples = _safe_int(detail.get("examples_mined")) or 0
+        total = _safe_int(detail.get("total_enrichments")) or (descriptions + joins + examples)
+        return defn["summary_template"].format(
+            total=total,
+            descriptions=descriptions,
+            joins=joins,
+            examples=examples,
+        )
+    if step_name == "Adaptive Optimization":
         patches = detail.get("patches_applied", 0)
         levers_accepted = detail.get("levers_accepted", [])
         before = f"{_finite(run_data.get('baseline_accuracy', 0)):.1f}" if run_data.get("baseline_accuracy") else "?"
@@ -862,10 +821,13 @@ def _build_step_summary(
             before=before,
             after=after,
         )
-    if step_num == 5:
+    if step_name == "Finalization":
         score = f"{_finite(run_data.get('best_accuracy', 0)):.1f}" if run_data.get("best_accuracy") else "?"
         rep = f"{_finite(run_data.get('best_repeatability', 0)):.1f}" if run_data.get("best_repeatability") else "?"
         return defn["summary_template"].format(score=score, repeatability=rep)
+    if step_name == "Deploy":
+        status = detail.get("status", "pending")
+        return defn["summary_template"].format(status=status)
 
     return None
 
@@ -1359,7 +1321,7 @@ def get_run(run_id: str, ws: Dependencies.UserClient, sp_ws: Dependencies.Client
         None,
     )
     for step in steps:
-        if step.stepNumber == 3 and isinstance(step.outputs, dict) and baseline_eval_link:
+        if step.name == "Baseline Evaluation" and isinstance(step.outputs, dict) and baseline_eval_link:
             step.outputs.setdefault("evaluationRunUrl", baseline_eval_link)
 
     deploy_status, deploy_url = _resolve_deployment_status(

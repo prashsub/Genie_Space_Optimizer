@@ -2049,6 +2049,7 @@ REPEATABILITY_FIX_BY_ASSET = {
 # ── 11. Lever Descriptions ─────────────────────────────────────────────
 
 LEVER_NAMES = {
+    0: "Proactive Enrichment",
     1: "Tables & Columns",
     2: "Metric Views",
     3: "Table-Valued Functions",

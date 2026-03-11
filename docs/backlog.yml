@@ -554,7 +554,7 @@ features:
             test passes and human review session completes.
         - path: src/genie_space_optimizer/backend/job_launcher.py
           detail: |
-            5-task DAG: preflight → baseline_eval → lever_loop → finalize → deploy.
+            6-task DAG: preflight → baseline_eval → enrichment → lever_loop → finalize → deploy.
             `_JOB_PARAM_DEFAULTS` includes `"deploy_target": ""` (always empty).
             `submit_optimization()` passes `"deploy_target": ""` to job_parameters.
         - path: src/genie_space_optimizer/common/config.py

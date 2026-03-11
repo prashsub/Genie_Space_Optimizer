@@ -41,6 +41,7 @@ _JOB_ENVIRONMENT_CLIENT_VERSION = "4"
 _DAG_TASK_KEYS = {
     "preflight": "preflight",
     "baseline": "baseline_eval",
+    "enrichment": "enrichment",
     "lever_loop": "lever_loop",
     "finalize": "finalize",
     "deploy": "deploy",
@@ -62,6 +63,7 @@ _JOB_PARAM_DEFAULTS = {
 _NOTEBOOK_SOURCES = {
     "run_preflight": Path(__file__).resolve().parent.parent / "jobs" / "run_preflight.py",
     "run_baseline": Path(__file__).resolve().parent.parent / "jobs" / "run_baseline.py",
+    "run_enrichment": Path(__file__).resolve().parent.parent / "jobs" / "run_enrichment.py",
     "run_lever_loop": Path(__file__).resolve().parent.parent / "jobs" / "run_lever_loop.py",
     "run_finalize": Path(__file__).resolve().parent.parent / "jobs" / "run_finalize.py",
     "run_deploy": Path(__file__).resolve().parent.parent / "jobs" / "run_deploy.py",
@@ -315,7 +317,7 @@ def _job_settings(
         run_as=run_as,
         description=(
             "Persistent DAG optimization runner managed by Genie Space Optimizer app "
-            "(preflight → baseline_eval → lever_loop → finalize → deploy). "
+            "(preflight → baseline_eval → enrichment → lever_loop → finalize → deploy). "
             "SP executes with granted privileges on user schemas."
         ),
         max_concurrent_runs=20,
@@ -359,8 +361,19 @@ def _job_settings(
                 max_retries=0,
             ),
             Task(
-                task_key=_DAG_TASK_KEYS["lever_loop"],
+                task_key=_DAG_TASK_KEYS["enrichment"],
                 depends_on=[TaskDependency(task_key=_DAG_TASK_KEYS["baseline"])],
+                notebook_task=NotebookTask(
+                    notebook_path=_WS_NOTEBOOKS["run_enrichment"],
+                    source=Source.WORKSPACE,
+                ),
+                environment_key="default",
+                timeout_seconds=7200,
+                max_retries=0,
+            ),
+            Task(
+                task_key=_DAG_TASK_KEYS["lever_loop"],
+                depends_on=[TaskDependency(task_key=_DAG_TASK_KEYS["enrichment"])],
                 notebook_task=NotebookTask(
                     notebook_path=_WS_NOTEBOOKS["run_lever_loop"],
                     source=Source.WORKSPACE,

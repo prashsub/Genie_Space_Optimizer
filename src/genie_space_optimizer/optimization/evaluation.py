@@ -861,14 +861,14 @@ def all_thresholds_met(
 _VALID_ASSET_TYPES = frozenset({"MV", "TVF", "TABLE"})
 
 
-def _normalize_expected_asset(raw: str, expected_sql: str) -> str:
+def _normalize_expected_asset(raw: Any, expected_sql: str) -> str:
     """Normalize ``expected_asset`` to a valid type category.
 
     Benchmarks may store table *names* (``BOOKING_ANALYTICS_METRICS``) instead
     of type categories (``MV``/``TVF``/``TABLE``).  When the stored value is
     not a recognized type, fall back to ``detect_asset_type(expected_sql)``.
     """
-    upper = raw.strip().upper() if raw else ""
+    upper = raw.strip().upper() if isinstance(raw, str) and raw else ""
     if upper in _VALID_ASSET_TYPES:
         return upper
     return detect_asset_type(expected_sql)
@@ -5538,7 +5538,8 @@ def load_benchmarks_from_dataset(
                     "question": inputs.get("question", ""),
                     "expected_sql": _cb_esql,
                     "expected_asset": _normalize_expected_asset(
-                        expectations.get("expected_asset", "TABLE"), _cb_esql,
+                        expectations.get("expected_asset") or inputs.get("expected_asset", "TABLE"),
+                        _cb_esql,
                     ),
                     "category": expectations.get("category", ""),
                     "required_tables": expectations.get("required_tables", []),

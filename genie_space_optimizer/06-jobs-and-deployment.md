@@ -532,7 +532,7 @@ graph TD
 
 6. **The app creates a QUEUED row** in `genie_opt_runs` and starts polling Delta.
 
-7. **The 5-task optimization job runs** on Serverless compute: preflight → baseline_eval → lever_loop → finalize → deploy. Each task writes stage transitions to Delta.
+7. **The 6-task optimization job runs** on Serverless compute: preflight → baseline_eval → enrichment → lever_loop → finalize → deploy. Each task writes stage transitions to Delta.
 
 8. **The app's dashboard auto-refreshes** every 5 seconds, reading Delta and rendering progress.
 

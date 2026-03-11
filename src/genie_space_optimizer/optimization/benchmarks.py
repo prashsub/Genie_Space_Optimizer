@@ -513,8 +513,8 @@ def assign_splits(
 def build_eval_records(benchmarks: list[dict]) -> list[dict]:
     """Convert benchmarks to MLflow evaluation record format.
 
-    Each record has ``inputs`` (question, expected_sql, expected_asset)
-    and ``expectations`` (expected_sql, expected_facts, required_tables).
+    Each record has ``inputs`` (question, question_id) and ``expectations``
+    (expected_sql, expected_asset, expected_facts, required_tables, etc.).
     """
     _VALID_ASSET_TYPES = frozenset({"MV", "TVF", "TABLE"})
     records: list[dict] = []
@@ -528,7 +528,7 @@ def build_eval_records(benchmarks: list[dict]) -> list[dict]:
         _esql = b.get("expected_sql", "")
         _asset = (
             _raw_asset.strip().upper()
-            if _raw_asset and _raw_asset.strip().upper() in _VALID_ASSET_TYPES
+            if isinstance(_raw_asset, str) and _raw_asset and _raw_asset.strip().upper() in _VALID_ASSET_TYPES
             else detect_asset_type(_esql)
         )
 
@@ -537,10 +537,10 @@ def build_eval_records(benchmarks: list[dict]) -> list[dict]:
                 "inputs": {
                     "question": question,
                     "question_id": qid,
-                    "expected_asset": _asset,
                 },
                 "expectations": {
                     "expected_sql": b.get("expected_sql", ""),
+                    "expected_asset": _asset,
                     "expected_facts": b.get("expected_facts", []),
                     "required_tables": b.get("required_tables", []),
                     "required_columns": b.get("required_columns", []),

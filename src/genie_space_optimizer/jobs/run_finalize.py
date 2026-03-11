@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC | Quick Reference | |
 # MAGIC |---|---|
-# MAGIC | **Task** | 4 of 5 — Finalize (Repeatability + Promotion + Report) |
+# MAGIC | **Task** | 5 of 6 — Finalize (Repeatability + Promotion + Report) |
 # MAGIC | **Harness function** | `_run_finalize()` in `optimization/harness.py` |
 # MAGIC | **Reads from** | `preflight` (run context) + `lever_loop` or `baseline_eval` (scores, model_id) |
 # MAGIC | **Publishes to** | `deploy` (status, convergence_reason, repeatability_pct, report_path) |
@@ -20,10 +20,11 @@
 # MAGIC | Step | Task | Status | Reads From | Publishes To |
 # MAGIC |:----:|------|:------:|------------|--------------|
 # MAGIC | 1 | preflight | Done | widgets | all tasks |
-# MAGIC | 2 | baseline_eval | Done | preflight | lever_loop |
-# MAGIC | 3 | lever_loop | Done | preflight + baseline | finalize |
-# MAGIC | 4 | **finalize** | **⬅️ THIS TASK** | lever_loop | deploy |
-# MAGIC | 5 | deploy | Next | preflight + finalize | *(terminal)* |
+# MAGIC | 2 | baseline_eval | Done | preflight | enrichment |
+# MAGIC | 3 | enrichment | Done | preflight + baseline | lever_loop |
+# MAGIC | 4 | lever_loop | Done | preflight + baseline + enrichment | finalize |
+# MAGIC | 5 | **finalize** | **⬅️ THIS TASK** | lever_loop | deploy |
+# MAGIC | 6 | deploy | Next | preflight + finalize | *(terminal)* |
 # MAGIC
 # MAGIC ## Input Sources: lever_loop vs baseline_eval
 # MAGIC

@@ -191,7 +191,7 @@ sequenceDiagram
 | Frontend | React 18 + TypeScript + Vite + Tailwind CSS | Modern SPA with type safety, fast builds, responsive design, Databricks-branded UI |
 | API layer | FastAPI | REST endpoints under `/api/genie/`, async support, Pydantic response models, serves React static build |
 | State store | Delta tables | ACID guarantees, multi-reader, SQL-queryable, time travel for audit, partitioned by `run_id` |
-| Compute | Databricks Jobs (multi-task) | 5-task DAG with per-task retry/timeout, Workflows UI shows stage progress, `dbutils.jobs.taskValues` for inter-task data |
+| Compute | Databricks Jobs (multi-task) | 6-task DAG with per-task retry/timeout, Workflows UI shows stage progress, `dbutils.jobs.taskValues` for inter-task data |
 | Evaluation | MLflow GenAI | `mlflow.genai.evaluate()` with custom `@scorer` judges, Prompt Registry, LoggedModels, trace storage |
 | Config versioning | MLflow LoggedModels | Snapshot Genie config + UC metadata per iteration, promote/rollback by model ID |
 | Metadata store | Unity Catalog | Table/column/tag introspection, evaluation dataset storage, trace location |

@@ -126,9 +126,10 @@ def list_levers():
     from genie_space_optimizer.common.config import LEVER_NAMES
 
     descriptions = {
+        0: "Proactively enrich descriptions, discover joins, seed instructions, and mine example SQLs",
         1: "Update table descriptions, column descriptions, column visibility, and synonyms",
         2: "Update metric view column descriptions",
-        3: "Modify function descriptions, routing logic, and remove underperforming TVFs",
+        3: "Remove underperforming TVFs",
         4: "Add, update, or remove join relationships between tables",
         5: "Rewrite global routing instructions and add domain-specific guidance",
     }

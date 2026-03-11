@@ -49,7 +49,7 @@ class TestGetRun:
         assert data["runId"] == "run-1"
         assert "steps" in data
         assert isinstance(data["steps"], list)
-        assert len(data["steps"]) == 5
+        assert len(data["steps"]) == 6
 
     @patch("genie_space_optimizer.backend.routes.runs.get_spark")
     def test_get_run_not_found(self, mock_get_spark, api_client):
@@ -65,10 +65,10 @@ class TestGetRun:
 
 
 class TestStageToStepMapping:
-    """Verify the stage-to-step mapping produces exactly 5 steps."""
+    """Verify the stage-to-step mapping produces exactly 6 steps."""
 
     @patch("genie_space_optimizer.backend.routes.runs.get_spark")
-    def test_five_steps_always(self, mock_get_spark, api_client):
+    def test_six_steps_always(self, mock_get_spark, api_client):
         mock_get_spark.return_value = MagicMock()
 
         with patch(
@@ -92,11 +92,14 @@ class TestStageToStepMapping:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data["steps"]) == 5
+        assert len(data["steps"]) == 6
         step_names = [s["name"] for s in data["steps"]]
-        assert "Configuration Analysis" in step_names
+        assert "Preflight" in step_names
         assert "Baseline Evaluation" in step_names
-        assert "Optimized Evaluation" in step_names
+        assert "Proactive Enrichment" in step_names
+        assert "Adaptive Optimization" in step_names
+        assert "Finalization" in step_names
+        assert "Deploy" in step_names
 
 
 class TestGetComparison:

@@ -11,6 +11,7 @@ from genie_space_optimizer.optimization.benchmarks import (
     resolve_sql,
     validate_ground_truth_sql,
 )
+from genie_space_optimizer.optimization.evaluation import _normalize_expected_asset
 
 
 class TestResolveSql:
@@ -113,6 +114,8 @@ class TestBuildEvalRecords:
             assert "question" in r["inputs"]
             assert "question_id" in r["inputs"]
             assert "expected_sql" in r["expectations"]
+            assert "expected_asset" in r["expectations"]
+            assert "expected_asset" not in r["inputs"]
 
     def test_empty_list(self):
         assert build_eval_records([]) == []
@@ -120,3 +123,46 @@ class TestBuildEvalRecords:
     def test_auto_generates_question_id(self):
         records = build_eval_records([{"question": "What is X?"}])
         assert records[0]["inputs"]["question_id"] != ""
+
+    def test_expected_asset_in_expectations(self):
+        records = build_eval_records([
+            {"question": "Q1", "expected_sql": "SELECT 1", "expected_asset": "MV"},
+        ])
+        assert records[0]["expectations"]["expected_asset"] == "MV"
+
+    def test_dict_expected_asset_falls_back_to_detect(self):
+        records = build_eval_records([
+            {"question": "Q1", "expected_sql": "SELECT * FROM t", "expected_asset": {"type": "TABLE"}},
+        ])
+        assert records[0]["expectations"]["expected_asset"] in ("MV", "TVF", "TABLE")
+
+
+class TestNormalizeExpectedAsset:
+    def test_string_table(self):
+        assert _normalize_expected_asset("TABLE", "") == "TABLE"
+
+    def test_string_mv(self):
+        assert _normalize_expected_asset("mv", "") == "MV"
+
+    def test_string_tvf(self):
+        assert _normalize_expected_asset("  tvf  ", "") == "TVF"
+
+    def test_empty_string_falls_back(self):
+        result = _normalize_expected_asset("", "SELECT * FROM t")
+        assert result in ("MV", "TVF", "TABLE")
+
+    def test_none_falls_back(self):
+        result = _normalize_expected_asset(None, "SELECT * FROM t")
+        assert result in ("MV", "TVF", "TABLE")
+
+    def test_dict_falls_back(self):
+        result = _normalize_expected_asset({"type": "TABLE"}, "SELECT * FROM t")
+        assert result in ("MV", "TVF", "TABLE")
+
+    def test_list_falls_back(self):
+        result = _normalize_expected_asset(["TABLE"], "SELECT * FROM t")
+        assert result in ("MV", "TVF", "TABLE")
+
+    def test_unrecognized_string_falls_back(self):
+        result = _normalize_expected_asset("BOOKING_ANALYTICS", "SELECT * FROM t")
+        assert result in ("MV", "TVF", "TABLE")

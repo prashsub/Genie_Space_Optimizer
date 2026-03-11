@@ -24,7 +24,7 @@ Poll `GET /api/genie/runs/{run_id}` or `GET /api/genie/trigger/status/{run_id}` 
 
 ### Via Databricks Workflows
 
-The optimization job is visible in the Databricks Workflows UI. Each run shows the 5-task DAG with per-task status, logs, and output.
+The optimization job is visible in the Databricks Workflows UI. Each run shows the 6-task DAG with per-task status, logs, and output.
 
 ```bash
 # Get job run details

@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC | Quick Reference | |
 # MAGIC |---|---|
-# MAGIC | **Task** | 5 of 5 — Deploy (Conditional) |
+# MAGIC | **Task** | 6 of 6 — Deploy (Conditional) |
 # MAGIC | **Harness function** | `_run_deploy()` in `optimization/harness.py` |
 # MAGIC | **Reads from** | `preflight` (deploy_target, run context) + `lever_loop` or `baseline_eval` (model_id) |
 # MAGIC | **Publishes to** | *(terminal — no downstream)* |
@@ -13,17 +13,18 @@
 # MAGIC
 # MAGIC ## 🎯 Purpose
 # MAGIC
-# MAGIC Task 5 (Deploy) is the **final and conditional** step in the 5-task optimization DAG. It applies the optimized Genie Space configuration to a target environment (e.g., via DABs) after optimization has completed successfully.
+# MAGIC Task 6 (Deploy) is the **final and conditional** step in the 6-task optimization DAG. It applies the optimized Genie Space configuration to a target environment (e.g., via DABs) after optimization has completed successfully.
 # MAGIC
 # MAGIC ## 🏗️ DAG Position
 # MAGIC
 # MAGIC | Step | Task | Status | Reads From | Publishes To |
 # MAGIC |:----:|------|:------:|------------|--------------|
 # MAGIC | 1 | preflight | Done | widgets | all tasks |
-# MAGIC | 2 | baseline_eval | Done | preflight | lever_loop |
-# MAGIC | 3 | lever_loop | Done | preflight + baseline | finalize |
-# MAGIC | 4 | finalize | Done | lever_loop | deploy |
-# MAGIC | 5 | **deploy** | **⬅️ THIS TASK** | preflight + finalize | *(terminal)* |
+# MAGIC | 2 | baseline_eval | Done | preflight | enrichment |
+# MAGIC | 3 | enrichment | Done | preflight + baseline | lever_loop |
+# MAGIC | 4 | lever_loop | Done | preflight + baseline + enrichment | finalize |
+# MAGIC | 5 | finalize | Done | lever_loop | deploy |
+# MAGIC | 6 | **deploy** | **⬅️ THIS TASK** | preflight + finalize | *(terminal)* |
 # MAGIC
 # MAGIC ## When Does Deploy Run?
 # MAGIC

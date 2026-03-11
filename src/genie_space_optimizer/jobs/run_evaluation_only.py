@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC | Quick Reference | |
 # MAGIC |---|---|
-# MAGIC | **Task** | Standalone — **Not part of the 5-task DAG** |
+# MAGIC | **Task** | Standalone — **Not part of the 6-task DAG** |
 # MAGIC | **Entry point** | `run_evaluation_via_job()` in `optimization/harness.py`, or manual run |
 # MAGIC | **Shares code with** | Task 2 (baseline_eval) — same `run_evaluation()`, `make_predict_fn()`, `make_all_scorers()` |
 # MAGIC | **Results via** | `dbutils.notebook.exit(accuracy)` + MLflow experiment runs |
@@ -13,7 +13,7 @@
 # MAGIC
 # MAGIC ## 🎯 Purpose
 # MAGIC
-# MAGIC This notebook runs evaluation **independently** — it is **not** part of the 5-task optimization DAG (preflight → baseline_eval → lever_loop → finalize → deploy). It is a self-contained evaluation runner used when evaluation needs to run in isolation.
+# MAGIC This notebook runs evaluation **independently** — it is **not** part of the 6-task optimization DAG (preflight → baseline_eval → enrichment → lever_loop → finalize → deploy). It is a self-contained evaluation runner used when evaluation needs to run in isolation.
 # MAGIC
 # MAGIC ## 🏗️ Relationship to the DAG
 # MAGIC
@@ -21,8 +21,8 @@
 # MAGIC
 # MAGIC ```
 # MAGIC ┌─────────────────────────────────────────────────────────────┐
-# MAGIC │  5-Task DAG (optimization pipeline)                        │
-# MAGIC │  preflight → baseline → lever_loop → finalize → deploy     │
+# MAGIC │  6-Task DAG (optimization pipeline)                                    │
+# MAGIC │  preflight → baseline → enrichment → lever_loop → finalize → deploy  │
 # MAGIC │  ↑ Uses run_evaluation() inline within _run_baseline()     │
 # MAGIC └─────────────────────────────────────────────────────────────┘
 # MAGIC

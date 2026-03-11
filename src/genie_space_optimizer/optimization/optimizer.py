@@ -6269,7 +6269,7 @@ def _merge_overlapping_instructions(proposals: list[dict]) -> list[dict]:
     return others + merged
 
 
-_LEVER_NAMES = {1: "Tables & Columns", 2: "Metric Views", 3: "Table-Valued Functions", 4: "Join Specifications", 5: "Genie Space Instructions"}
+_LEVER_NAMES = {0: "Proactive Enrichment", 1: "Tables & Columns", 2: "Metric Views", 3: "Table-Valued Functions", 4: "Join Specifications", 5: "Genie Space Instructions"}
 
 
 def _build_provenance(cluster: dict, lever: int, patch_type: str) -> dict:

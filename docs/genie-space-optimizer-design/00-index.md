@@ -30,7 +30,7 @@
 
 | Metric | Value |
 |--------|-------|
-| Pipeline stages | 5 (preflight, baseline eval, lever loop, finalize, deploy) |
+| Pipeline stages | 6 (preflight, baseline eval, enrichment, lever loop, finalize, deploy) |
 | Preparatory stages | 4 (prompt matching, description enrichment, join discovery, instruction seeding) |
 | Optimization levers | 5 (tables/columns, metric views, TVFs, joins, instructions) |
 | Quality dimensions | 7 + response quality + arbiter = 9 judges |

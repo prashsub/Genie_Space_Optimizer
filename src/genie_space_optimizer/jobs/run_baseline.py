@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC | Quick Reference | |
 # MAGIC |---|---|
-# MAGIC | **Task** | 2 of 5 — Baseline Evaluation |
+# MAGIC | **Task** | 2 of 6 — Baseline Evaluation |
 # MAGIC | **Harness function** | `_run_baseline()` in `optimization/harness.py` |
 # MAGIC | **Reads from** | `preflight` (task values) |
 # MAGIC | **Publishes to** | `lever_loop` (scores, accuracy, thresholds_met, model_id) |
@@ -20,10 +20,11 @@
 # MAGIC | Step | Task | Status | Reads From | Publishes To |
 # MAGIC |:----:|------|:------:|------------|--------------|
 # MAGIC | 1 | preflight | Done | widgets | all tasks |
-# MAGIC | 2 | **baseline_eval** | **⬅️ THIS TASK** | preflight | lever_loop |
-# MAGIC | 3 | lever_loop | Next | preflight + baseline | finalize |
-# MAGIC | 4 | finalize | Pending | lever_loop | deploy |
-# MAGIC | 5 | deploy | Pending | preflight + finalize | *(terminal)* |
+# MAGIC | 2 | **baseline_eval** | **⬅️ THIS TASK** | preflight | enrichment |
+# MAGIC | 3 | enrichment | Next | preflight + baseline | lever_loop |
+# MAGIC | 4 | lever_loop | Pending | preflight + baseline + enrichment | finalize |
+# MAGIC | 5 | finalize | Pending | lever_loop | deploy |
+# MAGIC | 6 | deploy | Pending | preflight + finalize | *(terminal)* |
 # MAGIC
 # MAGIC ## 9-Judge Scoring System
 # MAGIC

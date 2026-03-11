@@ -8,7 +8,7 @@ This is the most detailed document in the set. It walks through every stage of t
 
 ## Pipeline Overview
 
-The optimizer runs as a 5-task Databricks Job DAG. Each task is a notebook that reads parameters from the prior task via `dbutils.jobs.taskValues` and persists state to Delta tables.
+The optimizer runs as a 6-task Databricks Job DAG. Each task is a notebook that reads parameters from the prior task via `dbutils.jobs.taskValues` and persists state to Delta tables.
 
 ```mermaid
 graph TD

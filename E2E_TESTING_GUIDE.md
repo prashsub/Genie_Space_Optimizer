@@ -35,12 +35,13 @@ Understanding the architecture is critical for diagnosing failures. For a compre
 ### Components
 
 ```
-Browser (React)  ──API──▶  FastAPI Backend  ──triggers──▶  Databricks Job (5-task DAG)
+Browser (React)  ──API──▶  FastAPI Backend  ──triggers──▶  Databricks Job (6-task DAG)
                             │                                │
                             ├─ OBO user token (if available) ├─ preflight
                             ├─ SP fallback (if not)          ├─ baseline_eval
-                            ├─ Serverless Spark              ├─ lever_loop
-                            └─ Delta state tables            ├─ finalize
+                            ├─ Serverless Spark              ├─ enrichment
+                            └─ Delta state tables            ├─ lever_loop
+                                                             ├─ finalize
                                                              └─ deploy_check → deploy
 ```
 
