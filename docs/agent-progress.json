@@ -12,7 +12,7 @@
   ],
 
   "task_status": {
-    "2a": { "title": "Extend TriggerRequest model with levers field", "feature": "lever-acknowledgement-ui", "status": "pending", "passes": false, "depends_on": [] },
+    "2a": { "title": "Extend TriggerRequest model with levers field", "feature": "lever-acknowledgement-ui", "status": "done", "passes": true, "depends_on": [] },
     "2b": { "title": "Wire levers through trigger route → do_start_optimization → submit_optimization", "feature": "lever-acknowledgement-ui", "status": "pending", "passes": false, "depends_on": ["2a"] },
     "2c": { "title": "Add lever checkboxes to space detail page", "feature": "lever-acknowledgement-ui", "status": "pending", "passes": false, "depends_on": ["2a"] },
     "2d": { "title": "Add lever metadata endpoint (optional)", "feature": "lever-acknowledgement-ui", "status": "pending", "passes": false, "depends_on": ["2a"], "optional": true },
@@ -34,5 +34,15 @@
     "4g": { "title": "Implement function creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] }
   },
 
-  "sessions": []
+  "sessions": [
+    {
+      "session_id": "2026-03-11T20:00:00Z",
+      "task_id": "2a",
+      "feature": "lever-acknowledgement-ui",
+      "summary": "Added `levers: list[int] | None = None` field to TriggerRequest in models.py. When None, backend will treat as all levers [1,2,3,4,5]. Single-line change, zero linter errors.",
+      "files_changed": ["src/genie_space_optimizer/backend/models.py"],
+      "blockers": [],
+      "next_task": "2b"
+    }
+  ]
 }
