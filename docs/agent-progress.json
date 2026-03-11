@@ -29,7 +29,7 @@
     "4b": { "title": "Extend strategist output schema for proposals", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": [] },
     "4c": { "title": "Write proposals to state table during lever loop", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4a", "4b"] },
     "4d": { "title": "Add backend API endpoints for suggestions", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4a"] },
-    "4e": { "title": "Add suggestions UI to run detail page", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] },
+    "4e": { "title": "Add suggestions UI to run detail page", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4d"] },
     "4f": { "title": "Implement metric view creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] },
     "4g": { "title": "Implement function creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] }
   },
@@ -216,6 +216,18 @@
       ],
       "blockers": [],
       "next_task": "4e"
+    },
+    {
+      "session_id": "2026-03-12T11:00:00Z",
+      "task_id": "4e",
+      "feature": "strategist-improvement-suggestions",
+      "summary": "Created SuggestionsPanel.tsx component that fetches suggestions via useGetImprovementSuggestionsSuspense and renders each as a card with type badge (METRIC_VIEW/FUNCTION), title, rationale, SQL definition preview, impact info, and action buttons. Accept/Reject buttons call reviewSuggestion mutation; Apply button (visible after acceptance) calls applySuggestion mutation. Both invalidate the query cache on settle. Added 'Suggestions' tab with Lightbulb icon to the run detail page ($runId.tsx), wrapped in ErrorBoundary + Suspense.",
+      "files_changed": [
+        "src/genie_space_optimizer/ui/components/SuggestionsPanel.tsx",
+        "src/genie_space_optimizer/ui/routes/runs/$runId.tsx"
+      ],
+      "blockers": [],
+      "next_task": "4f"
     }
   ]
 }

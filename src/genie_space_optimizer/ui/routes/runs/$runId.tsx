@@ -15,6 +15,7 @@ import { AsiResultsPanel } from "@/components/AsiResultsPanel";
 import { StageTimeline, type StageEvent } from "@/components/StageTimeline";
 import { InsightTabs } from "@/components/InsightTabs";
 import { IterationExplorer } from "@/components/IterationExplorer";
+import { SuggestionsPanel } from "@/components/SuggestionsPanel";
 import { useIterationDetail } from "@/lib/transparency-api";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import {
@@ -31,6 +32,7 @@ import {
   UserCheck,
   Eye,
   Microscope,
+  Lightbulb,
 } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
 
@@ -724,6 +726,10 @@ function TransparencyPane({
           <Microscope className="h-3.5 w-3.5" />
           Iteration Explorer
         </TabsTrigger>
+        <TabsTrigger value="suggestions" className="gap-1.5">
+          <Lightbulb className="h-3.5 w-3.5" />
+          Suggestions
+        </TabsTrigger>
       </TabsList>
 
       <TabsContent value="summary" className="mt-4 space-y-4">
@@ -737,6 +743,14 @@ function TransparencyPane({
 
       <TabsContent value="explorer" className="mt-4">
         <IterationExplorer detail={iterDetail} links={links} />
+      </TabsContent>
+
+      <TabsContent value="suggestions" className="mt-4">
+        <ErrorBoundary fallback={<Alert variant="destructive"><AlertTitle>Failed to load suggestions</AlertTitle></Alert>}>
+          <Suspense fallback={<Skeleton className="h-32 rounded-lg" />}>
+            <SuggestionsPanel runId={runId} />
+          </Suspense>
+        </ErrorBoundary>
       </TabsContent>
     </Tabs>
   );
