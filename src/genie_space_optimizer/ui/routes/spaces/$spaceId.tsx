@@ -46,6 +46,7 @@ import {
 import { ErrorBoundary } from "react-error-boundary";
 import { toast } from "sonner";
 import { CrossRunChart } from "@/components/CrossRunChart";
+import { OptimizationLoadingStepper } from "@/components/OptimizationLoadingStepper";
 
 export const Route = createFileRoute("/spaces/$spaceId")({
   component: () => (
@@ -111,6 +112,10 @@ function SpaceDetail() {
     new Set(LEVERS.map((l) => l.id)),
   );
   const [deployTarget, setDeployTarget] = useState("");
+  const [stepperOpen, setStepperOpen] = useState(false);
+  const [stepperError, setStepperError] = useState<string | null>(null);
+  const [stepperComplete, setStepperComplete] = useState(false);
+  const [pendingRunId, setPendingRunId] = useState<string | null>(null);
 
   const toggleLever = (id: number) => {
     setSelectedLevers((prev) => {
@@ -162,6 +167,11 @@ function SpaceDetail() {
   )?.runId;
 
   function doStartOptimization() {
+    setStepperOpen(true);
+    setStepperError(null);
+    setStepperComplete(false);
+    setPendingRunId(null);
+
     triggerOpt.mutate(
       {
         params: {},
@@ -179,6 +189,8 @@ function SpaceDetail() {
           const runId = res.data?.runId;
           const jobUrl = res.data?.jobUrl;
           if (runId) {
+            setPendingRunId(runId);
+            setStepperComplete(true);
             if (jobUrl) {
               toast.success("Optimization started", {
                 description: "Run launched. Open Workflows for live task logs.",
@@ -189,10 +201,7 @@ function SpaceDetail() {
                   },
                 },
               });
-            } else {
-              toast.success("Optimization started");
             }
-            navigate({ to: "/runs/$runId", params: { runId } });
           }
         },
         onError: (err) => {
@@ -201,6 +210,7 @@ function SpaceDetail() {
             (err as { body?: { detail?: string } }).body?.detail ||
             (err as Error).message ||
             "Failed to start optimization";
+          setStepperError(detail);
           if (status === 409) {
             toast.warning("Optimization already in progress", {
               description: detail,
@@ -432,6 +442,18 @@ function SpaceDetail() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <OptimizationLoadingStepper
+        isOpen={stepperOpen}
+        isComplete={stepperComplete}
+        error={stepperError}
+        onNavigate={() => {
+          setStepperOpen(false);
+          if (pendingRunId) {
+            navigate({ to: "/runs/$runId", params: { runId: pendingRunId } });
+          }
+        }}
+      />
 
       <Tabs defaultValue="description" className="space-y-4">
         <TabsList className="h-auto w-full justify-start overflow-x-auto">
