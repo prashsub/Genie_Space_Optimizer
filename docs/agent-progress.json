@@ -30,8 +30,8 @@
     "4c": { "title": "Write proposals to state table during lever loop", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4a", "4b"] },
     "4d": { "title": "Add backend API endpoints for suggestions", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4a"] },
     "4e": { "title": "Add suggestions UI to run detail page", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4d"] },
-    "4f": { "title": "Implement metric view creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] },
-    "4g": { "title": "Implement function creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] }
+    "4f": { "title": "Implement metric view creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4d"] },
+    "4g": { "title": "Implement function creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4d"] }
   },
 
   "sessions": [
@@ -228,6 +228,17 @@
       ],
       "blockers": [],
       "next_task": "4f"
+    },
+    {
+      "session_id": "2026-03-12T12:00:00Z",
+      "task_id": "4f+4g",
+      "feature": "strategist-improvement-suggestions",
+      "summary": "Enhanced apply_suggestion endpoint with type-specific handling for both METRIC_VIEW and FUNCTION suggestions. After executing the SQL definition via Statement Execution API, the endpoint now: (1) parses the three-level identifier from the CREATE statement using regex, (2) fetches the current Genie Space config, (3) adds the new identifier to data_sources.metric_views or data_sources.functions if not already present, (4) PATCHes the space config. Added _CREATE_MV_RE and _CREATE_FUNC_RE regexes, _extract_identifier helper, and _register_in_genie_space function. Registration failures are logged but don't block the status update to IMPLEMENTED.",
+      "files_changed": [
+        "src/genie_space_optimizer/backend/routes/suggestions.py"
+      ],
+      "blockers": [],
+      "next_task": null
     }
   ]
 }
