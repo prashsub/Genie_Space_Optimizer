@@ -424,6 +424,30 @@ class PendingReviewsOut(BaseModel):
     items: list[PendingReviewItem] = []
 
 
+# ── Suggestion Models ────────────────────────────────────────────────
+
+
+class SuggestionOut(SafeModel):
+    suggestionId: str
+    runId: str
+    spaceId: str
+    iteration: int | None = None
+    suggestionType: str
+    title: str
+    rationale: str | None = None
+    definition: str | None = None
+    affectedQuestions: list[str] = []
+    estimatedImpact: str | None = None
+    status: str
+    reviewedBy: str | None = None
+    reviewedAt: str | None = None
+
+
+class SuggestionReviewRequest(BaseModel):
+    status: str
+    comment: str | None = None
+
+
 # ── Iteration Detail (Transparency) Models ───────────────────────────
 
 

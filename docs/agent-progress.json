@@ -28,7 +28,7 @@
     "4a": { "title": "Create improvement_suggestions Delta state table", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": [] },
     "4b": { "title": "Extend strategist output schema for proposals", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": [] },
     "4c": { "title": "Write proposals to state table during lever loop", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4a", "4b"] },
-    "4d": { "title": "Add backend API endpoints for suggestions", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4a"] },
+    "4d": { "title": "Add backend API endpoints for suggestions", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": ["4a"] },
     "4e": { "title": "Add suggestions UI to run detail page", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] },
     "4f": { "title": "Implement metric view creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] },
     "4g": { "title": "Implement function creation from accepted suggestion", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] }
@@ -202,6 +202,20 @@
       ],
       "blockers": [],
       "next_task": "4d"
+    },
+    {
+      "session_id": "2026-03-12T10:00:00Z",
+      "task_id": "4d",
+      "feature": "strategist-improvement-suggestions",
+      "summary": "Added SuggestionOut and SuggestionReviewRequest Pydantic models to models.py. Created routes/suggestions.py with three endpoints: GET /runs/{run_id}/suggestions (lists all suggestions for a run), POST /suggestions/{suggestion_id}/review (accept/reject with reviewer tracking), POST /suggestions/{suggestion_id}/apply (executes SQL definition via Statement Execution API then marks IMPLEMENTED). Added load_suggestion_by_id helper to state.py for single-suggestion lookup. Registered suggestions router in app.py.",
+      "files_changed": [
+        "src/genie_space_optimizer/backend/models.py",
+        "src/genie_space_optimizer/backend/routes/suggestions.py",
+        "src/genie_space_optimizer/backend/app.py",
+        "src/genie_space_optimizer/optimization/state.py"
+      ],
+      "blockers": [],
+      "next_task": "4e"
     }
   ]
 }

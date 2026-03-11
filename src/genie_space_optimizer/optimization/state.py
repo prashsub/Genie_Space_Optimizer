@@ -1225,6 +1225,23 @@ def load_suggestions(
     )
 
 
+def load_suggestion_by_id(
+    spark: Any,
+    suggestion_id: str,
+    catalog: str,
+    schema: str,
+) -> dict | None:
+    """Load a single suggestion by its ID. Returns dict or None."""
+    fqn = _fqn(catalog, schema, TABLE_SUGGESTIONS)
+    df = run_query(
+        spark,
+        f"SELECT * FROM {fqn} WHERE suggestion_id = '{suggestion_id}' LIMIT 1",
+    )
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
 def update_suggestion_status(
     spark: Any,
     suggestion_id: str,
