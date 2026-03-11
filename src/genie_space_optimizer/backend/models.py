@@ -142,6 +142,7 @@ class TriggerRequest(BaseModel):
     space_id: str
     apply_mode: str = "genie_config"
     levers: list[int] | None = None
+    deploy_target: str | None = None
 
 
 class TriggerResponse(BaseModel):

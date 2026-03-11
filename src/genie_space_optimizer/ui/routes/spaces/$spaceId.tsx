@@ -37,6 +37,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import { Input } from "@/components/ui/input";
 import {
   ArrowLeft,
   ChevronDown,
@@ -109,6 +110,7 @@ function SpaceDetail() {
   const [selectedLevers, setSelectedLevers] = useState<Set<number>>(
     new Set(LEVERS.map((l) => l.id)),
   );
+  const [deployTarget, setDeployTarget] = useState("");
 
   const toggleLever = (id: number) => {
     setSelectedLevers((prev) => {
@@ -169,6 +171,7 @@ function SpaceDetail() {
           levers: selectedLevers.size === LEVERS.length
             ? undefined
             : Array.from(selectedLevers).sort(),
+          deploy_target: deployTarget.trim() || undefined,
         },
       },
       {
@@ -281,6 +284,23 @@ function SpaceDetail() {
                   </div>
                 </label>
               ))}
+            </CollapsibleContent>
+          </Collapsible>
+          <Collapsible className="w-64 text-left">
+            <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+              <ChevronDown className="h-3 w-3" />
+              Deployment target (optional)
+            </CollapsibleTrigger>
+            <CollapsibleContent className="mt-2">
+              <Input
+                placeholder="https://target-workspace.cloud.databricks.com"
+                value={deployTarget}
+                onChange={(e) => setDeployTarget(e.target.value)}
+                className="h-8 text-xs"
+              />
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                Leave empty to skip cross-environment deployment.
+              </p>
             </CollapsibleContent>
           </Collapsible>
           <div>

@@ -756,6 +756,7 @@ def do_start_optimization(
     headers,
     apply_mode: str = "genie_config",
     levers: list[int] | None = None,
+    deploy_target: str | None = None,
 ) -> OptimizeResponse:
     """Core optimization trigger logic shared by the UI route and the API trigger route.
 
@@ -1048,6 +1049,7 @@ def do_start_optimization(
             levers=levers_str,
             triggered_by=current_user,
             experiment_name=experiment_name or "",
+            deploy_target=deploy_target or "",
         )
 
         if use_warehouse_fallback:

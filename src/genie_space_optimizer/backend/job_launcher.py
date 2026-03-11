@@ -677,6 +677,7 @@ def submit_optimization(
     max_iterations: str = "5",
     triggered_by: str = "",
     experiment_name: str = "",
+    deploy_target: str = "",
 ) -> tuple[str, int]:
     """Trigger a run on a persistent serverless optimization job.
 
@@ -708,7 +709,7 @@ def submit_optimization(
                 "max_iterations": max_iterations,
                 "triggered_by": triggered_by,
                 "experiment_name": experiment_name,
-                "deploy_target": "",
+                "deploy_target": deploy_target,
             },
         )
 
