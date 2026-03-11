@@ -755,6 +755,7 @@ def do_start_optimization(
     config,
     headers,
     apply_mode: str = "genie_config",
+    levers: list[int] | None = None,
 ) -> OptimizeResponse:
     """Core optimization trigger logic shared by the UI route and the API trigger route.
 
@@ -770,6 +771,9 @@ def do_start_optimization(
         update_run_status,
     )
     from ..job_launcher import submit_optimization
+    from genie_space_optimizer.common.config import DEFAULT_LEVER_ORDER
+
+    levers_str = json.dumps(levers if levers else DEFAULT_LEVER_ORDER)
 
     requested_apply_mode = (apply_mode or "genie_config").strip().lower()
     if requested_apply_mode not in _SUPPORTED_APPLY_MODES:
@@ -1041,6 +1045,7 @@ def do_start_optimization(
             catalog=config.catalog,
             schema=config.schema_name,
             apply_mode=requested_apply_mode,
+            levers=levers_str,
             triggered_by=current_user,
             experiment_name=experiment_name or "",
         )

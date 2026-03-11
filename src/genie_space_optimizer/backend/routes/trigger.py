@@ -46,6 +46,7 @@ def trigger_optimization(
         config=config,
         headers=headers,
         apply_mode=body.apply_mode,
+        levers=body.levers,
     )
     return TriggerResponse(
         runId=result.runId,
