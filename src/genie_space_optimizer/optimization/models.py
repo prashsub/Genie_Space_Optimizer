@@ -198,8 +198,12 @@ def register_uc_model(
     run_id: str,
     catalog: str,
     schema: str,
+    ws: "WorkspaceClient | None" = None,
 ) -> str | None:
     """Register champion LoggedModel as a UC Registered Model version.
+
+    If *ws* is provided, also creates/finds a deployment job and links it
+    to the registered model.
 
     Returns the model version number as a string, or None on failure.
     """
@@ -244,6 +248,27 @@ def register_uc_model(
             "Registered UC model %s version %s with @champion alias",
             uc_model_name, version,
         )
+
+        if ws is not None:
+            try:
+                from genie_space_optimizer.backend.job_launcher import ensure_deployment_job
+
+                deploy_job_id = ensure_deployment_job(
+                    ws, space_id=space_id, catalog=catalog, schema=schema,
+                )
+                client.update_registered_model(
+                    uc_model_name, deployment_job_id=str(deploy_job_id),
+                )
+                logger.info(
+                    "Linked deployment job %s to UC model %s",
+                    deploy_job_id, uc_model_name,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to link deployment job to UC model %s (non-fatal)",
+                    uc_model_name,
+                )
+
         return version
     except Exception:
         logger.exception("Failed to register UC model %s", uc_model_name)

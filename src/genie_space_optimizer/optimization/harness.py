@@ -4955,7 +4955,7 @@ def _run_finalize(
         promoted_model = promote_best_model(spark, run_id, catalog, schema)
 
         from genie_space_optimizer.optimization.models import register_uc_model
-        register_uc_model(spark, run_id, catalog, schema)
+        register_uc_model(spark, run_id, catalog, schema, ws=w)
 
         _check_timeout("generate_report")
         _emit_heartbeat("generate_report", force=True)

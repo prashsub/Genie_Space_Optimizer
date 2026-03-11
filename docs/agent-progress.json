@@ -19,7 +19,7 @@
     "1b": { "title": "Add config constants for UC model registration", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": [] },
     "1a": { "title": "Add register_uc_model() and call from finalize", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": ["1b"] },
     "1c": { "title": "Create cross-environment deployment job notebook", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": [] },
-    "1d": { "title": "Create and link deployment job programmatically", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1a", "1b", "1c"] },
+    "1d": { "title": "Create and link deployment job programmatically", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": ["1a", "1b", "1c"] },
     "1e": { "title": "Add deploy_target parameter to frontend trigger flow", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1b"] },
     "1f": { "title": "Show deployment job status in run detail page", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1d"] },
     "3c": { "title": "Check/add animation dependency", "feature": "start-optimization-loading-animation", "status": "pending", "passes": false, "depends_on": [] },
@@ -113,6 +113,19 @@
       ],
       "blockers": [],
       "next_task": "1d"
+    },
+    {
+      "session_id": "2026-03-12T03:00:00Z",
+      "task_id": "1d",
+      "feature": "uc-model-registration-and-deployment-job",
+      "summary": "Added ensure_deployment_job() to job_launcher.py — finds or creates a per-space deployment job (named via DEPLOYMENT_JOB_NAME_TEMPLATE) running run_cross_env_deploy notebook with model_name/version/target_workspace_url/target_space_id params. Added run_cross_env_deploy to _NOTEBOOK_SOURCES so it gets uploaded. Updated register_uc_model() to accept optional ws param; when provided, calls ensure_deployment_job() and links via client.update_registered_model(deployment_job_id=...). Updated harness.py to pass ws=w. All deployment job linking is fire-and-forget (non-fatal).",
+      "files_changed": [
+        "src/genie_space_optimizer/backend/job_launcher.py",
+        "src/genie_space_optimizer/optimization/models.py",
+        "src/genie_space_optimizer/optimization/harness.py"
+      ],
+      "blockers": [],
+      "next_task": "1e"
     }
   ]
 }
