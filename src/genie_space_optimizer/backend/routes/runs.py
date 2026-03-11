@@ -1260,6 +1260,45 @@ def _reconcile_single_run(
         return run_data
 
 
+def _resolve_deployment_status(
+    stages_rows: list[dict],
+    run_data: dict,
+    host: str,
+) -> tuple[str | None, str | None]:
+    """Derive deployment status and URL from DEPLOY stages.
+
+    Returns (status, url) where status is one of:
+    None — no deploy configured, SKIPPED, RUNNING, DEPLOYED, FAILED.
+    """
+    deploy_target = run_data.get("deploy_target")
+    deploy_stages = [
+        s for s in stages_rows
+        if str(s.get("stage", "")).startswith("DEPLOY")
+    ]
+    if not deploy_stages:
+        return (None, None) if not deploy_target else (None, None)
+
+    latest = deploy_stages[-1]
+    stage_name = str(latest.get("stage", ""))
+    stage_status = str(latest.get("status", "")).upper()
+
+    if "SKIPPED" in stage_name or stage_status == "SKIPPED":
+        return ("SKIPPED", None)
+    if stage_status == "FAILED":
+        return ("FAILED", None)
+    if stage_status == "COMPLETE":
+        detail = safe_json_parse(latest.get("detail_json"))
+        target = (
+            detail.get("deploy_target") if isinstance(detail, dict) else None
+        ) or deploy_target
+        url = str(target).rstrip("/") if target else None
+        return ("DEPLOYED", url)
+    if stage_status == "STARTED":
+        return ("RUNNING", None)
+
+    return (None, None)
+
+
 @router.get("/runs/{run_id}", response_model=PipelineRun, operation_id="getRun")
 def get_run(run_id: str, ws: Dependencies.UserClient, sp_ws: Dependencies.Client, config: Dependencies.Config):
     """Run status with 5 user-facing pipeline steps and lever detail."""
@@ -1323,6 +1362,10 @@ def get_run(run_id: str, ws: Dependencies.UserClient, sp_ws: Dependencies.Client
         if step.stepNumber == 3 and isinstance(step.outputs, dict) and baseline_eval_link:
             step.outputs.setdefault("evaluationRunUrl", baseline_eval_link)
 
+    deploy_status, deploy_url = _resolve_deployment_status(
+        stages_rows, run_data, host,
+    )
+
     result = PipelineRun(
         runId=run_id,
         spaceId=run_data.get("space_id", ""),
@@ -1337,6 +1380,8 @@ def get_run(run_id: str, ws: Dependencies.UserClient, sp_ws: Dependencies.Client
         levers=levers,
         convergenceReason=run_data.get("convergence_reason"),
         links=links,
+        deploymentJobStatus=deploy_status,
+        deploymentJobUrl=deploy_url,
     )
 
     try:

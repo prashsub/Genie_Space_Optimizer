@@ -215,6 +215,8 @@ class PipelineRun(SafeModel):
     levers: list[LeverStatus] = []
     convergenceReason: str | None = None
     links: list[PipelineLink] = []
+    deploymentJobStatus: str | None = None
+    deploymentJobUrl: str | None = None
 
 
 # ── Comparison Models ───────────────────────────────────────────────────

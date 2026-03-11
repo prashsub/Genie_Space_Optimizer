@@ -21,7 +21,7 @@
     "1c": { "title": "Create cross-environment deployment job notebook", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": [] },
     "1d": { "title": "Create and link deployment job programmatically", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": ["1a", "1b", "1c"] },
     "1e": { "title": "Add deploy_target parameter to frontend trigger flow", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": ["1b"] },
-    "1f": { "title": "Show deployment job status in run detail page", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1d"] },
+    "1f": { "title": "Show deployment job status in run detail page", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": ["1d"] },
     "3c": { "title": "Check/add animation dependency", "feature": "start-optimization-loading-animation", "status": "pending", "passes": false, "depends_on": [] },
     "3a": { "title": "Create OptimizationLoadingStepper component", "feature": "start-optimization-loading-animation", "status": "pending", "passes": false, "depends_on": ["3c"] },
     "3b": { "title": "Integrate stepper into space detail page", "feature": "start-optimization-loading-animation", "status": "pending", "passes": false, "depends_on": ["3a"] },
@@ -141,6 +141,19 @@
       ],
       "blockers": [],
       "next_task": "1f"
+    },
+    {
+      "session_id": "2026-03-12T05:00:00Z",
+      "task_id": "1f",
+      "feature": "uc-model-registration-and-deployment-job",
+      "summary": "Added deploymentJobStatus and deploymentJobUrl fields to PipelineRun model. Added _resolve_deployment_status() helper in runs.py that scans DEPLOY_* stage rows to derive status (SKIPPED/RUNNING/DEPLOYED/FAILED) and deploy_target URL. Frontend shows a color-coded DeploymentBadge (with Rocket icon) next to the run status in the header — green for DEPLOYED (clickable link to target workspace), blue+spinner for RUNNING, red for FAILED, muted for SKIPPED.",
+      "files_changed": [
+        "src/genie_space_optimizer/backend/models.py",
+        "src/genie_space_optimizer/backend/routes/runs.py",
+        "src/genie_space_optimizer/ui/routes/runs/$runId.tsx"
+      ],
+      "blockers": [],
+      "next_task": "3c"
     }
   ]
 }

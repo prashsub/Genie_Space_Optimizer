@@ -27,6 +27,7 @@ import {
   Zap,
   TrendingUp,
   ExternalLink,
+  Rocket,
   UserCheck,
   Eye,
   Microscope,
@@ -356,6 +357,8 @@ function PipelineView() {
     optimizedScore?: number | null;
     convergenceReason?: string | null;
     links?: { label: string; url: string; category: string }[];
+    deploymentJobStatus?: string | null;
+    deploymentJobUrl?: string | null;
   } | null;
 
   const isActive = run
@@ -441,6 +444,12 @@ function PipelineView() {
               {isActive && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
               {statusDisplayLabel(run.status)}
             </Badge>
+            {run.deploymentJobStatus && (
+              <DeploymentBadge
+                status={run.deploymentJobStatus}
+                url={run.deploymentJobUrl}
+              />
+            )}
           </div>
           <p className="text-sm text-muted-foreground">
             Run <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">{run.runId.slice(0, 8)}</code>
@@ -1003,4 +1012,52 @@ function StepInsights({
   }
 
   return null;
+}
+
+function DeploymentBadge({
+  status,
+  url,
+}: {
+  status: string;
+  url?: string | null;
+}) {
+  const label =
+    status === "DEPLOYED"
+      ? "Deployed"
+      : status === "RUNNING"
+        ? "Deploying…"
+        : status === "FAILED"
+          ? "Deploy failed"
+          : status === "SKIPPED"
+            ? "Deploy skipped"
+            : status;
+
+  const className =
+    status === "DEPLOYED"
+      ? "border-db-green/30 text-db-green"
+      : status === "RUNNING"
+        ? "border-db-blue/30 text-db-blue"
+        : status === "FAILED"
+          ? "border-db-red-error/30 text-db-red-error"
+          : "text-muted-foreground";
+
+  const badge = (
+    <Badge variant="outline" className={className}>
+      {status === "RUNNING" && (
+        <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+      )}
+      <Rocket className="mr-1 h-3 w-3" />
+      {label}
+      {url && <ExternalLink className="ml-1 h-3 w-3" />}
+    </Badge>
+  );
+
+  if (url) {
+    return (
+      <a href={url} target="_blank" rel="noopener noreferrer">
+        {badge}
+      </a>
+    );
+  }
+  return badge;
 }
