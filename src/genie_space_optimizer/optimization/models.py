@@ -193,6 +193,63 @@ def promote_best_model(
     return best_model_id
 
 
+def register_uc_model(
+    spark: "SparkSession",
+    run_id: str,
+    catalog: str,
+    schema: str,
+) -> str | None:
+    """Register champion LoggedModel as a UC Registered Model version.
+
+    Returns the model version number as a string, or None on failure.
+    """
+    from genie_space_optimizer.common.config import (
+        ENABLE_UC_MODEL_REGISTRATION,
+        UC_REGISTERED_MODEL_TEMPLATE,
+        format_mlflow_template,
+    )
+
+    if not ENABLE_UC_MODEL_REGISTRATION:
+        logger.info("UC model registration disabled, skipping")
+        return None
+
+    run_row = load_run(spark, run_id, catalog, schema)
+    if not run_row:
+        logger.error("Cannot register UC model: run %s not found", run_id)
+        return None
+
+    best_model_id = run_row.get("best_model_id")
+    space_id = run_row.get("space_id", "")
+    if not best_model_id:
+        logger.warning("No best_model_id for run %s, skipping UC registration", run_id)
+        return None
+
+    uc_model_name = format_mlflow_template(
+        UC_REGISTERED_MODEL_TEMPLATE,
+        catalog=catalog, schema=schema, space_id=space_id,
+    )
+
+    try:
+        mlflow.set_registry_uri("databricks-uc")
+        model_uri = f"models:/{best_model_id}"
+        mv = mlflow.register_model(model_uri, uc_model_name)
+        version = str(mv.version)
+
+        from mlflow import MlflowClient
+
+        client = MlflowClient(registry_uri="databricks-uc")
+        client.set_registered_model_alias(uc_model_name, "champion", int(version))
+
+        logger.info(
+            "Registered UC model %s version %s with @champion alias",
+            uc_model_name, version,
+        )
+        return version
+    except Exception:
+        logger.exception("Failed to register UC model %s", uc_model_name)
+        return None
+
+
 def rollback_to_model(
     w: WorkspaceClient,
     model_id: str,

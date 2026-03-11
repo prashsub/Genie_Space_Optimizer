@@ -17,7 +17,7 @@
     "2c": { "title": "Add lever checkboxes to space detail page", "feature": "lever-acknowledgement-ui", "status": "done", "passes": true, "depends_on": ["2a"] },
     "2d": { "title": "Add lever metadata endpoint (optional)", "feature": "lever-acknowledgement-ui", "status": "done", "passes": true, "depends_on": ["2a"], "optional": true },
     "1b": { "title": "Add config constants for UC model registration", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": [] },
-    "1a": { "title": "Add register_uc_model() and call from finalize", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1b"] },
+    "1a": { "title": "Add register_uc_model() and call from finalize", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": ["1b"] },
     "1c": { "title": "Create cross-environment deployment job notebook", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": [] },
     "1d": { "title": "Create and link deployment job programmatically", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1a", "1b", "1c"] },
     "1e": { "title": "Add deploy_target parameter to frontend trigger flow", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1b"] },
@@ -90,6 +90,18 @@
       ],
       "blockers": [],
       "next_task": "1a"
+    },
+    {
+      "session_id": "2026-03-12T01:00:00Z",
+      "task_id": "1a",
+      "feature": "uc-model-registration-and-deployment-job",
+      "summary": "Added register_uc_model() function to models.py — reads best_model_id from run state, builds 3-level UC model name via UC_REGISTERED_MODEL_TEMPLATE, calls mlflow.register_model() with databricks-uc registry, sets @champion alias via MlflowClient. Guarded by ENABLE_UC_MODEL_REGISTRATION flag. Called from harness.py _run_finalize() immediately after promote_best_model(). Fire-and-forget — failure does not block the run.",
+      "files_changed": [
+        "src/genie_space_optimizer/optimization/models.py",
+        "src/genie_space_optimizer/optimization/harness.py"
+      ],
+      "blockers": [],
+      "next_task": "1c"
     }
   ]
 }
