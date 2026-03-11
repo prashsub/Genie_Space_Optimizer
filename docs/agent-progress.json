@@ -18,7 +18,7 @@
     "2d": { "title": "Add lever metadata endpoint (optional)", "feature": "lever-acknowledgement-ui", "status": "done", "passes": true, "depends_on": ["2a"], "optional": true },
     "1b": { "title": "Add config constants for UC model registration", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": [] },
     "1a": { "title": "Add register_uc_model() and call from finalize", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": ["1b"] },
-    "1c": { "title": "Create cross-environment deployment job notebook", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": [] },
+    "1c": { "title": "Create cross-environment deployment job notebook", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": [] },
     "1d": { "title": "Create and link deployment job programmatically", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1a", "1b", "1c"] },
     "1e": { "title": "Add deploy_target parameter to frontend trigger flow", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1b"] },
     "1f": { "title": "Show deployment job status in run detail page", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1d"] },
@@ -102,6 +102,17 @@
       ],
       "blockers": [],
       "next_task": "1c"
+    },
+    {
+      "session_id": "2026-03-12T02:00:00Z",
+      "task_id": "1c",
+      "feature": "uc-model-registration-and-deployment-job",
+      "summary": "Created run_cross_env_deploy.py Databricks notebook in jobs/. Follows existing notebook pattern (dbutils.widgets, _banner/_log helpers, COMMAND separators). Reads model_name, model_version, target_workspace_url, target_space_id from widgets. Loads space_config.json from MLflow UC registry artifacts, connects to target workspace via WorkspaceClient(host=target_url), applies config via patch_space_config(), and tags model version with deploy status.",
+      "files_changed": [
+        "src/genie_space_optimizer/jobs/run_cross_env_deploy.py"
+      ],
+      "blockers": [],
+      "next_task": "1d"
     }
   ]
 }
