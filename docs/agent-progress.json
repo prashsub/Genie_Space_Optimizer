@@ -25,7 +25,7 @@
     "3c": { "title": "Check/add animation dependency", "feature": "start-optimization-loading-animation", "status": "done", "passes": true, "depends_on": [] },
     "3a": { "title": "Create OptimizationLoadingStepper component", "feature": "start-optimization-loading-animation", "status": "done", "passes": true, "depends_on": ["3c"] },
     "3b": { "title": "Integrate stepper into space detail page", "feature": "start-optimization-loading-animation", "status": "done", "passes": true, "depends_on": ["3a"] },
-    "4a": { "title": "Create improvement_suggestions Delta state table", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": [] },
+    "4a": { "title": "Create improvement_suggestions Delta state table", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": [] },
     "4b": { "title": "Extend strategist output schema for proposals", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": [] },
     "4c": { "title": "Write proposals to state table during lever loop", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4a", "4b"] },
     "4d": { "title": "Add backend API endpoints for suggestions", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4a"] },
@@ -167,6 +167,18 @@
       ],
       "blockers": [],
       "next_task": "4a"
+    },
+    {
+      "session_id": "2026-03-12T07:00:00Z",
+      "task_id": "4a",
+      "feature": "strategist-improvement-suggestions",
+      "summary": "Added TABLE_SUGGESTIONS constant to config.py. Added _GENIE_OPT_SUGGESTIONS_DDL in state.py with columns: suggestion_id, run_id, space_id, iteration, lever, type (METRIC_VIEW|FUNCTION), title, rationale, definition, affected_questions (JSON), estimated_impact, status (PROPOSED|ACCEPTED|REJECTED|IMPLEMENTED), reviewed_by, reviewed_at, created_at, updated_at. Registered in _ALL_DDL so ensure_optimization_tables() creates it automatically. Added three CRUD functions: write_suggestion(), load_suggestions(run_id), update_suggestion_status(suggestion_id, status, reviewed_by).",
+      "files_changed": [
+        "src/genie_space_optimizer/common/config.py",
+        "src/genie_space_optimizer/optimization/state.py"
+      ],
+      "blockers": [],
+      "next_task": "4b"
     }
   ]
 }

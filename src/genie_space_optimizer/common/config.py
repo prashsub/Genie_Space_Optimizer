@@ -1744,6 +1744,15 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     'Functions: purpose, best_for, use_instead_of, parameters, example.\n'
     'Use section KEYS, not labels.\n'
     '\n'
+    '## Contract: Section Ownership\n'
+    'When proposing table/column description updates, only target sections the lever can modify:\n'
+    '  Lever 1: purpose, best_for, grain, scd, definition, values, synonyms\n'
+    '  Lever 2: definition, values, aggregation, grain_note, important_filters, synonyms '
+    '(NOT purpose/best_for/grain/scd)\n'
+    '  Lever 3: purpose, best_for, use_instead_of, parameters, example\n'
+    '  Lever 4: relationships, join\n'
+    'Proposing sections outside the lever ownership will be rejected.\n'
+    '\n'
     '## Contract: Non-Regressive / Augment-Not-Overwrite\n'
     '[EDITABLE] sections can be updated. [LOCKED] must NOT be changed.\n'
     'INCORPORATE existing content and ADD new details. Only replace if empty or wrong.\n'
@@ -2069,6 +2078,7 @@ TABLE_ITERATIONS = "genie_opt_iterations"
 TABLE_PATCHES = "genie_opt_patches"
 TABLE_ASI = "genie_eval_asi_results"
 TABLE_PROVENANCE = "genie_opt_provenance"
+TABLE_SUGGESTIONS = "genie_opt_suggestions"
 
 # ── 13. MLflow Conventions ─────────────────────────────────────────────
 

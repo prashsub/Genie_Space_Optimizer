@@ -25,6 +25,7 @@ from genie_space_optimizer.common.config import (
     TABLE_PROVENANCE,
     TABLE_RUNS,
     TABLE_STAGES,
+    TABLE_SUGGESTIONS,
 )
 from genie_space_optimizer.common.delta_helpers import (
     _fqn,
@@ -243,6 +244,33 @@ TBLPROPERTIES (
     'delta.autoOptimize.autoCompact' = 'true'
 )"""
 
+_GENIE_OPT_SUGGESTIONS_DDL = """\
+CREATE TABLE IF NOT EXISTS {catalog}.{schema}.genie_opt_suggestions (
+    suggestion_id       STRING        NOT NULL COMMENT 'UUID for this suggestion',
+    run_id              STRING        NOT NULL COMMENT 'FK to genie_opt_runs.run_id',
+    space_id            STRING        NOT NULL COMMENT 'Genie Space ID',
+    iteration           INT                    COMMENT 'Lever-loop iteration that produced this suggestion',
+    lever               INT                    COMMENT 'Lever number that produced this suggestion',
+    type                STRING        NOT NULL COMMENT 'METRIC_VIEW | FUNCTION',
+    title               STRING        NOT NULL COMMENT 'Short human-readable title',
+    rationale           STRING                 COMMENT 'Why the strategist proposed this',
+    definition          STRING                 COMMENT 'SQL or pseudocode definition',
+    affected_questions  STRING                 COMMENT 'JSON array of question IDs that would benefit',
+    estimated_impact    STRING                 COMMENT 'Estimated accuracy improvement description',
+    status              STRING        NOT NULL COMMENT 'PROPOSED | ACCEPTED | REJECTED | IMPLEMENTED',
+    reviewed_by         STRING                 COMMENT 'User who reviewed the suggestion',
+    reviewed_at         TIMESTAMP              COMMENT 'When the suggestion was reviewed',
+    created_at          TIMESTAMP     NOT NULL COMMENT 'When the suggestion was created',
+    updated_at          TIMESTAMP     NOT NULL COMMENT 'Last update timestamp'
+)
+USING DELTA
+PARTITIONED BY (run_id)
+COMMENT 'Strategist improvement suggestions — proposed metric views and functions for human review'
+TBLPROPERTIES (
+    'delta.autoOptimize.optimizeWrite' = 'true',
+    'delta.autoOptimize.autoCompact' = 'true'
+)"""
+
 _ALL_DDL: dict[str, str] = {
     TABLE_RUNS: _GENIE_OPT_RUNS_DDL,
     TABLE_STAGES: _GENIE_OPT_STAGES_DDL,
@@ -251,6 +279,7 @@ _ALL_DDL: dict[str, str] = {
     TABLE_ASI: _GENIE_EVAL_ASI_RESULTS_DDL,
     TABLE_DATA_ACCESS_GRANTS: _GENIE_OPT_DATA_ACCESS_GRANTS_DDL,
     TABLE_PROVENANCE: _GENIE_OPT_PROVENANCE_DDL,
+    TABLE_SUGGESTIONS: _GENIE_OPT_SUGGESTIONS_DDL,
 }
 
 
@@ -1140,3 +1169,77 @@ def get_queued_patches(
     except Exception:
         logger.debug("Could not read queued patches table", exc_info=True)
         return []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Improvement Suggestions
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def write_suggestion(
+    spark: Any,
+    catalog: str,
+    schema: str,
+    suggestion: dict,
+) -> None:
+    """Insert a single improvement suggestion row."""
+    import uuid
+
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "suggestion_id": suggestion.get("suggestion_id") or str(uuid.uuid4()),
+        "run_id": suggestion["run_id"],
+        "space_id": suggestion["space_id"],
+        "iteration": suggestion.get("iteration"),
+        "lever": suggestion.get("lever"),
+        "type": suggestion["type"],
+        "title": suggestion["title"],
+        "rationale": suggestion.get("rationale"),
+        "definition": suggestion.get("definition"),
+        "affected_questions": json.dumps(suggestion.get("affected_questions", [])),
+        "estimated_impact": suggestion.get("estimated_impact"),
+        "status": suggestion.get("status", "PROPOSED"),
+        "reviewed_by": None,
+        "reviewed_at": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    insert_row(spark, catalog, schema, TABLE_SUGGESTIONS, row)
+    logger.info(
+        "Wrote suggestion %s (%s) for run %s",
+        row["suggestion_id"], row["type"], row["run_id"],
+    )
+
+
+def load_suggestions(
+    spark: Any,
+    run_id: str,
+    catalog: str,
+    schema: str,
+) -> pd.DataFrame:
+    """All suggestions for a run, ordered by created_at ASC."""
+    fqn = _fqn(catalog, schema, TABLE_SUGGESTIONS)
+    return run_query(
+        spark,
+        f"SELECT * FROM {fqn} WHERE run_id = '{run_id}' ORDER BY created_at ASC",
+    )
+
+
+def update_suggestion_status(
+    spark: Any,
+    suggestion_id: str,
+    catalog: str,
+    schema: str,
+    status: str,
+    reviewed_by: str | None = None,
+) -> None:
+    """Update the status of a suggestion (ACCEPTED, REJECTED, IMPLEMENTED)."""
+    now = datetime.now(timezone.utc).isoformat()
+    updates: dict[str, Any] = {
+        "status": status,
+        "updated_at": now,
+    }
+    if reviewed_by:
+        updates["reviewed_by"] = reviewed_by
+        updates["reviewed_at"] = now
+    update_row(spark, catalog, schema, TABLE_SUGGESTIONS, {"suggestion_id": suggestion_id}, updates)
