@@ -40,6 +40,30 @@ def _run_json(cmd: list[str]) -> dict:
     return json.loads(out)
 
 
+def _ensure_schema(*, profile: str, catalog: str, schema: str, warehouse_id: str) -> None:
+    """Create the optimization schema if it doesn't exist (deployer credentials)."""
+    schema_fqn = f"{catalog}.{schema}"
+    stmt = (
+        f"CREATE SCHEMA IF NOT EXISTS {schema_fqn} "
+        f"COMMENT 'Genie Space Optimizer state tables, prompts, and benchmarks'"
+    )
+    payload = json.dumps({
+        "warehouse_id": warehouse_id,
+        "statement": stmt,
+        "wait_timeout": "30s",
+    })
+    result = _run_json([
+        "databricks", "api", "post", "/api/2.0/sql/statements",
+        "--profile", profile,
+        "--json", payload,
+    ])
+    state = (result.get("status") or {}).get("state", "")
+    if state != "SUCCEEDED":
+        err_msg = (result.get("status") or {}).get("error", {}).get("message", "unknown")
+        raise RuntimeError(f"Schema creation failed ({state}): {err_msg}")
+    print(f"[grant-app-sp] Schema ensured: {schema_fqn}")
+
+
 def _is_app_missing(err: Exception) -> bool:
     msg = str(err).lower()
     return "does not exist" in msg or "resource_does_not_exist" in msg
@@ -162,7 +186,22 @@ def main() -> int:
     parser.add_argument("--app-name", required=True)
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--schema", required=True)
+    parser.add_argument("--warehouse-id", default=None)
     args = parser.parse_args()
+
+    if args.warehouse_id:
+        _ensure_schema(
+            profile=args.profile,
+            catalog=args.catalog,
+            schema=args.schema,
+            warehouse_id=args.warehouse_id,
+        )
+    else:
+        print(
+            "[grant-app-sp] WARNING: --warehouse-id not provided, "
+            "skipping schema creation",
+            file=sys.stderr,
+        )
 
     try:
         app = _run_json(

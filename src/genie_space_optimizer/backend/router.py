@@ -143,10 +143,10 @@ def health_check(config: Dependencies.Config, ws: Dependencies.Client):
                 f"The optimization tables in {fqn} have not been created yet. "
                 f"They are created automatically on the first optimization run. "
                 f"If this persists, check that the service principal has "
-                f"CREATE_TABLE permission on the schema."
+                f"CREATE TABLE permission on the schema."
             ),
             grantCommand=(
-                f"GRANT CREATE_TABLE, USE_SCHEMA, SELECT, MODIFY "
+                f"GRANT CREATE TABLE, USE SCHEMA, SELECT, MODIFY "
                 f"ON SCHEMA {fqn} TO `{sp_ref}`"
             ),
             **base,
@@ -172,8 +172,8 @@ def health_check(config: Dependencies.Config, ws: Dependencies.Client):
                     f"apply UC grants, or run the GRANT command below."
                 ),
                 grantCommand=(
-                    f"GRANT USE_CATALOG ON CATALOG `{cat}` TO `{sp_ref}`;\n"
-                    f"GRANT USE_SCHEMA, SELECT, MODIFY ON SCHEMA {fqn} TO `{sp_ref}`"
+                    f"GRANT USE CATALOG ON CATALOG `{cat}` TO `{sp_ref}`; "
+                    f"GRANT USE SCHEMA, SELECT, MODIFY ON SCHEMA {fqn} TO `{sp_ref}`"
                 ),
                 **base,
             )
@@ -198,7 +198,7 @@ def health_check(config: Dependencies.Config, ws: Dependencies.Client):
                     f"Run the GRANT command below to fix."
                 ),
                 grantCommand=(
-                    f"GRANT CREATE_FUNCTION, EXECUTE, MANAGE ON SCHEMA {fqn} TO `{sp_ref}`"
+                    f"GRANT CREATE FUNCTION, EXECUTE, MANAGE ON SCHEMA {fqn} TO `{sp_ref}`"
                 ),
                 **base,
             )

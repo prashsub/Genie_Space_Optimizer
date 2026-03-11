@@ -78,6 +78,7 @@ _apply_grants:
 		--app-name $(APP_NAME) \
 		--catalog $(CATALOG) \
 		--schema $(SCHEMA) \
+		--warehouse-id $(WAREHOUSE_ID) \
 		|| echo "[grant-app-sp] Grants deferred — will retry at app startup."
 
 _app_deploy:

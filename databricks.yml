@@ -23,15 +23,9 @@ sync:
 
 artifacts:
   default:
-    build: apx build && rm -f .build/.gitignore && python resources/patch_app_yml.py .build/app.yml --catalog ${var.catalog} --schema ${var.gold_schema} --warehouse-id ${var.warehouse_id} && uv run python resources/grant_app_uc_permissions.py --profile ${var.deploy_profile} --app-name ${var.app_name} --catalog ${var.catalog} --schema ${var.gold_schema}
+    build: apx build && rm -f .build/.gitignore && python resources/patch_app_yml.py .build/app.yml --catalog ${var.catalog} --schema ${var.gold_schema} --warehouse-id ${var.warehouse_id} && uv run python resources/grant_app_uc_permissions.py --profile ${var.deploy_profile} --app-name ${var.app_name} --catalog ${var.catalog} --schema ${var.gold_schema} --warehouse-id ${var.warehouse_id}
 
 resources:
-  schemas:
-    genie_optimization_schema:
-      name: ${var.gold_schema}
-      catalog_name: ${var.catalog}
-      comment: "Genie Space Optimizer state tables, prompts, and benchmarks"
-
   apps:
     genie-space-optimizer-app:
       name: ${var.app_name}
