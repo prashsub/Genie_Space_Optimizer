@@ -151,6 +151,12 @@ class TriggerResponse(BaseModel):
     status: str
 
 
+class LeverInfo(BaseModel):
+    id: int
+    name: str
+    description: str
+
+
 class RunStatusResponse(SafeModel):
     runId: str
     status: str

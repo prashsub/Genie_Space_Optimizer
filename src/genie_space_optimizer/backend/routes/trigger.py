@@ -11,7 +11,7 @@ import logging
 from fastapi import HTTPException
 
 from ..core import Dependencies, create_router
-from ..models import RunStatusResponse, TriggerRequest, TriggerResponse
+from ..models import LeverInfo, RunStatusResponse, TriggerRequest, TriggerResponse
 from ..utils import ensure_utc_iso, safe_float
 from .._spark import get_spark
 
@@ -113,3 +113,25 @@ def get_trigger_status(
         optimizedScore=safe_float(run_data.get("best_accuracy")),
         convergenceReason=run_data.get("convergence_reason"),
     )
+
+
+@router.get(
+    "/levers",
+    response_model=list[LeverInfo],
+    operation_id="listLevers",
+)
+def list_levers():
+    """Return the available optimization levers with descriptions."""
+    from genie_space_optimizer.common.config import LEVER_NAMES
+
+    descriptions = {
+        1: "Update table descriptions, column descriptions, column visibility, and synonyms",
+        2: "Update metric view column descriptions",
+        3: "Modify function descriptions, routing logic, and remove underperforming TVFs",
+        4: "Add, update, or remove join relationships between tables",
+        5: "Rewrite global routing instructions and add domain-specific guidance",
+    }
+    return [
+        LeverInfo(id=k, name=v, description=descriptions.get(k, ""))
+        for k, v in sorted(LEVER_NAMES.items())
+    ]
