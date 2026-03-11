@@ -70,6 +70,11 @@ export interface JoinInfo {
     relationshipType?: string | null;
     rightTable: string;
 }
+export interface LeverInfo {
+    description: string;
+    id: number;
+    name: string;
+}
 export type LeverStatus = Record<string, unknown>;
 export interface Name {
     family_name?: string | null;
@@ -149,6 +154,11 @@ export interface SpacePermissions {
     title: string;
 }
 export type SpaceSummary = Record<string, unknown>;
+export type SuggestionOut = Record<string, unknown>;
+export interface SuggestionReviewRequest {
+    comment?: string | null;
+    status: string;
+}
 export interface TableDescription {
     description: string;
     tableName: string;
@@ -163,6 +173,8 @@ export interface TableInfo {
 }
 export interface TriggerRequest {
     apply_mode?: string;
+    deploy_target?: string | null;
+    levers?: number[] | null;
     space_id: string;
 }
 export interface TriggerResponse {
@@ -423,6 +435,58 @@ export function useGetHealthSuspense<TData = {
     return useSuspenseQuery({
         queryKey: getHealthKey(),
         queryFn: ()=>getHealth(),
+        ...options?.query
+    });
+}
+export const listLevers = async (options?: RequestInit): Promise<{
+    data: LeverInfo[];
+}> =>{
+    const res = await fetch("/api/genie/levers", {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const listLeversKey = ()=>{
+    return [
+        "/api/genie/levers"
+    ] as const;
+};
+export function useListLevers<TData = {
+    data: LeverInfo[];
+}>(options?: {
+    query?: Omit<UseQueryOptions<{
+        data: LeverInfo[];
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: listLeversKey(),
+        queryFn: ()=>listLevers(),
+        ...options?.query
+    });
+}
+export function useListLeversSuspense<TData = {
+    data: LeverInfo[];
+}>(options?: {
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: LeverInfo[];
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: listLeversKey(),
+        queryFn: ()=>listLevers(),
         ...options?.query
     });
 }
@@ -1024,6 +1088,64 @@ export function useGetProvenanceSuspense<TData = {
         ...options?.query
     });
 }
+export interface GetImprovementSuggestionsParams {
+    run_id: string;
+}
+export const getImprovementSuggestions = async (params: GetImprovementSuggestionsParams, options?: RequestInit): Promise<{
+    data: SuggestionOut[];
+}> =>{
+    const res = await fetch(`/api/genie/runs/${params.run_id}/suggestions`, {
+        ...options,
+        method: "GET"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export const getImprovementSuggestionsKey = (params?: GetImprovementSuggestionsParams)=>{
+    return [
+        "/api/genie/runs/{run_id}/suggestions",
+        params
+    ] as const;
+};
+export function useGetImprovementSuggestions<TData = {
+    data: SuggestionOut[];
+}>(options: {
+    params: GetImprovementSuggestionsParams;
+    query?: Omit<UseQueryOptions<{
+        data: SuggestionOut[];
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useQuery({
+        queryKey: getImprovementSuggestionsKey(options.params),
+        queryFn: ()=>getImprovementSuggestions(options.params),
+        ...options?.query
+    });
+}
+export function useGetImprovementSuggestionsSuspense<TData = {
+    data: SuggestionOut[];
+}>(options: {
+    params: GetImprovementSuggestionsParams;
+    query?: Omit<UseSuspenseQueryOptions<{
+        data: SuggestionOut[];
+    }, ApiError, TData>, "queryKey" | "queryFn">;
+}) {
+    return useSuspenseQuery({
+        queryKey: getImprovementSuggestionsKey(options.params),
+        queryFn: ()=>getImprovementSuggestions(options.params),
+        ...options?.query
+    });
+}
 export interface GetPermissionDashboardParams {
     space_id?: string | null;
     metadata_only?: boolean;
@@ -1347,6 +1469,108 @@ export function useGetSpaceDetailSuspense<TData = {
         queryKey: getSpaceDetailKey(options.params),
         queryFn: ()=>getSpaceDetail(options.params),
         ...options?.query
+    });
+}
+export interface ApplySuggestionParams {
+    suggestion_id: string;
+}
+export const applySuggestion = async (params: ApplySuggestionParams, options?: RequestInit): Promise<{
+    data: SuggestionOut;
+}> =>{
+    const res = await fetch(`/api/genie/suggestions/${params.suggestion_id}/apply`, {
+        ...options,
+        method: "POST"
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export function useApplySuggestion(options?: {
+    mutation?: UseMutationOptions<{
+        data: SuggestionOut;
+    }, ApiError, {
+        params: ApplySuggestionParams;
+    }>;
+}) {
+    return useMutation({
+        mutationFn: (vars)=>applySuggestion(vars.params),
+        ...options?.mutation
+    });
+}
+export interface ReviewSuggestionParams {
+    suggestion_id: string;
+    "X-Forwarded-Host"?: string | null;
+    "X-Forwarded-Preferred-Username"?: string | null;
+    "X-Forwarded-User"?: string | null;
+    "X-Forwarded-Email"?: string | null;
+    "X-Request-Id"?: string | null;
+    "X-Forwarded-Access-Token"?: string | null;
+}
+export const reviewSuggestion = async (params: ReviewSuggestionParams, data: SuggestionReviewRequest, options?: RequestInit): Promise<{
+    data: SuggestionOut;
+}> =>{
+    const res = await fetch(`/api/genie/suggestions/${params.suggestion_id}/review`, {
+        ...options,
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            ...(params?.["X-Forwarded-Host"] != null && {
+                "X-Forwarded-Host": params["X-Forwarded-Host"]
+            }),
+            ...(params?.["X-Forwarded-Preferred-Username"] != null && {
+                "X-Forwarded-Preferred-Username": params["X-Forwarded-Preferred-Username"]
+            }),
+            ...(params?.["X-Forwarded-User"] != null && {
+                "X-Forwarded-User": params["X-Forwarded-User"]
+            }),
+            ...(params?.["X-Forwarded-Email"] != null && {
+                "X-Forwarded-Email": params["X-Forwarded-Email"]
+            }),
+            ...(params?.["X-Request-Id"] != null && {
+                "X-Request-Id": params["X-Request-Id"]
+            }),
+            ...(params?.["X-Forwarded-Access-Token"] != null && {
+                "X-Forwarded-Access-Token": params["X-Forwarded-Access-Token"]
+            }),
+            ...options?.headers
+        },
+        body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body);
+        } catch  {
+            parsed = body;
+        }
+        throw new ApiError(res.status, res.statusText, parsed);
+    }
+    return {
+        data: await res.json()
+    };
+};
+export function useReviewSuggestion(options?: {
+    mutation?: UseMutationOptions<{
+        data: SuggestionOut;
+    }, ApiError, {
+        params: ReviewSuggestionParams;
+        data: SuggestionReviewRequest;
+    }>;
+}) {
+    return useMutation({
+        mutationFn: (vars)=>reviewSuggestion(vars.params, vars.data),
+        ...options?.mutation
     });
 }
 export interface TriggerOptimizationParams {

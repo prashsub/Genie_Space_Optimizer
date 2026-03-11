@@ -20,8 +20,11 @@ from genie_space_optimizer.common.genie_schema import (
     SqlSnippetMeasure,
     SqlSnippets,
     TextInstruction,
+    _rewrite_predicate_aliases,
     count_instruction_slots,
+    ensure_join_spec_fields,
     generate_genie_id,
+    normalize_join_spec_sql,
     validate_serialized_space,
 )
 
@@ -364,6 +367,123 @@ class TestJoinSpec:
         )
         assert js.comment == ["Join on id"]
         assert js.instruction == ["Use for detail queries"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Join spec SQL normalisation
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestRewritePredicateAliases:
+    """Unit tests for _rewrite_predicate_aliases."""
+
+    def test_short_aliases_rewritten(self):
+        pred = "`jt`.`workspace_id` = `j`.`workspace_id` AND `jt`.`job_id` = `j`.`job_id`"
+        result = _rewrite_predicate_aliases(pred, "dim_job_task", "dim_job")
+        assert "`dim_job_task`.`workspace_id`" in result
+        assert "`dim_job`.`workspace_id`" in result
+        assert "`dim_job_task`.`job_id`" in result
+        assert "`dim_job`.`job_id`" in result
+        assert "`jt`" not in result
+        assert "`j`" not in result
+
+    def test_already_canonical_unchanged(self):
+        pred = "`dim_job_task`.`workspace_id` = `dim_job`.`workspace_id`"
+        result = _rewrite_predicate_aliases(pred, "dim_job_task", "dim_job")
+        assert result == "`dim_job_task`.`workspace_id` = `dim_job`.`workspace_id`"
+
+    def test_no_backticks_added(self):
+        pred = "jt.workspace_id = j.workspace_id"
+        result = _rewrite_predicate_aliases(pred, "dim_job_task", "dim_job")
+        assert "`dim_job_task`.`workspace_id`" in result
+        assert "`dim_job`.`workspace_id`" in result
+
+    def test_empty_string_passthrough(self):
+        assert _rewrite_predicate_aliases("", "left", "right") == ""
+
+    def test_no_table_refs_passthrough(self):
+        assert _rewrite_predicate_aliases("1 = 1", "left", "right") == "1 = 1"
+
+    def test_single_alias_passthrough(self):
+        pred = "`t`.`a` = `t`.`b`"
+        result = _rewrite_predicate_aliases(pred, "left", "right")
+        assert result == pred
+
+
+class TestNormalizeJoinSpecSql:
+    """Unit tests for normalize_join_spec_sql."""
+
+    def test_rewrites_short_aliases(self):
+        spec = {
+            "left": {"identifier": "cat.sch.dim_job_task", "alias": "dim_job_task"},
+            "right": {"identifier": "cat.sch.dim_job", "alias": "dim_job"},
+            "sql": [
+                "`jt`.`workspace_id` = `j`.`workspace_id` AND `jt`.`job_id` = `j`.`job_id`",
+                "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--",
+            ],
+        }
+        result = normalize_join_spec_sql(spec)
+        assert result["sql"][0].startswith("`dim_job_task`.")
+        assert "`jt`" not in result["sql"][0]
+        assert "`j`" not in result["sql"][0]
+        assert result["sql"][1] == "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"
+
+    def test_preserves_rt_marker(self):
+        spec = {
+            "left": {"identifier": "cat.sch.orders", "alias": "orders"},
+            "right": {"identifier": "cat.sch.customers", "alias": "customers"},
+            "sql": [
+                "`orders`.`customer_id` = `customers`.`customer_id`",
+                "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--",
+            ],
+        }
+        result = normalize_join_spec_sql(spec)
+        assert result["sql"][1] == "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"
+
+    def test_already_correct_passthrough(self):
+        spec = {
+            "left": {"identifier": "cat.sch.orders", "alias": "orders"},
+            "right": {"identifier": "cat.sch.customers", "alias": "customers"},
+            "sql": ["`orders`.`customer_id` = `customers`.`customer_id`"],
+        }
+        result = normalize_join_spec_sql(spec)
+        assert result["sql"] == ["`orders`.`customer_id` = `customers`.`customer_id`"]
+
+    def test_missing_alias_no_crash(self):
+        spec = {
+            "left": {"identifier": "cat.sch.orders"},
+            "right": {"identifier": "cat.sch.customers"},
+            "sql": ["`o`.`id` = `c`.`id`"],
+        }
+        result = normalize_join_spec_sql(spec)
+        assert result["sql"] == ["`o`.`id` = `c`.`id`"]
+
+    def test_empty_sql_no_crash(self):
+        spec = {
+            "left": {"identifier": "cat.sch.orders", "alias": "orders"},
+            "right": {"identifier": "cat.sch.customers", "alias": "customers"},
+            "sql": [],
+        }
+        result = normalize_join_spec_sql(spec)
+        assert result["sql"] == []
+
+
+class TestEnsureJoinSpecFieldsNormalization:
+    """Verify that ensure_join_spec_fields auto-normalises SQL aliases."""
+
+    def test_derives_alias_and_normalises(self):
+        spec = {
+            "left": {"identifier": "cat.sch.dim_job_task"},
+            "right": {"identifier": "cat.sch.dim_job"},
+            "sql": ["`jt`.`id` = `j`.`id`", "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"],
+        }
+        result = ensure_join_spec_fields(spec)
+        assert result["left"]["alias"] == "dim_job_task"
+        assert result["right"]["alias"] == "dim_job"
+        assert "`dim_job_task`.`id`" in result["sql"][0]
+        assert "`dim_job`.`id`" in result["sql"][0]
+        assert result["sql"][1] == "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"
+        assert result.get("id")
 
 
 # ═══════════════════════════════════════════════════════════════════════

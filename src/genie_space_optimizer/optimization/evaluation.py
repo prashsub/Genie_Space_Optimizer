@@ -1351,6 +1351,8 @@ def make_predict_fn(
             result = run_genie_query(w, space_id, question)
             genie_sql = sanitize_sql(result.get("sql") or "")
             gt_sql = resolve_sql(expected_sql, catalog, schema)
+            from genie_space_optimizer.optimization.benchmarks import fix_mv_alias_sort_collision
+            gt_sql = fix_mv_alias_sort_collision(gt_sql)
             if _mv_measures and gt_sql:
                 gt_sql = _rewrite_measure_refs(gt_sql, _mv_measures)
             temporal_intent = _detect_temporal_intent(question)

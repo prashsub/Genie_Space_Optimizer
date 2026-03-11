@@ -34,6 +34,8 @@ mlflow.set_experiment_tags({
 >
 > **What I learned:** An experiment isn't just a folder -- it's a searchable, tagged project. Set it up with intent."
 
+**In this codebase:** The preflight step creates and tags the experiment before any work starts. See [`preflight.py` lines 1187–1207](../src/genie_space_optimizer/optimization/preflight.py) — `mlflow.set_experiment()` is called first, then `mlflow.set_experiment_tags()` stamps it with `genie.space_id`, `genie.domain`, `genie.pipeline_version`, `genie.catalog`, and `genie.schema` so every subsequent run is findable by domain or space.
+
 ---
 
 ## Chapter 3: "I Need Ground Truth" -- Evaluation Datasets
@@ -70,6 +72,11 @@ eval_dataset.merge_records(records)
 > And because it lives in Unity Catalog, I get access control, lineage, and I can query it with SQL if I want to inspect it.
 >
 > **What I learned:** Don't manage eval data yourself. Let MLflow and UC handle versioning and governance. You'll need to update benchmarks constantly -- make that cheap."
+
+**In this codebase:**
+
+- [`evaluation.py` lines 2752–2821](../src/genie_space_optimizer/optimization/evaluation.py) — `_persist_benchmarks_to_uc_dataset()` does exactly this: `get_dataset()` for an existing table or `create_dataset()` for a new one, then `merge_records()` with a deduped record list so repeated runs upsert rather than overwrite.
+- [`benchmarks.py` lines 513–551](../src/genie_space_optimizer/optimization/benchmarks.py) — `build_eval_records()` converts the raw benchmark dicts into the `{"inputs": ..., "expectations": ...}` record format that `merge_records` expects, normalising the `expected_asset` field to `TABLE`, `MV`, or `TVF`.
 
 ---
 
@@ -142,6 +149,12 @@ def make_all_scorers(w, spark, catalog, schema) -> list:
 
 > "**What I learned:** Don't build one giant evaluator. Build a panel of small, focused scorers. Return structured `Feedback`, not numbers. Your future self debugging a regression will thank you for every field in that metadata dict."
 
+**In this codebase:**
+
+- [`scorers/asset_routing.py`](../src/genie_space_optimizer/optimization/scorers/asset_routing.py) — The live implementation of the `@scorer`-decorated CODE judge shown above. Returns a `Feedback` with a `rationale` and structured metadata including `failure_type`, `blame_set`, and `counterfactual_fix`. Also demonstrates the result-match override pattern: if results are numerically equivalent, asset-type differences are downgraded from failures to soft preferences.
+- [`scorers/schema_accuracy.py`](../src/genie_space_optimizer/optimization/scorers/schema_accuracy.py) — The LLM judge factory (`_make_schema_accuracy_judge`). Calls the LLM endpoint, parses structured JSON, then assembles a `Feedback` with `LLM_SOURCE` and metadata fields. Shows how `build_asi_metadata()` standardises the structured metadata across all judges.
+- [`scorers/__init__.py` lines 93–123](../src/genie_space_optimizer/optimization/scorers/__init__.py) — `make_all_scorers()` assembles all 9 judges in order: 6 LLM judges (schema_accuracy, logical_accuracy, semantic_equivalence, completeness, response_quality, arbiter) and 3 CODE judges (syntax_validity, asset_routing, result_correctness). The `CODE_SOURCE` and `LLM_SOURCE` constants live in [`evaluation.py`](../src/genie_space_optimizer/optimization/evaluation.py).
+
 ---
 
 ## Chapter 5: "I Need to See What's Happening" -- Tracing
@@ -187,6 +200,11 @@ with mlflow.start_span(name="generate_strategy") as span:
 > "Now I can see the strategist's two-phase reasoning as a span tree. When it proposes a bad patch, I trace back through the spans to see what input it was working from.
 >
 > **What I learned:** `@mlflow.trace` is the single best investment you can make in a GenAI app. Add it early. Tag traces with business context, not just technical metadata. Use `start_span` for multi-step LLM reasoning chains."
+
+**In this codebase:**
+
+- [`evaluation.py` lines 1296–1330](../src/genie_space_optimizer/optimization/evaluation.py) — `genie_predict_fn` is decorated with `@mlflow.trace`. After calling Genie and executing GT SQL, it calls `mlflow.update_current_trace()` to stamp every trace with `question_id`, `space_id`, `genie.iteration`, `genie.lever`, `genie.eval_scope`, and `genie.optimization_run_id` — making the MLflow trace explorer filterable by business context.
+- [`optimizer.py` lines 5382–5450](../src/genie_space_optimizer/optimization/optimizer.py) — `generate_holistic_strategy()` uses `mlflow.start_span` for its two-phase LLM strategy generation: a `phase_1a_triage` span that calls the LLM for a high-level action-group skeleton, followed by per-action-group `phase_1b_detail_<AG_ID>` spans that fill in the specifics. Each span records its inputs and outputs, so the full reasoning chain is visible in the trace tree.
 
 ---
 
@@ -248,6 +266,11 @@ mlflow.log_dict(
 
 > "**What I learned:** `mlflow.genai.evaluate()` handles the happy path beautifully. For production, add retry logic and log failure artifacts. Log *more* than you think you need -- storage is cheap, re-running an evaluation is not."
 
+**In this codebase:**
+
+- [`evaluation.py` lines 3150–3163](../src/genie_space_optimizer/optimization/evaluation.py) — `run_evaluation()` opens a `mlflow.start_run()` context, stamps it with `genie.space_id`, `genie.iteration`, `genie.lever`, `genie.eval_scope`, and `genie.optimization_run_id`, then logs params and calls `mlflow.genai.evaluate()`.
+- [`evaluation.py` lines 2526–2588](../src/genie_space_optimizer/optimization/evaluation.py) — `_run_evaluate_with_retries()` wraps `mlflow.genai.evaluate()` with up to `EVAL_MAX_ATTEMPTS` attempts. On transient harness errors it sets `MLFLOW_GENAI_EVAL_MAX_WORKERS=1` to fall back to sequential execution, exactly as described above.
+
 ---
 
 ## Chapter 7: "How Do I Version My App's State?" -- LoggedModel
@@ -305,6 +328,11 @@ mlflow.log_metrics(
 
 > "**What I learned:** In GenAI, your 'model' is usually a configuration, not weights. LoggedModel versions it with params, tags, and artifacts. Aliases give you promotion semantics. Linking metrics to models gives you a quality dashboard for free."
 
+**In this codebase:**
+
+- [`models.py` lines 50–127](../src/genie_space_optimizer/optimization/models.py) — `snapshot_config()` is the live implementation. It logs the full Genie Space JSON config as an artifact at `model_snapshots/iter_{N}/space_config.json`, then calls `mlflow.create_logged_model()` with params that include `space_id`, `iteration`, `uc_schema`, `patch_count`, and the serialised config itself (for rollback). Tags include `domain`, `space_id`, and `traceability: genie_space_optimizer`.
+- [`models.py` lines 130–195](../src/genie_space_optimizer/optimization/models.py) — `promote_best_model()` reads all iteration rows from Delta, finds the highest `overall_accuracy`, and calls `mlflow.set_logged_model_alias(model_id=best_model_id, alias="champion")` to mark the winner.
+
 ---
 
 ## Chapter 8: "Did That Patch Help or Hurt?" -- Feedback on Traces
@@ -348,6 +376,11 @@ mlflow.log_feedback(
 > "Now every trace tells a complete story: what question was asked, what Genie produced, what each judge thought, whether the gate passed, and what the root cause was. A reviewer can open one trace and understand everything.
 >
 > **What I learned:** Traces are living documents. Don't just record what happened -- annotate them with what you *concluded*. `log_feedback` turns traces from logs into investigation tools."
+
+**In this codebase:**
+
+- [`evaluation.py` lines 5607–5630](../src/genie_space_optimizer/optimization/evaluation.py) — `log_gate_feedback_on_traces()` iterates the `trace_map` (a `{question_id: trace_id}` dict) and calls `mlflow.log_feedback()` with `name="gate_{type}"` (slice, p0, or full), a pass/fail boolean, and metadata containing `gate_type`, `gate_result`, `lever`, and `iteration`. This is called after each of the 3 evaluation gates.
+- [`evaluation.py` lines 5633+](../src/genie_space_optimizer/optimization/evaluation.py) — `log_asi_feedback_on_traces()` attaches the Actionable Suggestion Index (ASI) root-cause analysis as feedback on every failing trace. Each feedback entry includes `failure_type`, `blame_set`, `severity`, and `counterfactual_fix` — the structured metadata that turns a trace from a log entry into an investigation tool.
 
 ---
 
@@ -411,6 +444,11 @@ corrections = feedback["corrections"]
 >
 > **What I learned:** Build human review into your pipeline from day one, not as an afterthought. Labeling Sessions give you structured review forms, trace-level review, and automatic correction flow-back. Your judges will have bugs -- give humans a paved path to fix them."
 
+**In this codebase:**
+
+- [`labeling.py` lines 39–130](../src/genie_space_optimizer/optimization/labeling.py) — `ensure_labeling_schemas()` creates three schemas using `mlflow.genai.label_schemas.create_label_schema()`: `judge_verdict_accuracy` (categorical: is the judge right?), `corrected_expected_sql` (free-text: provide the correct SQL), and `improvement_suggestions` (text list: actionable Genie Space improvements). All use `overwrite=True` for idempotency.
+- [`labeling.py` lines 160–230](../src/genie_space_optimizer/optimization/labeling.py) — `create_review_session()` calls `mlflow.genai.labeling.create_labeling_session()` with the schema names and optional reviewers list, then populates the session with failure traces, regression traces, and a random sample of passing traces (for spot-checking). The session URL is stored in the run state table so the frontend can surface it directly.
+
 ---
 
 ## Chapter 10: "Making It Visible" -- Linking MLflow to Your UI
@@ -447,6 +485,11 @@ ws.api_client.do("PUT", f"/api/2.0/permissions/experiments/{exp.experiment_id}",
 > "Without this, users would click the MLflow link and get a 403. Permissions matter.
 >
 > **What I learned:** Your users shouldn't have to know MLflow exists to benefit from it. Surface experiment links, run links, and trace links in your own UI. Handle permissions so the click-through just works."
+
+**In this codebase:**
+
+- [`ui/components/ResourceLinks.tsx` lines 20–59](../src/genie_space_optimizer/ui/components/ResourceLinks.tsx) — `categoryConfig` defines the visual treatment for each link category. The `mlflow` entry (emerald color, `FlaskConical` icon) is used by `ResourceLinks` to group experiment and run links returned by the backend alongside Genie Space links, Databricks Job links, and labeling session links — all in a unified sidebar panel.
+- [`ui/components/IterationExplorer.tsx` lines 740+](../src/genie_space_optimizer/ui/components/IterationExplorer.tsx) — The `MLflowLinks` sub-component renders per-iteration MLflow run links and labeling session links, constructing deep-link URLs into the MLflow experiment UI (including the specific run ID) so users can jump directly from the iteration card into the relevant MLflow run.
 
 ---
 

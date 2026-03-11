@@ -58,7 +58,8 @@ def ensure_join_spec_fields(spec: dict) -> dict:
 
     Mutates and returns the spec for convenience. Derives ``alias`` from
     the last segment of ``identifier`` when missing, and generates a new
-    ``id`` when absent.
+    ``id`` when absent.  Also normalises ``sql`` predicates so that table
+    references match ``left.alias`` / ``right.alias``.
     """
     for side_key in ("left", "right"):
         side = spec.get(side_key)
@@ -66,6 +67,110 @@ def ensure_join_spec_fields(spec: dict) -> dict:
             side["alias"] = side["identifier"].rsplit(".", 1)[-1]
     if not spec.get("id"):
         spec["id"] = generate_genie_id()
+    spec = normalize_join_spec_sql(spec)
+    return spec
+
+
+# ── Join spec SQL normalisation ──────────────────────────────────────
+
+_TABLE_DOT_COL_RE = re.compile(r"`?(\w+)`?\s*\.\s*`?(\w+)`?")
+
+
+def _alias_match_score(short: str, canonical: str) -> int:
+    """Score how well *short* abbreviates *canonical* (higher = better)."""
+    s, c = short.lower(), canonical.lower()
+    if s == c:
+        return 100
+    parts = c.split("_")
+    if parts and parts[0] in ("dim", "fact", "mv"):
+        parts = parts[1:]
+    if parts and "".join(p[0] for p in parts if p) == s:
+        return 80
+    if c.startswith(s):
+        return 50
+    if s in c:
+        return 20
+    return 0
+
+
+def _map_old_to_canonical(
+    old_aliases: list[str], left_alias: str, right_alias: str,
+) -> dict[str, str]:
+    """Map two old SQL aliases to the spec's canonical left/right aliases."""
+    a, b = old_aliases
+
+    for old, other in ((a, b), (b, a)):
+        if old == left_alias:
+            return {old: left_alias, other: right_alias}
+        if old == right_alias:
+            return {old: right_alias, other: left_alias}
+
+    score_ab = _alias_match_score(a, left_alias) + _alias_match_score(b, right_alias)
+    score_ba = _alias_match_score(a, right_alias) + _alias_match_score(b, left_alias)
+    if score_ab >= score_ba:
+        return {a: left_alias, b: right_alias}
+    return {a: right_alias, b: left_alias}
+
+
+def _rewrite_predicate_aliases(
+    predicate: str, left_alias: str, right_alias: str,
+) -> str:
+    """Rewrite table references in a join predicate to use canonical aliases.
+
+    Replaces arbitrary SQL aliases (e.g. ``jt``, ``j``) with the spec's
+    ``left.alias`` / ``right.alias`` and ensures backtick quoting so the
+    Genie API proto parser can resolve them.
+    """
+    refs = _TABLE_DOT_COL_RE.findall(predicate)
+    if not refs:
+        return predicate
+
+    old_aliases = list(dict.fromkeys(tbl for tbl, _ in refs))
+    canonical = {left_alias, right_alias}
+
+    if set(old_aliases) == canonical:
+        return _TABLE_DOT_COL_RE.sub(r"`\1`.`\2`", predicate)
+
+    if len(old_aliases) != 2:
+        return predicate
+
+    mapping = _map_old_to_canonical(old_aliases, left_alias, right_alias)
+
+    def _replace(m: re.Match) -> str:
+        tbl, col = m.group(1), m.group(2)
+        return f"`{mapping.get(tbl, tbl)}`.`{col}`"
+
+    return _TABLE_DOT_COL_RE.sub(_replace, predicate)
+
+
+def normalize_join_spec_sql(spec: dict) -> dict:
+    """Rewrite ``sql[]`` predicates so table refs use left/right aliases.
+
+    The Genie API requires that equijoin predicates in the ``sql`` field
+    reference the canonical aliases declared in ``left.alias`` and
+    ``right.alias``.  Execution-proven SQL and LLM-generated conditions
+    often use arbitrary short aliases (e.g. ``jt``, ``j``) that the API
+    proto parser rejects.
+    """
+    left_alias = (spec.get("left") or {}).get("alias", "")
+    right_alias = (spec.get("right") or {}).get("alias", "")
+    if not left_alias or not right_alias:
+        return spec
+
+    sql_parts = spec.get("sql", [])
+    if not sql_parts:
+        return spec
+
+    rewritten: list[str] = []
+    for part in sql_parts:
+        if not isinstance(part, str):
+            rewritten.append(part)
+            continue
+        if part.startswith("--rt="):
+            rewritten.append(part)
+            continue
+        rewritten.append(_rewrite_predicate_aliases(part, left_alias, right_alias))
+    spec["sql"] = rewritten
     return spec
 
 
