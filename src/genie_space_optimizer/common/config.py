@@ -2075,6 +2075,16 @@ TABLE_PROVENANCE = "genie_opt_provenance"
 EXPERIMENT_PATH_TEMPLATE = "/Shared/genie-space-optimizer/{{ space_id }}/{{ domain }}"
 RUN_NAME_TEMPLATE = "genie_eval_iter{{ iteration }}_{{ timestamp }}"
 MODEL_NAME_TEMPLATE = "genie-space-{{ space_id }}"
+
+UC_REGISTERED_MODEL_TEMPLATE = "{{ catalog }}.{{ schema }}.genie_space_{{ space_id }}"
+"""Three-level UC registered model name. Interpolated at runtime."""
+
+ENABLE_UC_MODEL_REGISTRATION: bool = True
+"""When True, finalize registers the champion as a UC Registered Model."""
+
+DEPLOYMENT_JOB_NAME_TEMPLATE = "genie-optimizer-deploy-{{ space_id }}"
+"""Name pattern for the per-space deployment job."""
+
 PROMPT_NAME_TEMPLATE = "{{ uc_schema }}.genie_opt_{{ judge_name }}"
 PROMPT_ALIAS = "production"
 

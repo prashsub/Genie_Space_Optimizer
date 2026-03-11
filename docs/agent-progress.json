@@ -16,7 +16,7 @@
     "2b": { "title": "Wire levers through trigger route → do_start_optimization → submit_optimization", "feature": "lever-acknowledgement-ui", "status": "done", "passes": true, "depends_on": ["2a"] },
     "2c": { "title": "Add lever checkboxes to space detail page", "feature": "lever-acknowledgement-ui", "status": "done", "passes": true, "depends_on": ["2a"] },
     "2d": { "title": "Add lever metadata endpoint (optional)", "feature": "lever-acknowledgement-ui", "status": "done", "passes": true, "depends_on": ["2a"], "optional": true },
-    "1b": { "title": "Add config constants for UC model registration", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": [] },
+    "1b": { "title": "Add config constants for UC model registration", "feature": "uc-model-registration-and-deployment-job", "status": "done", "passes": true, "depends_on": [] },
     "1a": { "title": "Add register_uc_model() and call from finalize", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1b"] },
     "1c": { "title": "Create cross-environment deployment job notebook", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": [] },
     "1d": { "title": "Create and link deployment job programmatically", "feature": "uc-model-registration-and-deployment-job", "status": "pending", "passes": false, "depends_on": ["1a", "1b", "1c"] },
@@ -79,6 +79,17 @@
       ],
       "blockers": [],
       "next_task": "1b"
+    },
+    {
+      "session_id": "2026-03-12T00:00:00Z",
+      "task_id": "1b",
+      "feature": "uc-model-registration-and-deployment-job",
+      "summary": "Added three config constants in config.py after MODEL_NAME_TEMPLATE: UC_REGISTERED_MODEL_TEMPLATE (3-level UC model name pattern), ENABLE_UC_MODEL_REGISTRATION (bool flag, default True), and DEPLOYMENT_JOB_NAME_TEMPLATE (per-space deployment job name pattern). All use {{ variable }} syntax compatible with format_mlflow_template().",
+      "files_changed": [
+        "src/genie_space_optimizer/common/config.py"
+      ],
+      "blockers": [],
+      "next_task": "1a"
     }
   ]
 }
