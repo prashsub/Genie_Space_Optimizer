@@ -5322,32 +5322,37 @@ def _call_llm_for_ag_detail(
                 lever_dirs = {}
             coord = result.get("coordination_notes", "")
             instr_contrib = result.get("instruction_contribution", "")
+            proposals = result.get("proposals", [])
+            if not isinstance(proposals, list):
+                proposals = []
 
             logger.info(
-                "AG %s detail: %d lever directives, coordination=%d chars, instruction=%d chars",
-                ag_id, len(lever_dirs), len(coord), len(instr_contrib),
+                "AG %s detail: %d lever directives, coordination=%d chars, instruction=%d chars, proposals=%d",
+                ag_id, len(lever_dirs), len(coord), len(instr_contrib), len(proposals),
             )
             print(
                 f"    {ag_id} detail: levers={sorted(lever_dirs.keys())}, "
-                f"coordination={len(coord)} chars, instruction={len(instr_contrib)} chars"
+                f"coordination={len(coord)} chars, instruction={len(instr_contrib)} chars, "
+                f"proposals={len(proposals)}"
             )
 
             return {
                 "lever_directives": lever_dirs,
                 "coordination_notes": coord,
                 "instruction_contribution": instr_contrib,
+                "proposals": proposals,
             }
         except json.JSONDecodeError:
             logger.warning("AG detail LLM response not valid JSON (attempt %d): %.500s", attempt + 1, text)
             if attempt >= LLM_MAX_RETRIES - 1:
-                return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": ""}
+                return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": "", "proposals": []}
         except Exception:
             if attempt < LLM_MAX_RETRIES - 1:
                 time.sleep(2**attempt)
             else:
                 logger.exception("AG detail LLM call failed after %d retries for %s", LLM_MAX_RETRIES, ag_id)
-                return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": ""}
-    return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": ""}
+                return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": "", "proposals": []}
+    return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": "", "proposals": []}
 
 
 def _generate_holistic_strategy(
@@ -5453,6 +5458,7 @@ def _generate_holistic_strategy(
                 lever_dirs = detail.get("lever_directives", {})
                 coord_notes = detail.get("coordination_notes", "")
                 instr_contrib = detail.get("instruction_contribution", "")
+                proposals = detail.get("proposals", [])
 
                 assembled_ag: dict[str, Any] = {
                     "id": skeleton["id"],
@@ -5462,6 +5468,7 @@ def _generate_holistic_strategy(
                     "priority": skeleton.get("priority", i + 1),
                     "lever_directives": lever_dirs,
                     "coordination_notes": coord_notes,
+                    "proposals": proposals,
                 }
                 final_ags.append(assembled_ag)
 
@@ -5472,6 +5479,7 @@ def _generate_holistic_strategy(
                     "lever_count": len(lever_dirs),
                     "coordination_len": len(coord_notes),
                     "instruction_contribution_len": len(instr_contrib),
+                    "proposals_count": len(proposals),
                 })
 
         # ── Merge instruction contributions (structure-aware) ────────

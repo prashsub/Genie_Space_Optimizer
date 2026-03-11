@@ -26,7 +26,7 @@
     "3a": { "title": "Create OptimizationLoadingStepper component", "feature": "start-optimization-loading-animation", "status": "done", "passes": true, "depends_on": ["3c"] },
     "3b": { "title": "Integrate stepper into space detail page", "feature": "start-optimization-loading-animation", "status": "done", "passes": true, "depends_on": ["3a"] },
     "4a": { "title": "Create improvement_suggestions Delta state table", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": [] },
-    "4b": { "title": "Extend strategist output schema for proposals", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": [] },
+    "4b": { "title": "Extend strategist output schema for proposals", "feature": "strategist-improvement-suggestions", "status": "done", "passes": true, "depends_on": [] },
     "4c": { "title": "Write proposals to state table during lever loop", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4a", "4b"] },
     "4d": { "title": "Add backend API endpoints for suggestions", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4a"] },
     "4e": { "title": "Add suggestions UI to run detail page", "feature": "strategist-improvement-suggestions", "status": "pending", "passes": false, "depends_on": ["4d"] },
@@ -179,6 +179,18 @@
       ],
       "blockers": [],
       "next_task": "4b"
+    },
+    {
+      "session_id": "2026-03-12T08:00:00Z",
+      "task_id": "4b",
+      "feature": "strategist-improvement-suggestions",
+      "summary": "Extended STRATEGIST_DETAIL_PROMPT with proposals support. Added 'Contract: Improvement Proposals' instruction section explaining when to propose METRIC_VIEW vs FUNCTION. Added 'proposals' array to the output_schema JSON (type, title, rationale, definition, affected_questions, estimated_impact). Updated example output with empty proposals array. Added rule marking proposals as OPTIONAL. In optimizer.py: _call_llm_for_ag_detail now parses proposals from LLM response and includes in return dict (with [] fallback on all error paths). _generate_holistic_strategy passes proposals through to assembled action groups. Telemetry span includes proposals_count.",
+      "files_changed": [
+        "src/genie_space_optimizer/common/config.py",
+        "src/genie_space_optimizer/optimization/optimizer.py"
+      ],
+      "blockers": [],
+      "next_task": "4c"
     }
   ]
 }
