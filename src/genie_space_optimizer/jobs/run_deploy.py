@@ -87,7 +87,7 @@ from pyspark.sql import SparkSession
 
 from genie_space_optimizer.jobs._helpers import _banner as _banner_base
 from genie_space_optimizer.jobs._helpers import _log as _log_base
-from genie_space_optimizer.optimization.harness import _run_deploy
+from genie_space_optimizer.optimization.harness import deploy_check, deploy_execute
 
 dbutils = cast(Any, globals().get("dbutils"))
 
@@ -164,22 +164,34 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🔧 What `_run_deploy` Does Internally
+# MAGIC ## Step 5a: Deploy Gate Check
 # MAGIC
-# MAGIC The harness function `_run_deploy()` (in `optimization/harness.py`) performs:
+# MAGIC Before attempting deployment, verify whether a `deploy_target` was configured.
+# MAGIC If no target is set, the deploy step will be skipped gracefully.
+# MAGIC This cell prints the deploy target, model ID, and iteration context so you
+# MAGIC can confirm the correct configuration is being deployed.
+
+# COMMAND ----------
+
+_banner("Deploy Gate Check")
+gate = deploy_check(deploy_target, prev_model_id, iteration_counter)
+_log("Gate result", **gate)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 5b: Deploy Execution
 # MAGIC
-# MAGIC 1. **No-target check** — If `deploy_target` is `None` or empty, writes `DEPLOY_SKIPPED` to Delta and returns immediately.
-# MAGIC 2. **Stage write** — Records `DEPLOY_STARTED` in Delta `genie_opt_stages`.
-# MAGIC 3. **Deploy execution** — Applies the optimized configuration to the target (DABs integration placeholder — full implementation pending).
-# MAGIC 4. **Completion** — Writes `DEPLOY_COMPLETE` stage record and returns deploy status.
-# MAGIC
-# MAGIC **Returns:** `{status, deploy_target}` where status is `DEPLOYED`, `SKIPPED`, or raises on failure.
+# MAGIC Execute the deployment to the configured target, or skip if no target is set.
+# MAGIC On success, a `DEPLOY_COMPLETE` stage record is written to Delta.
+# MAGIC On skip, a `DEPLOY_SKIPPED` record is written instead.
+# MAGIC The deploy status is printed and published as the notebook exit value.
 
 # COMMAND ----------
 
 try:
-    _banner("Running _run_deploy")
-    deploy_out = _run_deploy(
+    _banner("Running Deploy Execution")
+    deploy_out = deploy_execute(
         w, spark, run_id, deploy_target, space_id, exp_name,
         domain, prev_model_id, iteration_counter,
         catalog, schema,

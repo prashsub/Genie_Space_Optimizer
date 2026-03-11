@@ -59,10 +59,14 @@ export function IterationExplorer({ detail, links = [] }: IterationExplorerProps
             }`}
           >
             <span className="font-medium">
-              {iter.iteration === 0 ? "Baseline" : `Iter ${iter.iteration}`}
+              {iter.iteration === 0
+                ? "Baseline"
+                : iter.status === "patch_failed"
+                  ? `Iter ${iter.iteration} (Failed)`
+                  : `Iter ${iter.iteration}`}
             </span>
             <span className="tabular-nums text-muted-foreground">
-              {iter.overallAccuracy.toFixed(1)}%
+              {iter.status === "patch_failed" ? "—" : `${iter.overallAccuracy.toFixed(1)}%`}
             </span>
             <StatusDot status={iter.status} />
           </button>
@@ -125,10 +129,61 @@ function StatusDot({ status }: { status: string }) {
       ? "bg-green-500"
       : status === "rolled_back"
         ? "bg-red-500"
-        : status === "baseline"
-          ? "bg-blue-500"
-          : "bg-gray-400";
+        : status === "patch_failed"
+          ? "bg-orange-500"
+          : status === "baseline"
+            ? "bg-blue-500"
+            : "bg-gray-400";
   return <div className={`h-1.5 w-1.5 rounded-full ${color}`} />;
+}
+
+function PatchFailedView({ iteration }: { iteration: IterationDetail }) {
+  const patchError = (iteration.clusterInfo as Record<string, unknown>)?.patch_error;
+  const rootCause = (iteration.clusterInfo as Record<string, unknown>)?.root_cause;
+  const rationale = (iteration.clusterInfo as Record<string, unknown>)?.rationale;
+
+  return (
+    <div className="space-y-4">
+      <Card className="border-orange-200">
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <AlertTriangle className="h-4 w-4 text-orange-500" />
+            Patch Application Failed
+            <Badge variant="outline" className="ml-auto border-orange-300 text-orange-600 text-[10px]">
+              Skipped
+            </Badge>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 text-xs">
+          {rootCause && (
+            <div className="flex items-center gap-2">
+              <Target className="h-3.5 w-3.5 text-orange-500" />
+              <span className="text-muted-foreground">Root cause targeted:</span>
+              <span>{String(rootCause)}</span>
+            </div>
+          )}
+          {rationale && (
+            <div className="rounded border border-blue-200 bg-blue-50/50 p-2">
+              <p className="mb-1 text-[10px] font-medium text-blue-700">Strategist Rationale</p>
+              <p className="text-[11px] leading-relaxed">{String(rationale)}</p>
+            </div>
+          )}
+          {patchError && (
+            <div className="rounded border border-orange-200 bg-orange-50/50 p-2">
+              <p className="mb-1 text-[10px] font-medium text-orange-700">Error</p>
+              <pre className="whitespace-pre-wrap text-[10px] leading-relaxed text-orange-900">
+                {String(patchError)}
+              </pre>
+            </div>
+          )}
+          <p className="text-muted-foreground">
+            The strategist's proposed patches could not be applied. The optimizer
+            automatically advanced to the next iteration with a different approach.
+          </p>
+        </CardContent>
+      </Card>
+    </div>
+  );
 }
 
 function IterationView({
@@ -140,6 +195,9 @@ function IterationView({
   detail: IterationDetailResponse;
   experimentLink?: { label: string; url: string; category: string };
 }) {
+  if (iteration.status === "patch_failed") {
+    return <PatchFailedView iteration={iteration} />;
+  }
   if (iteration.iteration === 0) {
     return <BaselineView iteration={iteration} detail={detail} experimentLink={experimentLink} />;
   }

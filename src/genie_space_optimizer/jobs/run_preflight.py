@@ -122,7 +122,15 @@ from genie_space_optimizer.common.config import MAX_ITERATIONS
 from genie_space_optimizer.jobs._helpers import _banner as _banner_base
 from genie_space_optimizer.jobs._helpers import _log as _log_base
 from genie_space_optimizer.optimization.harness import _run_preflight
-from genie_space_optimizer.optimization.state import ensure_optimization_tables
+from genie_space_optimizer.optimization.preflight import (
+    preflight_collect_uc_metadata,
+    preflight_fetch_config,
+    preflight_generate_benchmarks,
+    preflight_load_human_feedback,
+    preflight_setup_experiment,
+    preflight_validate_benchmarks,
+)
+from genie_space_optimizer.optimization.state import ensure_optimization_tables, update_run_status
 
 dbutils = cast(Any, globals().get("dbutils"))
 
@@ -244,68 +252,179 @@ _log("State tables verified", catalog=catalog, schema=schema)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🔧 What `_run_preflight` Does Internally
+# MAGIC ## Step 1a: Genie Space Configuration Import
 # MAGIC
-# MAGIC The harness calls `run_preflight` (in `optimization/preflight.py`) wrapped by `_safe_stage` for error handling:
-# MAGIC
-# MAGIC | Step | Action | Key Function | Output |
-# MAGIC |:----:|--------|-------------|--------|
-# MAGIC | 1 | Config fetch | `fetch_space_config(w, space_id)` or Delta snapshot | `config` dict |
-# MAGIC | 2 | UC metadata | `get_columns`, `get_tags`, `get_routines` | columns, tags, routines |
-# MAGIC | 3 | Experiment resolution | MLflow experiment lookup | `experiment_name`, `experiment_id` |
-# MAGIC | 4 | Benchmarks | Load from UC (≥5) or `generate_benchmarks()` | benchmark list |
-# MAGIC | 5 | Benchmark validation | SQL `EXPLAIN` gating | filtered benchmarks |
-# MAGIC | 6 | Evaluation dataset | `create_evaluation_dataset()` | MLflow dataset |
-# MAGIC | 7 | Judge prompts | `register_judge_prompts()` | ASI judge setup |
-# MAGIC | 8 | Model creation | `create_genie_model_version()` | iteration 0 `model_id` |
-# MAGIC | 9 | State updates | `write_stage()`, `update_run_status()` | Delta records |
-# MAGIC
-# MAGIC > **📝 Note:** Step 2 (UC metadata) is best-effort — continues if some calls fail (e.g. limited permissions). Step 5 (benchmark validation) discards invalid benchmarks; the primary quarantine path (SQL/routine gating) now also runs inside `run_evaluation()` itself, shared across all eval scopes.
-# MAGIC
-# MAGIC **Returns:** `{benchmarks, config, model_id, experiment_name, experiment_id}` — used for task values and downstream tasks.
+# MAGIC Load the Genie Space configuration from the run snapshot (captured at trigger time
+# MAGIC by the app backend) or, as a fallback, fetch it via the Genie API. The configuration
+# MAGIC contains table references, metric views, TVFs, instructions, and column descriptions
+# MAGIC that form the foundation for benchmark generation and optimization.
 
 # COMMAND ----------
 
 try:
-    _banner("Running _run_preflight")
-    _log("Starting preflight", space_id=space_id, catalog=catalog, schema=schema)
-    preflight_out = _run_preflight(
-        w, spark, run_id, space_id, catalog, schema, domain, experiment_name,
-        apply_mode,
+    _banner("Step 1a — Config Fetch")
+    ctx_config = preflight_fetch_config(
+        w, spark, run_id, space_id, catalog, schema, domain, apply_mode,
     )
-    _benchmarks = preflight_out["benchmarks"]
-    _config = preflight_out.get("config", {})
-    _parsed = _config.get("_parsed_space", _config)
-    _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
-
-    _log(
-        "Preflight complete",
-        benchmark_count=len(_benchmarks),
-        model_id=preflight_out["model_id"],
-        experiment_name=preflight_out["experiment_name"],
-        experiment_id=preflight_out.get("experiment_id", ""),
-        table_count=len(_ds.get("tables", [])),
-        metric_view_count=len(_ds.get("metric_views", [])),
-        function_count=len(_ds.get("functions", [])),
-        uc_column_count=len(_config.get("_uc_columns", [])),
-    )
-
-    _log(
-        "Benchmark summary",
-        total=len(_benchmarks),
-        with_sql=sum(1 for b in _benchmarks if b.get("expected_sql")),
-        question_only=sum(1 for b in _benchmarks if not b.get("expected_sql")),
-        sample_questions=[b.get("question", "")[:80] for b in _benchmarks[:5]],
-    )
+    _config = ctx_config["config"]
+    _snapshot = ctx_config["snapshot"]
+    _genie_table_refs = ctx_config["genie_table_refs"]
+    _domain = ctx_config["domain"]
+    _log("Config fetched", tables=len(ctx_config["genie_table_refs"]))
 except Exception as exc:
-    _banner("Preflight FAILED")
-    _log(
-        "Failure details",
-        error_type=type(exc).__name__,
-        error_message=str(exc),
-        traceback=traceback.format_exc(),
-    )
+    _banner("Config Fetch FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
     raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1b: Unity Catalog Metadata Collection
+# MAGIC
+# MAGIC Collect columns, tags, routines, and foreign-key constraints for all tables and views
+# MAGIC referenced in the Genie Space. Uses a 3-tier fallback: prefetched (OBO cache) →
+# MAGIC REST API → Spark SQL. Also runs data profiling to discover low-cardinality columns
+# MAGIC with value hints, and computes join overlap scores for FK pairs.
+
+# COMMAND ----------
+
+try:
+    _banner("Step 1b — UC Metadata")
+    ctx_uc = preflight_collect_uc_metadata(
+        w, spark, run_id, catalog, schema, _config, _snapshot,
+        _genie_table_refs, apply_mode=apply_mode,
+        configured_cols=ctx_config.get("configured_cols", 0),
+    )
+    _log("Metadata collected", columns=len(ctx_uc["uc_columns"]), tags=len(ctx_uc["uc_tags"]),
+         routines=len(ctx_uc["uc_routines"]), fk=len(ctx_uc["uc_fk"]))
+except Exception as exc:
+    _banner("UC Metadata FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
+    raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1c: Benchmark Generation
+# MAGIC
+# MAGIC Load existing benchmarks from the Unity Catalog evaluation dataset, or generate
+# MAGIC new ones using the LLM if no suitable benchmarks exist. Benchmarks are
+# MAGIC natural-language questions paired with optional expected SQL that drive the
+# MAGIC 9-judge evaluation scoring.
+
+# COMMAND ----------
+
+try:
+    _banner("Step 1c — Benchmark Generation")
+    ctx_bench = preflight_generate_benchmarks(
+        w, spark, run_id, catalog, schema, _config,
+        ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
+        _domain,
+    )
+    _benchmarks = ctx_bench["benchmarks"]
+    _log("Benchmarks loaded", count=len(_benchmarks), regenerated=ctx_bench["regenerated"])
+except Exception as exc:
+    _banner("Benchmark Generation FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
+    raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1d: Benchmark Validation
+# MAGIC
+# MAGIC Validate each benchmark's SQL via `EXPLAIN` to ensure it compiles against the
+# MAGIC current schema. Invalid benchmarks (unresolved columns, missing tables, syntax errors)
+# MAGIC are quarantined. If fewer than 5 valid benchmarks remain, regeneration is triggered.
+
+# COMMAND ----------
+
+try:
+    _banner("Step 1d — Benchmark Validation")
+    ctx_valid = preflight_validate_benchmarks(
+        w, spark, run_id, catalog, schema, _config, _benchmarks,
+        ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
+        _domain,
+    )
+    _benchmarks = ctx_valid["benchmarks"]
+    _log("Validation complete", valid=len(_benchmarks), pre_count=ctx_valid["pre_count"],
+         rejected=ctx_valid["pre_count"] - len(_benchmarks))
+except Exception as exc:
+    _banner("Benchmark Validation FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
+    raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1e: Past Human Feedback
+# MAGIC
+# MAGIC Load human corrections from prior completed optimization runs for this Genie Space.
+# MAGIC Corrections include benchmark fixes, judge overrides, and quarantine decisions
+# MAGIC that carry forward to improve accuracy in subsequent runs.
+
+# COMMAND ----------
+
+_banner("Step 1e — Human Feedback")
+ctx_feedback = preflight_load_human_feedback(
+    spark, run_id, space_id, catalog, schema, _domain,
+)
+_log("Feedback loaded", corrections=len(ctx_feedback["human_corrections"]))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1f: Experiment and Model Setup
+# MAGIC
+# MAGIC Create or resolve the MLflow experiment, register judge prompts, flag stale temporal
+# MAGIC benchmarks, sync the evaluation dataset, and create the initial LoggedModel
+# MAGIC (iteration 0). This cell writes the final `PREFLIGHT_STARTED → COMPLETE` stage record
+# MAGIC to Delta.
+
+# COMMAND ----------
+
+try:
+    _banner("Step 1f — Experiment & Model Setup")
+    ctx_exp = preflight_setup_experiment(
+        w, spark, run_id, space_id, catalog, schema, _domain,
+        _config, _benchmarks,
+        ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
+        _genie_table_refs, experiment_name,
+    )
+    _log("Experiment created", model_id=ctx_exp["model_id"],
+         experiment=ctx_exp["experiment_name"], prompts=len(ctx_exp["prompt_registrations"]))
+except Exception as exc:
+    _banner("Experiment Setup FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
+    raise
+
+# Assemble the preflight_out dict for downstream task value publication
+import mlflow as _mlflow
+_exp = _mlflow.get_experiment_by_name(ctx_exp["experiment_name"])
+_experiment_id = _exp.experiment_id if _exp else ""
+
+update_run_status(
+    spark, run_id, catalog, schema,
+    status="IN_PROGRESS",
+    experiment_name=ctx_exp["experiment_name"],
+    experiment_id=_experiment_id,
+)
+
+preflight_out = {
+    "config": _config,
+    "benchmarks": _benchmarks,
+    "model_id": ctx_exp["model_id"],
+    "experiment_name": ctx_exp["experiment_name"],
+    "experiment_id": _experiment_id,
+    "human_corrections": ctx_feedback["human_corrections"],
+}
+
+_log(
+    "Preflight complete",
+    benchmark_count=len(_benchmarks),
+    model_id=preflight_out["model_id"],
+    experiment_name=preflight_out["experiment_name"],
+)
 
 # COMMAND ----------
 

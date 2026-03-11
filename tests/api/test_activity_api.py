@@ -38,6 +38,12 @@ class TestGetActivity:
                     },
                 ]
             ),
+        ), patch(
+            "genie_space_optimizer.backend.routes.activity._check_access_for_spaces",
+            return_value={"space-abc": "CAN_EDIT", "space-def": "CAN_VIEW"},
+        ), patch(
+            "genie_space_optimizer.backend.routes.activity._load_baseline_scores",
+            return_value={},
         ):
             response = api_client.get("/api/genie/activity")
 

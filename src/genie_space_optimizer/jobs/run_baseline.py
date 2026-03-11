@@ -175,7 +175,12 @@ from pyspark.sql import SparkSession
 from genie_space_optimizer.jobs._helpers import _banner as _banner_base
 from genie_space_optimizer.jobs._helpers import _log as _log_base
 from genie_space_optimizer.optimization.evaluation import load_benchmarks_from_dataset
-from genie_space_optimizer.optimization.harness import _run_baseline
+from genie_space_optimizer.optimization.harness import (
+    baseline_setup_scorers,
+    baseline_run_evaluation,
+    baseline_display_scorecard,
+    baseline_persist_state,
+)
 
 dbutils = cast(Any, globals().get("dbutils"))
 
@@ -239,17 +244,82 @@ if not benchmarks:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🔄 Run Baseline Evaluation
+# MAGIC ## Step 2a: Evaluation Setup
 # MAGIC
-# MAGIC `_run_baseline()` creates the predict function and scorers, runs `mlflow.genai.evaluate()` with retry (benchmark quarantine is integrated inside the evaluation path), checks thresholds, and writes Delta state. On success it returns `scores`, `overall_accuracy`, `thresholds_met`, and `model_id`. On failure it re-raises after logging full details.
+# MAGIC Create the Genie predict function (rate-limited, calls Genie API, executes SQL,
+# MAGIC normalizes results, compares hashes) and assemble the 9 custom scorers for
+# MAGIC `mlflow.genai.evaluate()`. This cell also sets the SQL context (`USE CATALOG`,
+# MAGIC `USE SCHEMA`) and writes the `BASELINE_EVAL_STARTED` stage to Delta.
 
 # COMMAND ----------
 
 try:
-    _banner("Running _run_baseline")
-    baseline_out = _run_baseline(
-        w, spark, run_id, space_id, benchmarks, exp_name, model_id,
-        catalog, schema, domain,
+    _banner("Evaluation Setup")
+    setup_ctx = baseline_setup_scorers(
+        w, spark, space_id, run_id, catalog, schema, exp_name, model_id, domain,
+    )
+    _log("Setup complete", scorers=len(setup_ctx["scorers"]), model_id=model_id)
+except Exception as exc:
+    _banner("Baseline Setup FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
+    raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 2b: Run 9-Judge Evaluation
+# MAGIC
+# MAGIC Run the full evaluation suite against all benchmarks. The evaluation engine
+# MAGIC wraps `mlflow.genai.evaluate()` with retry logic (up to 4 attempts with
+# MAGIC exponential backoff and single-worker fallback). Benchmark quarantine
+# MAGIC (SQL/routine gating) is integrated inside the evaluation path.
+
+# COMMAND ----------
+
+try:
+    _banner("Running 9-Judge Evaluation")
+    eval_result = baseline_run_evaluation(spark, run_id, catalog, schema, benchmarks, setup_ctx)
+    _log("Evaluation complete", overall_accuracy=eval_result.get("overall_accuracy", 0.0))
+except Exception as exc:
+    _banner("Baseline Evaluation FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
+    raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 2c: Baseline Scorecard
+# MAGIC
+# MAGIC Display the per-judge scorecard showing each judge's score against its
+# MAGIC threshold. This gives a clear picture of where the Genie Space stands
+# MAGIC before any optimization and which quality dimensions need improvement.
+
+# COMMAND ----------
+
+scorecard = baseline_display_scorecard(eval_result)
+_log(
+    "Scorecard",
+    overall_accuracy=scorecard["overall_accuracy"],
+    thresholds_met=scorecard["thresholds_met"],
+    judge_count=len(scorecard["scores"]),
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 2d: State Persistence and Labeling
+# MAGIC
+# MAGIC Write the baseline iteration to Delta, link evaluation scores to the MLflow
+# MAGIC model, update the run status with the best accuracy, write the
+# MAGIC `BASELINE_EVAL_STARTED -> COMPLETE` stage record, and log expected SQL
+# MAGIC and judge verdicts on evaluation traces for human reviewers.
+
+# COMMAND ----------
+
+try:
+    _banner("Persisting Baseline State")
+    baseline_out = baseline_persist_state(
+        w, spark, run_id, model_id, catalog, schema, eval_result, scorecard,
     )
     _log(
         "Baseline finished",
@@ -259,13 +329,8 @@ try:
         judge_count=len(baseline_out.get("scores", {})),
     )
 except Exception as exc:
-    _banner("Baseline FAILED")
-    _log(
-        "Failure details",
-        error_type=type(exc).__name__,
-        error_message=str(exc),
-        traceback=traceback.format_exc(),
-    )
+    _banner("Baseline Persistence FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
     raise
 
 # COMMAND ----------

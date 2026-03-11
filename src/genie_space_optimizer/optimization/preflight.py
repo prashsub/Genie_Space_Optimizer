@@ -50,13 +50,33 @@ from genie_space_optimizer.optimization.evaluation import (
     register_judge_prompts,
 )
 from genie_space_optimizer.optimization.models import create_genie_model_version
-from genie_space_optimizer.optimization.state import load_run, load_runs_for_space, write_stage
+from genie_space_optimizer.optimization.state import (
+    load_run,
+    load_runs_for_space,
+    update_run_status as _update_run_status,
+    write_stage,
+)
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
     from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
+
+# ── Preflight print helpers ──────────────────────────────────────────
+_PF_W = 60
+
+
+def _pf_section(title: str) -> str:
+    return f"\n{'=' * _PF_W}\n  {title}\n{'=' * _PF_W}"
+
+
+def _pf_kv(key: str, value: object) -> str:
+    return f"  {key + ':':<22s} {value}"
+
+
+def _pf_bar() -> str:
+    return "-" * _PF_W
 
 
 def compute_asset_fingerprint(config: dict) -> str:
@@ -463,32 +483,25 @@ def _validate_write_access(spark: SparkSession, genie_table_refs: list) -> None:
         )
 
 
-def run_preflight(
-    w: WorkspaceClient,
-    spark: SparkSession,
+# ── Preflight Sub-Step Functions ────────────────────────────────────
+# Each phase is individually callable from a notebook cell. The wrapper
+# ``run_preflight()`` calls them in sequence for backward compatibility.
+
+
+def preflight_fetch_config(
+    w: "WorkspaceClient",
+    spark: "SparkSession",
     run_id: str,
     space_id: str,
     catalog: str,
     schema: str,
     domain: str,
-    experiment_name: str | None = None,
     apply_mode: str = "genie_config",
-) -> tuple[dict, list[dict], str, str, list[dict]]:
-    """Execute the full preflight sequence (Stage 1).
+) -> dict:
+    """Sub-step 1: Load Genie Space config from snapshot or API.
 
-    Steps:
-      1. Fetch Genie Space config via API
-      2. Fetch UC metadata (columns, tags, routines)
-      3. Resolve or create MLflow experiment
-      4. Load or generate benchmarks
-      5. Validate benchmark SQL via EXPLAIN
-      6. Sync benchmarks to MLflow evaluation dataset
-      7. Register judge prompts (idempotent)
-      8. Create LoggedModel iteration 0
-      9. Write PREFLIGHT_STARTED → PREFLIGHT_COMPLETE to Delta
-
-    Returns:
-        (config, benchmarks, model_id, experiment_name)
+    Returns a context dict with keys: config, snapshot, genie_table_refs,
+    domain, apply_mode, configured_cols.
     """
     domain = re.sub(r"[^a-z0-9_]+", "_", domain.lower()).strip("_") or "default"
 
@@ -514,8 +527,7 @@ def run_preflight(
         config = fetch_space_config(w, space_id)
         logger.info("Fetched config for space %s", space_id)
         try:
-            from genie_space_optimizer.optimization.state import update_run_status
-            update_run_status(
+            _update_run_status(
                 spark, run_id, catalog, schema,
                 config_snapshot=config,
             )
@@ -525,7 +537,6 @@ def run_preflight(
                 "Could not back-fill config_snapshot for %s", run_id, exc_info=True,
             )
 
-    # ── Schema validation (lenient: structural checks only) ────
     _parsed = config.get("_parsed_space", config)
     _schema_ok, _schema_errors = validate_serialized_space(
         _parsed if isinstance(_parsed, dict) else config
@@ -535,7 +546,6 @@ def run_preflight(
             "Space config has structural issues for %s: %s", space_id, _schema_errors
         )
 
-    # ── Diagnostic Block 1: Genie Space Inventory ──
     _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
     _inv_tables = _ds.get("tables", [])
     _inv_mvs = _ds.get("metric_views", [])
@@ -546,34 +556,6 @@ def run_preflight(
         for ti in _inv_instructions
     )
     _configured_cols = sum(len(t.get("column_configs", [])) for t in _inv_tables + _inv_mvs)
-    print(
-        f"\n{'=' * 60}\n"
-        f"  PREFLIGHT — GENIE SPACE INVENTORY\n"
-        f"{'=' * 60}\n"
-        f"  Space ID:         {space_id}\n"
-        f"  Tables:           {len(_inv_tables)}\n"
-        f"  Metric Views:     {len(_inv_mvs)}\n"
-        f"  Functions (TVF):  {len(_inv_funcs)}\n"
-        f"  Instructions:     {_inv_instr_count}\n"
-        f"  Configured cols:  {_configured_cols}  (column_configs with desc/FA/VD; UC columns collected later)\n"
-        f"{'-' * 60}"
-    )
-    for t in _inv_tables[:10]:
-        _tid = t.get("identifier", "?")
-        _tcols = len(t.get("column_configs", []))
-        print(f"    TABLE: {_tid} ({_tcols} configured cols)")
-    for mv in _inv_mvs[:10]:
-        _mid = mv.get("identifier", "?")
-        _mcols = len(mv.get("column_configs", []))
-        print(f"    METRIC VIEW: {_mid} ({_mcols} configured cols)")
-    for fn in _inv_funcs[:10]:
-        _fid = fn.get("identifier", "?")
-        print(f"    FUNCTION: {_fid}")
-    print(f"{'-' * 60}\n")
-
-    # Prefetched UC metadata from the backend OBO call is used as a cache
-    # optimisation; the harness falls back to REST API (w.tables.get) if absent.
-    prefetched = snapshot.get("_prefetched_uc_metadata", {}) if isinstance(snapshot, dict) else {}
 
     genie_table_refs = extract_genie_space_table_refs(config)
     if genie_table_refs:
@@ -583,20 +565,68 @@ def run_preflight(
             sorted({f"{c}.{s}" for c, s, _ in genie_table_refs if c and s}),
         )
 
+    _lines = [_pf_section("PREFLIGHT — GENIE SPACE CONFIGURATION")]
+    _lines.append(_pf_kv("Space ID", space_id))
+    _lines.append(_pf_kv("Source", "snapshot" if (isinstance(snapshot, dict) and snapshot) else "API"))
+    _lines.append(_pf_kv("Tables", len(_inv_tables)))
+    _lines.append(_pf_kv("Metric Views", len(_inv_mvs)))
+    _lines.append(_pf_kv("Functions (TVF)", len(_inv_funcs)))
+    _lines.append(_pf_kv("Instructions", _inv_instr_count))
+    _lines.append(_pf_kv("Configured cols", f"{_configured_cols}  (column_configs with desc/FA/VD)"))
+    _lines.append(_pf_bar())
+    for t in _inv_tables[:10]:
+        _tid = t.get("identifier", "?")
+        _tcols = len(t.get("column_configs", []))
+        _lines.append(f"    TABLE: {_tid} ({_tcols} configured cols)")
+    for mv in _inv_mvs[:10]:
+        _mid = mv.get("identifier", "?")
+        _mcols = len(mv.get("column_configs", []))
+        _lines.append(f"    METRIC VIEW: {_mid} ({_mcols} configured cols)")
+    for fn in _inv_funcs[:10]:
+        _fid = fn.get("identifier", "?")
+        _lines.append(f"    FUNCTION: {_fid}")
+    _lines.append(_pf_bar())
+    print("\n".join(_lines))
+
+    return {
+        "config": config,
+        "snapshot": snapshot,
+        "genie_table_refs": genie_table_refs,
+        "domain": domain,
+        "apply_mode": apply_mode,
+        "configured_cols": _configured_cols,
+    }
+
+
+def preflight_collect_uc_metadata(
+    w: "WorkspaceClient",
+    spark: "SparkSession",
+    run_id: str,
+    catalog: str,
+    schema: str,
+    config: dict,
+    snapshot: dict,
+    genie_table_refs: list,
+    apply_mode: str = "genie_config",
+    configured_cols: int = 0,
+) -> dict:
+    """Sub-step 2: Collect UC columns, tags, routines, FK constraints.
+
+    Mutates ``config`` (adds ``_uc_columns``, ``_uc_foreign_keys``,
+    ``_data_profile``, ``_join_overlaps``).
+
+    Returns a dict with keys: uc_columns, uc_tags, uc_routines, uc_fk.
+    """
     _validate_core_access(w, spark, genie_table_refs)
 
     if apply_mode in ("both", "uc_artifact"):
         _validate_write_access(spark, genie_table_refs)
 
+    prefetched = snapshot.get("_prefetched_uc_metadata", {}) if isinstance(snapshot, dict) else {}
     _pf = prefetched if isinstance(prefetched, dict) else {}
     _actual_source: dict[str, str] = {}
 
     def _usable_prefetch(key: str) -> list | None:
-        """Return prefetched data when available.
-
-        - Key missing or value is ``None``: query failed upstream → fall back.
-        - Key present with ``[]``: query succeeded but returned no rows → valid empty result, no fallback needed.
-        """
         if key not in _pf:
             return None
         val = _pf[key]
@@ -613,7 +643,6 @@ def run_preflight(
     _collection_errors: dict[str, str] = {}
 
     def _rest_collect(fetch_fn: Any, label: str, source_key: str) -> list[dict] | None:
-        """Try REST API first; return None on failure so caller can fall back."""
         try:
             print(f"[PREFLIGHT] Attempting REST API for {label}...", flush=True)
             rows = fetch_fn()
@@ -633,7 +662,6 @@ def run_preflight(
             _collection_errors[source_key] = err
         return rows
 
-    # Columns, routines & tags: prefetch → REST API → Spark SQL
     if genie_table_refs:
         uc_columns_dicts = (
             _usable_prefetch("uc_columns")
@@ -718,26 +746,23 @@ def run_preflight(
         len(uc_fk_dicts),
     )
 
-    # ── Diagnostic Block 2: UC Metadata Collection Summary ──
     _uc_table_names = {
         str(c.get("table_name") or "").strip().lower()
         for c in uc_columns_dicts if isinstance(c, dict) and c.get("table_name")
     }
-    print(
-        f"\n{'=' * 60}\n"
-        f"  PREFLIGHT — UC METADATA COLLECTION SUMMARY\n"
-        f"{'=' * 60}\n"
-        f"  UC Columns:   {len(uc_columns_dicts):>5}  (covering {len(_uc_table_names)} tables, source: {_actual_source.get('uc_columns', 'unknown')})\n"
-        f"  Genie config: {_configured_cols:>5}  column_configs entries (descriptions/FA/VD)\n"
-        f"  Tags:         {len(uc_tags_dicts):>5}  (source: {_actual_source.get('uc_tags', 'unknown')})\n"
-        f"  Routines:     {len(uc_routines_dicts):>5}  (source: {_actual_source.get('uc_routines', 'unknown')})\n"
-        f"  FK Constraints:{len(uc_fk_dicts):>4}  (source: {_actual_source.get('uc_foreign_keys', 'unknown')})"
-    )
+
+    _lines = [_pf_section("PREFLIGHT — UC METADATA COLLECTION SUMMARY")]
+    _lines.append(_pf_kv("UC Columns", f"{len(uc_columns_dicts):>5}  (covering {len(_uc_table_names)} tables, source: {_actual_source.get('uc_columns', 'unknown')})"))
+    _lines.append(_pf_kv("Genie config", f"{configured_cols:>5}  column_configs entries (descriptions/FA/VD)"))
+    _lines.append(_pf_kv("Tags", f"{len(uc_tags_dicts):>5}  (source: {_actual_source.get('uc_tags', 'unknown')})"))
+    _lines.append(_pf_kv("Routines", f"{len(uc_routines_dicts):>5}  (source: {_actual_source.get('uc_routines', 'unknown')})"))
+    _lines.append(_pf_kv("FK Constraints", f"{len(uc_fk_dicts):>4}  (source: {_actual_source.get('uc_foreign_keys', 'unknown')})"))
     if _collection_errors:
-        print("  Collection errors:")
+        _lines.append("  Collection errors:")
         for k, v in _collection_errors.items():
-            print(f"    {k}: {v[:200]}")
-    print(f"{'-' * 60}")
+            _lines.append(f"    {k}: {v[:200]}")
+    _lines.append(_pf_bar())
+
     column_samples: list[str] = []
     for col in uc_columns_dicts[:12]:
         if not isinstance(col, dict):
@@ -770,6 +795,8 @@ def run_preflight(
         routine_name = str(routine.get("routine_name") or routine.get("name") or "").strip()
         if routine_name:
             routine_samples.append(routine_name)
+
+    print("\n".join(_lines))
 
     config["_uc_columns"] = uc_columns_dicts
     config["_uc_foreign_keys"] = uc_fk_dicts
@@ -806,7 +833,6 @@ def run_preflight(
         detail=stage_detail,
     )
 
-    # ── Data Profiling ──
     table_names = config.get("_tables", [])
     if table_names and uc_columns_dicts:
         write_stage(
@@ -853,7 +879,6 @@ def run_preflight(
     else:
         config["_data_profile"] = {}
 
-    # ── Join Overlap Scores ──
     if uc_fk_dicts:
         try:
             join_overlaps = _compute_join_overlaps(spark, uc_fk_dicts)
@@ -868,54 +893,70 @@ def run_preflight(
     else:
         config["_join_overlaps"] = []
 
+    return {
+        "uc_columns": uc_columns_dicts,
+        "uc_tags": uc_tags_dicts,
+        "uc_routines": uc_routines_dicts,
+        "uc_fk": uc_fk_dicts,
+    }
+
+
+def preflight_generate_benchmarks(
+    w: "WorkspaceClient",
+    spark: "SparkSession",
+    run_id: str,
+    catalog: str,
+    schema: str,
+    config: dict,
+    uc_columns: list[dict],
+    uc_tags: list[dict],
+    uc_routines: list[dict],
+    domain: str,
+) -> dict:
+    """Sub-step 3: Load existing or generate new benchmarks.
+
+    Returns a dict with keys: benchmarks, regenerated.
+    """
     uc_schema = f"{catalog}.{schema}"
-    if experiment_name is None:
-        experiment_name = _resolve_experiment_path(space_id=space_id, domain=domain)
-
-    _ensure_experiment_parent_dir(w, experiment_name)
-    try:
-        mlflow.set_experiment(experiment_name)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Cannot create MLflow experiment at {experiment_name}: {exc}"
-        ) from exc
-    exp = mlflow.get_experiment_by_name(experiment_name)
-    experiment_id = exp.experiment_id if exp else ""
-    logger.info("Experiment: %s (id=%s)", experiment_name, experiment_id)
-
-    try:
-        from genie_space_optimizer import __version__ as _pipeline_version
-    except ImportError:
-        _pipeline_version = "0.0.0"
-    try:
-        mlflow.set_experiment_tags({
-            "genie.space_id": space_id,
-            "genie.domain": domain,
-            "genie.pipeline_version": _pipeline_version,
-            "genie.catalog": catalog,
-            "genie.schema": schema,
-        })
-    except Exception:
-        logger.debug("Failed to set experiment-level tags", exc_info=True)
-
-    initial_instructions = _get_general_instructions(config.get("_parsed_space", config))
-    if initial_instructions:
-        register_instruction_version(
-            uc_schema=uc_schema,
-            space_id=space_id,
-            instruction_text=initial_instructions,
-            run_id=run_id,
-            lever=0,
-            iteration=0,
-            accuracy=0.0,
-            domain=domain,
-        )
 
     benchmarks, _benchmarks_regenerated = _load_or_generate_benchmarks(
-        w, spark, config, uc_columns_dicts, uc_tags_dicts, uc_routines_dicts,
+        w, spark, config, uc_columns, uc_tags, uc_routines,
         domain, catalog, schema, uc_schema, run_id,
     )
 
+    _lines = [_pf_section("PREFLIGHT — BENCHMARK GENERATION")]
+    _lines.append(_pf_kv("Benchmarks loaded", len(benchmarks)))
+    _lines.append(_pf_kv("Regenerated", _benchmarks_regenerated))
+    _lines.append(_pf_bar())
+    for bm in benchmarks[:10]:
+        _bq = str(bm.get("question", ""))[:80]
+        _bid = bm.get("id", bm.get("question_id", "?"))
+        _lines.append(f"    [{_bid}] {_bq}")
+    if len(benchmarks) > 10:
+        _lines.append(f"    ... and {len(benchmarks) - 10} more")
+    _lines.append(_pf_bar())
+    print("\n".join(_lines))
+
+    return {"benchmarks": benchmarks, "regenerated": _benchmarks_regenerated}
+
+
+def preflight_validate_benchmarks(
+    w: "WorkspaceClient",
+    spark: "SparkSession",
+    run_id: str,
+    catalog: str,
+    schema: str,
+    config: dict,
+    benchmarks: list[dict],
+    uc_columns: list[dict],
+    uc_tags: list[dict],
+    uc_routines: list[dict],
+    domain: str,
+) -> dict:
+    """Sub-step 4: Validate benchmarks via EXPLAIN gating.
+
+    Returns a dict with keys: benchmarks (filtered), pre_count, invalid_errors.
+    """
     MIN_VALID_BENCHMARKS = 5
 
     validation_results = validate_benchmarks(
@@ -973,29 +1014,44 @@ def run_preflight(
                 cat = "OTHER"
             _err_categories[cat] = _err_categories.get(cat, 0) + 1
 
-        print(
-            f"\n{'=' * 60}\n"
-            f"  PREFLIGHT — BENCHMARK VALIDATION\n"
-            f"{'=' * 60}\n"
-            f"  Total benchmarks: {pre_count}\n"
-            f"  Valid after validation: {len(benchmarks)}\n"
-            f"  Rejected: {pre_count - len(benchmarks)}"
-        )
-        if _err_categories:
-            print("  Error categories:")
-            for cat, cnt in sorted(_err_categories.items(), key=lambda x: -x[1]):
-                print(f"    {cat}: {cnt}")
-        print("  Rejected details:")
-        print("\n".join(rejected_details[:20]))
-        if len(benchmarks) > 0:
-            print("  Valid benchmark questions:")
-            for vb in benchmarks[:15]:
-                _vbq = str(vb.get("question", ""))[:80]
-                _vbid = vb.get("id", vb.get("question_id", "?"))
-                print(f"    [{_vbid}] {_vbq}")
-            if len(benchmarks) > 15:
-                print(f"    ... and {len(benchmarks) - 15} more")
-        print(f"{'-' * 60}")
+    _lines = [_pf_section("PREFLIGHT — BENCHMARK VALIDATION")]
+    _lines.append(_pf_kv("Total benchmarks", pre_count))
+    _lines.append(_pf_kv("Valid", len(benchmarks)))
+    _lines.append(_pf_kv("Rejected", pre_count - len(benchmarks)))
+    if pre_count > len(benchmarks):
+        _err_categories_v: dict[str, int] = {}
+        for err in invalid_errors:
+            low = err.lower()
+            if "unresolved_column" in low:
+                cat = "UNRESOLVED_COLUMN"
+            elif "table_or_view_not_found" in low or "does not exist" in low:
+                cat = "MISSING_TABLE/VIEW"
+            elif "tvf" in low or "table_valued_function" in low:
+                cat = "TVF_ERROR"
+            elif "syntax" in low or "parse" in low:
+                cat = "SYNTAX_ERROR"
+            elif "permission" in low:
+                cat = "PERMISSION_ERROR"
+            else:
+                cat = "OTHER"
+            _err_categories_v[cat] = _err_categories_v.get(cat, 0) + 1
+        if _err_categories_v:
+            _lines.append("  Error categories:")
+            for cat, cnt in sorted(_err_categories_v.items(), key=lambda x: -x[1]):
+                _lines.append(f"    {cat}: {cnt}")
+        _lines.append("  Rejected details:")
+        for rd in rejected_details[:20]:
+            _lines.append(rd)
+    if benchmarks:
+        _lines.append("  Valid benchmark questions:")
+        for vb in benchmarks[:15]:
+            _vbq = str(vb.get("question", ""))[:80]
+            _vbid = vb.get("id", vb.get("question_id", "?"))
+            _lines.append(f"    [{_vbid}] {_vbq}")
+        if len(benchmarks) > 15:
+            _lines.append(f"    ... and {len(benchmarks) - 15} more")
+    _lines.append(_pf_bar())
+    print("\n".join(_lines))
 
     if len(benchmarks) < MIN_VALID_BENCHMARKS:
         logger.warning(
@@ -1003,7 +1059,6 @@ def run_preflight(
             "Re-generating from scratch using Genie space assets.",
             len(benchmarks), MIN_VALID_BENCHMARKS,
         )
-        _benchmarks_regenerated = True
         genie_benchmarks_regen = extract_genie_space_benchmarks(
             config, spark, catalog=catalog, schema=schema,
         )
@@ -1013,7 +1068,7 @@ def run_preflight(
             detail={"reason": "too_few_valid_benchmarks", "valid_count": len(benchmarks), "discarded_errors": invalid_errors[:5]},
         )
         benchmarks = generate_benchmarks(
-            w, config, uc_columns_dicts, uc_tags_dicts, uc_routines_dicts,
+            w, config, uc_columns, uc_tags, uc_routines,
             domain, catalog, schema, spark,
             target_count=TARGET_BENCHMARK_COUNT,
             genie_space_benchmarks=genie_benchmarks_regen,
@@ -1032,26 +1087,22 @@ def run_preflight(
             "Check that the Genie space's referenced tables actually exist."
         )
 
-    _flag_stale_temporal_benchmarks(benchmarks, spark)
+    return {"benchmarks": benchmarks, "pre_count": pre_count, "invalid_errors": invalid_errors}
 
-    _asset_fp = compute_asset_fingerprint(config)
-    for _b in benchmarks:
-        _b["asset_fingerprint"] = _asset_fp
 
-    _uc_table = f"{uc_schema}.genie_benchmarks_{domain}"
-    logger.info(
-        "Dropping benchmark table %s before persist to eliminate stale duplicates "
-        "(regenerated=%s, benchmarks=%d, asset_fingerprint=%s)",
-        _uc_table, _benchmarks_regenerated, len(benchmarks), _asset_fp,
-    )
-    _drop_benchmark_table(spark, _uc_table)
+def preflight_load_human_feedback(
+    spark: "SparkSession",
+    run_id: str,
+    space_id: str,
+    catalog: str,
+    schema: str,
+    domain: str,
+) -> dict:
+    """Sub-step 5: Load human corrections from prior labeling sessions.
 
-    create_evaluation_dataset(
-        spark, benchmarks, uc_schema, domain,
-        space_id=space_id, catalog=catalog, gold_schema=schema,
-        experiment_id=experiment_id,
-    )
-
+    Returns a dict with key: human_corrections (list[dict]).
+    """
+    uc_schema = f"{catalog}.{schema}"
     _human_corrections: list[dict] = []
     try:
         from genie_space_optimizer.optimization.labeling import (
@@ -1083,30 +1134,131 @@ def run_preflight(
     except Exception:
         logger.warning("Human feedback ingestion skipped (no prior session or module unavailable)", exc_info=True)
 
+    _lines = [_pf_section("PREFLIGHT — PAST HUMAN FEEDBACK")]
+    _lines.append(_pf_kv("Corrections loaded", len(_human_corrections)))
+    if _human_corrections:
+        _type_counts: dict[str, int] = {}
+        for c in _human_corrections:
+            ct = c.get("type", c.get("correction_type", "unknown"))
+            _type_counts[ct] = _type_counts.get(ct, 0) + 1
+        for ct, cnt in sorted(_type_counts.items()):
+            _lines.append(_pf_kv(f"  {ct}", cnt))
+        sample = _human_corrections[0]
+        _sq = str(sample.get("question", sample.get("question_text", "")))[:80]
+        _lines.append(_pf_kv("Sample", f'"{_sq}"'))
+    else:
+        _lines.append(_pf_kv("Status", "No prior labeling sessions found"))
+    _lines.append(_pf_bar())
+    print("\n".join(_lines))
+
+    return {"human_corrections": _human_corrections}
+
+
+def preflight_setup_experiment(
+    w: "WorkspaceClient",
+    spark: "SparkSession",
+    run_id: str,
+    space_id: str,
+    catalog: str,
+    schema: str,
+    domain: str,
+    config: dict,
+    benchmarks: list[dict],
+    uc_columns: list[dict],
+    uc_tags: list[dict],
+    uc_routines: list[dict],
+    genie_table_refs: list,
+    experiment_name: str | None = None,
+) -> dict:
+    """Sub-step 6: Create MLflow experiment, register judges, create model.
+
+    Returns a dict with keys: model_id, experiment_name, experiment_id,
+    prompt_registrations.
+    """
+    uc_schema = f"{catalog}.{schema}"
+
+    if experiment_name is None:
+        experiment_name = _resolve_experiment_path(space_id=space_id, domain=domain)
+
+    _ensure_experiment_parent_dir(w, experiment_name)
+    try:
+        mlflow.set_experiment(experiment_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot create MLflow experiment at {experiment_name}: {exc}"
+        ) from exc
+    exp = mlflow.get_experiment_by_name(experiment_name)
+    experiment_id = exp.experiment_id if exp else ""
+    logger.info("Experiment: %s (id=%s)", experiment_name, experiment_id)
+
+    try:
+        from genie_space_optimizer import __version__ as _pipeline_version
+    except ImportError:
+        _pipeline_version = "0.0.0"
+    try:
+        mlflow.set_experiment_tags({
+            "genie.space_id": space_id,
+            "genie.domain": domain,
+            "genie.pipeline_version": _pipeline_version,
+            "genie.catalog": catalog,
+            "genie.schema": schema,
+        })
+    except Exception:
+        logger.debug("Failed to set experiment-level tags", exc_info=True)
+
+    initial_instructions = _get_general_instructions(config.get("_parsed_space", config))
+    if initial_instructions:
+        register_instruction_version(
+            uc_schema=uc_schema,
+            space_id=space_id,
+            instruction_text=initial_instructions,
+            run_id=run_id,
+            lever=0,
+            iteration=0,
+            accuracy=0.0,
+            domain=domain,
+        )
+
+    _flag_stale_temporal_benchmarks(benchmarks, spark)
+
+    _asset_fp = compute_asset_fingerprint(config)
+    for _b in benchmarks:
+        _b["asset_fingerprint"] = _asset_fp
+
+    _uc_table = f"{uc_schema}.genie_benchmarks_{domain}"
+    logger.info(
+        "Dropping benchmark table %s before persist to eliminate stale duplicates "
+        "(benchmarks=%d, asset_fingerprint=%s)",
+        _uc_table, len(benchmarks), _asset_fp,
+    )
+    _drop_benchmark_table(spark, _uc_table)
+
+    create_evaluation_dataset(
+        spark, benchmarks, uc_schema, domain,
+        space_id=space_id, catalog=catalog, gold_schema=schema,
+        experiment_id=experiment_id,
+    )
+
     prompt_registrations = register_judge_prompts(uc_schema, domain, experiment_name)
 
     model_id = create_genie_model_version(
         w, space_id, config, iteration=0, domain=domain,
         experiment_name=experiment_name,
         uc_schema=uc_schema,
-        uc_columns=uc_columns_dicts,
-        uc_tags=uc_tags_dicts,
-        uc_routines=uc_routines_dicts,
+        uc_columns=uc_columns,
+        uc_tags=uc_tags,
+        uc_routines=uc_routines,
     )
 
-    # ── Diagnostic Block 5: Experiment and Model Setup ──
-    print(
-        f"\n{'=' * 60}\n"
-        f"  PREFLIGHT — EXPERIMENT & MODEL SETUP\n"
-        f"{'=' * 60}\n"
-        f"  Experiment:       {experiment_name}\n"
-        f"  Experiment ID:    {experiment_id}\n"
-        f"  Model version:    {model_id}\n"
-        f"  Judge prompts:    {len(prompt_registrations)} registered\n"
-        f"  Eval dataset:     synced ({len(benchmarks)} benchmarks)\n"
-        f"  Instructions:     {'registered' if initial_instructions else 'none to register'}\n"
-        f"{'-' * 60}\n"
-    )
+    _lines = [_pf_section("PREFLIGHT — EXPERIMENT & MODEL SETUP")]
+    _lines.append(_pf_kv("Experiment", experiment_name))
+    _lines.append(_pf_kv("Experiment ID", experiment_id))
+    _lines.append(_pf_kv("Model version", model_id))
+    _lines.append(_pf_kv("Judge prompts", f"{len(prompt_registrations)} registered"))
+    _lines.append(_pf_kv("Eval dataset", f"synced ({len(benchmarks)} benchmarks)"))
+    _lines.append(_pf_kv("Instructions", "registered" if initial_instructions else "none to register"))
+    _lines.append(_pf_bar())
+    print("\n".join(_lines))
 
     _instr_items = (
         config.get("_parsed_space", config)
@@ -1131,7 +1283,79 @@ def run_preflight(
         catalog=catalog, schema=schema,
     )
 
-    return config, benchmarks, model_id, experiment_name, _human_corrections
+    return {
+        "model_id": model_id,
+        "experiment_name": experiment_name,
+        "experiment_id": experiment_id,
+        "prompt_registrations": prompt_registrations,
+    }
+
+
+def run_preflight(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    catalog: str,
+    schema: str,
+    domain: str,
+    experiment_name: str | None = None,
+    apply_mode: str = "genie_config",
+) -> tuple[dict, list[dict], str, str, list[dict]]:
+    """Execute the full preflight sequence (Stage 1).
+
+    Wrapper that calls 6 sub-steps in sequence. Each sub-step is individually
+    callable from a notebook cell for transparency.
+
+    Returns:
+        (config, benchmarks, model_id, experiment_name, human_corrections)
+    """
+    ctx1 = preflight_fetch_config(
+        w, spark, run_id, space_id, catalog, schema, domain, apply_mode,
+    )
+    config = ctx1["config"]
+    snapshot = ctx1["snapshot"]
+    genie_table_refs = ctx1["genie_table_refs"]
+    domain = ctx1["domain"]
+
+    ctx2 = preflight_collect_uc_metadata(
+        w, spark, run_id, catalog, schema, config, snapshot,
+        genie_table_refs, apply_mode=apply_mode,
+        configured_cols=ctx1.get("configured_cols", 0),
+    )
+
+    ctx3 = preflight_generate_benchmarks(
+        w, spark, run_id, catalog, schema, config,
+        ctx2["uc_columns"], ctx2["uc_tags"], ctx2["uc_routines"],
+        domain,
+    )
+    benchmarks = ctx3["benchmarks"]
+
+    ctx4 = preflight_validate_benchmarks(
+        w, spark, run_id, catalog, schema, config, benchmarks,
+        ctx2["uc_columns"], ctx2["uc_tags"], ctx2["uc_routines"],
+        domain,
+    )
+    benchmarks = ctx4["benchmarks"]
+
+    ctx5 = preflight_load_human_feedback(
+        spark, run_id, space_id, catalog, schema, domain,
+    )
+
+    ctx6 = preflight_setup_experiment(
+        w, spark, run_id, space_id, catalog, schema, domain,
+        config, benchmarks,
+        ctx2["uc_columns"], ctx2["uc_tags"], ctx2["uc_routines"],
+        genie_table_refs, experiment_name,
+    )
+
+    return (
+        config,
+        benchmarks,
+        ctx6["model_id"],
+        ctx6["experiment_name"],
+        ctx5["human_corrections"],
+    )
 
 
 def _load_or_generate_benchmarks(

@@ -63,10 +63,12 @@ def api_client(mock_config, mock_workspace_client):
     from genie_space_optimizer.backend.core._defaults import (
         _ConfigDependency,
         _WorkspaceClientDependency,
+        _get_user_ws,
     )
 
     app.dependency_overrides[_ConfigDependency.__call__] = lambda: mock_config
     app.dependency_overrides[_WorkspaceClientDependency.__call__] = lambda: mock_workspace_client
+    app.dependency_overrides[_get_user_ws] = lambda: mock_workspace_client
 
     client = TestClient(app, raise_server_exceptions=False)
     yield client

@@ -1901,6 +1901,13 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
                 entry.setdefault("iteration", iteration)
                 if isinstance(detail, dict):
                     entry["rollback_detail"] = detail
+        elif stage_name.startswith("AG_") and "_PATCH_FAILED" in stage_name:
+            ag_id = stage_name.replace("AG_", "").replace("_PATCH_FAILED", "")
+            entry = ag_stages.setdefault(ag_id, {})
+            entry.setdefault("iteration", s.get("iteration"))
+            entry["accepted"] = False
+            entry["patch_failed"] = True
+            entry["patch_error"] = str(s.get("error_message", ""))[:500]
         elif stage_name.startswith("AG_") and "_ESCALATION" in stage_name:
             ag_id = stage_name.replace("AG_", "").replace("_ESCALATION", "")
             detail = safe_json_parse(s.get("detail_json"))
@@ -2117,6 +2124,27 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
             clusterInfo=cluster_info if isinstance(cluster_info, dict) else None,
             timestamp=timestamp,
         ))
+
+    existing_iter_nums = {it.iteration for it in iterations}
+    for ag_id, ag_data in ag_stages.items():
+        if not ag_data.get("patch_failed"):
+            continue
+        it_num = _safe_int(ag_data.get("iteration"))
+        if it_num is None or it_num in existing_iter_nums:
+            continue
+        cluster_info = dict(ag_data.get("cluster_info") or {})
+        cluster_info["patch_error"] = ag_data.get("patch_error", "")
+        iterations.append(IterationDetail(
+            iteration=it_num,
+            agId=ag_id,
+            status="patch_failed",
+            overallAccuracy=0,
+            totalQuestions=0,
+            correctCount=0,
+            clusterInfo=cluster_info,
+            patches=[_patch_for_ui(p) for p in patches_by_iter.get(it_num, [])],
+        ))
+    iterations.sort(key=lambda it: it.iteration)
 
     baseline_score, optimized_score = _get_baseline_and_best_accuracy(iters_rows)
 

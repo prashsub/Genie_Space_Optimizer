@@ -258,7 +258,7 @@ class TestJudgeOverrideProcessing:
         corrections = result["corrections"]
         overrides = [c for c in corrections if c["type"] == "judge_override"]
         assert len(overrides) == 1
-        assert "Ambiguous" in overrides[0]["feedback"]
+        assert overrides[0]["feedback"] == "ambiguous"
         assert overrides[0].get("question") == "What is X?"
         assert overrides[0].get("question_id") == "qid-001"
 
@@ -268,7 +268,7 @@ class TestJudgeOverrideProcessing:
         import pandas as pd
         from genie_space_optimizer.optimization.labeling import ingest_human_feedback
 
-        row = self._make_trace_row("Genie answer is actually fine — Correct")
+        row = self._make_trace_row("No — the Genie answer is correct")
         mock_session = MagicMock()
         mock_find.return_value = mock_session
         mock_mlflow.search_traces.return_value = pd.DataFrame([row])
@@ -277,7 +277,7 @@ class TestJudgeOverrideProcessing:
         corrections = result["corrections"]
         overrides = [c for c in corrections if c["type"] == "judge_override"]
         assert len(overrides) == 1
-        assert "Correct" in overrides[0]["feedback"]
+        assert overrides[0]["feedback"] == "genie_correct"
 
 
 # ── log_patch_history_on_traces ───────────────────────────────────────

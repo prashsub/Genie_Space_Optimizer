@@ -149,6 +149,19 @@ Test various time-range patterns:
   expected_asset: "MV"
 ```
 
+> **MV Rule — Never sort by alias name.** Spark's Catalyst planner re-wraps
+> `ORDER BY alias` in a second `MEASURE()` when the alias collides with the
+> source column name, causing `MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION`.
+>
+> BAD (alias == source column, sort by alias):
+>   `MEASURE(total_runs) AS total_runs ... ORDER BY total_runs DESC`
+>
+> GOOD (sort by explicit MEASURE()):
+>   `MEASURE(total_runs) AS total_runs ... ORDER BY MEASURE(total_runs) DESC`
+>
+> GOOD (distinct alias, sort by alias):
+>   `MEASURE(total_runs) AS job_total_runs ... ORDER BY job_total_runs DESC`
+
 ### TVF Queries
 
 ```yaml

@@ -107,6 +107,43 @@ def parse_sql_dependencies(sql: str) -> dict:
     }
 
 
+def detect_mv_alias_sort_collision(sql: str) -> str | None:
+    """Return a warning if MEASURE(col) AS col is followed by ORDER BY col.
+
+    Spark's Catalyst planner re-wraps the output alias in a second MEASURE()
+    when the alias matches the source column name, causing
+    MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION.
+    Returns None if no collision detected.
+    """
+    if not sql:
+        return None
+    measure_aliases = _re.findall(
+        r'MEASURE\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)',
+        sql,
+        _re.IGNORECASE,
+    )
+    if not measure_aliases:
+        return None
+    order_clause = _re.search(
+        r'ORDER\s+BY\s+(.*?)(?:LIMIT|$)', sql, _re.IGNORECASE | _re.DOTALL,
+    )
+    if not order_clause:
+        return None
+    bare_order_cols: set[str] = set()
+    for token in _re.split(r'[,\s]+', order_clause.group(1)):
+        clean = token.strip().rstrip(';').lower()
+        if clean and clean not in ('asc', 'desc', 'nulls', 'last', 'first', ''):
+            bare_order_cols.add(clean)
+
+    for source_col, alias in measure_aliases:
+        if source_col.lower() == alias.lower() and alias.lower() in bare_order_cols:
+            return (
+                f"MEASURE({source_col}) aliased as '{alias}' (same name as source column) "
+                f"with ORDER BY '{alias}' — use ORDER BY MEASURE({source_col}) instead."
+            )
+    return None
+
+
 def validate_ground_truth_sql(sql: str, spark) -> dict:
     """Execute ground truth SQL and return validation result with hash."""
     try:
@@ -218,6 +255,12 @@ def validate_benchmarks(benchmarks, spark):
             q.setdefault("required_tables", deps["required_tables"])
             q.setdefault("required_columns", deps["required_columns"])
             q.setdefault("required_joins", deps["required_joins"])
+
+        collision_warning = detect_mv_alias_sort_collision(sql)
+        if collision_warning:
+            print(f"  [WARN] {qid} MV collision: {collision_warning}")
+            report["details"].append({"id": qid, "status": "mv_alias_collision_warning",
+                                       "error": collision_warning})
 
         result = validate_ground_truth_sql(sql, spark)
         if result["valid"]:

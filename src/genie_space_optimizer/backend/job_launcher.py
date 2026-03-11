@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import logging
 import os
 import threading
 from pathlib import Path
 
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.catalog import VolumeType
 from databricks.sdk.service.compute import Environment
 from databricks.sdk.service.iam import AccessControlRequest, PermissionLevel
 from databricks.sdk.service.jobs import (
@@ -33,7 +35,7 @@ from databricks.sdk.service.workspace import ImportFormat, Language
 logger = logging.getLogger(__name__)
 
 _WS_BASE = "/Workspace/Shared/genie-space-optimizer"
-_WS_WHEEL_DIR = f"{_WS_BASE}/dist"
+_VOLUME_NAME = "app_artifacts"
 _PERSISTENT_JOB_NAME = "genie-space-optimizer-runner"
 _JOB_ENVIRONMENT_CLIENT_VERSION = "4"
 _DAG_TASK_KEYS = {
@@ -70,9 +72,58 @@ _cached_wheel_path: str | None = None
 _cached_wheel_hash: str | None = None
 _cached_job_id: int | None = None
 _cached_job_wheel_path: str | None = None
+_volume_ensured: bool = False
+_legacy_cleaned: bool = False
 # Only guards single-process races; with multiple uvicorn workers cross-process
 # safety relies on the Databricks idempotency_token passed to run_now().
 _job_submit_lock = threading.Lock()
+
+
+def _volume_wheel_dir(catalog: str, schema: str) -> str:
+    """Return the Volume-based directory path for wheel storage."""
+    return f"/Volumes/{catalog}/{schema}/{_VOLUME_NAME}/dist"
+
+
+def _ensure_volume(ws: WorkspaceClient, catalog: str, schema: str) -> None:
+    """Create the managed Volume for app artifacts if it doesn't already exist.
+
+    Idempotent and cached per process — only attempts creation once.
+    """
+    global _volume_ensured
+    if _volume_ensured:
+        return
+    try:
+        ws.volumes.create(
+            catalog_name=catalog,
+            schema_name=schema,
+            name=_VOLUME_NAME,
+            volume_type=VolumeType.MANAGED,
+        )
+        logger.info("Created managed volume %s.%s.%s", catalog, schema, _VOLUME_NAME)
+    except Exception as exc:
+        if "ALREADY_EXISTS" in str(exc):
+            logger.debug("Volume %s.%s.%s already exists", catalog, schema, _VOLUME_NAME)
+        else:
+            logger.warning("Could not create volume %s.%s.%s: %s", catalog, schema, _VOLUME_NAME, exc)
+    _volume_ensured = True
+
+
+def _cleanup_legacy_workspace_wheels(ws: WorkspaceClient) -> None:
+    """One-time removal of the old workspace-based wheel directory.
+
+    After migrating to UC Volumes, the legacy ``/Workspace/Shared/.../dist/``
+    tree is no longer used.  Best-effort, non-fatal.
+    """
+    global _legacy_cleaned
+    if _legacy_cleaned:
+        return
+    _legacy_cleaned = True
+    legacy_dir = f"{_WS_BASE}/dist"
+    try:
+        ws.workspace.delete(legacy_dir, recursive=True)
+        logger.info("Cleaned up legacy workspace wheel directory: %s", legacy_dir)
+    except Exception:
+        logger.debug("No legacy workspace wheel directory to clean up", exc_info=True)
 
 
 def _build_idempotency_token(*, run_id: str, space_id: str, triggered_by: str) -> str:
@@ -155,43 +206,51 @@ def _find_wheel() -> Path:
     return wheels[-1]
 
 
-def _cleanup_stale_wheels(ws: WorkspaceClient, keep_path: str) -> None:
-    """Remove old hash-bucketed wheel directories from the workspace dist directory.
+def _cleanup_stale_wheels(ws: WorkspaceClient, dist_dir: str, keep_path: str) -> None:
+    """Remove old hash-bucketed wheel directories from the Volume dist directory.
 
-    Wheels are stored as ``{_WS_WHEEL_DIR}/{hash[:8]}/{filename}.whl``.
+    Wheels are stored as ``{dist_dir}/{hash[:8]}/{filename}.whl``.
     This deletes any sibling hash directories that don't contain the current wheel.
     """
     keep_dir = keep_path.rsplit("/", 1)[0] if "/" in keep_path else keep_path
     try:
-        entries = ws.workspace.list(_WS_WHEEL_DIR)
-        for entry in entries or []:
+        for entry in ws.files.list_directory_contents(dist_dir):
             path = entry.path or ""
-            if path != keep_dir and path != keep_path:
+            if entry.is_directory and path and path != keep_dir:
                 try:
-                    ws.workspace.delete(path, recursive=True)
+                    ws.files.delete_directory(path)
                     logger.info("Deleted stale wheel artifact: %s", path)
                 except Exception:
                     logger.debug("Could not delete stale artifact: %s", path, exc_info=True)
     except Exception:
-        logger.debug("Could not list %s for cleanup", _WS_WHEEL_DIR, exc_info=True)
+        logger.debug("Could not list %s for cleanup", dist_dir, exc_info=True)
 
 
-def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
-    """Upload wheel + runner notebooks to the workspace.
+def _ensure_artifacts(
+    ws: WorkspaceClient, catalog: str, schema: str,
+) -> tuple[str, str]:
+    """Upload wheel to a UC Volume and runner notebooks to the workspace.
+
+    The wheel is stored in a managed Volume at
+    ``/Volumes/{catalog}/{schema}/app_artifacts/dist/{hash[:8]}/{filename}``.
+    Notebooks remain in the workspace (required by ``NotebookTask``).
 
     Always re-discovers the local wheel and computes a content hash so that
     new wheels are detected even if the app process was not restarted after a
     deploy.
 
-    Returns ``(ws_wheel_path, wheel_hash)``.
+    Returns ``(vol_wheel_path, wheel_hash)``.
     """
     global _cached_wheel_path, _cached_wheel_hash
+
+    _ensure_volume(ws, catalog, schema)
 
     wheel_local = _find_wheel()
     wheel_bytes = wheel_local.read_bytes()
     wheel_hash = hashlib.md5(wheel_bytes).hexdigest()
     wheel_filename = wheel_local.name
-    ws_wheel_path = f"{_WS_WHEEL_DIR}/{wheel_hash[:8]}/{wheel_filename}"
+    dist_dir = _volume_wheel_dir(catalog, schema)
+    vol_wheel_path = f"{dist_dir}/{wheel_hash[:8]}/{wheel_filename}"
 
     logger.info(
         "Wheel resolved: %s (local=%s, size=%d, hash=%s)",
@@ -201,31 +260,24 @@ def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
         wheel_hash[:8],
     )
 
-    if _cached_wheel_hash == wheel_hash and _cached_wheel_path == ws_wheel_path:
+    if _cached_wheel_hash == wheel_hash and _cached_wheel_path == vol_wheel_path:
         logger.debug(
             "Wheel unchanged (hash=%s), skipping upload", wheel_hash[:8]
         )
-        return ws_wheel_path, wheel_hash
+        return vol_wheel_path, wheel_hash
 
-    ws.workspace.mkdirs(_WS_BASE)
-    ws_wheel_dir = ws_wheel_path.rsplit("/", 1)[0]
-    ws.workspace.mkdirs(ws_wheel_dir)
-
-    ws.workspace.import_(
-        ws_wheel_path,
-        content=base64.b64encode(wheel_bytes).decode("ascii"),
-        format=ImportFormat.AUTO,
-        overwrite=True,
-    )
+    ws.files.upload(vol_wheel_path, io.BytesIO(wheel_bytes), overwrite=True)
     logger.info(
         "Uploaded wheel → %s (%d bytes, hash=%s)",
-        ws_wheel_path,
+        vol_wheel_path,
         len(wheel_bytes),
         wheel_hash[:8],
     )
 
-    _cleanup_stale_wheels(ws, keep_path=ws_wheel_path)
+    _cleanup_stale_wheels(ws, dist_dir=dist_dir, keep_path=vol_wheel_path)
+    _cleanup_legacy_workspace_wheels(ws)
 
+    ws.workspace.mkdirs(_WS_BASE)
     for name, src_path in _NOTEBOOK_SOURCES.items():
         notebook_src = src_path.read_text(encoding="utf-8")
         ws_path = _WS_NOTEBOOKS[name]
@@ -238,9 +290,9 @@ def _ensure_artifacts(ws: WorkspaceClient) -> tuple[str, str]:
         )
         logger.info("Uploaded notebook → %s", ws_path)
 
-    _cached_wheel_path = ws_wheel_path
+    _cached_wheel_path = vol_wheel_path
     _cached_wheel_hash = wheel_hash
-    return ws_wheel_path, wheel_hash
+    return vol_wheel_path, wheel_hash
 
 
 def _job_settings(
@@ -522,7 +574,7 @@ def submit_optimization(
     schemas via the Data Access Settings page.
     """
     sp_client_id = _resolve_sp_client_id(ws)
-    ws_wheel_path, wheel_hash = _ensure_artifacts(ws)
+    ws_wheel_path, wheel_hash = _ensure_artifacts(ws, catalog=catalog, schema=schema)
     job_id = _ensure_persistent_job(
         ws, ws_wheel_path, wheel_hash=wheel_hash, sp_client_id=sp_client_id,
     )

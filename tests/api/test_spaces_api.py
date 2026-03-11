@@ -22,8 +22,6 @@ class TestListSpaces:
         mock_spark.sql.return_value.toPandas.return_value = pd.DataFrame()
         mock_get_spark.return_value = mock_spark
 
-        # The route imports list_spaces inside the handler,
-        # so we patch at module level
         with patch(
             "genie_space_optimizer.common.genie_client.list_spaces",
             return_value=[
@@ -38,7 +36,10 @@ class TestListSpaces:
 
         assert response.status_code == 200
         data = response.json()
-        assert isinstance(data, list)
+        assert isinstance(data, dict)
+        assert "spaces" in data
+        assert len(data["spaces"]) == 2
+        assert "totalCount" in data
 
     @patch("genie_space_optimizer.backend.routes.spaces.get_spark")
     def test_list_spaces_empty(self, mock_get_spark, api_client):
@@ -56,7 +57,9 @@ class TestListSpaces:
             response = api_client.get("/api/genie/spaces")
 
         assert response.status_code == 200
-        assert response.json() == []
+        data = response.json()
+        assert data["spaces"] == []
+        assert data["totalCount"] == 0
 
 
 class TestGetSpaceDetail:
@@ -115,17 +118,22 @@ class TestGetSpaceDetail:
 
 
 class TestStartOptimization:
-    @patch("genie_space_optimizer.backend.routes.spaces.get_spark")
+    @patch("genie_space_optimizer.backend.routes.trigger.get_spark")
     def test_start_optimization(self, mock_get_spark, api_client, mock_workspace_client):
         mock_spark = MagicMock()
         mock_get_spark.return_value = mock_spark
 
         with patch(
-            "genie_space_optimizer.optimization.state.create_run",
-        ), patch(
-            "genie_space_optimizer.optimization.state.update_run_status",
-        ):
-            response = api_client.post("/api/genie/spaces/space-123/optimize")
+            "genie_space_optimizer.backend.routes.spaces.do_start_optimization",
+        ) as mock_do:
+            from genie_space_optimizer.backend.models import OptimizeResponse
+            mock_do.return_value = OptimizeResponse(
+                runId="run-123", jobRunId="job-456", jobUrl=None,
+            )
+            response = api_client.post(
+                "/api/genie/trigger",
+                json={"space_id": "space-123"},
+            )
 
         assert response.status_code == 200
         data = response.json()

@@ -46,6 +46,7 @@ class TestBaselineScoring:
             "logical_accuracy": 0.92,
             "semantic_equivalence": 0.91,
             "completeness": 0.93,
+            "response_quality": 0.50,
             "result_correctness": 0.88,
             "asset_routing": 0.97,
         }

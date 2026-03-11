@@ -107,6 +107,7 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
     .filter((e) => e.durationSeconds > 0);
 
   const hasData = chartData.length > 0;
+  const chartHeight = Math.max(300, chartData.length * 32);
 
   return (
     <Card>
@@ -136,18 +137,18 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
                 No timeline data available
               </p>
             ) : (
-              <ChartContainer config={chartConfig} className="h-[300px] w-full">
+              <ChartContainer config={chartConfig} className="w-full" style={{ height: `${chartHeight}px` }}>
                 <BarChart
                   layout="vertical"
                   data={chartData}
-                  margin={{ top: 5, right: 30, left: 100, bottom: 5 }}
+                  margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
                 >
                   <XAxis type="number" dataKey="durationSeconds" />
                   <YAxis
                     type="category"
                     dataKey="shortStage"
-                    width={90}
-                    tick={{ fontSize: 12 }}
+                    width={130}
+                    tick={{ fontSize: 11 }}
                   />
                   <ChartTooltip
                     content={

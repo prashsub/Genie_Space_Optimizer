@@ -143,11 +143,14 @@ class _JobOwnershipBootstrap(LifespanDependency):
     async def lifespan(self, app: FastAPI) -> AsyncGenerator[None, None]:
         try:
             ws = app.state.workspace_client
+            config = app.state.config
             sp_client_id = ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
+            cat = config.catalog or "main"
+            sch = config.schema_name or "genie_optimization"
             if sp_client_id:
                 from .job_launcher import _ensure_artifacts, _ensure_persistent_job
 
-                wheel_path, wheel_hash = _ensure_artifacts(ws)
+                wheel_path, wheel_hash = _ensure_artifacts(ws, catalog=cat, schema=sch)
                 _ensure_persistent_job(
                     ws, wheel_path, wheel_hash=wheel_hash, sp_client_id=sp_client_id,
                 )

@@ -313,36 +313,53 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🔄 Running the Adaptive Lever Loop
+# MAGIC ## Step 3a: Proactive Enrichment
 # MAGIC
-# MAGIC `_run_lever_loop()` orchestrates the adaptive optimization cycle:
+# MAGIC Before iterating, the optimizer proactively improves the Genie Space configuration:
+# MAGIC - **Description enrichment:** LLM-generated column descriptions for blank columns
+# MAGIC - **Join discovery:** Cross-table join path detection from baseline failures
+# MAGIC - **Space metadata:** Auto-generate space description and sample questions if missing
+# MAGIC - **Instruction seeding:** Seed initial instructions for empty instruction sets
 # MAGIC
-# MAGIC **Pre-loop setup:**
-# MAGIC - Extracts arbiter corrections from baseline and applies benchmark rewrites when threshold is met
-# MAGIC - Initializes `reflection_buffer` (empty) and `tried_patches` (empty set)
-# MAGIC - Computes noise floor and gate tolerances
-# MAGIC - Tracks reference SQLs from baseline for cross-iteration consistency scoring
+# MAGIC Each enrichment phase that modifies the space triggers a config refresh.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 3b: Pre-Loop Setup
 # MAGIC
-# MAGIC **Each iteration:**
-# MAGIC - Re-clusters failures from the latest eval (baseline on iter 1, gate-3 results on iter 2+)
-# MAGIC - Filters out `genie_correct` arbiter verdicts and previously attempted clusters
-# MAGIC - Ranks remaining clusters by `cluster_impact()` (causal weight × severity × fixability)
-# MAGIC - Calls `_call_llm_for_adaptive_strategy()` with the reflection buffer and priority ranking — the strategist returns exactly **1 action group** per iteration
-# MAGIC - Applies patches and runs 3-gate evaluation (slice → P0 → full) with noise-floor-adjusted tolerances
-# MAGIC - On accept: builds reflection entry, updates `tried_patches`, logs expectations on traces, updates best scores
-# MAGIC - On rollback: builds reflection entry noting failure, updates `tried_patches`
-# MAGIC - Checks convergence (thresholds met, diminishing returns, no clusters remaining)
+# MAGIC Extract reference SQLs and result hashes from the baseline iteration for
+# MAGIC cross-iteration consistency scoring. Run arbiter corrections to identify
+# MAGIC questions where the baseline Genie answer was actually correct. Mine
+# MAGIC benchmark example SQLs to seed the space with reference queries.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 3c: Adaptive Lever Loop
 # MAGIC
-# MAGIC **Post-loop:**
-# MAGIC - Creates MLflow labeling session for human review
-# MAGIC - Supports resume from Delta if the task retries mid-loop
+# MAGIC The core optimization loop. Each iteration:
+# MAGIC 1. Re-cluster failures from the latest evaluation
+# MAGIC 2. Rank clusters by `cluster_impact()` (causal weight × severity × fixability)
+# MAGIC 3. Call the LLM strategist to propose exactly 1 action group
+# MAGIC 4. Apply patches and run 3-gate evaluation (slice → P0 → full)
+# MAGIC 5. Accept (if accuracy improves) or rollback (if regression)
+# MAGIC 6. Build reflection entry for the next iteration's context
+# MAGIC 7. Check convergence (thresholds met, diminishing returns, no clusters left)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 3d: Optimization Summary
 # MAGIC
-# MAGIC Returns: `scores`, `accuracy`, `model_id`, `iteration_counter`, `best_iteration`, `levers_attempted`, `levers_accepted`, `levers_rolled_back`.
+# MAGIC After the loop completes, print a comprehensive summary comparing baseline
+# MAGIC vs. final accuracy, listing all iterations, accepted/rolled-back levers,
+# MAGIC and proactive changes applied.
 
 # COMMAND ----------
 
 try:
-    _banner("Running _run_lever_loop")
+    _banner("Running _run_lever_loop (4 phases print below)")
     loop_out = _run_lever_loop(
         w, spark, run_id, space_id, domain, benchmarks, exp_name,
         prev_scores, prev_accuracy, prev_model_id, config,

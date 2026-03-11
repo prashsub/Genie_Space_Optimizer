@@ -243,11 +243,13 @@ class TestHandleEscalationTvfDetail:
     @patch("genie_space_optimizer.optimization.labeling.flag_for_human_review")
     @patch("genie_space_optimizer.optimization.state.load_provenance")
     @patch("genie_space_optimizer.optimization.harness._score_tvf_removal_confidence")
+    @patch("genie_space_optimizer.optimization.harness._validate_tvf_removal_coverage")
     def test_missing_tvf_in_config_returns_empty_asset(
-        self, mock_score, mock_prov, mock_flag, mock_overlap,
+        self, mock_coverage, mock_score, mock_prov, mock_flag, mock_overlap,
     ):
         from genie_space_optimizer.optimization.harness import _handle_escalation
 
+        mock_coverage.return_value = {"valid": True}
         mock_score.return_value = "high"
         mock_prov.return_value = MagicMock(empty=True)
         mock_overlap.return_value = {"coverage": 1.0}

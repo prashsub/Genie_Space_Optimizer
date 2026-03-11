@@ -219,26 +219,49 @@ _log(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🔧 What `_run_finalize` Does Internally
+# MAGIC ## Step 4a: Repeatability Testing
 # MAGIC
-# MAGIC The harness function `_run_finalize()` (in `optimization/harness.py`) performs:
+# MAGIC Run 2 repeatability evaluation passes to measure how consistently the optimized
+# MAGIC Genie Space returns the same SQL for identical questions. Each pass calls the
+# MAGIC Genie API for every benchmark and compares the generated SQL against reference
+# MAGIC SQLs from the best iteration. The average match rate is the repeatability score.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 4b: Human Review Session
 # MAGIC
-# MAGIC | Step | Action | Key Detail | Output |
-# MAGIC |:----:|--------|-----------|--------|
-# MAGIC | 1 | Stage write | Records `FINALIZE_STARTED` in Delta | stage record |
-# MAGIC | 2 | Repeatability testing | 2 eval passes, compare SQL hashes per question | `repeatability_pct` |
-# MAGIC | 3 | Terminal status resolution | Converged / max_iterations / stalled / failed | `convergence_reason` |
-# MAGIC | 4 | Model promotion | Best model → production registry via MLflow | promoted model |
-# MAGIC | 5 | Report generation | Scores, convergence, iteration history, repeatability | `report_path` |
-# MAGIC | 6 | State updates | `FINALIZE_COMPLETE`, update `genie_opt_runs` | Delta records |
-# MAGIC | 7 | Heartbeat loop | Periodic `FINALIZE_HEARTBEAT` during long runs | prevents stale-state detection |
+# MAGIC After repeatability testing, identify persistently failing questions — those that
+# MAGIC failed across multiple iterations despite lever applications. Create an MLflow
+# MAGIC labeling session populated with these failure traces so human reviewers can
+# MAGIC inspect and correct them for the next optimization run.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 4c: Model Promotion and Report
 # MAGIC
-# MAGIC **Returns:** `{status, convergence_reason, terminal_reason, repeatability_pct, report_path, elapsed_seconds, heartbeat_count}`
+# MAGIC Promote the best model version to the production registry via MLflow, generate
+# MAGIC a comprehensive optimization report (scores, convergence, iteration history,
+# MAGIC repeatability), and publish benchmarks to the Genie Space's native benchmarks
+# MAGIC section so they appear in the Genie UI.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 4d: Terminal Status Resolution
+# MAGIC
+# MAGIC Determine the final run status based on threshold convergence:
+# MAGIC - **CONVERGED** — all judge thresholds met
+# MAGIC - **MAX_ITERATIONS** — iteration limit reached without full convergence
+# MAGIC - **STALLED** — no further improvement detected
+# MAGIC
+# MAGIC The terminal status is written to Delta and controls whether the deploy step proceeds.
 
 # COMMAND ----------
 
 try:
-    _banner("Running _run_finalize")
+    _banner("Running _run_finalize (4 phases print below)")
     finalize_out = _run_finalize(
         w, spark, run_id, space_id, domain, exp_name,
         prev_scores, prev_model_id, iteration_counter,

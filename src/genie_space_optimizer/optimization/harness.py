@@ -340,6 +340,180 @@ def _run_preflight(
 # ── Stage 2: BASELINE EVAL ──────────────────────────────────────────
 
 
+def baseline_setup_scorers(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    space_id: str,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    exp_name: str,
+    model_id: str,
+    domain: str = "",
+) -> dict:
+    """Sub-step 2a: Create predict function and scorers. Writes STARTED stage."""
+    write_stage(
+        spark, run_id, "BASELINE_EVAL_STARTED", "STARTED",
+        task_key="baseline_eval", catalog=catalog, schema=schema,
+    )
+    _ensure_sql_context(spark, catalog, schema)
+
+    _instr_prompt = format_mlflow_template(
+        INSTRUCTION_PROMPT_NAME_TEMPLATE,
+        uc_schema=f"{catalog}.{schema}", space_id=space_id,
+    )
+    predict_fn = make_predict_fn(
+        w, space_id, spark, catalog, schema,
+        instruction_prompt_name=_instr_prompt,
+    )
+    scorers = make_all_scorers(w, spark, catalog, schema)
+
+    _lines = [_section("BASELINE — EVALUATION SETUP", "-")]
+    _lines.append(_kv("Space ID", space_id))
+    _lines.append(_kv("Model ID", model_id))
+    _lines.append(_kv("Experiment", exp_name))
+    _lines.append(_kv("Scorers", len(scorers)))
+    _lines.append(_bar("-"))
+    print("\n".join(_lines))
+
+    return {
+        "predict_fn": predict_fn,
+        "scorers": scorers,
+        "model_id": model_id,
+        "exp_name": exp_name,
+        "space_id": space_id,
+        "domain": domain,
+    }
+
+
+def baseline_run_evaluation(
+    spark: SparkSession,
+    run_id: str,
+    catalog: str,
+    schema: str,
+    benchmarks: list[dict],
+    setup_ctx: dict,
+) -> dict:
+    """Sub-step 2b: Run 9-judge evaluation with retry."""
+    _ensure_sql_context(spark, catalog, schema)
+    eval_result = _safe_stage(
+        spark, run_id, "BASELINE_EVAL", run_evaluation,
+        catalog, schema,
+        setup_ctx["space_id"], setup_ctx["exp_name"], 0, benchmarks,
+        setup_ctx["domain"], setup_ctx["model_id"], "full",
+        setup_ctx["predict_fn"], setup_ctx["scorers"],
+        spark=spark, catalog=catalog, gold_schema=schema,
+        uc_schema=f"{catalog}.{schema}",
+    )
+    return eval_result
+
+
+def baseline_display_scorecard(
+    eval_result: dict,
+    thresholds: dict[str, float] | None = None,
+) -> dict:
+    """Sub-step 2c: Print per-judge scorecard and return scores summary."""
+    _thresholds = thresholds or DEFAULT_THRESHOLDS
+    scores = eval_result.get("scores", {})
+    overall = eval_result.get("overall_accuracy", 0.0)
+    thresholds_met = eval_result.get("thresholds_met", False)
+
+    _lines = [_section("BASELINE EVALUATION — 9-JUDGE SCORECARD", "-")]
+    _lines.append(_kv("Overall accuracy", f"{overall:.1f}%"))
+    _lines.append("")
+    _lines.append(f"  {'Judge':<28s} {'Score':>8s}  {'Threshold':>10s}  {'Status'}")
+    for judge in sorted(_thresholds.keys()):
+        score_val = scores.get(judge)
+        threshold_val = _thresholds[judge]
+        if score_val is not None:
+            passed = score_val >= threshold_val if threshold_val > 0 else True
+            status = "PASS" if passed else "FAIL  <--"
+            t_str = f"{threshold_val:.1f}%" if threshold_val > 0 else "--"
+            _lines.append(f"  {judge:<28s} {score_val:>7.1f}%  {t_str:>10s}  {status}")
+    _lines.append("")
+    _lines.append(_kv("Thresholds met", thresholds_met))
+    _lines.append(_kv("Eval attempts", eval_result.get("harness_retry_count", 0) + 1))
+    _lines.append(_kv("Quarantined questions", eval_result.get("invalid_benchmark_count", 0)))
+    _lines.append(_bar("-"))
+    print("\n".join(_lines))
+
+    return {
+        "scores": scores,
+        "overall_accuracy": overall,
+        "thresholds_met": thresholds_met,
+    }
+
+
+def baseline_persist_state(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    model_id: str,
+    catalog: str,
+    schema: str,
+    eval_result: dict,
+    scorecard: dict,
+) -> dict:
+    """Sub-step 2d: Write iteration, link scores, log expectations."""
+    scores = scorecard["scores"]
+    thresholds_met = scorecard["thresholds_met"]
+
+    write_iteration(
+        spark, run_id, 0, eval_result,
+        catalog=catalog, schema=schema,
+        eval_scope="full", model_id=model_id,
+    )
+
+    link_eval_scores_to_model(model_id, scores)
+
+    update_run_status(
+        spark, run_id, catalog, schema,
+        best_iteration=0,
+        best_accuracy=eval_result.get("overall_accuracy", 0.0),
+        best_model_id=model_id,
+    )
+
+    write_stage(
+        spark, run_id, "BASELINE_EVAL_STARTED", "COMPLETE",
+        task_key="baseline_eval",
+        detail={
+            "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
+            "thresholds_met": thresholds_met,
+            "invalid_benchmark_count": eval_result.get("invalid_benchmark_count", 0),
+            "permission_blocked_count": eval_result.get("permission_blocked_count", 0),
+            "unresolved_column_count": eval_result.get("unresolved_column_count", 0),
+            "harness_retry_count": eval_result.get("harness_retry_count", 0),
+        },
+        catalog=catalog, schema=schema,
+    )
+
+    try:
+        from genie_space_optimizer.optimization.evaluation import log_expectations_on_traces
+        log_expectations_on_traces(eval_result)
+    except Exception:
+        logger.debug("Failed to log expectations on baseline traces", exc_info=True)
+
+    try:
+        log_judge_verdicts_on_traces(eval_result)
+    except Exception:
+        logger.debug("Failed to log judge verdicts on baseline traces", exc_info=True)
+
+    _lines = [_section("BASELINE — STATE PERSISTENCE", "-")]
+    _lines.append(_kv("Iteration written", 0))
+    _lines.append(_kv("Model linked", model_id))
+    _lines.append(_kv("Stage", "BASELINE_EVAL_STARTED -> COMPLETE"))
+    _lines.append(_bar("-"))
+    print("\n".join(_lines))
+
+    return {
+        "scores": scores,
+        "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
+        "thresholds_met": thresholds_met,
+        "model_id": model_id,
+        "eval_result": eval_result,
+    }
+
+
 def _run_baseline(
     w: WorkspaceClient,
     spark: SparkSession,
@@ -354,102 +528,37 @@ def _run_baseline(
 ) -> dict:
     """Stage 2: Run full 8-judge evaluation, check thresholds.
 
-    Returns a dict with scores, thresholds_met flag, and model_id.
+    Wrapper that calls sub-steps in sequence. Returns a dict with scores,
+    thresholds_met flag, and model_id.
     """
-    write_stage(
-        spark, run_id, "BASELINE_EVAL_STARTED", "STARTED",
-        task_key="baseline_eval", catalog=catalog, schema=schema,
-    )
-    _ensure_sql_context(spark, catalog, schema)
-
     try:
-        # Strict SQL/routine gating now lives inside run_evaluation so all eval
-        # scopes (baseline, slice, p0, full) share one consistent quarantine path.
-        baseline_benchmarks = benchmarks
-
-        _ensure_sql_context(spark, catalog, schema)
-        _instr_prompt = format_mlflow_template(
-            INSTRUCTION_PROMPT_NAME_TEMPLATE,
-            uc_schema=f"{catalog}.{schema}", space_id=space_id,
+        setup_ctx = baseline_setup_scorers(
+            w, spark, space_id, run_id, catalog, schema, exp_name, model_id, domain,
         )
-        predict_fn = make_predict_fn(
-            w, space_id, spark, catalog, schema,
-            instruction_prompt_name=_instr_prompt,
+        eval_result = baseline_run_evaluation(
+            spark, run_id, catalog, schema, benchmarks, setup_ctx,
         )
-        scorers = make_all_scorers(w, spark, catalog, schema)
-
-        eval_result = _safe_stage(
-            spark, run_id, "BASELINE_EVAL", run_evaluation,
-            catalog, schema,
-            space_id, exp_name, 0, baseline_benchmarks, domain, model_id, "full",
-            predict_fn, scorers,
-            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=f"{catalog}.{schema}",
+        scorecard = baseline_display_scorecard(eval_result)
+        return baseline_persist_state(
+            w, spark, run_id, model_id, catalog, schema, eval_result, scorecard,
         )
-
-        scores = eval_result.get("scores", {})
-        thresholds_met = eval_result.get("thresholds_met", False)
-
-        write_iteration(
-            spark, run_id, 0, eval_result,
-            catalog=catalog, schema=schema,
-            eval_scope="full", model_id=model_id,
-        )
-
-        link_eval_scores_to_model(model_id, scores)
-
-        update_run_status(
-            spark, run_id, catalog, schema,
-            best_iteration=0,
-            best_accuracy=eval_result.get("overall_accuracy", 0.0),
-            best_model_id=model_id,
-        )
-
-        write_stage(
-            spark, run_id, "BASELINE_EVAL_STARTED", "COMPLETE",
-            task_key="baseline_eval",
-            detail={
-                "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
-                "thresholds_met": thresholds_met,
-                "invalid_benchmark_count": eval_result.get("invalid_benchmark_count", 0),
-                "permission_blocked_count": eval_result.get("permission_blocked_count", 0),
-                "unresolved_column_count": eval_result.get("unresolved_column_count", 0),
-                "harness_retry_count": eval_result.get("harness_retry_count", 0),
-            },
-            catalog=catalog, schema=schema,
-        )
-
-        try:
-            from genie_space_optimizer.optimization.evaluation import log_expectations_on_traces
-            log_expectations_on_traces(eval_result)
-        except Exception:
-            logger.debug("Failed to log expectations on baseline traces", exc_info=True)
-
-        try:
-            log_judge_verdicts_on_traces(eval_result)
-        except Exception:
-            logger.debug("Failed to log judge verdicts on baseline traces", exc_info=True)
-
-        return {
-            "scores": scores,
-            "overall_accuracy": eval_result.get("overall_accuracy", 0.0),
-            "thresholds_met": thresholds_met,
-            "model_id": model_id,
-            "eval_result": eval_result,
-        }
     except Exception as exc:
         err_msg = f"{type(exc).__name__}: {exc}"
         logger.exception("BASELINE_EVAL FAILED for run %s", run_id)
-        write_stage(
-            spark, run_id, "BASELINE_EVAL", "FAILED",
-            task_key="baseline_eval",
-            error_message=err_msg[:500],
-            catalog=catalog, schema=schema,
-        )
-        update_run_status(
-            spark, run_id, catalog, schema,
-            status="FAILED",
-            convergence_reason="error_in_BASELINE_EVAL",
-        )
+        try:
+            write_stage(
+                spark, run_id, "BASELINE_EVAL", "FAILED",
+                task_key="baseline_eval",
+                error_message=err_msg[:500],
+                catalog=catalog, schema=schema,
+            )
+            update_run_status(
+                spark, run_id, catalog, schema,
+                status="FAILED",
+                convergence_reason="error_in_BASELINE_EVAL",
+            )
+        except Exception:
+            logger.exception("Failed to write FAILED state for baseline %s", run_id)
         raise
 
 
@@ -3393,7 +3502,13 @@ def _run_lever_loop(
     if uc_columns:
         enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
-    # Stage 2.75: Proactive description enrichment for blank columns
+    # ── Phase 1: Proactive Enrichment ──
+    _pe_lines = [_section("LEVER LOOP — PROACTIVE ENRICHMENT", "-")]
+    _pe_lines.append(_kv("Space ID", space_id))
+    _pe_lines.append(_kv("UC columns", len(uc_columns)))
+    _pe_lines.append(_bar("-"))
+    print("\n".join(_pe_lines))
+
     enrichment_result = _run_description_enrichment(
         w, spark, run_id, space_id, config, metadata_snapshot, catalog, schema,
     )
@@ -3440,6 +3555,21 @@ def _run_lever_loop(
         metadata_snapshot = config.get("_parsed_space", config)
         if uc_columns:
             enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+    _enr_summary = [_section("PROACTIVE ENRICHMENT — SUMMARY", "-")]
+    _enr_summary.append(_kv("Descriptions enriched", enrichment_result.get("total_enriched", 0)))
+    _enr_summary.append(_kv("Joins discovered", join_result.get("total_applied", 0)))
+    _enr_summary.append(_kv("Space metadata", "description=%s, questions=%s" % (
+        "generated" if meta_result.get("description_generated") else "unchanged",
+        "generated" if meta_result.get("questions_generated") else "unchanged",
+    )))
+    _enr_summary.append(_kv("Instructions seeded", "yes" if instruction_result.get("instructions_seeded") else "no"))
+    _enr_summary.append(_bar("-"))
+    print("\n".join(_enr_summary))
+
+    # ── Phase 2: Pre-Loop Setup ──
+    _pls_lines = [_section("LEVER LOOP — PRE-LOOP SETUP", "-")]
+    print("\n".join(_pls_lines))
 
     baseline_iter = load_latest_full_iteration(spark, run_id, catalog, schema)
     reference_sqls: dict[str, str] = {}
@@ -3494,6 +3624,24 @@ def _run_lever_loop(
         metadata_snapshot = config.get("_parsed_space", config)
         if uc_columns:
             enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
+    _setup_lines = [_section("PRE-LOOP SETUP — COMPLETE", "-")]
+    _setup_lines.append(_kv("Reference SQLs", len(reference_sqls)))
+    _setup_lines.append(_kv("Reference hashes", len(reference_result_hashes)))
+    _setup_lines.append(_kv("Arbiter corrections", len(_pre_loop_corr.get("corrected_qids", set()))))
+    _setup_lines.append(_kv("Mined examples", len(mined_example_proposals)))
+    _setup_lines.append(_kv("Starting lever", start_lever))
+    _setup_lines.append(_kv("Iteration counter", iteration_counter))
+    _setup_lines.append(_kv("Baseline accuracy", f"{baseline_accuracy:.1f}%"))
+    _setup_lines.append(_bar("-"))
+    print("\n".join(_setup_lines))
+
+    # ── Phase 3: Adaptive Lever Loop ──
+    _loop_lines = [_section("LEVER LOOP — ADAPTIVE ITERATION", "-")]
+    _loop_lines.append(_kv("Max iterations", max_iterations))
+    _loop_lines.append(_kv("Lever order", levers))
+    _loop_lines.append(_bar("-"))
+    print("\n".join(_loop_lines))
 
     # ═══════════════════════════════════════════════════════════════════
     # ADAPTIVE LEVER LOOP
@@ -4556,6 +4704,13 @@ def _run_finalize(
     terminal_reason = ""
     repeatability_pct = 0.0
     try:
+        # ── Phase 1: Repeatability Testing ──
+        _lines = [_section("FINALIZE — REPEATABILITY TESTING", "-")]
+        _lines.append(_kv("Run repeatability", run_repeatability))
+        _lines.append(_kv("Benchmarks available", len(benchmarks) if benchmarks else 0))
+        _lines.append(_bar("-"))
+        print("\n".join(_lines))
+
         rep_results: list[dict] = []
         _check_timeout("pre_repeatability")
         if run_repeatability and benchmarks:
@@ -4681,7 +4836,16 @@ def _run_finalize(
                 detail={"reason": "disabled_or_no_benchmarks"},
             )
 
-        # ── Human review session (post-repeatability) ─────────────────
+        # ── Phase 2: Human Review Session ──
+        _rep_lines = [_section("FINALIZE — REPEATABILITY RESULTS", "-")]
+        _rep_lines.append(_kv("Average repeatability", f"{repeatability_pct:.1f}%"))
+        _rep_lines.append(_kv("Passes completed", len(rep_results)))
+        _rep_lines.append(_bar("-"))
+        print("\n".join(_rep_lines))
+
+        _review_lines = [_section("FINALIZE — HUMAN REVIEW SESSION", "-")]
+        print("\n".join(_review_lines))
+
         _check_timeout("human_review_session")
         _emit_heartbeat("human_review_session", force=True)
         session_info: dict = {}
@@ -4782,6 +4946,10 @@ def _run_finalize(
             print(f"[Labeling] Failed to create post-repeatability review session: {exc}")
             logger.warning("Failed to create post-repeatability review session", exc_info=True)
 
+        # ── Phase 3: Model Promotion & Report ──
+        _promo_lines = [_section("FINALIZE — MODEL PROMOTION & REPORT", "-")]
+        print("\n".join(_promo_lines))
+
         _check_timeout("promote_best_model")
         _emit_heartbeat("promote_best_model", force=True)
         promoted_model = promote_best_model(spark, run_id, catalog, schema)
@@ -4831,6 +4999,17 @@ def _run_finalize(
                 catalog=catalog, schema=schema,
             )
 
+        _promo_result_lines = [_section("FINALIZE — PROMOTION RESULTS", "-")]
+        _promo_result_lines.append(_kv("Promoted model", promoted_model or "(none)"))
+        _promo_result_lines.append(_kv("Report path", report_path or "(none)"))
+        _promo_result_lines.append(_kv("Benchmarks published", benchmark_publish_count))
+        _promo_result_lines.append(_bar("-"))
+        print("\n".join(_promo_result_lines))
+
+        # ── Phase 4: Terminal Status Resolution ──
+        _term_lines = [_section("FINALIZE — TERMINAL STATUS RESOLUTION", "-")]
+        print("\n".join(_term_lines))
+
         _check_timeout("resolve_terminal_status")
         converged = all_thresholds_met(prev_scores, thresholds)
         if converged:
@@ -4875,6 +5054,17 @@ def _run_finalize(
             },
             catalog=catalog, schema=schema,
         )
+
+        _term_result_lines = [_section("FINALIZE — FINAL STATUS", "-")]
+        _term_result_lines.append(_kv("Status", status))
+        _term_result_lines.append(_kv("Convergence reason", reason))
+        _term_result_lines.append(_kv("Repeatability", f"{repeatability_pct:.1f}%"))
+        _term_result_lines.append(_kv("Promoted model", promoted_model or "(none)"))
+        _term_result_lines.append(_kv("Report path", report_path or "(none)"))
+        _term_result_lines.append(_kv("Elapsed", f"{_elapsed_seconds():.1f}s"))
+        _term_result_lines.append(_kv("Heartbeats", heartbeat_count))
+        _term_result_lines.append(_bar("-"))
+        print("\n".join(_term_result_lines))
 
         return {
             "status": status,
@@ -4953,7 +5143,28 @@ def _run_finalize(
 # ── Stage 5: DEPLOY ─────────────────────────────────────────────────
 
 
-def _run_deploy(
+def deploy_check(
+    deploy_target: str | None,
+    prev_model_id: str,
+    iteration_counter: int,
+) -> dict:
+    """Sub-step 5a: Check deploy eligibility and print target info."""
+    _lines = [_section("DEPLOY — GATE CHECK", "-")]
+    _lines.append(_kv("Deploy target", deploy_target or "(none — will skip)"))
+    _lines.append(_kv("Model ID", prev_model_id))
+    _lines.append(_kv("Iteration", iteration_counter))
+    _lines.append(_kv("Decision", "PROCEED" if deploy_target else "SKIP"))
+    _lines.append(_bar("-"))
+    print("\n".join(_lines))
+    return {
+        "should_deploy": bool(deploy_target),
+        "deploy_target": deploy_target,
+        "prev_model_id": prev_model_id,
+        "iteration_counter": iteration_counter,
+    }
+
+
+def deploy_execute(
     w: WorkspaceClient,
     spark: SparkSession,
     run_id: str,
@@ -4966,7 +5177,7 @@ def _run_deploy(
     catalog: str,
     schema: str,
 ) -> dict:
-    """Stage 5: Deploy via DABs, held-out evaluation (optional)."""
+    """Sub-step 5b: Execute deployment or skip. Writes Delta stages."""
     if not deploy_target:
         write_stage(
             spark, run_id, "DEPLOY_SKIPPED", "SKIPPED",
@@ -4974,6 +5185,11 @@ def _run_deploy(
             detail={"reason": "no_deploy_target"},
             catalog=catalog, schema=schema,
         )
+        _lines = [_section("DEPLOY — RESULT", "-")]
+        _lines.append(_kv("Status", "SKIPPED"))
+        _lines.append(_kv("Reason", "no deploy target configured"))
+        _lines.append(_bar("-"))
+        print("\n".join(_lines))
         return {"status": "SKIPPED", "reason": "no_deploy_target"}
 
     write_stage(
@@ -4990,6 +5206,12 @@ def _run_deploy(
             detail={"deploy_target": deploy_target},
             catalog=catalog, schema=schema,
         )
+        _lines = [_section("DEPLOY — RESULT", "-")]
+        _lines.append(_kv("Status", "DEPLOYED"))
+        _lines.append(_kv("Target", deploy_target))
+        _lines.append(_kv("Model ID", prev_model_id))
+        _lines.append(_bar("-"))
+        print("\n".join(_lines))
         return {"status": "DEPLOYED", "deploy_target": deploy_target}
 
     except Exception as exc:
@@ -4999,7 +5221,36 @@ def _run_deploy(
             error_message=str(exc)[:500],
             catalog=catalog, schema=schema,
         )
+        _lines = [_section("DEPLOY — RESULT", "-")]
+        _lines.append(_kv("Status", "FAILED"))
+        _lines.append(_kv("Error", str(exc)[:200]))
+        _lines.append(_bar("-"))
+        print("\n".join(_lines))
         return {"status": "FAILED", "error": str(exc)}
+
+
+def _run_deploy(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    deploy_target: str | None,
+    space_id: str,
+    exp_name: str,
+    domain: str,
+    prev_model_id: str,
+    iteration_counter: int,
+    catalog: str,
+    schema: str,
+) -> dict:
+    """Stage 5: Deploy via DABs, held-out evaluation (optional).
+
+    Wrapper that calls deploy_check() then deploy_execute() in sequence.
+    """
+    deploy_check(deploy_target, prev_model_id, iteration_counter)
+    return deploy_execute(
+        w, spark, run_id, deploy_target, space_id, exp_name,
+        domain, prev_model_id, iteration_counter, catalog, schema,
+    )
 
 
 # ── Resume Helper ────────────────────────────────────────────────────

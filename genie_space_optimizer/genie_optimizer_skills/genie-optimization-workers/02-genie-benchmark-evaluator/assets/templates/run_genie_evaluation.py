@@ -610,10 +610,19 @@ for _b in benchmarks:
                     except Exception:
                         pass
 
+                _mv_hint = ""
+                if "MISSING_ATTRIBUTES" in _err_msg or "RESOLVED_ATTRIBUTE_APPEAR_IN_OPERATION" in _err_msg:
+                    _mv_hint = (
+                        "\n\nIMPORTANT: This is a Spark metric view alias collision. "
+                        "Fix by replacing 'ORDER BY alias_name' with 'ORDER BY MEASURE(column_name)' "
+                        "for any MEASURE() expression. Do NOT alias MEASURE(col) with the same name "
+                        "as the source column — use a distinct alias like 'col_total' if needed."
+                    )
+
                 _fix_prompt = (
                     f"Fix this SQL query that produces an error.\n\n"
                     f"SQL:\n{_expected_sql}\n\n"
-                    f"Error:\n{_err_msg[:500]}\n\n"
+                    f"Error:\n{_err_msg[:500]}{_mv_hint}\n\n"
                     f"Schema context:{_schema_ctx}\n\n"
                     f"Return ONLY the corrected SQL, no explanation."
                 )
@@ -638,11 +647,18 @@ for _b in benchmarks:
 
         if not _remediated:
             _gt_excluded.append({"id": _b_id, "reason": str(_gt_err)[:200]})
+            _gt_err_str = str(_gt_err)
+            _error_type = (
+                "mv_alias_collision"
+                if ("MISSING_ATTRIBUTES" in _gt_err_str or "RESOLVED_ATTRIBUTE" in _gt_err_str)
+                else "sql_error"
+            )
             _gt_remediation_queue.append({
                 "id": _b_id,
                 "question": _b.get("question", ""),
                 "original_sql": _expected_sql,
-                "error": str(_gt_err)[:500],
+                "error": _gt_err_str[:500],
+                "error_type": _error_type,
             })
 
 benchmarks = [b for b in benchmarks if b.get("_gt_validated", False)]
