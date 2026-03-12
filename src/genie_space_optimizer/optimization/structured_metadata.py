@@ -252,6 +252,52 @@ def render_structured_description(
     return lines if lines else [""]
 
 
+def _infer_entity_type_from_sections(sections: dict[str, str]) -> EntityType:
+    """Infer the entity type from which section keys are present."""
+    keys = set(sections) - {"_preamble"}
+    if keys & {"use_instead_of", "parameters", "example"}:
+        return "function"
+    if keys & {"important_filters"} and "scd" not in keys:
+        return "mv_table"
+    if keys & {"purpose", "best_for", "grain", "scd", "relationships"}:
+        return "table"
+    if keys & {"aggregation", "grain_note"}:
+        return "column_measure"
+    if keys & {"join"}:
+        return "column_key"
+    return "column_dim"
+
+
+def deduplicate_structured_description(text: str | list[str] | None) -> str:
+    """Parse and re-render a structured description, collapsing duplicates.
+
+    When descriptions are updated by successive lever applications they can
+    accumulate repeated section headers (e.g. two PURPOSE blocks).  Since
+    :func:`parse_structured_description` stores sections in a dict, later
+    occurrences of the same key overwrite earlier ones.  Re-rendering thus
+    produces a clean, deduplicated description.
+
+    Returns the original text unchanged if no structured sections are found.
+    """
+    if text is None:
+        return ""
+    if isinstance(text, list):
+        text = "\n".join(text)
+    text = text.strip()
+    if not text:
+        return ""
+    sections = parse_structured_description(text)
+    if not sections or not any(k != "_preamble" for k in sections):
+        return text
+    preamble = sections.pop("_preamble", "")
+    etype = _infer_entity_type_from_sections(sections)
+    rendered_lines = render_structured_description(sections, etype)
+    result = "\n".join(rendered_lines)
+    if not result.strip() and preamble:
+        return preamble
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Updater
 # ---------------------------------------------------------------------------

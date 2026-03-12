@@ -1739,6 +1739,7 @@ def _run_enrichment(
         mined_example_proposals = _mine_benchmark_example_sqls(
             benchmarks, metadata_snapshot,
             spark=spark, catalog=catalog, gold_schema=schema,
+            w=w, warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
         )
         if mined_example_proposals:
             _apply_proactive_example_sqls(
@@ -2737,6 +2738,8 @@ def _attempt_gt_repair(
     w: WorkspaceClient,
     candidate: dict,
     spark: Any,
+    *,
+    warehouse_id: str = "",
 ) -> str | None:
     """Use LLM to produce a corrected ground-truth SQL for a ``neither_correct`` question.
 
@@ -2769,7 +2772,10 @@ def _attempt_gt_repair(
             logger.warning("GT repair returned empty SQL for: %s", candidate["question"][:60])
             return None
 
-        is_valid, val_err = validate_ground_truth_sql(repaired_sql, spark, execute=True)
+        is_valid, val_err = validate_ground_truth_sql(
+            repaired_sql, spark, execute=True,
+            w=w, warehouse_id=warehouse_id,
+        )
         if not is_valid:
             logger.warning(
                 "GT repair SQL failed validation for '%s': %s",
@@ -2893,7 +2899,10 @@ def _run_arbiter_corrections(
                     f"    - [{qid}] REPAIR ATTEMPT: \"{cand['question'][:60]}\" "
                     f"(neither_correct in {cand['nc_count']} evals)"
                 )
-                repaired_sql = _attempt_gt_repair(w, cand, spark)
+                repaired_sql = _attempt_gt_repair(
+                    w, cand, spark,
+                    warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
+                )
                 if repaired_sql:
                     repair_actions = [{
                         "question": cand["question"],
@@ -3853,6 +3862,7 @@ def _run_lever_loop(
         mined_example_proposals = _mine_benchmark_example_sqls(
             benchmarks, metadata_snapshot,
             spark=spark, catalog=catalog, gold_schema=schema,
+            w=w, warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
         )
         if mined_example_proposals:
             _apply_proactive_example_sqls(
@@ -4311,6 +4321,7 @@ def _run_lever_loop(
                 spark=spark,
                 catalog=catalog,
                 gold_schema=schema,
+                warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
             )
             all_proposals.extend(lever_proposals)
 
@@ -4493,6 +4504,20 @@ def _run_lever_loop(
                 _ap_lines.append(_fmt_patch(ai, _ap, _aa))
             _ap_lines.append(_bar("="))
             print("\n".join(_ap_lines))
+
+        _dropped = apply_log.get("dropped_patches", [])
+        if _dropped:
+            _dp_lines = [_section(f"[{ag_id}] Dropped {len(_dropped)} Join Spec Patch(es)", "!")]
+            for di, dp in enumerate(_dropped, 1):
+                _dp_lines.append(
+                    f"|  [{di}] {dp.get('type', '?')}: "
+                    f"{dp.get('left_table', '?')} <-> {dp.get('right_table', '?')}"
+                )
+            _dp_lines.append(
+                "|  Reason: join spec PATCH failed; remaining patches deployed successfully"
+            )
+            _dp_lines.append(_bar("!"))
+            print("\n".join(_dp_lines))
 
         # ── 3B.6: Three-gate eval ───────────────────────────────────
         gate_result = _run_gate_checks(

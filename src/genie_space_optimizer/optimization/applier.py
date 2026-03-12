@@ -1565,6 +1565,8 @@ def apply_patch_set(
 
     patch_deployed = False
     patch_error: str = ""
+    dropped_patches: list[dict] = []
+
     if w is not None and applied:
         try:
             patch_space_config(w, space_id, config)
@@ -1572,10 +1574,53 @@ def apply_patch_set(
         except Exception as exc:
             patch_error = str(exc)
             logger.exception(
-                "Failed to PATCH Genie Space config after %d retries — "
+                "Failed to PATCH Genie Space config after retries — "
                 "patches were NOT deployed remotely",
-                2,
             )
+
+            join_spec_entries = [
+                e for e in applied
+                if e.get("patch", {}).get("type") == "add_join_spec"
+            ]
+            if join_spec_entries:
+                logger.warning(
+                    "PATCH failed with %d join spec patch(es) — retrying without them",
+                    len(join_spec_entries),
+                )
+                config_retry = copy.deepcopy(metadata_snapshot)
+                applied_retry: list[dict] = []
+                patched_objects_retry: set[str] = set()
+                rollback_retry: list[str] = []
+                for entry in applied:
+                    if entry.get("patch", {}).get("type") == "add_join_spec":
+                        continue
+                    rendered = render_patch(entry["patch"], space_id, config_retry)
+                    if _apply_action_to_config(config_retry, rendered):
+                        applied_retry.append(entry)
+                        rollback_retry.append(rendered.get("rollback_command", ""))
+                        target = rendered.get("target", "")
+                        if target:
+                            patched_objects_retry.add(target)
+                if applied_retry:
+                    sort_genie_config(config_retry)
+                    _enforce_instruction_limit(config_retry)
+                    try:
+                        patch_space_config(w, space_id, config_retry)
+                        patch_deployed = True
+                        patch_error = ""
+                        config = config_retry
+                        dropped_patches = [e["patch"] for e in join_spec_entries]
+                        applied = applied_retry
+                        rollback_commands = rollback_retry
+                        patched_objects = patched_objects_retry
+                        logger.info(
+                            "PATCH succeeded after dropping %d join spec patch(es); "
+                            "%d patches deployed",
+                            len(join_spec_entries), len(applied_retry),
+                        )
+                    except Exception as exc2:
+                        patch_error = str(exc2)
+                        logger.exception("Retry without join specs also failed")
 
     return {
         "space_id": space_id,
@@ -1589,6 +1634,7 @@ def apply_patch_set(
         "validation_errors": [],
         "patch_deployed": patch_deployed,
         "patch_error": patch_error,
+        "dropped_patches": dropped_patches,
     }
 
 

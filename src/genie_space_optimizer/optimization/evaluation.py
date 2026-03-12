@@ -130,6 +130,8 @@ def _flag_stale_temporal_benchmarks(
     temporal patterns and the GT SQL returns 0 rows.  Flagged benchmarks are
     excluded from accuracy scoring in ``_compute_arbiter_adjusted_accuracy``.
     """
+    from genie_space_optimizer.optimization.benchmarks import _quiet_grpc_logs
+
     flagged_count = 0
     for b in benchmarks:
         q = b.get("question", "")
@@ -139,14 +141,15 @@ def _flag_stale_temporal_benchmarks(
         if not sql:
             continue
         try:
-            df = spark.sql(sql).limit(1)
-            if df.count() == 0:
-                b["temporal_stale"] = True
-                flagged_count += 1
-                logger.info(
-                    "Temporal benchmark '%s' returns 0 rows -- flagged as stale",
-                    q[:60],
-                )
+            with _quiet_grpc_logs():
+                df = spark.sql(sql).limit(1)
+                if df.count() == 0:
+                    b["temporal_stale"] = True
+                    flagged_count += 1
+                    logger.info(
+                        "Temporal benchmark '%s' returns 0 rows -- flagged as stale",
+                        q[:60],
+                    )
         except Exception:
             pass
     if flagged_count:
@@ -4284,6 +4287,9 @@ def extract_genie_space_benchmarks(
     spark: SparkSession,
     catalog: str = "",
     schema: str = "",
+    *,
+    w: Any = None,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Extract curated benchmark questions from a Genie Space config.
 
@@ -4334,6 +4340,7 @@ def extract_genie_space_benchmarks(
             expected_sql = fix_mv_alias_sort_collision(expected_sql)
             is_valid, err = validate_ground_truth_sql(
                 expected_sql, spark, catalog=catalog, gold_schema=schema,
+                w=w, warehouse_id=warehouse_id,
             )
             if not is_valid:
                 logger.warning(
@@ -4388,6 +4395,7 @@ def extract_genie_space_benchmarks(
             expected_sql = fix_mv_alias_sort_collision(expected_sql)
             is_valid, err = validate_ground_truth_sql(
                 expected_sql, spark, catalog=catalog, gold_schema=schema,
+                w=w, warehouse_id=warehouse_id,
             )
             if not is_valid:
                 logger.warning(
@@ -4525,6 +4533,8 @@ def _validate_benchmark_sql(
     schema: str,
     *,
     execute: bool = False,
+    w: Any = None,
+    warehouse_id: str = "",
 ) -> tuple[bool, str]:
     """Validate a benchmark's expected_sql. Returns (is_valid, error)."""
     from genie_space_optimizer.optimization.benchmarks import validate_ground_truth_sql
@@ -4535,6 +4545,7 @@ def _validate_benchmark_sql(
         return False, "Empty SQL"
     return validate_ground_truth_sql(
         sanitized, spark, catalog=catalog, gold_schema=schema, execute=execute,
+        w=w, warehouse_id=warehouse_id,
     )
 
 

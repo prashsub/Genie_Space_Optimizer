@@ -56,14 +56,15 @@ def generate_genie_id() -> str:
 def ensure_join_spec_fields(spec: dict) -> dict:
     """Ensure a join spec dict has all required fields (alias, id).
 
-    Mutates and returns the spec for convenience. Derives ``alias`` from
-    the last segment of ``identifier`` when missing, and generates a new
-    ``id`` when absent.  Also normalises ``sql`` predicates so that table
-    references match ``left.alias`` / ``right.alias``.
+    Mutates and returns the spec for convenience. Always derives ``alias``
+    from the last segment of ``identifier`` (overriding any LLM-provided
+    alias to prevent rejected short aliases like ``jt``), and generates a
+    new ``id`` when absent.  Also normalises ``sql`` predicates so that
+    table references match ``left.alias`` / ``right.alias``.
     """
     for side_key in ("left", "right"):
         side = spec.get(side_key)
-        if isinstance(side, dict) and "identifier" in side and not side.get("alias"):
+        if isinstance(side, dict) and "identifier" in side:
             side["alias"] = side["identifier"].rsplit(".", 1)[-1]
     if not spec.get("id"):
         spec["id"] = generate_genie_id()
@@ -160,6 +161,14 @@ def normalize_join_spec_sql(spec: dict) -> dict:
     sql_parts = spec.get("sql", [])
     if not sql_parts:
         return spec
+
+    split_parts: list[str] = []
+    for part in sql_parts:
+        if isinstance(part, str) and not part.startswith("--rt="):
+            split_parts.extend(p.strip() for p in re.split(r"\bAND\b", part, flags=re.IGNORECASE) if p.strip())
+        else:
+            split_parts.append(part)
+    sql_parts = split_parts
 
     rewritten: list[str] = []
     for part in sql_parts:

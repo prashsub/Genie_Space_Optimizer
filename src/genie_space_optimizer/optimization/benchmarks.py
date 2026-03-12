@@ -7,15 +7,53 @@ Benchmarks are stored as MLflow evaluation datasets in UC (no YAML files).
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import random
 import re as _re
+from contextlib import contextmanager
 from typing import Any
 
 from genie_space_optimizer.common.config import TEMPLATE_VARIABLES
 from genie_space_optimizer.common.genie_client import detect_asset_type
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _quiet_grpc_logs():
+    """Capture ``pyspark.sql.connect.logging`` to a buffer instead of stdout.
+
+    Yields a summary object whose ``.get()`` returns a one-line digest
+    of any captured gRPC errors (empty string if none).  This avoids
+    multi-KB stacktrace spam while retaining signal for edge cases
+    where the gRPC log contains info not present in the Python exception.
+    """
+    grpc_logger = logging.getLogger("pyspark.sql.connect.logging")
+    prev_propagate = grpc_logger.propagate
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message).200s"))
+    grpc_logger.addHandler(handler)
+    grpc_logger.propagate = False
+
+    class _Summary:
+        def get(self) -> str:
+            raw = buf.getvalue()
+            if not raw:
+                return ""
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            if len(lines) <= 1:
+                return lines[0] if lines else ""
+            return f"{lines[0]} (+{len(lines) - 1} more gRPC errors)"
+
+    try:
+        yield _Summary()
+    finally:
+        grpc_logger.removeHandler(handler)
+        grpc_logger.propagate = prev_propagate
+        handler.close()
+        buf.close()
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -274,6 +312,8 @@ def validate_ground_truth_sql(
     *,
     execute: bool = False,
     parameters: list[dict] | None = None,
+    w: Any = None,
+    warehouse_id: str = "",
 ) -> tuple[bool, str]:
     """Validate a single expected SQL via EXPLAIN + table existence checks.
 
@@ -284,6 +324,10 @@ def validate_ground_truth_sql(
       3. Execution sanity (optional, ``execute=True``): runs the query with
          ``LIMIT 1`` to verify it produces at least one row and doesn't fail
          at runtime on data type mismatches.
+
+    When *w* and *warehouse_id* are provided, EXPLAIN and execution calls
+    are routed through the SQL Warehouse Statement Execution API (no gRPC).
+    Falls back to ``spark.sql()`` otherwise.
 
     When *parameters* are provided, attempts to substitute default values
     before running EXPLAIN rather than short-circuiting on parameterized SQL.
@@ -317,8 +361,18 @@ def validate_ground_truth_sql(
             return True, ""
 
     try:
-        _set_sql_context(spark, catalog, gold_schema)
-        spark.sql(f"EXPLAIN {resolved}")
+        if w and warehouse_id:
+            from genie_space_optimizer.optimization.evaluation import (
+                _execute_sql_via_warehouse,
+            )
+            _execute_sql_via_warehouse(
+                w, warehouse_id, f"EXPLAIN {resolved}",
+                catalog=catalog, schema=gold_schema,
+            )
+        else:
+            with _quiet_grpc_logs():
+                _set_sql_context(spark, catalog, gold_schema)
+                spark.sql(f"EXPLAIN {resolved}")
     except Exception as e:
         err_msg = str(e)
         if "UNBOUND_SQL_PARAMETER" in err_msg:
@@ -346,14 +400,34 @@ def validate_ground_truth_sql(
             return False, err
 
     if execute:
-        try:
-            result = spark.sql(f"SELECT * FROM ({resolved}) _vgt LIMIT 1").collect()
-            if len(result) == 0:
-                return False, (
-                    "EMPTY_RESULT: Query returned 0 rows — likely wrong filter or empty table"
+        if w and warehouse_id:
+            try:
+                from genie_space_optimizer.optimization.evaluation import (
+                    _execute_sql_via_warehouse,
                 )
-        except Exception as exec_err:
-            return False, f"EXECUTION_ERROR: {str(exec_err)[:300]}"
+                result_df = _execute_sql_via_warehouse(
+                    w, warehouse_id,
+                    f"SELECT * FROM ({resolved}) _vgt LIMIT 1",
+                    catalog=catalog, schema=gold_schema,
+                )
+                if result_df.empty:
+                    return False, (
+                        "EMPTY_RESULT: Query returned 0 rows — likely wrong filter or empty table"
+                    )
+            except Exception as exec_err:
+                return False, f"EXECUTION_ERROR: {str(exec_err)[:300]}"
+        else:
+            with _quiet_grpc_logs() as grpc:
+                try:
+                    result = spark.sql(f"SELECT * FROM ({resolved}) _vgt LIMIT 1").collect()
+                    if len(result) == 0:
+                        return False, (
+                            "EMPTY_RESULT: Query returned 0 rows — likely wrong filter or empty table"
+                        )
+                except Exception as exec_err:
+                    grpc_detail = grpc.get()
+                    suffix = f" [grpc: {grpc_detail}]" if grpc_detail else ""
+                    return False, f"EXECUTION_ERROR: {str(exec_err)[:300]}{suffix}"
 
     return True, ""
 
@@ -363,6 +437,9 @@ def validate_benchmarks(
     spark: Any,
     catalog: str = "",
     gold_schema: str = "",
+    *,
+    w: Any = None,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Validate each benchmark's ``expected_sql`` via EXPLAIN.
 
@@ -374,7 +451,8 @@ def validate_benchmarks(
         sql = b.get("expected_sql", "")
         question = b.get("question", "")
         is_valid, error = validate_ground_truth_sql(
-            sql, spark, catalog=catalog, gold_schema=gold_schema
+            sql, spark, catalog=catalog, gold_schema=gold_schema,
+            w=w, warehouse_id=warehouse_id,
         )
         results.append(
             {
@@ -564,6 +642,9 @@ def apply_benchmark_corrections(
     spark: Any,
     uc_schema: str,
     domain: str,
+    *,
+    w: Any = None,
+    warehouse_id: str = "",
 ) -> dict:
     """Apply arbiter corrections to the MLflow evaluation dataset.
 
@@ -593,7 +674,9 @@ def apply_benchmark_corrections(
             skipped += 1
             continue
 
-        is_valid, val_err = validate_ground_truth_sql(new_sql, spark, execute=True)
+        is_valid, val_err = validate_ground_truth_sql(
+            new_sql, spark, execute=True, w=w, warehouse_id=warehouse_id,
+        )
         if not is_valid:
             errors.append(
                 f"Correction SQL invalid for '{question[:50]}': {val_err[:200]}"

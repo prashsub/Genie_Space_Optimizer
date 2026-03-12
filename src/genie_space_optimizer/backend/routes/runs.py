@@ -2234,13 +2234,14 @@ def _build_links(
 
     experiment_id = run_data.get("experiment_id")
     experiment_name = run_data.get("experiment_name")
-    if experiment_id:
+    _has_mlflow_runs = any(row.get("mlflow_run_id") for row in iters_rows)
+    if experiment_id and _has_mlflow_runs:
         links.append(PipelineLink(
             label="MLflow Experiment",
             url=f"{host}/ml/experiments/{experiment_id}",
             category="mlflow",
         ))
-    elif experiment_name:
+    elif experiment_name and _has_mlflow_runs:
         from urllib.parse import quote
         links.append(PipelineLink(
             label="MLflow Experiment",

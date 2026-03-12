@@ -771,9 +771,12 @@ def cluster_failures(
         profile["root_causes"].append(root)
 
         if f.get("asi_blame_set"):
-            blame_str = str(f["asi_blame_set"])
-            if blame_str not in profile["blame_sets"]:
-                profile["blame_sets"].append(blame_str)
+            raw_blame = f["asi_blame_set"]
+            items = raw_blame if isinstance(raw_blame, list) else [str(raw_blame)]
+            for item in items:
+                item_str = str(item).strip()
+                if item_str and item_str not in profile["blame_sets"]:
+                    profile["blame_sets"].append(item_str)
         if f.get("asi_counterfactual_fix"):
             profile["counterfactual_fixes"].append(f["asi_counterfactual_fix"])
         if f.get("asi_wrong_clause"):
@@ -882,7 +885,7 @@ def cluster_failures(
             "affected_judge": sorted(all_judges)[0] if all_judges else "unknown",
             "confidence": min(0.9, 0.5 + 0.1 * len(unique_qids)),
             "asi_failure_type": sample_asi_type,
-            "asi_blame_set": blame_str or None,
+            "asi_blame_set": [b.strip() for b in blame_str.split("|") if b.strip()] if blame_str else None,
             "asi_wrong_clause": next((wc for wc in all_wrong_clauses if wc), None),
             "asi_counterfactual_fixes": list(dict.fromkeys(cf for cf in all_counterfactuals if cf)),
             "sql_contexts": sql_contexts[:5],
@@ -2748,6 +2751,10 @@ def _format_full_schema_context(
         ds = {}
     tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
 
+    from genie_space_optimizer.optimization.structured_metadata import (
+        deduplicate_structured_description,
+    )
+
     lines: list[str] = []
     for tbl in tables:
         if filter_tables is not None:
@@ -2757,7 +2764,8 @@ def _format_full_schema_context(
         identifier = tbl.get("identifier", "")
         tbl_desc = tbl.get("description", [])
         if isinstance(tbl_desc, list):
-            tbl_desc = " ".join(tbl_desc)
+            tbl_desc = "\n".join(tbl_desc)
+        tbl_desc = deduplicate_structured_description(tbl_desc)
         lines.append(f"### Table: {identifier}")
         if tbl_desc:
             lines.append(f"  Description: {tbl_desc}")
@@ -2766,7 +2774,8 @@ def _format_full_schema_context(
             data_type = cc.get("data_type", "")
             desc = cc.get("description", [])
             if isinstance(desc, list):
-                desc = " ".join(desc) if desc else ""
+                desc = "\n".join(desc) if desc else ""
+            desc = deduplicate_structured_description(desc) if desc else ""
             uc_comment = cc.get("uc_comment", "")
             if not desc and uc_comment:
                 desc = uc_comment
@@ -3541,6 +3550,15 @@ def _format_lever_summary(lever_changes: list[dict] | None) -> str:
     return "\n".join(lines) if lines else "(No changes applied.)"
 
 
+def _normalize_blame(raw: Any) -> list[str]:
+    """Normalize a blame_set value to a flat list of strings."""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str) and raw:
+        return [b.strip() for b in raw.split("|") if b.strip()]
+    return []
+
+
 def _format_cluster_briefs(
     clusters: list[dict],
     top_n: int = 5,
@@ -3567,10 +3585,11 @@ def _format_cluster_briefs(
         rc = cluster.get("root_cause", "unknown")
         q_ids = cluster.get("question_ids", [])
         judge = cluster.get("affected_judge", "unknown")
-        blame = cluster.get("asi_blame_set") or []
-        lines.append(f"### Cluster {idx}: {rc} ({len(q_ids)} questions, judge: {judge})")
+        blame = _normalize_blame(cluster.get("asi_blame_set"))
+        cid = cluster.get("cluster_id", f"C{idx:03d}")
+        lines.append(f"### {cid}: {rc} ({len(q_ids)} questions, judge: {judge})")
         if blame:
-            lines.append(f"Blamed objects: {', '.join(str(b) for b in blame[:5])}")
+            lines.append(f"Blamed objects: {', '.join(blame[:5])}")
         lines.append(_format_sql_diffs(cluster, max_sql_chars=max_sql_chars))
         lines.append("")
 
@@ -3581,8 +3600,8 @@ def _format_cluster_briefs(
             rc = cluster.get("root_cause", "unknown")
             q_ids = cluster.get("question_ids", [])
             judge = cluster.get("affected_judge", "unknown")
-            blame = cluster.get("asi_blame_set") or []
-            blame_str = f" blamed=[{', '.join(str(b) for b in blame[:3])}]" if blame else ""
+            blame = _normalize_blame(cluster.get("asi_blame_set"))
+            blame_str = f" blamed=[{', '.join(blame[:3])}]" if blame else ""
             lines.append(
                 f"  - {rc}: {len(q_ids)} questions (judge: {judge}){blame_str}"
             )
@@ -3598,10 +3617,11 @@ def _format_cluster_briefs(
             rc = cluster.get("root_cause", "unknown")
             q_ids = cluster.get("question_ids", [])
             judge = cluster.get("affected_judge", "unknown")
-            blame = cluster.get("asi_blame_set") or []
-            lines.append(f"#### Soft {idx}: {rc} ({len(q_ids)} questions, judge: {judge})")
+            blame = _normalize_blame(cluster.get("asi_blame_set"))
+            cid = cluster.get("cluster_id", f"S{idx:03d}")
+            lines.append(f"#### {cid}: {rc} ({len(q_ids)} questions, judge: {judge})")
             if blame:
-                lines.append(f"Blamed objects: {', '.join(str(b) for b in blame[:5])}")
+                lines.append(f"Blamed objects: {', '.join(blame[:5])}")
             lines.append(_format_sql_diffs(cluster, max_sql_chars=max_sql_chars))
             lines.append("")
         remaining_soft = sorted_soft[top_n:]
@@ -3611,13 +3631,652 @@ def _format_cluster_briefs(
                 rc = cluster.get("root_cause", "unknown")
                 q_ids = cluster.get("question_ids", [])
                 judge = cluster.get("affected_judge", "unknown")
-                blame = cluster.get("asi_blame_set") or []
-                blame_str = f" blamed=[{', '.join(str(b) for b in blame[:3])}]" if blame else ""
+                blame = _normalize_blame(cluster.get("asi_blame_set"))
+                blame_str = f" blamed=[{', '.join(blame[:3])}]" if blame else ""
                 lines.append(
                     f"  - {rc}: {len(q_ids)} questions (judge: {judge}){blame_str}"
                 )
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Structured-JSON context builders (Phase 7)
+# ---------------------------------------------------------------------------
+
+def _build_cluster_data(clusters: list[dict], *, top_n: int = 5) -> list[dict]:
+    """Convert failure clusters into structured dicts for JSON context."""
+    hard = [c for c in clusters if c.get("signal_type") != "soft"]
+    sorted_hard = sorted(hard, key=lambda c: len(c.get("question_ids", [])), reverse=True)
+    result: list[dict] = []
+    for cluster in sorted_hard[:top_n]:
+        questions: list[dict] = []
+        for ctx in cluster.get("sql_contexts", [])[:3]:
+            comp = ctx.get("comparison", {}) or {}
+            q_entry: dict[str, Any] = {
+                "question": ctx.get("question", ""),
+                "expected_sql": ctx.get("expected_sql", ""),
+                "generated_sql": ctx.get("generated_sql", ""),
+            }
+            if isinstance(comp, dict):
+                if comp.get("error"):
+                    q_entry["error"] = comp["error"]
+                elif not comp.get("match"):
+                    q_entry["mismatch_type"] = comp.get("match_type", "unknown")
+                gt_sample = comp.get("gt_sample")
+                if gt_sample:
+                    q_entry["expected_sample"] = str(gt_sample)[:500]
+                genie_sample = comp.get("genie_sample")
+                if genie_sample:
+                    q_entry["genie_sample"] = str(genie_sample)[:500]
+            questions.append(q_entry)
+        entry: dict[str, Any] = {
+            "cluster_id": cluster.get("cluster_id", "?"),
+            "root_cause": cluster.get("root_cause", "unknown"),
+            "judge": cluster.get("affected_judge", "unknown"),
+            "question_count": len(cluster.get("question_ids", [])),
+            "blamed_objects": _normalize_blame(cluster.get("asi_blame_set")),
+            "questions": questions,
+        }
+        cf = cluster.get("asi_counterfactual_fixes", [])
+        if cf:
+            entry["suggested_fixes"] = [str(f)[:200] for f in cf[:5]]
+        result.append(entry)
+    if len(sorted_hard) > top_n:
+        for cluster in sorted_hard[top_n:]:
+            result.append({
+                "cluster_id": cluster.get("cluster_id", "?"),
+                "root_cause": cluster.get("root_cause", "unknown"),
+                "judge": cluster.get("affected_judge", "unknown"),
+                "question_count": len(cluster.get("question_ids", [])),
+                "blamed_objects": _normalize_blame(cluster.get("asi_blame_set")),
+                "summary_only": True,
+            })
+    return result
+
+
+def _build_soft_signal_data(soft_clusters: list[dict]) -> list[dict]:
+    """Convert soft-signal clusters into structured dicts."""
+    if not soft_clusters:
+        return []
+    _info_judges = {j for j, t in DEFAULT_THRESHOLDS.items() if t == 0.0}
+    filtered: list[dict] = []
+    for sc in soft_clusters:
+        judges_in = {
+            fj.get("judge", "")
+            for qt in sc.get("question_traces", [])
+            for fj in qt.get("failed_judges", [])
+        }
+        if judges_in and judges_in <= _info_judges:
+            continue
+        filtered.append(sc)
+    result: list[dict] = []
+    for sc in filtered[:10]:
+        entry: dict[str, Any] = {
+            "cluster_id": sc.get("cluster_id", "?"),
+            "root_cause": sc.get("root_cause", "unknown"),
+            "question_count": len(sc.get("question_ids", [])),
+        }
+        traces: list[dict] = []
+        for qt in sc.get("question_traces", [])[:2]:
+            t: dict[str, Any] = {"question": qt.get("question_text", "")[:120]}
+            judges_detail = []
+            for fj in qt.get("failed_judges", []):
+                judges_detail.append({
+                    "judge": fj.get("judge", "?"),
+                    "root_cause": fj.get("resolved_root_cause", "?"),
+                    "rationale": fj.get("rationale_snippet", "")[:150],
+                })
+            if judges_detail:
+                t["failed_judges"] = judges_detail
+            traces.append(t)
+        if traces:
+            entry["traces"] = traces
+        result.append(entry)
+    return result
+
+
+def _build_schema_data(
+    metadata_snapshot: dict,
+    filter_tables: set[str] | None = None,
+) -> list[dict]:
+    """Build schema context as structured list of table dicts."""
+    from genie_space_optimizer.optimization.structured_metadata import (
+        deduplicate_structured_description,
+    )
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+    result: list[dict] = []
+    for tbl in tables:
+        identifier = tbl.get("identifier", "")
+        if filter_tables is not None:
+            tbl_id = (identifier or "").lower()
+            if tbl_id not in filter_tables:
+                continue
+        tbl_desc = tbl.get("description", [])
+        if isinstance(tbl_desc, list):
+            tbl_desc = "\n".join(tbl_desc)
+        tbl_desc = deduplicate_structured_description(tbl_desc)
+        columns: list[dict] = []
+        for cc in tbl.get("column_configs", []):
+            col_name = cc.get("column_name", "")
+            data_type = cc.get("data_type", "")
+            desc = cc.get("description", [])
+            if isinstance(desc, list):
+                desc = "\n".join(desc) if desc else ""
+            desc = deduplicate_structured_description(desc) if desc else ""
+            uc_comment = cc.get("uc_comment", "")
+            if not desc and uc_comment:
+                desc = uc_comment
+            col_entry: dict[str, Any] = {"name": col_name}
+            if data_type:
+                col_entry["type"] = data_type
+            if desc:
+                col_entry["description"] = desc
+            syns = cc.get("synonyms", [])
+            if syns:
+                col_entry["synonyms"] = syns
+            columns.append(col_entry)
+        entry: dict[str, Any] = {"table": identifier}
+        if tbl_desc:
+            entry["description"] = tbl_desc
+        if columns:
+            entry["columns"] = columns
+        result.append(entry)
+    return result
+
+
+def _build_structured_table_data(
+    metadata_snapshot: dict,
+    blame_set: list[str] | None,
+) -> list[dict]:
+    """Build structured table metadata as dicts with editability info."""
+    from genie_space_optimizer.optimization.structured_metadata import (
+        ENTITY_TYPE_TEMPLATES,
+        LEVER_SECTION_OWNERSHIP,
+        SECTION_LABELS,
+        parse_structured_description,
+    )
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+    mvs = ds.get("metric_views", []) or []
+    mv_identifiers = {
+        (m.get("identifier") or "").rsplit(".", 1)[-1].lower()
+        for m in mvs
+    }
+
+    blame_lower: set[str] = set()
+    if blame_set:
+        for b in blame_set:
+            bl = b.lower().strip()
+            blame_lower.add(bl)
+            if "." in bl:
+                blame_lower.add(bl.rsplit(".", 1)[-1])
+
+    owned_sections = LEVER_SECTION_OWNERSHIP.get(1, set())
+    result: list[dict] = []
+
+    for tbl in tables:
+        identifier = tbl.get("identifier", "")
+        short_name = identifier.rsplit(".", 1)[-1].lower() if identifier else ""
+        is_mv = short_name in mv_identifiers
+
+        if blame_lower:
+            tbl_match = short_name in blame_lower or identifier.lower() in blame_lower
+            col_match = any(
+                (cc.get("column_name") or "").lower() in blame_lower
+                for cc in tbl.get("column_configs", [])
+            )
+            if not tbl_match and not col_match:
+                continue
+
+        etype = "mv_table" if is_mv else "table"
+        template_sections = ENTITY_TYPE_TEMPLATES.get(etype, [])
+        desc = tbl.get("description", [])
+        desc_text = "\n".join(desc) if isinstance(desc, list) else str(desc or "")
+        sections = parse_structured_description(desc_text)
+
+        tbl_entry: dict[str, Any] = {
+            "table": identifier,
+            "entity_type": etype,
+            "sections": {},
+        }
+        for sk in template_sections:
+            value = sections.get(sk, "").strip()
+            editable = sk in owned_sections
+            tbl_entry["sections"][SECTION_LABELS[sk]] = {
+                "value": value or None,
+                "editable": editable,
+            }
+        preamble = sections.get("_preamble", "").strip()
+        if preamble:
+            tbl_entry["legacy_text"] = preamble
+        result.append(tbl_entry)
+
+    return result
+
+
+def _build_structured_column_data(
+    metadata_snapshot: dict,
+    blame_set: list[str] | None,
+) -> list[dict]:
+    """Build structured column metadata as dicts with editability info."""
+    from genie_space_optimizer.optimization.structured_metadata import (
+        ENTITY_TYPE_TEMPLATES,
+        LEVER_SECTION_OWNERSHIP,
+        SECTION_LABELS,
+        classify_column,
+        entity_type_for_column,
+        extract_synonyms_section,
+        format_synonyms_section,
+        merge_synonyms,
+        parse_structured_description,
+    )
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+    mvs = ds.get("metric_views", []) or []
+    mv_identifiers = {
+        (m.get("identifier") or "").rsplit(".", 1)[-1].lower()
+        for m in mvs
+    }
+
+    blame_lower: set[str] = set()
+    if blame_set:
+        for b in blame_set:
+            bl = b.lower().strip()
+            blame_lower.add(bl)
+            if "." in bl:
+                blame_lower.add(bl.rsplit(".", 1)[-1])
+
+    owned_sections = LEVER_SECTION_OWNERSHIP.get(1, set())
+    result: list[dict] = []
+    columns_shown = 0
+    max_columns = 40
+
+    for tbl in tables:
+        identifier = tbl.get("identifier", "")
+        short_name = identifier.rsplit(".", 1)[-1].lower() if identifier else ""
+        is_mv = short_name in mv_identifiers
+
+        if blame_lower:
+            tbl_match = short_name in blame_lower or identifier.lower() in blame_lower
+            col_match = any(
+                (cc.get("column_name") or "").lower() in blame_lower
+                for cc in tbl.get("column_configs", [])
+            )
+            if not tbl_match and not col_match:
+                continue
+
+        tbl_columns: list[dict] = []
+        for cc in tbl.get("column_configs", []):
+            if columns_shown >= max_columns:
+                break
+            col_name = cc.get("column_name", "")
+            if not col_name:
+                continue
+            data_type = cc.get("data_type", "")
+            desc = cc.get("description", [])
+            syns = cc.get("synonyms", [])
+            uc_comment = cc.get("uc_comment", "")
+            desc_text = "\n".join(desc) if isinstance(desc, list) else str(desc or "")
+            if not desc_text and uc_comment:
+                desc_text = uc_comment
+            sections = parse_structured_description(desc_text)
+            if syns:
+                existing_syn = extract_synonyms_section(sections)
+                all_syns = merge_synonyms(existing_syn, syns)
+                sections["synonyms"] = format_synonyms_section(all_syns)
+            etype = entity_type_for_column(col_name, data_type, is_in_metric_view=is_mv)
+            kind = classify_column(col_name, data_type, is_in_metric_view=is_mv)
+            template_secs = ENTITY_TYPE_TEMPLATES.get(etype, [])
+            col_entry: dict[str, Any] = {
+                "name": col_name,
+                "type": data_type or "unknown",
+                "classification": kind,
+                "sections": {},
+            }
+            for sk in template_secs:
+                value = sections.get(sk, "").strip()
+                editable = sk in owned_sections
+                col_entry["sections"][SECTION_LABELS[sk]] = {
+                    "value": value or None,
+                    "editable": editable,
+                }
+            preamble = sections.get("_preamble", "").strip()
+            if preamble:
+                col_entry["legacy_text"] = preamble
+            _profile = metadata_snapshot.get("_data_profile", {})
+            _tbl_profile = _profile.get(identifier, {}) or _profile.get(identifier.lower(), {})
+            _col_profile = _tbl_profile.get("columns", {}).get(col_name, {})
+            if _col_profile.get("distinct_values"):
+                col_entry["data_values"] = _col_profile["distinct_values"]
+            elif _col_profile.get("min") is not None:
+                col_entry["data_range"] = [_col_profile["min"], _col_profile["max"]]
+            tbl_columns.append(col_entry)
+            columns_shown += 1
+
+        if tbl_columns:
+            result.append({"table": identifier, "columns": tbl_columns})
+        if columns_shown >= max_columns:
+            break
+
+    return result
+
+
+def _build_structured_function_data(metadata_snapshot: dict) -> list[dict]:
+    """Build structured function metadata as dicts."""
+    from genie_space_optimizer.optimization.structured_metadata import (
+        ENTITY_TYPE_TEMPLATES,
+        LEVER_SECTION_OWNERSHIP,
+        SECTION_LABELS,
+        parse_structured_description,
+    )
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    funcs = metadata_snapshot.get("functions", []) or ds.get("functions", [])
+    if not funcs:
+        return []
+
+    owned_sections = LEVER_SECTION_OWNERSHIP.get(3, set())
+    template_sections = ENTITY_TYPE_TEMPLATES.get("function", [])
+    result: list[dict] = []
+
+    for fn in funcs:
+        name = fn.get("name") or fn.get("identifier", "")
+        comment = fn.get("comment") or fn.get("description") or ""
+        if isinstance(comment, list):
+            comment = "\n".join(comment)
+        sections = parse_structured_description(comment)
+        fn_entry: dict[str, Any] = {"name": name, "sections": {}}
+        for sk in template_sections:
+            value = sections.get(sk, "").strip()
+            editable = sk in owned_sections
+            fn_entry["sections"][SECTION_LABELS[sk]] = {
+                "value": value or None,
+                "editable": editable,
+            }
+        preamble = sections.get("_preamble", "").strip()
+        if preamble:
+            fn_entry["legacy_text"] = preamble
+        result.append(fn_entry)
+    return result
+
+
+def _build_join_specs_data(metadata_snapshot: dict) -> list[dict]:
+    """Build join specifications as structured dicts with clean relationship types."""
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    inst = metadata_snapshot.get("instructions", {})
+    if not isinstance(inst, dict):
+        inst = {}
+    specs = (
+        metadata_snapshot.get("join_specs", [])
+        or inst.get("join_specs", [])
+        or ds.get("join_specs", [])
+    )
+    if not specs:
+        return []
+    result: list[dict] = []
+    for js in specs:
+        left = js.get("left", {})
+        right = js.get("right", {})
+        sql_raw = js.get("sql", "")
+
+        condition_text = ""
+        relationship = None
+        if isinstance(sql_raw, list):
+            conditions = [s for s in sql_raw if not str(s).startswith("--rt=")]
+            rt_parts = [s for s in sql_raw if str(s).startswith("--rt=")]
+            condition_text = " AND ".join(str(c) for c in conditions)
+            if rt_parts:
+                rt_str = str(rt_parts[0]).strip("-").removeprefix("rt=")
+                relationship = rt_str.replace("FROM_RELATIONSHIP_TYPE_", "").replace("_", " ").lower()
+        else:
+            condition_text = str(sql_raw)[:200]
+
+        entry: dict[str, Any] = {
+            "left_table": left.get("identifier", "?"),
+            "right_table": right.get("identifier", "?"),
+            "condition": condition_text[:200],
+        }
+        if relationship:
+            entry["relationship"] = relationship
+        result.append(entry)
+    return result
+
+
+def _build_example_sqls_data(metadata_snapshot: dict) -> list[dict]:
+    """Build existing example SQL as structured dicts."""
+    example_sqls = metadata_snapshot.get("example_question_sqls", [])
+    if not example_sqls:
+        return []
+    result: list[dict] = []
+    for ex in example_sqls[:20]:
+        if not isinstance(ex, dict):
+            continue
+        q = ex.get("question", "")
+        if isinstance(q, list):
+            q = q[0] if q else ""
+        sql = ex.get("sql", "")
+        if isinstance(sql, list):
+            sql = sql[0] if sql else ""
+        if not q:
+            continue
+        entry: dict[str, Any] = {"question": q, "sql": sql[:200]}
+        params = ex.get("parameters", [])
+        if params:
+            entry["parameters"] = [
+                {"name": p.get("name", "?"), "type": p.get("type_hint", "STRING")}
+                for p in params if isinstance(p, dict)
+            ]
+        guidance = ex.get("usage_guidance", [])
+        if guidance:
+            g = guidance[0] if isinstance(guidance, list) else str(guidance)
+            entry["guidance"] = g[:150]
+        result.append(entry)
+    return result
+
+
+def _build_blamed_values_data(
+    clusters: list[dict],
+    data_profile: dict,
+    *,
+    max_columns: int = 20,
+) -> dict[str, dict]:
+    """Build blamed column value profiles as structured dict."""
+    if not data_profile:
+        return {}
+
+    blamed_refs: set[str] = set()
+    for cluster in clusters:
+        blame = _normalize_blame(cluster.get("asi_blame_set"))
+        for b in blame:
+            blamed_refs.add(b.strip().lower())
+
+    if not blamed_refs:
+        return {}
+
+    profile_lower: dict[str, dict] = {}
+    for table_fqn, tinfo in data_profile.items():
+        tkey = table_fqn.lower()
+        short_name = tkey.split(".")[-1] if "." in tkey else tkey
+        for col_name, cinfo in tinfo.get("columns", {}).items():
+            col_lower = col_name.lower()
+            profile_lower[f"{tkey}.{col_lower}"] = cinfo
+            profile_lower[f"{short_name}.{col_lower}"] = cinfo
+            profile_lower[col_lower] = cinfo
+
+    result: dict[str, dict] = {}
+    matched = 0
+    for ref in sorted(blamed_refs):
+        if matched >= max_columns:
+            break
+        cinfo = profile_lower.get(ref)
+        if not cinfo:
+            continue
+        matched += 1
+        entry: dict[str, Any] = {}
+        card = cinfo.get("cardinality")
+        if card is not None:
+            entry["cardinality"] = card
+        vals = cinfo.get("distinct_values")
+        if vals:
+            entry["values"] = vals
+        minv = cinfo.get("min")
+        maxv = cinfo.get("max")
+        if minv is not None:
+            entry["range"] = [minv, maxv]
+        result[ref] = entry
+
+    return result
+
+
+def _extract_tables_from_clusters(clusters: list[dict]) -> set[str] | None:
+    """Extract relevant table identifiers from SQL diffs and blame sets.
+
+    Returns a lowercased set of fully-qualified or short table names, or
+    ``None`` if nothing could be extracted (which disables filtering).
+    """
+    tables: set[str] = set()
+    for cluster in clusters:
+        blame = _normalize_blame(cluster.get("asi_blame_set"))
+        for b in blame:
+            bl = b.lower().strip()
+            if ":table" in bl:
+                tables.add(bl.split(":")[0])
+            else:
+                tables.add(bl)
+        for ctx in cluster.get("sql_contexts", [])[:3]:
+            for key in ("expected_sql", "generated_sql"):
+                for m in re.finditer(r'\b(\w+\.\w+\.\w+)\b', ctx.get(key, "")):
+                    tables.add(m.group(1).lower())
+    return tables if tables else None
+
+
+def _truncate_context_to_budget(context: dict, budget_tokens: int) -> dict:
+    """Truncate context dict to fit within token budget.
+
+    Removes entries from lowest-priority sections first:
+    1. Remove soft_signal_clusters entries
+    2. Remove non-blamed schema table entries
+    3. Trim column lists per table in schema
+    4. Trim example_sqls
+    5. Trim blamed_column_values
+    Never touches failure_clusters or priority_analysis.
+    """
+    import copy as _copy
+
+    def _estimate(d: dict) -> int:
+        return _estimate_tokens(json.dumps(d, default=str))
+
+    current = _estimate(context)
+    if current <= budget_tokens:
+        return context
+
+    result = _copy.deepcopy(context)
+
+    if current > budget_tokens and result.get("soft_signal_clusters"):
+        result["soft_signal_clusters"] = result["soft_signal_clusters"][:3]
+        current = _estimate(result)
+
+    if current > budget_tokens and result.get("soft_signal_clusters"):
+        result["soft_signal_clusters"] = []
+        current = _estimate(result)
+
+    if current > budget_tokens and isinstance(result.get("schema"), list):
+        half = max(3, len(result["schema"]) // 2)
+        result["schema"] = result["schema"][:half]
+        current = _estimate(result)
+
+    if current > budget_tokens and isinstance(result.get("schema"), list):
+        for tbl in result["schema"]:
+            if isinstance(tbl.get("columns"), list) and len(tbl["columns"]) > 10:
+                tbl["columns"] = tbl["columns"][:10]
+        current = _estimate(result)
+
+    if current > budget_tokens and isinstance(result.get("existing_example_sqls"), list):
+        result["existing_example_sqls"] = result["existing_example_sqls"][:5]
+        current = _estimate(result)
+
+    if current > budget_tokens and isinstance(result.get("blamed_column_values"), dict):
+        items = list(result["blamed_column_values"].items())
+        result["blamed_column_values"] = dict(items[:10])
+        current = _estimate(result)
+
+    if current > budget_tokens and isinstance(result.get("structured_metadata"), dict):
+        sm = result["structured_metadata"]
+        if isinstance(sm.get("functions"), list):
+            sm["functions"] = sm["functions"][:3]
+        current = _estimate(result)
+
+    if current > budget_tokens and isinstance(result.get("schema"), list):
+        result["schema"] = result["schema"][:3]
+        current = _estimate(result)
+
+    return result
+
+
+def _build_context_data(
+    *,
+    clusters: list[dict],
+    soft_signal_clusters: list[dict],
+    metadata_snapshot: dict,
+    reflection_buffer: list[dict],
+    priority_ranking: list[dict],
+    blame_set: list[str] | None,
+    success_summary: str,
+    reflection_text: str,
+    persistence_text: str,
+    proven_patterns_text: str,
+    suggestions_text: str,
+) -> dict:
+    """Assemble all context sections as a single Python dict for JSON serialization."""
+    relevant_tables = _extract_tables_from_clusters(clusters + soft_signal_clusters)
+
+    return {
+        "progress_summary": success_summary,
+        "priority_analysis": [
+            {
+                "rank": c.get("rank", "?"),
+                "cluster_id": c.get("cluster_id", "?"),
+                "root_cause": c.get("root_cause", "?"),
+                "judge": c.get("affected_judge", "?"),
+                "questions": len(c.get("question_ids", [])),
+                "impact": c.get("impact_score", 0),
+            }
+            for c in priority_ranking[:10]
+        ],
+        "reflection_history": reflection_text,
+        "proven_patterns": proven_patterns_text,
+        "persistent_failures": persistence_text,
+        "human_suggestions": suggestions_text or None,
+        "schema": _build_schema_data(metadata_snapshot, filter_tables=relevant_tables),
+        "failure_clusters": _build_cluster_data(clusters),
+        "soft_signal_clusters": _build_soft_signal_data(soft_signal_clusters),
+        "structured_metadata": {
+            "tables": _build_structured_table_data(metadata_snapshot, blame_set),
+            "columns": _build_structured_column_data(metadata_snapshot, blame_set),
+            "functions": _build_structured_function_data(metadata_snapshot),
+        },
+        "join_specifications": _build_join_specs_data(metadata_snapshot),
+        "current_instructions": metadata_snapshot.get("general_instructions", "") or None,
+        "existing_example_sqls": _build_example_sqls_data(metadata_snapshot),
+        "blamed_column_values": _build_blamed_values_data(
+            clusters, metadata_snapshot.get("_data_profile", {}),
+        ),
+    }
 
 
 _SQL_PATTERN_ROOT_CAUSES = frozenset({
@@ -4661,11 +5320,10 @@ def _call_llm_for_strategy(
         _link_prompt_to_trace,
     )
 
-    blame_set: Any = None
+    _blame_items: list[str] = []
     for c in clusters:
-        if c.get("asi_blame_set"):
-            blame_set = c["asi_blame_set"]
-            break
+        _blame_items.extend(_normalize_blame(c.get("asi_blame_set")))
+    blame_set: list[str] | None = list(dict.fromkeys(_blame_items)) if _blame_items else None
 
     format_kwargs: dict[str, Any] = {
         "full_schema_context": _format_full_schema_context(metadata_snapshot),
@@ -4815,11 +5473,10 @@ def _call_llm_for_adaptive_strategy(
         _link_prompt_to_trace,
     )
 
-    blame_set: Any = None
+    _blame_items: list[str] = []
     for c in clusters:
-        if c.get("asi_blame_set"):
-            blame_set = c["asi_blame_set"]
-            break
+        _blame_items.extend(_normalize_blame(c.get("asi_blame_set")))
+    blame_set: list[str] | None = list(dict.fromkeys(_blame_items)) if _blame_items else None
 
     # ── Build priority ranking text ──────────────────────────────────
     ranking_lines: list[str] = []
@@ -4899,54 +5556,30 @@ def _call_llm_for_adaptive_strategy(
                 lines_hs.append(f"- {item}")
         suggestions_text = "\n".join(lines_hs)
 
-    # ── Assemble prompt kwargs ───────────────────────────────────────
+    # ── Build structured context ────────────────────────────────────
+    context_data = _build_context_data(
+        clusters=clusters,
+        soft_signal_clusters=soft_signal_clusters,
+        metadata_snapshot=metadata_snapshot,
+        reflection_buffer=reflection_buffer,
+        priority_ranking=priority_ranking,
+        blame_set=blame_set,
+        success_summary=success_summary,
+        reflection_text=reflection_text,
+        persistence_text=persistence_text,
+        proven_patterns_text=proven_patterns_text,
+        suggestions_text=suggestions_text,
+    )
+    context_data = _truncate_context_to_budget(context_data, PROMPT_TOKEN_BUDGET)
+    context_json = json.dumps(context_data, indent=2, default=str)
+
     format_kwargs: dict[str, Any] = {
-        "success_summary": success_summary,
-        "priority_ranking": ranking_text,
-        "reflection_buffer": reflection_text,
-        "question_persistence_summary": persistence_text,
-        "human_reviewer_suggestions": suggestions_text or "(No human reviewer suggestions available.)",
-        "proven_patterns": proven_patterns_text,
-        "full_schema_context": _format_full_schema_context(metadata_snapshot),
-        "cluster_briefs": _format_cluster_briefs(clusters),
-        "soft_signal_summary": _format_soft_signal_summary(soft_signal_clusters),
-        "structured_table_context": _format_structured_table_context(
-            metadata_snapshot, blame_set, lever=1,
-        ),
-        "structured_column_context": _format_structured_column_context(
-            metadata_snapshot, blame_set, lever=1,
-        ),
-        "structured_function_context": _format_structured_function_context(
-            metadata_snapshot, lever=3,
-        ),
-        "current_join_specs": _format_join_specs_context(metadata_snapshot),
-        "current_instructions": (
-            metadata_snapshot.get("general_instructions", "")
-            or "(No current instructions.)"
-        ),
-        "existing_example_sqls": _format_existing_example_sqls(metadata_snapshot),
+        "context_json": context_json,
         "identifier_allowlist": _format_identifier_allowlist(
             _build_identifier_allowlist(metadata_snapshot)
         ),
-        "blamed_column_values": _format_blamed_column_values(
-            clusters, metadata_snapshot.get("_data_profile", {}),
-        ),
         "instruction_char_budget": max(0, 24500 - 500),
     }
-
-    format_kwargs = _truncate_to_budget(
-        format_kwargs,
-        ADAPTIVE_STRATEGIST_PROMPT,
-        priority_keys=[
-            "blamed_column_values",
-            "soft_signal_summary",
-            "existing_example_sqls",
-            "structured_function_context",
-            "full_schema_context",
-            "structured_column_context",
-            "cluster_briefs",
-        ],
-    )
 
     prompt = format_mlflow_template(ADAPTIVE_STRATEGIST_PROMPT, **format_kwargs)
 
@@ -5690,6 +6323,8 @@ def _validate_lever5_proposals(
     spark: Any = None,
     catalog: str = "",
     gold_schema: str = "",
+    w: Any = None,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Filter out empty, generic, over-length, or hallucinated Lever 5 proposals."""
     from genie_space_optimizer.common.config import MAX_INSTRUCTION_TEXT_CHARS
@@ -5840,6 +6475,7 @@ def _validate_lever5_proposals(
                         es, spark, catalog=catalog, gold_schema=gold_schema,
                         execute=True,
                         parameters=p.get("parameters"),
+                        w=w, warehouse_id=warehouse_id,
                     )
                     if not is_valid:
                         logger.warning(
@@ -5869,6 +6505,8 @@ def _mine_benchmark_example_sqls(
     spark: Any = None,
     catalog: str = "",
     gold_schema: str = "",
+    w: Any = None,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Mine benchmarks with ``expected_sql`` as ready-made example SQL proposals.
 
@@ -5935,6 +6573,7 @@ def _mine_benchmark_example_sqls(
                     sql, spark, catalog=catalog, gold_schema=gold_schema,
                     execute=True,
                     parameters=b.get("parameters"),
+                    w=w, warehouse_id=warehouse_id,
                 )
                 if not is_valid:
                     logger.info(
@@ -6258,6 +6897,7 @@ def generate_proposals_from_strategy(
     spark: Any = None,
     catalog: str = "",
     gold_schema: str = "",
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Generate proposals for a single lever guided by the holistic strategy.
 
@@ -6628,6 +7268,7 @@ def generate_proposals_from_strategy(
         proposals = _validate_lever5_proposals(
             proposals, metadata_snapshot,
             spark=spark, catalog=catalog, gold_schema=gold_schema,
+            w=w, warehouse_id=warehouse_id,
         )
         proposals = _deduplicate_proposals(proposals)
         proposals = _filter_no_op_proposals(proposals, metadata_snapshot)
@@ -6659,6 +7300,7 @@ def generate_metadata_proposals(
     catalog: str = "",
     gold_schema: str = "",
     benchmarks: list[dict] | None = None,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Generate metadata change proposals from failure clusters.
 
@@ -6795,6 +7437,7 @@ def generate_metadata_proposals(
             mined = _mine_benchmark_example_sqls(
                 benchmarks, metadata_snapshot,
                 spark=spark, catalog=catalog, gold_schema=gold_schema,
+                w=w, warehouse_id=warehouse_id,
             )
             if mined:
                 logger.info("Benchmark mining added %d example SQL proposals", len(mined))
@@ -6803,6 +7446,7 @@ def generate_metadata_proposals(
         proposals = _validate_lever5_proposals(
             proposals, metadata_snapshot,
             spark=spark, catalog=catalog, gold_schema=gold_schema,
+            w=w, warehouse_id=warehouse_id,
         )
         _pre_dedup_p = len(proposals)
         proposals = _deduplicate_proposals(proposals)
@@ -7066,6 +7710,7 @@ def generate_metadata_proposals(
     proposals = _validate_lever5_proposals(
         proposals, metadata_snapshot,
         spark=spark, catalog=catalog, gold_schema=gold_schema,
+        w=w, warehouse_id=warehouse_id,
     )
     _pre_dedup_p = len(proposals)
     proposals = _deduplicate_proposals(proposals)
