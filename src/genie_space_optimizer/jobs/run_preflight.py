@@ -358,7 +358,40 @@ except Exception as exc:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 1e: Past Human Feedback
+# MAGIC ## Step 1e: Experiment and Model Setup
+# MAGIC
+# MAGIC Create or resolve the MLflow experiment, register judge prompts, flag stale temporal
+# MAGIC benchmarks, sync the evaluation dataset, and create the initial LoggedModel
+# MAGIC (iteration 0). This cell writes the final `PREFLIGHT_STARTED → COMPLETE` stage record
+# MAGIC to Delta.
+# MAGIC
+# MAGIC > **Note:** This step runs before human feedback loading so that
+# MAGIC > `mlflow.set_experiment()` is called first — label schemas and other MLflow
+# MAGIC > artifacts created during feedback ingestion are then scoped to the correct
+# MAGIC > per-Genie-Space experiment.
+
+# COMMAND ----------
+
+try:
+    _banner("Step 1e — Experiment & Model Setup")
+    ctx_exp = preflight_setup_experiment(
+        w, spark, run_id, space_id, catalog, schema, _domain,
+        _config, _benchmarks,
+        ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
+        _genie_table_refs, experiment_name,
+    )
+    _log("Experiment created",
+         experiment=ctx_exp["experiment_name"],
+         model_creation="deferred to baseline eval")
+except Exception as exc:
+    _banner("Experiment Setup FAILED")
+    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
+    raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1f: Past Human Feedback
 # MAGIC
 # MAGIC Load human corrections from prior completed optimization runs for this Genie Space.
 # MAGIC Corrections include benchmark fixes, judge overrides, and quarantine decisions
@@ -366,42 +399,15 @@ except Exception as exc:
 
 # COMMAND ----------
 
-_banner("Step 1e — Human Feedback")
+_banner("Step 1f — Human Feedback")
 ctx_feedback = preflight_load_human_feedback(
     spark, run_id, space_id, catalog, schema, _domain,
 )
 _log("Feedback loaded", corrections=len(ctx_feedback["human_corrections"]))
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 1f: Experiment and Model Setup
-# MAGIC
-# MAGIC Create or resolve the MLflow experiment, register judge prompts, flag stale temporal
-# MAGIC benchmarks, sync the evaluation dataset, and create the initial LoggedModel
-# MAGIC (iteration 0). This cell writes the final `PREFLIGHT_STARTED → COMPLETE` stage record
-# MAGIC to Delta.
-
-# COMMAND ----------
-
-try:
-    _banner("Step 1f — Experiment & Model Setup")
-    ctx_exp = preflight_setup_experiment(
-        w, spark, run_id, space_id, catalog, schema, _domain,
-        _config, _benchmarks,
-        ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
-        _genie_table_refs, experiment_name,
-    )
-    _log("Experiment created", model_id=ctx_exp["model_id"],
-         experiment=ctx_exp["experiment_name"], prompts=len(ctx_exp["prompt_registrations"]))
-except Exception as exc:
-    _banner("Experiment Setup FAILED")
-    _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
-    raise
-
 # Assemble the preflight_out dict for downstream task value publication
-import mlflow as _mlflow
-_exp = _mlflow.get_experiment_by_name(ctx_exp["experiment_name"])
+from mlflow.tracking import MlflowClient as _MlflowClient
+_exp = _MlflowClient().get_experiment_by_name(ctx_exp["experiment_name"])
 _experiment_id = _exp.experiment_id if _exp else ""
 
 update_run_status(
@@ -414,7 +420,8 @@ update_run_status(
 preflight_out = {
     "config": _config,
     "benchmarks": _benchmarks,
-    "model_id": ctx_exp["model_id"],
+    "model_id": None,
+    "model_creation_params": ctx_exp.get("model_creation_params", {}),
     "experiment_name": ctx_exp["experiment_name"],
     "experiment_id": _experiment_id,
     "human_corrections": ctx_feedback["human_corrections"],
@@ -423,7 +430,7 @@ preflight_out = {
 _log(
     "Preflight complete",
     benchmark_count=len(_benchmarks),
-    model_id=preflight_out["model_id"],
+    model_creation="deferred to baseline eval",
     experiment_name=preflight_out["experiment_name"],
 )
 
@@ -459,7 +466,11 @@ dbutils.jobs.taskValues.set(key="catalog", value=catalog)
 dbutils.jobs.taskValues.set(key="schema", value=schema)
 dbutils.jobs.taskValues.set(key="experiment_name", value=preflight_out["experiment_name"])
 dbutils.jobs.taskValues.set(key="experiment_id", value=preflight_out.get("experiment_id", ""))
-dbutils.jobs.taskValues.set(key="model_id", value=preflight_out["model_id"])
+_mcp = preflight_out.get("model_creation_params", {})
+_mcp_json = json.dumps(_mcp, default=str)
+if len(_mcp_json) > 40_000:
+    _log("WARNING: model_creation_params JSON approaching 48KB task value limit", size=len(_mcp_json))
+dbutils.jobs.taskValues.set(key="model_creation_params", value=_mcp_json)
 dbutils.jobs.taskValues.set(key="benchmark_count", value=len(preflight_out["benchmarks"]))
 dbutils.jobs.taskValues.set(key="max_iterations", value=max_iterations)
 dbutils.jobs.taskValues.set(key="levers", value=json.dumps(levers))
@@ -472,13 +483,12 @@ _log(
     "Task values published",
     run_id=run_id,
     benchmark_count=len(preflight_out["benchmarks"]),
-    model_id=preflight_out["model_id"],
+    model_creation="deferred to baseline eval",
 )
 _banner("Task 1 Completed")
 dbutils.notebook.exit(json.dumps({
     "run_id": run_id,
     "benchmark_count": len(preflight_out["benchmarks"]),
-    "model_id": preflight_out["model_id"],
 }, default=str))
 
 # COMMAND ----------

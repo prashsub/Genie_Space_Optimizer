@@ -89,7 +89,8 @@ if not target_workspace_url:
 
 _banner("Loading Model Artifacts")
 
-mlflow.set_registry_uri("databricks-uc")
+from mlflow import set_registry_uri
+set_registry_uri("databricks-uc")
 client = MlflowClient(registry_uri="databricks-uc")
 
 mv = client.get_model_version(model_name, model_version)
@@ -99,7 +100,8 @@ _log("Model version info", run_id=source_run_id, status=mv.status)
 
 space_config: dict | None = None
 if source_run_id:
-    artifacts_dir = mlflow.artifacts.download_artifacts(
+    from mlflow.artifacts import download_artifacts
+    artifacts_dir = download_artifacts(
         run_id=source_run_id,
         artifact_path="model_snapshots",
     )

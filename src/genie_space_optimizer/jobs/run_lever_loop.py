@@ -231,6 +231,9 @@ enrichment_model_id = dbutils.jobs.taskValues.get(taskKey="enrichment", key="enr
 enrichment_skipped_raw = dbutils.jobs.taskValues.get(taskKey="enrichment", key="enrichment_skipped")
 enrichment_skipped = str(enrichment_skipped_raw).lower() in ("true", "1")
 
+import mlflow
+mlflow.set_experiment(exp_name)
+
 _banner("Resolved Upstream Task Values")
 _log(
     "Inputs",

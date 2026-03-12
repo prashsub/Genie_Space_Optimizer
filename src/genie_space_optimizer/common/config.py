@@ -2103,7 +2103,8 @@ TABLE_SUGGESTIONS = "genie_opt_suggestions"
 # ── 13. MLflow Conventions ─────────────────────────────────────────────
 
 EXPERIMENT_PATH_TEMPLATE = "/Shared/genie-space-optimizer/{{ space_id }}/{{ domain }}"
-RUN_NAME_TEMPLATE = "genie_eval_iter{{ iteration }}_{{ timestamp }}"
+RUN_NAME_TEMPLATE = "iter_{{ iteration }}_eval_{{ timestamp }}"
+BASELINE_RUN_NAME_TEMPLATE = "baseline_eval_{{ timestamp }}"
 MODEL_NAME_TEMPLATE = "genie-space-{{ space_id }}"
 
 UC_REGISTERED_MODEL_TEMPLATE = "{{ catalog }}.{{ schema }}.genie_space_{{ space_id }}"

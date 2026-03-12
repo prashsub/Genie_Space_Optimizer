@@ -7,7 +7,6 @@ as an MLflow LoggedModel. This provides full lineage and one-click rollback.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 import json
 import logging
 import tempfile
@@ -49,7 +48,10 @@ def create_genie_model_version(
     """Create an MLflow LoggedModel snapshot for a Genie Space iteration.
 
     Captures the full Genie config and UC metadata state as model params
-    and artifacts. Returns the ``model_id`` string.
+    and artifacts.  Must be called inside an active ``mlflow.start_run()``
+    context so that artifacts are logged to the caller's run.
+
+    Returns the ``model_id`` string.
     """
     model_name = format_mlflow_template(MODEL_NAME_TEMPLATE, space_id=space_id)
 
@@ -76,45 +78,46 @@ def create_genie_model_version(
         artifact_prefix = f"model_snapshots/iter_{iteration}"
 
         active_run = mlflow.active_run()
-        run_ctx = nullcontext(active_run) if active_run else mlflow.start_run(
-            run_name=f"model_snapshot_iter_{iteration}",
-        )
-        with run_ctx as run:
-            current_run = run if run is not None else mlflow.active_run()
-            run_id = current_run.info.run_id if current_run else ""
-            _log_dict_artifact(config, f"{artifact_prefix}/space_config.json")
-            _log_dict_artifact(metadata_snapshot, f"{artifact_prefix}/metadata_snapshot.json")
-
-            model = _initialize_logged_model(
-                name=model_name,
-                source_run_id=run_id or None,
-                params={
-                    "space_id": space_id,
-                    "domain": domain,
-                    "iteration": str(iteration),
-                    "uc_schema": uc_schema,
-                    "uc_columns_count": str(len(resolved_columns)),
-                    "uc_tags_count": str(len(resolved_tags)),
-                    "uc_routines_count": str(len(resolved_routines)),
-                    "patch_count": str(len(patch_set or [])),
-                    "parent_model_id": str(parent_model_id or ""),
-                    "snapshot_run_id": run_id or "",
-                    "space_config_artifact": f"{artifact_prefix}/space_config.json",
-                    "metadata_artifact": f"{artifact_prefix}/metadata_snapshot.json",
-                    # Backward-compatible key used by rollback fallback path.
-                    "model_space_config": _safe_serialize(config),
-                },
-                tags={
-                    "domain": domain,
-                    "space_id": space_id,
-                    "iteration": str(iteration),
-                    "uc_schema": uc_schema,
-                    "traceability": "genie_space_optimizer",
-                    **({"genie.optimization_run_id": optimization_run_id} if optimization_run_id else {}),
-                },
+        if not active_run:
+            raise RuntimeError(
+                "create_genie_model_version requires an active MLflow run "
+                "for artifact logging.  Call from inside run_evaluation() "
+                "or a dedicated mlflow.start_run() block."
             )
-            model_id = model.model_id
-            _finalize_logged_model(model_id)
+
+        run_id = active_run.info.run_id
+        _log_dict_artifact(config, f"{artifact_prefix}/space_config.json")
+        _log_dict_artifact(metadata_snapshot, f"{artifact_prefix}/metadata_snapshot.json")
+
+        model = _initialize_logged_model(
+            name=model_name,
+            source_run_id=run_id,
+            params={
+                "space_id": space_id,
+                "domain": domain,
+                "iteration": str(iteration),
+                "uc_schema": uc_schema,
+                "uc_columns_count": str(len(resolved_columns)),
+                "uc_tags_count": str(len(resolved_tags)),
+                "uc_routines_count": str(len(resolved_routines)),
+                "patch_count": str(len(patch_set or [])),
+                "parent_model_id": str(parent_model_id or ""),
+                "snapshot_run_id": run_id,
+                "space_config_artifact": f"{artifact_prefix}/space_config.json",
+                "metadata_artifact": f"{artifact_prefix}/metadata_snapshot.json",
+                "model_space_config": _safe_serialize(config),
+            },
+            tags={
+                "domain": domain,
+                "space_id": space_id,
+                "iteration": str(iteration),
+                "uc_schema": uc_schema,
+                "traceability": "genie_space_optimizer",
+                **({"genie.optimization_run_id": optimization_run_id} if optimization_run_id else {}),
+            },
+        )
+        model_id = model.model_id
+        _finalize_logged_model(model_id)
 
         logger.info(
             "Created LoggedModel %s (iter=%d, model_id=%s)",
@@ -242,7 +245,7 @@ def register_uc_model(
         from mlflow import MlflowClient
 
         client = MlflowClient(registry_uri="databricks-uc")
-        client.set_registered_model_alias(uc_model_name, "champion", int(version))
+        client.set_registered_model_alias(uc_model_name, "champion", str(version))
 
         logger.info(
             "Registered UC model %s version %s with @champion alias",
@@ -314,15 +317,24 @@ def rollback_to_model(
 def link_eval_scores_to_model(
     model_id: str,
     scores: dict[str, float],
+    eval_run_id: str = "",
 ) -> None:
     """Link evaluation metrics to a LoggedModel.
 
-    Logs metrics both on the active MLflow Run (for backward compat) and
-    directly to the LoggedModel so they appear on the Model card in the UI.
+    Logs metrics to the eval run via ``MlflowClient`` (avoiding implicit
+    run creation) and directly to the LoggedModel so they appear on the
+    Model card in the UI.
     """
     try:
-        for judge, score in scores.items():
-            mlflow.log_metric(f"eval_{judge}", score)
+        from mlflow.tracking import MlflowClient
+
+        if eval_run_id:
+            client = MlflowClient()
+            for judge, score in scores.items():
+                client.log_metric(eval_run_id, f"eval_{judge}", score)
+        else:
+            for judge, score in scores.items():
+                mlflow.log_metric(f"eval_{judge}", score)
 
         if model_id and model_id.startswith("m-"):
             try:

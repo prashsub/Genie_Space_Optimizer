@@ -47,9 +47,7 @@ from genie_space_optimizer.optimization.evaluation import (
     generate_benchmarks,
     load_benchmarks_from_dataset,
     register_instruction_version,
-    register_judge_prompts,
 )
-from genie_space_optimizer.optimization.models import create_genie_model_version
 from genie_space_optimizer.optimization.state import (
     load_run,
     load_runs_for_space,
@@ -1241,22 +1239,17 @@ def preflight_setup_experiment(
         experiment_id=experiment_id,
     )
 
-    prompt_registrations = register_judge_prompts(uc_schema, domain, experiment_name)
-
-    model_id = create_genie_model_version(
-        w, space_id, config, iteration=0, domain=domain,
-        experiment_name=experiment_name,
-        uc_schema=uc_schema,
-        uc_columns=uc_columns,
-        uc_tags=uc_tags,
-        uc_routines=uc_routines,
-    )
+    model_creation_params = {
+        "config": config,
+        "uc_columns": uc_columns,
+        "uc_tags": uc_tags,
+        "uc_routines": uc_routines,
+    }
 
     _lines = [_pf_section("PREFLIGHT — EXPERIMENT & MODEL SETUP")]
     _lines.append(_pf_kv("Experiment", experiment_name))
     _lines.append(_pf_kv("Experiment ID", experiment_id))
-    _lines.append(_pf_kv("Model version", model_id))
-    _lines.append(_pf_kv("Judge prompts", f"{len(prompt_registrations)} registered"))
+    _lines.append(_pf_kv("Model creation", "deferred to baseline eval"))
     _lines.append(_pf_kv("Eval dataset", f"synced ({len(benchmarks)} benchmarks)"))
     _lines.append(_pf_kv("Instructions", "registered" if initial_instructions else "none to register"))
     _lines.append(_pf_bar())
@@ -1279,17 +1272,16 @@ def preflight_setup_experiment(
             "instruction_count": _instr_count,
             "benchmark_count": len(benchmarks),
             "experiment_name": experiment_name,
-            "model_id": model_id,
-            "prompt_count": len(prompt_registrations),
+            "model_id": None,
         },
         catalog=catalog, schema=schema,
     )
 
     return {
-        "model_id": model_id,
+        "model_id": None,
+        "model_creation_params": model_creation_params,
         "experiment_name": experiment_name,
         "experiment_id": experiment_id,
-        "prompt_registrations": prompt_registrations,
     }
 
 
@@ -1303,14 +1295,14 @@ def run_preflight(
     domain: str,
     experiment_name: str | None = None,
     apply_mode: str = "genie_config",
-) -> tuple[dict, list[dict], str, str, list[dict]]:
+) -> tuple[dict, list[dict], str | None, str, list[dict], dict | None]:
     """Execute the full preflight sequence (Stage 1).
 
     Wrapper that calls 6 sub-steps in sequence. Each sub-step is individually
     callable from a notebook cell for transparency.
 
     Returns:
-        (config, benchmarks, model_id, experiment_name, human_corrections)
+        (config, benchmarks, model_id, experiment_name, human_corrections, model_creation_params)
     """
     ctx1 = preflight_fetch_config(
         w, spark, run_id, space_id, catalog, schema, domain, apply_mode,
@@ -1357,6 +1349,7 @@ def run_preflight(
         ctx6["model_id"],
         ctx6["experiment_name"],
         ctx5["human_corrections"],
+        ctx6.get("model_creation_params"),
     )
 
 

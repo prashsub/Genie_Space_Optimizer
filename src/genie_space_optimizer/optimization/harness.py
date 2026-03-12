@@ -82,7 +82,6 @@ from genie_space_optimizer.optimization.evaluation import (
 )
 from genie_space_optimizer.optimization.models import (
     create_genie_model_version,
-    link_eval_scores_to_model,
     promote_best_model,
 )
 from genie_space_optimizer.optimization.optimizer import (
@@ -349,7 +348,7 @@ def baseline_setup_scorers(
     catalog: str,
     schema: str,
     exp_name: str,
-    model_id: str,
+    model_id: str | None,
     domain: str = "",
 ) -> dict:
     """Sub-step 2a: Create predict function and scorers. Writes STARTED stage."""
@@ -396,6 +395,7 @@ def baseline_run_evaluation(
     benchmarks: list[dict],
     setup_ctx: dict,
     w: WorkspaceClient | None = None,
+    model_creation_kwargs: dict | None = None,
 ) -> dict:
     """Sub-step 2b: Run 9-judge evaluation with retry."""
     _ensure_sql_context(spark, catalog, schema)
@@ -403,10 +403,11 @@ def baseline_run_evaluation(
         spark, run_id, "BASELINE_EVAL", run_evaluation,
         catalog, schema,
         setup_ctx["space_id"], setup_ctx["exp_name"], 0, benchmarks,
-        setup_ctx["domain"], setup_ctx["model_id"], "full",
+        setup_ctx["domain"], setup_ctx.get("model_id"), "full",
         setup_ctx["predict_fn"], setup_ctx["scorers"],
         spark=spark, w=w, catalog=catalog, gold_schema=schema,
         uc_schema=f"{catalog}.{schema}",
+        model_creation_kwargs=model_creation_kwargs,
     )
     return eval_result
 
@@ -466,8 +467,6 @@ def baseline_persist_state(
         catalog=catalog, schema=schema,
         eval_scope="full", model_id=model_id,
     )
-
-    link_eval_scores_to_model(model_id, scores)
 
     update_run_status(
         spark, run_id, catalog, schema,
@@ -1778,19 +1777,28 @@ def _run_enrichment(
         enrichment_skipped = total_enrichments == 0
 
         # ── 3. LoggedModel snapshot of enriched state ─────────────────────
+        import mlflow as _mlflow_enr
         uc_schema = f"{catalog}.{schema}"
-        enrichment_model_id = create_genie_model_version(
-            w,
-            space_id,
-            config,
-            iteration=-1,
-            domain=domain,
-            experiment_name=exp_name,
-            uc_schema=uc_schema,
-            uc_columns=uc_columns,
-            parent_model_id=baseline_model_id or None,
-            optimization_run_id=optimization_run_id or run_id,
-        )
+        _enr_run_name = f"enrichment_snapshot_{(optimization_run_id or run_id)[:12]}"
+        with _mlflow_enr.start_run(run_name=_enr_run_name):
+            _mlflow_enr.set_tags({
+                "genie.space_id": space_id,
+                "genie.domain": domain,
+                "genie.optimization_run_id": optimization_run_id or run_id,
+                "genie.run_type": "enrichment_snapshot",
+            })
+            enrichment_model_id = create_genie_model_version(
+                w,
+                space_id,
+                config,
+                iteration=-1,
+                domain=domain,
+                experiment_name=exp_name,
+                uc_schema=uc_schema,
+                uc_columns=uc_columns,
+                parent_model_id=baseline_model_id or None,
+                optimization_run_id=optimization_run_id or run_id,
+            )
 
         write_stage(
             spark, run_id, "ENRICHMENT_COMPLETE", "COMPLETE",
@@ -3377,22 +3385,23 @@ def _run_gate_checks(
         catalog=catalog, schema=schema,
     )
 
-    new_model_id = create_genie_model_version(
-        w, space_id, metadata_snapshot, iteration_counter, domain,
-        experiment_name=exp_name,
-        uc_schema=uc_schema,
-        patch_set=patches,
-        parent_model_id=prev_model_id,
-    )
+    _model_kwargs = {
+        "w": w, "space_id": space_id, "config": metadata_snapshot,
+        "iteration": iteration_counter, "domain": domain,
+        "experiment_name": exp_name, "uc_schema": uc_schema,
+        "patch_set": patches, "parent_model_id": prev_model_id,
+    }
 
     _ensure_sql_context(spark, catalog, schema)
     full_result_1 = run_evaluation(
         space_id, exp_name, iteration_counter, benchmarks,
-        domain, new_model_id, "full",
+        domain, None, "full",
         predict_fn, scorers,
         spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
         reference_sqls=reference_sqls if reference_sqls else None,
+        model_creation_kwargs=_model_kwargs,
     )
+    new_model_id = full_result_1.get("model_id", "")
 
     scores_1 = full_result_1.get("scores", {})
     accuracy_1 = full_result_1.get("overall_accuracy", 0.0)
@@ -3706,6 +3715,11 @@ def _run_lever_loop(
     if uc_columns:
         enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
+    enrichment_result: dict = {}
+    join_result: dict = {}
+    meta_result: dict = {}
+    instruction_result: dict = {}
+
     if not enrichment_done:
         # ── Phase 1: Proactive Enrichment (inline, legacy path) ──
         _pe_lines = [_section("LEVER LOOP — PROACTIVE ENRICHMENT", "-")]
@@ -4016,42 +4030,66 @@ def _run_lever_loop(
 
         _total_q = len(benchmarks)
         _passing_q = _total_q - sum(len(c.get("question_ids", [])) for c in clusters)
-        strategy = _call_llm_for_adaptive_strategy(
-            clusters=clusters,
-            soft_signal_clusters=soft_signal_clusters,
-            metadata_snapshot=metadata_snapshot,
-            reflection_buffer=reflection_buffer,
-            priority_ranking=ranked,
-            tried_patches=tried_patches,
-            w=w,
-            total_benchmarks=_total_q,
-            passing_benchmarks=max(0, _passing_q),
-            verdict_history=_verdict_history,
-            skill_exemplars=skill_exemplars or None,
-            human_suggestions=_human_suggestions or None,
+
+        # ── Open a strategy MLflow run for this iteration ──────────
+        import mlflow as _mlflow
+        from datetime import datetime as _dt
+
+        try:
+            _mlflow.end_run()
+        except Exception:
+            pass
+        _strat_ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        _mlflow.start_run(
+            run_name=f"strategy_{iteration_counter}_eval_{_strat_ts}",
         )
-        action_groups = strategy.get("action_groups", [])
-        ag = action_groups[0] if action_groups else None
+        try:
+            _mlflow.set_tags({
+                "genie.space_id": space_id,
+                "genie.domain": domain,
+                "genie.optimization_run_id": run_id,
+                "genie.iteration": str(iteration_counter),
+                "genie.run_type": "strategy",
+            })
 
-        _global_rewrite = (strategy.get("global_instruction_rewrite") or "").strip()
-        if _global_rewrite and ag is not None:
-            ld = ag.setdefault("lever_directives", {})
-            l5 = ld.setdefault("5", {})
-            l5["instruction_guidance"] = _global_rewrite
-
-        if ag is None and _iter_num == 1:
-            logger.info("Adaptive strategist returned 0 AGs on iter 1 — trying holistic fallback")
-            fallback_strategy = _generate_holistic_strategy(
+            strategy = _call_llm_for_adaptive_strategy(
                 clusters=clusters,
                 soft_signal_clusters=soft_signal_clusters,
                 metadata_snapshot=metadata_snapshot,
+                reflection_buffer=reflection_buffer,
+                priority_ranking=ranked,
+                tried_patches=tried_patches,
                 w=w,
+                total_benchmarks=_total_q,
+                passing_benchmarks=max(0, _passing_q),
+                verdict_history=_verdict_history,
+                skill_exemplars=skill_exemplars or None,
+                human_suggestions=_human_suggestions or None,
             )
-            _fb_ags = fallback_strategy.get("action_groups", [])
-            _fb_ags.sort(key=lambda a: a.get("priority", 999))
-            if _fb_ags:
-                ag = _fb_ags[0]
-                strategy = fallback_strategy
+            action_groups = strategy.get("action_groups", [])
+            ag = action_groups[0] if action_groups else None
+
+            _global_rewrite = (strategy.get("global_instruction_rewrite") or "").strip()
+            if _global_rewrite and ag is not None:
+                ld = ag.setdefault("lever_directives", {})
+                l5 = ld.setdefault("5", {})
+                l5["instruction_guidance"] = _global_rewrite
+
+            if ag is None and _iter_num == 1:
+                logger.info("Adaptive strategist returned 0 AGs on iter 1 — trying holistic fallback")
+                fallback_strategy = _generate_holistic_strategy(
+                    clusters=clusters,
+                    soft_signal_clusters=soft_signal_clusters,
+                    metadata_snapshot=metadata_snapshot,
+                    w=w,
+                )
+                _fb_ags = fallback_strategy.get("action_groups", [])
+                _fb_ags.sort(key=lambda a: a.get("priority", 999))
+                if _fb_ags:
+                    ag = _fb_ags[0]
+                    strategy = fallback_strategy
+        finally:
+            _mlflow.end_run()
 
         if ag is None:
             logger.info("Strategist produced 0 action groups — ending lever loop")
@@ -4687,7 +4725,6 @@ def _run_lever_loop(
         if new_hashes:
             reference_result_hashes.update(new_hashes)
 
-        link_eval_scores_to_model(new_model_id, full_scores)
         update_run_status(
             spark, run_id, catalog, schema,
             best_iteration=best_iteration,

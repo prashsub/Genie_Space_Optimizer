@@ -129,6 +129,99 @@ def _truncate_to_budget(
     return result
 
 
+# ── Traced LLM Call Helper ─────────────────────────────────────────────
+
+def _traced_llm_call(
+    w: WorkspaceClient | None,
+    system_msg: str,
+    prompt: str,
+    *,
+    span_name: str,
+    max_retries: int = LLM_MAX_RETRIES,
+    temperature: float = LLM_TEMPERATURE,
+    max_tokens: int | None = None,
+) -> tuple[str, Any]:
+    """Execute an LLM call wrapped in a ``CHAT_MODEL`` MLflow span.
+
+    The span captures the full prompt messages, model, temperature,
+    raw response text, token usage, and retry events.
+
+    Returns ``(raw_text, response_object)`` for the caller to parse.
+    Raises the last exception if all retries are exhausted.
+    """
+    import time
+
+    import mlflow
+    from mlflow.entities import SpanEvent, SpanType
+
+    with mlflow.start_span(name=span_name, span_type=SpanType.CHAT_MODEL) as span:
+        span.set_inputs({
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
+            "model": LLM_ENDPOINT,
+            "temperature": temperature,
+        })
+        span.set_attribute("prompt_chars", len(prompt))
+
+        text = ""
+        last_err: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                wc = _ws_with_timeout(w)
+                query_kwargs: dict[str, Any] = {
+                    "name": LLM_ENDPOINT,
+                    "messages": [
+                        ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
+                        ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                    ],
+                    "temperature": temperature,
+                }
+                if max_tokens is not None:
+                    query_kwargs["max_tokens"] = max_tokens
+                response = wc.serving_endpoints.query(**query_kwargs)
+                choices = getattr(response, "choices", None) or []
+                if not choices:
+                    raise ValueError("LLM response had no choices")
+                content = getattr(choices[0].message, "content", None)
+                if not content:
+                    raise ValueError("LLM response content is empty")
+                text = str(content).strip()
+
+                usage = getattr(response, "usage", None)
+                if usage:
+                    _usage_attrs: dict[str, Any] = {}
+                    for attr in ("total_tokens", "prompt_tokens", "completion_tokens"):
+                        val = getattr(usage, attr, None)
+                        if val is not None:
+                            _usage_attrs[attr] = val
+                    if _usage_attrs:
+                        span.set_attributes(_usage_attrs)
+
+                span.set_outputs({
+                    "response_text": text[:10_000],
+                    "response_chars": len(text),
+                    "attempts": attempt + 1,
+                })
+                return text, response
+
+            except Exception as exc:
+                last_err = exc
+                span.add_event(SpanEvent(
+                    name=f"retry_attempt_{attempt + 1}",
+                    attributes={"error": str(exc)[:500]},
+                ))
+                if attempt < max_retries - 1:
+                    time.sleep(2**attempt)
+
+        span.set_outputs({
+            "error": str(last_err)[:500] if last_err else "unknown",
+            "attempts": max_retries,
+        })
+        raise last_err  # type: ignore[misc]
+
+
 def _row_qid(row: dict, *, fallback: str = "unknown") -> str:
     """Extract question_id from an eval-results row regardless of column layout.
 
@@ -4624,8 +4717,6 @@ def _call_llm_for_strategy(
 
     _link_prompt_to_trace("strategist")
 
-    import time
-
     system_msg = (
         "You are a JSON API. You MUST respond with ONLY a valid JSON object. "
         "Do NOT include any explanation, analysis, or markdown outside the JSON. "
@@ -4633,96 +4724,65 @@ def _call_llm_for_strategy(
         "The JSON must contain an 'action_groups' array."
     )
 
-    text = ""
-    for attempt in range(LLM_MAX_RETRIES):
+    try:
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt,
+            span_name="monolithic_strategy_fallback",
+        )
+    except Exception:
+        logger.exception(
+            "Strategist LLM call failed after retries (prompt len: %d)", len(prompt),
+        )
+        return {**_EMPTY_STRATEGY, "rationale": "LLM call failed"}
+
+    try:
+        result = _extract_json(text)
+    except json.JSONDecodeError:
         try:
-            wc = _ws_with_timeout(w)
-            response = wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
-                messages=[
-                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
-                ],
-                temperature=LLM_TEMPERATURE,
-            )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                raise ValueError("LLM response had no choices")
-            first_choice = choices[0]
-            message = getattr(first_choice, "message", None)
-            content = getattr(message, "content", None)
-            if not content:
-                raise ValueError("LLM response content is empty")
-            text = str(content).strip()
-            try:
-                result = _extract_json(text)
-            except json.JSONDecodeError:
-                result = _repair_truncated_strategy_json(text)
-
-            action_groups = result.get("action_groups", [])
-            if not isinstance(action_groups, list):
-                action_groups = []
-            global_rewrite = result.get("global_instruction_rewrite", "")
-            if isinstance(global_rewrite, str) and global_rewrite:
-                global_rewrite = _sanitize_plaintext_instructions(global_rewrite)
-            if isinstance(global_rewrite, str) and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
-                logger.warning(
-                    "Strategist instruction rewrite exceeds %d chars (%d), truncating",
-                    MAX_HOLISTIC_INSTRUCTION_CHARS, len(global_rewrite),
-                )
-                global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
-            rationale = result.get("rationale", "")
-
-            logger.info(
-                "\n┌─── LLM Response [STRATEGIST] ────────────────────────────────────────\n"
-                "│ Action groups: %d\n"
-                "│ Global instruction rewrite: %d chars\n"
-                "│ Rationale: %s\n"
-                "└─────────────────────────────────────────────────────────────────────────",
-                len(action_groups), len(global_rewrite), str(rationale)[:300],
-            )
-            print(
-                f"\n  Strategy produced {len(action_groups)} action group(s), "
-                f"{len(global_rewrite)} chars instruction rewrite"
-            )
-            for i, ag in enumerate(action_groups):
-                levers = sorted(ag.get("lever_directives", {}).keys())
-                qs = ag.get("affected_questions", [])
-                print(
-                    f"    AG{i + 1}: {ag.get('root_cause_summary', '?')[:80]}"
-                    f" | levers={levers} | questions={len(qs)}"
-                )
-
-            return {
-                "action_groups": action_groups,
-                "global_instruction_rewrite": global_rewrite,
-                "rationale": rationale,
-            }
+            result = _repair_truncated_strategy_json(text)
         except json.JSONDecodeError:
-            logger.warning(
-                "Strategist LLM response was not valid JSON (attempt %d): %.500s",
-                attempt + 1, text,
-            )
-            m = re.search(r'"action_groups"\s*:\s*\[', text)
-            if m and attempt >= LLM_MAX_RETRIES - 1:
-                logger.info("Last-ditch: attempting bracket extraction for action_groups")
-                try:
-                    repaired = _repair_truncated_strategy_json(text)
-                    return repaired
-                except json.JSONDecodeError:
-                    pass
-            if attempt >= LLM_MAX_RETRIES - 1:
-                return {**_EMPTY_STRATEGY, "rationale": "JSON parse failed"}
-        except Exception:
-            if attempt < LLM_MAX_RETRIES - 1:
-                time.sleep(2**attempt)
-            else:
-                logger.exception(
-                    "Strategist LLM call failed after %d retries (prompt len: %d)",
-                    LLM_MAX_RETRIES, len(prompt),
-                )
-                return {**_EMPTY_STRATEGY, "rationale": "LLM call failed"}
-    return {**_EMPTY_STRATEGY, "rationale": "All retries exhausted"}
+            logger.warning("Strategist LLM response was not valid JSON: %.500s", text)
+            return {**_EMPTY_STRATEGY, "rationale": "JSON parse failed"}
+
+    action_groups = result.get("action_groups", [])
+    if not isinstance(action_groups, list):
+        action_groups = []
+    global_rewrite = result.get("global_instruction_rewrite", "")
+    if isinstance(global_rewrite, str) and global_rewrite:
+        global_rewrite = _sanitize_plaintext_instructions(global_rewrite)
+    if isinstance(global_rewrite, str) and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+        logger.warning(
+            "Strategist instruction rewrite exceeds %d chars (%d), truncating",
+            MAX_HOLISTIC_INSTRUCTION_CHARS, len(global_rewrite),
+        )
+        global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+    rationale = result.get("rationale", "")
+
+    logger.info(
+        "\n┌─── LLM Response [STRATEGIST] ────────────────────────────────────────\n"
+        "│ Action groups: %d\n"
+        "│ Global instruction rewrite: %d chars\n"
+        "│ Rationale: %s\n"
+        "└─────────────────────────────────────────────────────────────────────────",
+        len(action_groups), len(global_rewrite), str(rationale)[:300],
+    )
+    print(
+        f"\n  Strategy produced {len(action_groups)} action group(s), "
+        f"{len(global_rewrite)} chars instruction rewrite"
+    )
+    for i, ag in enumerate(action_groups):
+        levers = sorted(ag.get("lever_directives", {}).keys())
+        qs = ag.get("affected_questions", [])
+        print(
+            f"    AG{i + 1}: {ag.get('root_cause_summary', '?')[:80]}"
+            f" | levers={levers} | questions={len(qs)}"
+        )
+
+    return {
+        "action_groups": action_groups,
+        "global_instruction_rewrite": global_rewrite,
+        "rationale": rationale,
+    }
 
 
 # ── Adaptive Strategist (single-call, one AG per iteration) ─────────────
@@ -4750,8 +4810,6 @@ def _call_llm_for_adaptive_strategy(
     adaptive lever loop where this call is made every iteration with
     fresh evaluation results.
     """
-    import time
-
     from genie_space_optimizer.optimization.evaluation import (
         _extract_json,
         _link_prompt_to_trace,
@@ -4949,111 +5007,71 @@ def _call_llm_for_adaptive_strategy(
         "The JSON must contain an 'action_groups' array with EXACTLY one entry."
     )
 
-    text = ""
-    for attempt in range(LLM_MAX_RETRIES):
+    try:
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt, span_name="adaptive_strategy",
+        )
+    except Exception:
+        logger.exception("Adaptive strategist LLM call failed after retries")
+        return {**_EMPTY_STRATEGY, "rationale": "LLM call failed"}
+
+    try:
+        result = _extract_json(text)
+    except json.JSONDecodeError:
         try:
-            wc = _ws_with_timeout(w)
-            response = wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
-                messages=[
-                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
-                ],
-                temperature=LLM_TEMPERATURE,
-            )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                raise ValueError("LLM response had no choices")
-            first_choice = choices[0]
-            message = getattr(first_choice, "message", None)
-            content = getattr(message, "content", None)
-            if not content:
-                raise ValueError("LLM response content is empty")
-            text = str(content).strip()
-
-            try:
-                result = _extract_json(text)
-            except json.JSONDecodeError:
-                result = _repair_truncated_strategy_json(text)
-
-            action_groups = result.get("action_groups", [])
-            if not isinstance(action_groups, list):
-                action_groups = []
-            global_rewrite = result.get("global_instruction_rewrite", "")
-            if isinstance(global_rewrite, str) and global_rewrite:
-                global_rewrite = _sanitize_plaintext_instructions(global_rewrite)
-            if isinstance(global_rewrite, str) and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
-                global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
-            rationale = result.get("rationale", "")
-
-            logger.info(
-                "\n┌─── LLM Response [ADAPTIVE STRATEGIST] ──────────────────────────────\n"
-                "│ Action groups: %d\n"
-                "│ Global instruction rewrite: %d chars\n"
-                "│ Rationale: %s\n"
-                "└─────────────────────────────────────────────────────────────────────────",
-                len(action_groups),
-                len(global_rewrite),
-                str(rationale)[:300],
-            )
-            _out_lines = [
-                f"\n{'=' * _W}",
-                f"  STRATEGIST OUTPUT (Iteration {_iter_label})",
-                f"{'=' * _W}",
-            ]
-            if action_groups:
-                ag = action_groups[0]
-                levers = sorted(ag.get("lever_directives", {}).keys())
-                qs = ag.get("affected_questions", [])
-                _out_lines.append(f"|  {'AG:':<28s} {ag.get('root_cause_summary', '?')[:100]}")
-                _out_lines.append(f"|  {'Levers:':<28s} {', '.join(levers)}")
-                _out_lines.append(f"|  {'Affected Questions:':<28s} {len(qs)} — {', '.join(qs[:5])}")
-                _out_lines.append(f"|  {'Escalation:':<28s} {ag.get('escalation', 'none') or 'none'}")
-                _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
-                if global_rewrite:
-                    _out_lines.append(f"|  {'Instruction Rewrite:':<28s} {global_rewrite[:200]}...")
-            else:
-                _out_lines.append("|  No action group produced")
-                if rationale:
-                    _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
-            _out_lines.append(f"{'=' * _W}")
-            print("\n".join(_out_lines))
-
-            return {
-                "action_groups": action_groups[:1],
-                "global_instruction_rewrite": global_rewrite,
-                "rationale": rationale,
-            }
+            result = _repair_truncated_strategy_json(text)
         except json.JSONDecodeError:
-            logger.warning(
-                "Adaptive strategist response not valid JSON (attempt %d): %.500s",
-                attempt + 1,
-                text,
-            )
-            if attempt >= LLM_MAX_RETRIES - 1:
-                try:
-                    repaired = _repair_truncated_strategy_json(text)
-                    ags = repaired.get("action_groups", [])
-                    return {
-                        "action_groups": ags[:1],
-                        "global_instruction_rewrite": repaired.get(
-                            "global_instruction_rewrite", ""
-                        ),
-                        "rationale": repaired.get("rationale", ""),
-                    }
-                except json.JSONDecodeError:
-                    pass
-                return {**_EMPTY_STRATEGY, "rationale": "JSON parse failed"}
-        except Exception:
-            if attempt < LLM_MAX_RETRIES - 1:
-                time.sleep(2**attempt)
-            else:
-                logger.exception(
-                    "Adaptive strategist LLM call failed after %d retries",
-                    LLM_MAX_RETRIES,
-                )
-                return {**_EMPTY_STRATEGY, "rationale": "LLM call failed"}
-    return {**_EMPTY_STRATEGY, "rationale": "All retries exhausted"}
+            logger.warning("Adaptive strategist response not valid JSON: %.500s", text)
+            return {**_EMPTY_STRATEGY, "rationale": "JSON parse failed"}
+
+    action_groups = result.get("action_groups", [])
+    if not isinstance(action_groups, list):
+        action_groups = []
+    global_rewrite = result.get("global_instruction_rewrite", "")
+    if isinstance(global_rewrite, str) and global_rewrite:
+        global_rewrite = _sanitize_plaintext_instructions(global_rewrite)
+    if isinstance(global_rewrite, str) and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+        global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+    rationale = result.get("rationale", "")
+
+    logger.info(
+        "\n┌─── LLM Response [ADAPTIVE STRATEGIST] ──────────────────────────────\n"
+        "│ Action groups: %d\n"
+        "│ Global instruction rewrite: %d chars\n"
+        "│ Rationale: %s\n"
+        "└─────────────────────────────────────────────────────────────────────────",
+        len(action_groups),
+        len(global_rewrite),
+        str(rationale)[:300],
+    )
+    _out_lines = [
+        f"\n{'=' * _W}",
+        f"  STRATEGIST OUTPUT (Iteration {_iter_label})",
+        f"{'=' * _W}",
+    ]
+    if action_groups:
+        ag = action_groups[0]
+        levers = sorted(ag.get("lever_directives", {}).keys())
+        qs = ag.get("affected_questions", [])
+        _out_lines.append(f"|  {'AG:':<28s} {ag.get('root_cause_summary', '?')[:100]}")
+        _out_lines.append(f"|  {'Levers:':<28s} {', '.join(levers)}")
+        _out_lines.append(f"|  {'Affected Questions:':<28s} {len(qs)} — {', '.join(qs[:5])}")
+        _out_lines.append(f"|  {'Escalation:':<28s} {ag.get('escalation', 'none') or 'none'}")
+        _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
+        if global_rewrite:
+            _out_lines.append(f"|  {'Instruction Rewrite:':<28s} {global_rewrite[:200]}...")
+    else:
+        _out_lines.append("|  No action group produced")
+        if rationale:
+            _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
+    _out_lines.append(f"{'=' * _W}")
+    print("\n".join(_out_lines))
+
+    return {
+        "action_groups": action_groups[:1],
+        "global_instruction_rewrite": global_rewrite,
+        "rationale": rationale,
+    }
 
 
 # ── Phase 1a: Triage ────────────────────────────────────────────────────
@@ -5120,70 +5138,49 @@ def _call_llm_for_triage(
 
     _link_prompt_to_trace("strategist_triage")
 
-    import time
-
     system_msg = (
         "You are a JSON API. Respond with ONLY a valid JSON object. "
         "No explanation or markdown outside the JSON. "
         "The JSON must contain an 'action_groups' array."
     )
 
-    text = ""
-    for attempt in range(LLM_MAX_RETRIES):
+    try:
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt, span_name="phase_1a_triage",
+        )
+    except Exception:
+        logger.exception("Triage LLM call failed after retries (prompt len: %d)", len(prompt))
+        return {**_EMPTY_TRIAGE, "rationale": "LLM call failed"}
+
+    try:
+        result = _extract_json(text)
+    except json.JSONDecodeError:
         try:
-            wc = _ws_with_timeout(w)
-            response = wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
-                messages=[
-                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
-                ],
-                temperature=LLM_TEMPERATURE,
-            )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                raise ValueError("LLM response had no choices")
-            content = getattr(choices[0].message, "content", None)
-            if not content:
-                raise ValueError("LLM response content is empty")
-            text = str(content).strip()
-
-            try:
-                result = _extract_json(text)
-            except json.JSONDecodeError:
-                result = _repair_truncated_strategy_json(text)
-
-            ags = result.get("action_groups", [])
-            if not isinstance(ags, list):
-                ags = []
-
-            logger.info("Triage produced %d action group skeleton(s)", len(ags))
-            print(f"\n  Triage produced {len(ags)} action group skeleton(s)")
-            for i, ag in enumerate(ags):
-                levers = ag.get("levers_needed", [])
-                ft = ag.get("focus_tables", [])
-                fc = ag.get("focus_columns", [])
-                print(
-                    f"    AG{i + 1}: {ag.get('root_cause_summary', '?')[:80]}"
-                    f" | levers={levers} | tables={len(ft)} | cols={len(fc)}"
-                )
-
-            return {
-                "action_groups": ags,
-                "global_instruction_guidance": result.get("global_instruction_guidance", ""),
-                "rationale": result.get("rationale", ""),
-            }
+            result = _repair_truncated_strategy_json(text)
         except json.JSONDecodeError:
-            logger.warning("Triage LLM response was not valid JSON (attempt %d): %.500s", attempt + 1, text)
-            if attempt >= LLM_MAX_RETRIES - 1:
-                return {**_EMPTY_TRIAGE, "rationale": "JSON parse failed"}
-        except Exception:
-            if attempt < LLM_MAX_RETRIES - 1:
-                time.sleep(2**attempt)
-            else:
-                logger.exception("Triage LLM call failed after %d retries (prompt len: %d)", LLM_MAX_RETRIES, len(prompt))
-                return {**_EMPTY_TRIAGE, "rationale": "LLM call failed"}
-    return {**_EMPTY_TRIAGE, "rationale": "All retries exhausted"}
+            logger.warning("Triage LLM response was not valid JSON: %.500s", text)
+            return {**_EMPTY_TRIAGE, "rationale": "JSON parse failed"}
+
+    ags = result.get("action_groups", [])
+    if not isinstance(ags, list):
+        ags = []
+
+    logger.info("Triage produced %d action group skeleton(s)", len(ags))
+    print(f"\n  Triage produced {len(ags)} action group skeleton(s)")
+    for i, ag in enumerate(ags):
+        levers = ag.get("levers_needed", [])
+        ft = ag.get("focus_tables", [])
+        fc = ag.get("focus_columns", [])
+        print(
+            f"    AG{i + 1}: {ag.get('root_cause_summary', '?')[:80]}"
+            f" | levers={levers} | tables={len(ft)} | cols={len(fc)}"
+        )
+
+    return {
+        "action_groups": ags,
+        "global_instruction_guidance": result.get("global_instruction_guidance", ""),
+        "rationale": result.get("rationale", ""),
+    }
 
 
 # ── Phase 1b: AG Detail ─────────────────────────────────────────────────
@@ -5284,7 +5281,10 @@ def _call_llm_for_ag_detail(
 
     _link_prompt_to_trace("strategist_detail")
 
-    import time
+    _EMPTY_DETAIL: dict[str, Any] = {
+        "lever_directives": {}, "coordination_notes": "",
+        "instruction_contribution": "", "proposals": [],
+    }
 
     system_msg = (
         "You are a JSON API. Respond with ONLY a valid JSON object. "
@@ -5292,67 +5292,49 @@ def _call_llm_for_ag_detail(
         "The JSON must contain a 'lever_directives' object."
     )
 
-    text = ""
-    for attempt in range(LLM_MAX_RETRIES):
+    try:
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt,
+            span_name=f"phase_1b_detail_{ag_id}",
+        )
+    except Exception:
+        logger.exception("AG detail LLM call failed after retries for %s", ag_id)
+        return dict(_EMPTY_DETAIL)
+
+    try:
+        result = _extract_json(text)
+    except json.JSONDecodeError:
         try:
-            wc = _ws_with_timeout(w)
-            response = wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
-                messages=[
-                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
-                ],
-                temperature=LLM_TEMPERATURE,
-            )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                raise ValueError("LLM response had no choices")
-            content = getattr(choices[0].message, "content", None)
-            if not content:
-                raise ValueError("LLM response content is empty")
-            text = str(content).strip()
-
-            try:
-                result = _extract_json(text)
-            except json.JSONDecodeError:
-                result = _repair_truncated_strategy_json(text)
-
-            lever_dirs = result.get("lever_directives", {})
-            if not isinstance(lever_dirs, dict):
-                lever_dirs = {}
-            coord = result.get("coordination_notes", "")
-            instr_contrib = result.get("instruction_contribution", "")
-            proposals = result.get("proposals", [])
-            if not isinstance(proposals, list):
-                proposals = []
-
-            logger.info(
-                "AG %s detail: %d lever directives, coordination=%d chars, instruction=%d chars, proposals=%d",
-                ag_id, len(lever_dirs), len(coord), len(instr_contrib), len(proposals),
-            )
-            print(
-                f"    {ag_id} detail: levers={sorted(lever_dirs.keys())}, "
-                f"coordination={len(coord)} chars, instruction={len(instr_contrib)} chars, "
-                f"proposals={len(proposals)}"
-            )
-
-            return {
-                "lever_directives": lever_dirs,
-                "coordination_notes": coord,
-                "instruction_contribution": instr_contrib,
-                "proposals": proposals,
-            }
+            result = _repair_truncated_strategy_json(text)
         except json.JSONDecodeError:
-            logger.warning("AG detail LLM response not valid JSON (attempt %d): %.500s", attempt + 1, text)
-            if attempt >= LLM_MAX_RETRIES - 1:
-                return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": "", "proposals": []}
-        except Exception:
-            if attempt < LLM_MAX_RETRIES - 1:
-                time.sleep(2**attempt)
-            else:
-                logger.exception("AG detail LLM call failed after %d retries for %s", LLM_MAX_RETRIES, ag_id)
-                return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": "", "proposals": []}
-    return {"lever_directives": {}, "coordination_notes": "", "instruction_contribution": "", "proposals": []}
+            logger.warning("AG detail LLM response not valid JSON: %.500s", text)
+            return dict(_EMPTY_DETAIL)
+
+    lever_dirs = result.get("lever_directives", {})
+    if not isinstance(lever_dirs, dict):
+        lever_dirs = {}
+    coord = result.get("coordination_notes", "")
+    instr_contrib = result.get("instruction_contribution", "")
+    proposals = result.get("proposals", [])
+    if not isinstance(proposals, list):
+        proposals = []
+
+    logger.info(
+        "AG %s detail: %d lever directives, coordination=%d chars, instruction=%d chars, proposals=%d",
+        ag_id, len(lever_dirs), len(coord), len(instr_contrib), len(proposals),
+    )
+    print(
+        f"    {ag_id} detail: levers={sorted(lever_dirs.keys())}, "
+        f"coordination={len(coord)} chars, instruction={len(instr_contrib)} chars, "
+        f"proposals={len(proposals)}"
+    )
+
+    return {
+        "lever_directives": lever_dirs,
+        "coordination_notes": coord,
+        "instruction_contribution": instr_contrib,
+        "proposals": proposals,
+    }
 
 
 def _generate_holistic_strategy(
@@ -5376,6 +5358,7 @@ def _generate_holistic_strategy(
     and ``rationale`` — identical shape to what harness.py expects.
     """
     import mlflow
+    from mlflow.entities import SpanType
 
     hard = [c for c in clusters if c.get("cluster_id")]
     soft = [c for c in soft_signal_clusters if c.get("cluster_id")]
@@ -5384,25 +5367,20 @@ def _generate_holistic_strategy(
         logger.info("No clusters to strategize on — returning empty strategy")
         return {**_EMPTY_STRATEGY, "rationale": "No clusters available"}
 
-    with mlflow.start_span(name="generate_holistic_strategy") as span:
+    with mlflow.start_span(name="generate_holistic_strategy", span_type=SpanType.CHAIN) as span:
         span.set_inputs({
             "hard_clusters": len(hard),
             "soft_clusters": len(soft),
         })
 
-        # ── Phase 1a: Triage ────────────────────────────────────────
-        with mlflow.start_span(name="phase_1a_triage") as triage_span:
-            triage_result = _call_llm_for_triage(
-                clusters=hard,
-                soft_signal_clusters=soft,
-                metadata_snapshot=metadata_snapshot,
-                w=w,
-            )
-            triage_ags = triage_result.get("action_groups", [])
-            triage_span.set_outputs({
-                "action_groups": len(triage_ags),
-                "rationale": str(triage_result.get("rationale", ""))[:300],
-            })
+        # ── Phase 1a: Triage (CHAT_MODEL span created inside _call_llm_for_triage)
+        triage_result = _call_llm_for_triage(
+            clusters=hard,
+            soft_signal_clusters=soft,
+            metadata_snapshot=metadata_snapshot,
+            w=w,
+        )
+        triage_ags = triage_result.get("action_groups", [])
 
         if not triage_ags:
             logger.warning(
@@ -5428,7 +5406,7 @@ def _generate_holistic_strategy(
             })
             return fallback
 
-        # ── Phase 1b: Detail per AG ─────────────────────────────────
+        # ── Phase 1b: Detail per AG (CHAT_MODEL spans created inside _call_llm_for_ag_detail)
         per_ag_budget = max(2000, 24000 // max(len(triage_ags), 1))
         final_ags: list[dict] = []
         instruction_contributions: list[str] = []
@@ -5439,48 +5417,33 @@ def _generate_holistic_strategy(
             if "priority" not in skeleton:
                 skeleton["priority"] = i + 1
 
-            with mlflow.start_span(name=f"phase_1b_detail_{skeleton['id']}") as detail_span:
-                detail_span.set_inputs({
-                    "ag_id": skeleton["id"],
-                    "levers_needed": skeleton.get("levers_needed", []),
-                    "focus_tables": skeleton.get("focus_tables", []),
-                    "focus_columns": skeleton.get("focus_columns", []),
-                })
+            detail = _call_llm_for_ag_detail(
+                ag_skeleton=skeleton,
+                clusters=hard,
+                metadata_snapshot=metadata_snapshot,
+                instruction_char_budget=per_ag_budget,
+                w=w,
+            )
 
-                detail = _call_llm_for_ag_detail(
-                    ag_skeleton=skeleton,
-                    clusters=hard,
-                    metadata_snapshot=metadata_snapshot,
-                    instruction_char_budget=per_ag_budget,
-                    w=w,
-                )
+            lever_dirs = detail.get("lever_directives", {})
+            coord_notes = detail.get("coordination_notes", "")
+            instr_contrib = detail.get("instruction_contribution", "")
+            proposals = detail.get("proposals", [])
 
-                lever_dirs = detail.get("lever_directives", {})
-                coord_notes = detail.get("coordination_notes", "")
-                instr_contrib = detail.get("instruction_contribution", "")
-                proposals = detail.get("proposals", [])
+            assembled_ag: dict[str, Any] = {
+                "id": skeleton["id"],
+                "root_cause_summary": skeleton.get("root_cause_summary", ""),
+                "source_cluster_ids": skeleton.get("source_cluster_ids", []),
+                "affected_questions": skeleton.get("affected_questions", []),
+                "priority": skeleton.get("priority", i + 1),
+                "lever_directives": lever_dirs,
+                "coordination_notes": coord_notes,
+                "proposals": proposals,
+            }
+            final_ags.append(assembled_ag)
 
-                assembled_ag: dict[str, Any] = {
-                    "id": skeleton["id"],
-                    "root_cause_summary": skeleton.get("root_cause_summary", ""),
-                    "source_cluster_ids": skeleton.get("source_cluster_ids", []),
-                    "affected_questions": skeleton.get("affected_questions", []),
-                    "priority": skeleton.get("priority", i + 1),
-                    "lever_directives": lever_dirs,
-                    "coordination_notes": coord_notes,
-                    "proposals": proposals,
-                }
-                final_ags.append(assembled_ag)
-
-                if instr_contrib:
-                    instruction_contributions.append(instr_contrib)
-
-                detail_span.set_outputs({
-                    "lever_count": len(lever_dirs),
-                    "coordination_len": len(coord_notes),
-                    "instruction_contribution_len": len(instr_contrib),
-                    "proposals_count": len(proposals),
-                })
+            if instr_contrib:
+                instruction_contributions.append(instr_contrib)
 
         # ── Merge instruction contributions (structure-aware) ────────
         global_guidance = triage_result.get("global_instruction_guidance", "")
@@ -6328,10 +6291,17 @@ def generate_proposals_from_strategy(
         "patch_type": "",
     }
 
-    with mlflow.start_span(name=f"generate_proposals_lever_{target_lever}_ag_{ag_id}") as span:
+    from mlflow.entities import SpanType as _SpanType
+
+    with mlflow.start_span(
+        name=f"generate_proposals_lever_{target_lever}_ag_{ag_id}",
+        span_type=_SpanType.CHAIN,
+    ) as span:
         span.set_inputs({
             "action_group_id": ag_id,
             "target_lever": target_lever,
+            "root_cause": root_cause[:200],
+            "affected_questions": len(affected_qs),
             "directives_keys": list(lever_dir.keys()) if isinstance(lever_dir, dict) else [],
         })
 
@@ -6663,7 +6633,11 @@ def generate_proposals_from_strategy(
         proposals = _filter_no_op_proposals(proposals, metadata_snapshot)
         proposals.sort(key=lambda p: p.get("net_impact", 0), reverse=True)
 
-        span.set_outputs({"proposal_count": len(proposals)})
+        span.set_outputs({
+            "proposal_count": len(proposals),
+            "proposal_types": [p.get("patch_type", "?") for p in proposals],
+            "tables_affected": sorted({p.get("table", "") for p in proposals if p.get("table")}),
+        })
         logger.info(
             "[%s] Lever %d generated %d proposal(s) from strategy directives",
             ag_id, target_lever, len(proposals),

@@ -75,11 +75,13 @@ domain = dbutils.jobs.taskValues.get(taskKey="preflight", key="domain")
 catalog = dbutils.jobs.taskValues.get(taskKey="preflight", key="catalog")
 schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
-model_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="model_id")
 
 thresholds_met_raw = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="thresholds_met")
 thresholds_met = str(thresholds_met_raw).lower() in ("true", "1")
 baseline_model_id = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="model_id")
+
+import mlflow
+mlflow.set_experiment(exp_name)
 
 _banner("Resolved Upstream Task Values")
 _log(

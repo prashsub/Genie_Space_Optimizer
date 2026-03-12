@@ -210,7 +210,11 @@ domain = dbutils.jobs.taskValues.get(taskKey="preflight", key="domain")
 catalog = dbutils.jobs.taskValues.get(taskKey="preflight", key="catalog")
 schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
-model_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="model_id")
+_mcp_json = dbutils.jobs.taskValues.get(taskKey="preflight", key="model_creation_params", default="{}")
+_model_creation_params = json.loads(_mcp_json) if isinstance(_mcp_json, str) else (_mcp_json or {})
+
+import mlflow
+mlflow.set_experiment(exp_name)
 
 _banner("Resolved Upstream Task Values")
 _log(
@@ -221,7 +225,7 @@ _log(
     catalog=catalog,
     schema=schema,
     experiment_name=exp_name,
-    model_id=model_id,
+    model_creation_params="present" if _model_creation_params else "empty",
 )
 
 # COMMAND ----------
@@ -257,9 +261,9 @@ if not benchmarks:
 try:
     _banner("Evaluation Setup")
     setup_ctx = baseline_setup_scorers(
-        w, spark, space_id, run_id, catalog, schema, exp_name, model_id, domain,
+        w, spark, space_id, run_id, catalog, schema, exp_name, None, domain,
     )
-    _log("Setup complete", scorers=len(setup_ctx["scorers"]), model_id=model_id)
+    _log("Setup complete", scorers=len(setup_ctx["scorers"]))
 except Exception as exc:
     _banner("Baseline Setup FAILED")
     _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
@@ -277,9 +281,25 @@ except Exception as exc:
 
 # COMMAND ----------
 
+_baseline_model_kwargs = {
+    "w": w,
+    "space_id": space_id,
+    "config": _model_creation_params.get("config", {}),
+    "iteration": 0,
+    "domain": domain,
+    "experiment_name": exp_name,
+    "uc_schema": f"{catalog}.{schema}",
+    "uc_columns": _model_creation_params.get("uc_columns"),
+    "uc_tags": _model_creation_params.get("uc_tags"),
+    "uc_routines": _model_creation_params.get("uc_routines"),
+} if _model_creation_params else None
+
 try:
     _banner("Running 9-Judge Evaluation")
-    eval_result = baseline_run_evaluation(spark, run_id, catalog, schema, benchmarks, setup_ctx, w=w)
+    eval_result = baseline_run_evaluation(
+        spark, run_id, catalog, schema, benchmarks, setup_ctx, w=w,
+        model_creation_kwargs=_baseline_model_kwargs,
+    )
     _log("Evaluation complete", overall_accuracy=eval_result.get("overall_accuracy", 0.0))
 except Exception as exc:
     _banner("Baseline Evaluation FAILED")
@@ -317,6 +337,8 @@ _log(
 
 # COMMAND ----------
 
+model_id = eval_result.get("model_id", "")
+
 try:
     _banner("Persisting Baseline State")
     baseline_out = baseline_persist_state(
@@ -348,6 +370,7 @@ dbutils.jobs.taskValues.set(key="scores", value=json.dumps(baseline_out["scores"
 dbutils.jobs.taskValues.set(key="overall_accuracy", value=baseline_out["overall_accuracy"])
 dbutils.jobs.taskValues.set(key="thresholds_met", value=baseline_out["thresholds_met"])
 dbutils.jobs.taskValues.set(key="model_id", value=baseline_out["model_id"])
+dbutils.jobs.taskValues.set(key="mlflow_run_id", value=eval_result.get("mlflow_run_id", ""))
 
 _log(
     "Task values published",

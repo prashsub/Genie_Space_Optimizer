@@ -169,6 +169,9 @@ schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
 max_iterations = int(dbutils.jobs.taskValues.get(taskKey="preflight", key="max_iterations"))
 
+import mlflow
+mlflow.set_experiment(exp_name)
+
 # Read from lever_loop (or baseline if lever_loop was skipped)
 lever_skipped_raw = dbutils.jobs.taskValues.get(taskKey="lever_loop", key="skipped")
 lever_skipped = str(lever_skipped_raw).lower() in ("true", "1")

@@ -55,6 +55,7 @@ from genie_space_optimizer.common.config import (
     MODEL_NAME_TEMPLATE,
     PROMPT_ALIAS,
     PROMPT_NAME_TEMPLATE,
+    BASELINE_RUN_NAME_TEMPLATE,
     RATE_LIMIT_SECONDS,
     RUN_NAME_TEMPLATE,
     TARGET_BENCHMARK_COUNT,
@@ -2196,16 +2197,10 @@ def register_judge_prompts(
             failed_details=failed_details,
         )
     else:
-        run_name = f"register_prompts_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        with mlflow.start_run(run_name=run_name):
-            _log_judge_prompt_artifacts(
-                domain=domain,
-                uc_schema=uc_schema,
-                registered=registered,
-                register_registry=register_registry,
-                failed_judges=failed_judges,
-                failed_details=failed_details,
-            )
+        logger.warning(
+            "register_judge_prompts called without an active MLflow run; "
+            "prompt artifacts will not be logged to any run."
+        )
 
     if register_registry and STRICT_PROMPT_REGISTRATION and failed_judges:
         cause_codes = sorted(
@@ -3161,6 +3156,7 @@ def run_evaluation(
     metric_view_measures: dict[str, set[str]] | None = None,
     optimization_run_id: str = "",
     lever: int | None = None,
+    model_creation_kwargs: dict | None = None,
 ) -> dict:
     """Run ``mlflow.genai.evaluate()`` and return structured results.
 
@@ -3195,7 +3191,8 @@ def run_evaluation(
         scope_filtered = benchmarks
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = format_mlflow_template(RUN_NAME_TEMPLATE, iteration=iteration, timestamp=ts)
+    _tpl = BASELINE_RUN_NAME_TEMPLATE if iteration == 0 else RUN_NAME_TEMPLATE
+    run_name = format_mlflow_template(_tpl, iteration=iteration, timestamp=ts)
 
     with mlflow.start_run(run_name=run_name) as run:
         _version_tags: dict[str, str] = {
@@ -3211,6 +3208,13 @@ def run_evaluation(
         else:
             _version_tags["genie.lever"] = "baseline"
         mlflow.set_tags(_version_tags)
+
+        if model_creation_kwargs:
+            from genie_space_optimizer.optimization.models import create_genie_model_version
+            _created_model_id = create_genie_model_version(**model_creation_kwargs)
+            if _created_model_id:
+                mlflow_model_id = _created_model_id
+                model_id = _created_model_id
 
         # NOTE: We intentionally use the in-memory deduped eval_data DataFrame
         # for evaluation instead of the MLflow EvaluationDataset object.  The
@@ -3760,6 +3764,13 @@ def run_evaluation(
                 run_name, len(trace_map), len(rows_for_output), _rows_without_tid,
             )
 
+        if model_id and scores_100:
+            from genie_space_optimizer.optimization.models import link_eval_scores_to_model
+            try:
+                link_eval_scores_to_model(model_id, scores_100, eval_run_id=run.info.run_id)
+            except Exception:
+                logger.warning("Failed to link scores to model %s", model_id, exc_info=True)
+
         output: dict[str, Any] = {
             "run_id": run.info.run_id,
             "mlflow_run_id": run.info.run_id,
@@ -3808,7 +3819,7 @@ def run_evaluation(
 # ── Repeatability Evaluation ──────────────────────────────────────────
 
 
-REPEATABILITY_RUN_NAME_TEMPLATE = "genie_repeatability_iter{iteration}_{timestamp}"
+REPEATABILITY_RUN_NAME_TEMPLATE = "repeatability_{iteration}_eval_{timestamp}"
 
 
 def run_repeatability_evaluation(
