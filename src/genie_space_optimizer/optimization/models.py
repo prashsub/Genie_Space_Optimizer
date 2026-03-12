@@ -23,6 +23,7 @@ from genie_space_optimizer.optimization.state import (
 )
 
 if TYPE_CHECKING:
+    import pandas as pd
     from databricks.sdk import WorkspaceClient
     from pyspark.sql import SparkSession
 
@@ -212,12 +213,17 @@ class _GenieConfigSnapshot(mlflow.pyfunc.PythonModel):
     real value lives in the embedded ``space_config.json`` artifact.
     """
 
-    def predict(self, context, model_input, params=None):
+    def predict(
+        self,
+        context: mlflow.pyfunc.PythonModelContext,
+        model_input: pd.DataFrame,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict]:
         if context and context.artifacts:
             cfg_path = context.artifacts.get("space_config", "")
             if cfg_path:
-                return json.loads(Path(cfg_path).read_text(encoding="utf-8"))
-        return {"status": "config_snapshot_only"}
+                return [json.loads(Path(cfg_path).read_text(encoding="utf-8"))]
+        return [{"status": "config_snapshot_only"}]
 
 
 def _register_uc_version(
@@ -237,11 +243,20 @@ def _register_uc_version(
             json.dumps(space_config, default=str, indent=2), encoding="utf-8",
         )
 
+        from mlflow.models.signature import ModelSignature
+        from mlflow.types.schema import ColSpec, Schema
+
+        signature = ModelSignature(
+            inputs=Schema([ColSpec("string", "command")]),
+            outputs=Schema([ColSpec("string", "config_json")]),
+        )
+
         model_dir = str(Path(tmp) / "pyfunc_model")
         mlflow.pyfunc.save_model(
             path=model_dir,
             python_model=_GenieConfigSnapshot(),
             artifacts={"space_config": str(config_path)},
+            signature=signature,
         )
 
         tracking_client = mlflow.tracking.MlflowClient()

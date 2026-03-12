@@ -15,6 +15,7 @@ from genie_space_optimizer.optimization.structured_metadata import (
     EntityType,
     LeverOwnershipError,
     classify_column,
+    deduplicate_structured_description,
     entity_type_for_column,
     extract_synonyms_section,
     format_column_for_prompt,
@@ -461,3 +462,60 @@ class TestPlainTextParsing:
         text = "PURPOSE:\nThis is a table\nthat tracks bookings\nacross destinations."
         result = parse_structured_description(text)
         assert "across destinations." in result["purpose"]
+
+
+class TestNewlineInjection:
+    """Tests for the pre-processing that injects newlines before inline ALL-CAPS headers."""
+
+    def test_single_line_multi_section(self):
+        text = "PURPOSE: Stores job run data BEST FOR: Analyzing history GRAIN: One row per run"
+        result = parse_structured_description(text)
+        assert result["purpose"] == "Stores job run data"
+        assert result["best_for"] == "Analyzing history"
+        assert result["grain"] == "One row per run"
+
+    def test_single_line_with_scd(self):
+        text = "PURPOSE: Fact table GRAIN: One row SCD: Type 1"
+        result = parse_structured_description(text)
+        assert result["purpose"] == "Fact table"
+        assert result["grain"] == "One row"
+        assert result["scd"] == "Type 1"
+
+    def test_multi_word_label_use_instead_of(self):
+        text = "DEFINITION: Old column USE INSTEAD OF: new_column"
+        result = parse_structured_description(text)
+        assert result["definition"] == "Old column"
+        assert result["use_instead_of"] == "new_column"
+
+    def test_multi_word_label_important_filters(self):
+        text = "PURPOSE: Main table IMPORTANT FILTERS: status = 'active'"
+        result = parse_structured_description(text)
+        assert result["purpose"] == "Main table"
+        assert result["important_filters"] == "status = 'active'"
+
+    def test_already_separate_lines_unchanged(self):
+        text = "PURPOSE:\nStores data\n\nGRAIN:\nOne row per run"
+        result = parse_structured_description(text)
+        assert result["purpose"] == "Stores data"
+        assert result["grain"] == "One row per run"
+
+    def test_no_false_positive_without_colon(self):
+        text = "PURPOSE: This is the best for analysis of GRAIN patterns"
+        result = parse_structured_description(text)
+        assert result["purpose"] == "This is the best for analysis of GRAIN patterns"
+        assert "best_for" not in result
+        assert "grain" not in result
+
+    def test_dedup_round_trip_single_line(self):
+        text = "PURPOSE: First desc PURPOSE: Second desc GRAIN: Per row"
+        deduped = deduplicate_structured_description(text)
+        result = parse_structured_description(deduped)
+        assert result["purpose"] == "Second desc"
+        assert result["grain"] == "Per row"
+
+    def test_inline_value_with_preamble(self):
+        text = "Legacy text\nPURPOSE: Fact table GRAIN: One row"
+        result = parse_structured_description(text)
+        assert result.get("_preamble") == "Legacy text"
+        assert result["purpose"] == "Fact table"
+        assert result["grain"] == "One row"

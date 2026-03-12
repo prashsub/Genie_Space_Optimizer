@@ -301,6 +301,15 @@ def fetch_space_config(w: WorkspaceClient, space_id: str) -> dict:
     else:
         tables_list, mvs_list, funcs_list = [], [], []
 
+    from genie_space_optimizer.common.genie_schema import normalize_join_spec_sql
+
+    for _js_source in (ds, ss.get("instructions", {})):
+        if not isinstance(_js_source, dict):
+            continue
+        for _js in _js_source.get("join_specs", []):
+            if isinstance(_js, dict):
+                normalize_join_spec_sql(_js)
+
     instr = ss.get("instructions", {})
     text_instr = instr.get("text_instructions", []) if isinstance(instr, dict) else []
     has_instructions = bool(text_instr) or bool(config.get("description", ""))
@@ -571,7 +580,10 @@ def strip_non_exportable_fields(config: dict) -> dict:
     Including them in the PATCH payload causes ``InvalidParameterValue``.
     Also strips internal-only keys from nested ``column_configs``.
     """
-    cleaned = {k: v for k, v in config.items() if k not in NON_EXPORTABLE_FIELDS}
+    cleaned = {
+        k: v for k, v in config.items()
+        if k not in NON_EXPORTABLE_FIELDS and not k.startswith("_")
+    }
 
     ds = cleaned.get("data_sources")
     if isinstance(ds, dict):

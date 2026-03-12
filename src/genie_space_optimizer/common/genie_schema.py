@@ -159,6 +159,8 @@ def normalize_join_spec_sql(spec: dict) -> dict:
         return spec
 
     sql_parts = spec.get("sql", [])
+    if isinstance(sql_parts, str):
+        sql_parts = [sql_parts]
     if not sql_parts:
         return spec
 

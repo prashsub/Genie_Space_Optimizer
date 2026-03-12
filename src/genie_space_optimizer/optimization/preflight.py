@@ -260,8 +260,15 @@ def _collect_data_profile(
         try:
             stats_row = spark.sql(query).collect()
         except Exception:
-            logger.info("Data profiling: stats query failed for %s, skipping", table_fqn, exc_info=True)
-            continue
+            fallback_query = (
+                f"SELECT {select_clause} "
+                f"FROM (SELECT * FROM {fq_table} LIMIT {sample_size})"
+            )
+            try:
+                stats_row = spark.sql(fallback_query).collect()
+            except Exception:
+                logger.info("Data profiling: stats query failed for %s, skipping", table_fqn, exc_info=True)
+                continue
 
         if not stats_row:
             continue
@@ -306,10 +313,21 @@ def _collect_data_profile(
                     vals = sorted(str(v) for v in dv_rows[0]["vals"])
                     columns_profile[col_name]["distinct_values"] = vals
             except Exception:
-                logger.debug(
-                    "Data profiling: COLLECT_SET failed for %s.%s",
-                    table_fqn, col_name, exc_info=True,
+                dv_fallback = (
+                    f"SELECT COLLECT_SET({escaped_col}) AS vals "
+                    f"FROM (SELECT * FROM {fq_table} LIMIT {sample_size}) "
+                    f"WHERE {escaped_col} IS NOT NULL"
                 )
+                try:
+                    dv_rows = spark.sql(dv_fallback).collect()
+                    if dv_rows and dv_rows[0]["vals"]:
+                        vals = sorted(str(v) for v in dv_rows[0]["vals"])
+                        columns_profile[col_name]["distinct_values"] = vals
+                except Exception:
+                    logger.debug(
+                        "Data profiling: COLLECT_SET failed for %s.%s",
+                        table_fqn, col_name, exc_info=True,
+                    )
 
         profile[escaped_table] = {
             "row_count": row_count,
@@ -833,7 +851,7 @@ def preflight_collect_uc_metadata(
         detail=stage_detail,
     )
 
-    table_names = config.get("_tables", [])
+    table_names = list(config.get("_tables", [])) + list(config.get("_metric_views", []))
     if table_names and uc_columns_dicts:
         write_stage(
             spark, run_id, "DATA_PROFILING", "STARTED",

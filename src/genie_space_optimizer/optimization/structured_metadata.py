@@ -105,6 +105,15 @@ _PLAINTEXT_SECTION_RE = re.compile(
     r"^(?P<label>[A-Z][A-Z ]+?):\s*(?P<value>.*)$",
 )
 
+_SORTED_UPPER_LABELS: list[str] = sorted(
+    list(_UPPER_LABEL_TO_KEY.keys()), key=lambda s: len(s), reverse=True
+)
+_INJECT_NL_RE = re.compile(
+    r"(?<=\S) +(?=(?:"
+    + "|".join(re.escape(k) for k in _SORTED_UPPER_LABELS)
+    + r"):)",
+)
+
 
 # ---------------------------------------------------------------------------
 # Numeric / measure heuristics (mirrored from config.py to avoid circular)
@@ -150,6 +159,8 @@ def parse_structured_description(text: str | list[str] | None) -> dict[str, str]
     text = text.strip()
     if not text:
         return {}
+
+    text = _INJECT_NL_RE.sub("\n", text)
 
     sections: dict[str, str] = {}
     preamble_lines: list[str] = []
