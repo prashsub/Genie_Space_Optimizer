@@ -421,7 +421,6 @@ preflight_out = {
     "config": _config,
     "benchmarks": _benchmarks,
     "model_id": None,
-    "model_creation_params": ctx_exp.get("model_creation_params", {}),
     "experiment_name": ctx_exp["experiment_name"],
     "experiment_id": _experiment_id,
     "human_corrections": ctx_feedback["human_corrections"],
@@ -450,7 +449,7 @@ _log(
 # MAGIC | Key | Consumed By |
 # MAGIC |-----|-------------|
 # MAGIC | `run_id`, `space_id`, `domain`, `catalog`, `schema` | All tasks |
-# MAGIC | `experiment_name`, `experiment_id`, `model_id` | baseline, lever_loop, finalize |
+# MAGIC | `experiment_name`, `experiment_id` | baseline, lever_loop, finalize |
 # MAGIC | `benchmark_count` | baseline (validates benchmark load) |
 # MAGIC | `max_iterations`, `levers`, `apply_mode`, `deploy_target` | lever_loop, finalize, deploy |
 # MAGIC | `triggered_by` | lever_loop (for context/audit) |
@@ -466,11 +465,6 @@ dbutils.jobs.taskValues.set(key="catalog", value=catalog)
 dbutils.jobs.taskValues.set(key="schema", value=schema)
 dbutils.jobs.taskValues.set(key="experiment_name", value=preflight_out["experiment_name"])
 dbutils.jobs.taskValues.set(key="experiment_id", value=preflight_out.get("experiment_id", ""))
-_mcp = preflight_out.get("model_creation_params", {})
-_mcp_json = json.dumps(_mcp, default=str)
-if len(_mcp_json) > 40_000:
-    _log("WARNING: model_creation_params JSON approaching 48KB task value limit", size=len(_mcp_json))
-dbutils.jobs.taskValues.set(key="model_creation_params", value=_mcp_json)
 dbutils.jobs.taskValues.set(key="benchmark_count", value=len(preflight_out["benchmarks"]))
 dbutils.jobs.taskValues.set(key="max_iterations", value=max_iterations)
 dbutils.jobs.taskValues.set(key="levers", value=json.dumps(levers))

@@ -210,8 +210,6 @@ domain = dbutils.jobs.taskValues.get(taskKey="preflight", key="domain")
 catalog = dbutils.jobs.taskValues.get(taskKey="preflight", key="catalog")
 schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
-_mcp_json = dbutils.jobs.taskValues.get(taskKey="preflight", key="model_creation_params", default="{}")
-_model_creation_params = json.loads(_mcp_json) if isinstance(_mcp_json, str) else (_mcp_json or {})
 
 import mlflow
 mlflow.set_experiment(exp_name)
@@ -225,7 +223,6 @@ _log(
     catalog=catalog,
     schema=schema,
     experiment_name=exp_name,
-    model_creation_params="present" if _model_creation_params else "empty",
 )
 
 # COMMAND ----------
@@ -281,18 +278,37 @@ except Exception as exc:
 
 # COMMAND ----------
 
+from genie_space_optimizer.common.genie_client import fetch_space_config
+from genie_space_optimizer.common.uc_metadata import extract_genie_space_table_refs
+from genie_space_optimizer.optimization.preflight import preflight_collect_uc_metadata
+
+_baseline_config = fetch_space_config(w, space_id)
+_genie_table_refs = extract_genie_space_table_refs(_baseline_config)
+_uc_ctx = preflight_collect_uc_metadata(
+    w, spark, run_id, catalog, schema,
+    _baseline_config, _baseline_config,
+    _genie_table_refs,
+)
+_log(
+    "Local config + UC metadata collected for model creation",
+    table_refs=len(_genie_table_refs),
+    uc_columns=len(_uc_ctx.get("uc_columns") or []),
+    uc_tags=len(_uc_ctx.get("uc_tags") or []),
+    uc_routines=len(_uc_ctx.get("uc_routines") or []),
+)
+
 _baseline_model_kwargs = {
     "w": w,
     "space_id": space_id,
-    "config": _model_creation_params.get("config", {}),
+    "config": _baseline_config,
     "iteration": 0,
     "domain": domain,
     "experiment_name": exp_name,
     "uc_schema": f"{catalog}.{schema}",
-    "uc_columns": _model_creation_params.get("uc_columns"),
-    "uc_tags": _model_creation_params.get("uc_tags"),
-    "uc_routines": _model_creation_params.get("uc_routines"),
-} if _model_creation_params else None
+    "uc_columns": _uc_ctx.get("uc_columns"),
+    "uc_tags": _uc_ctx.get("uc_tags"),
+    "uc_routines": _uc_ctx.get("uc_routines"),
+}
 
 try:
     _banner("Running 9-Judge Evaluation")

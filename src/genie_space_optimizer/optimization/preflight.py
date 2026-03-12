@@ -1239,13 +1239,6 @@ def preflight_setup_experiment(
         experiment_id=experiment_id,
     )
 
-    model_creation_params = {
-        "config": config,
-        "uc_columns": uc_columns,
-        "uc_tags": uc_tags,
-        "uc_routines": uc_routines,
-    }
-
     _lines = [_pf_section("PREFLIGHT — EXPERIMENT & MODEL SETUP")]
     _lines.append(_pf_kv("Experiment", experiment_name))
     _lines.append(_pf_kv("Experiment ID", experiment_id))
@@ -1279,7 +1272,6 @@ def preflight_setup_experiment(
 
     return {
         "model_id": None,
-        "model_creation_params": model_creation_params,
         "experiment_name": experiment_name,
         "experiment_id": experiment_id,
     }
@@ -1295,14 +1287,14 @@ def run_preflight(
     domain: str,
     experiment_name: str | None = None,
     apply_mode: str = "genie_config",
-) -> tuple[dict, list[dict], str | None, str, list[dict], dict | None]:
+) -> tuple[dict, list[dict], str | None, str, list[dict]]:
     """Execute the full preflight sequence (Stage 1).
 
     Wrapper that calls 6 sub-steps in sequence. Each sub-step is individually
     callable from a notebook cell for transparency.
 
     Returns:
-        (config, benchmarks, model_id, experiment_name, human_corrections, model_creation_params)
+        (config, benchmarks, model_id, experiment_name, human_corrections)
     """
     ctx1 = preflight_fetch_config(
         w, spark, run_id, space_id, catalog, schema, domain, apply_mode,
@@ -1349,7 +1341,6 @@ def run_preflight(
         ctx6["model_id"],
         ctx6["experiment_name"],
         ctx5["human_corrections"],
-        ctx6.get("model_creation_params"),
     )
 
 
