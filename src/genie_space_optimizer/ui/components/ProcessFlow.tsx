@@ -90,7 +90,7 @@ const JUDGES = [
 ];
 
 const LEVERS = [
-  { number: 1, name: "Tables & Columns", description: "Descriptions, visibility, aliases, synonyms", examples: ["update_column_description", "add_column_synonym"], icon: Table2 },
+  { number: 1, name: "Tables & Columns", description: "Descriptions, aliases, synonyms", examples: ["update_column_description", "add_column_synonym"], icon: Table2 },
   { number: 2, name: "Metric Views", description: "MV measures, dimensions, YAML definitions", examples: ["update_mv_measure", "add_mv_dimension"], icon: BarChart3 },
   { number: 3, name: "Table-Valued Functions", description: "TVF SQL, parameters, function signatures", examples: ["update_tvf_sql", "add_tvf_parameter"], icon: Code2 },
   { number: 4, name: "Join Specifications", description: "Table relationships, join columns, cardinality", examples: ["add_join_spec", "update_join_spec"], icon: Link2 },

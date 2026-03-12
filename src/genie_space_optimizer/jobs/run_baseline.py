@@ -279,7 +279,7 @@ except Exception as exc:
 
 try:
     _banner("Running 9-Judge Evaluation")
-    eval_result = baseline_run_evaluation(spark, run_id, catalog, schema, benchmarks, setup_ctx)
+    eval_result = baseline_run_evaluation(spark, run_id, catalog, schema, benchmarks, setup_ctx, w=w)
     _log("Evaluation complete", overall_accuracy=eval_result.get("overall_accuracy", 0.0))
 except Exception as exc:
     _banner("Baseline Evaluation FAILED")

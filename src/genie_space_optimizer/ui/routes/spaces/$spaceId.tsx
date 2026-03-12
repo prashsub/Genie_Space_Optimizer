@@ -42,6 +42,7 @@ import {
   ArrowLeft,
   ChevronDown,
   Rocket,
+  ShieldAlert,
 } from "lucide-react";
 import { ErrorBoundary } from "react-error-boundary";
 import { toast } from "sonner";
@@ -85,7 +86,7 @@ function SpaceDetailSkeleton() {
 }
 
 const LEVERS = [
-  { id: 1, label: "Tables & Columns", desc: "Update table descriptions, column descriptions, column visibility, and synonyms" },
+  { id: 1, label: "Tables & Columns", desc: "Update table descriptions, column descriptions, and synonyms" },
   { id: 2, label: "Metric Views", desc: "Update metric view column descriptions" },
   { id: 3, label: "Table-Valued Functions", desc: "Remove underperforming TVFs" },
   { id: 4, label: "Join Specifications", desc: "Add, update, or remove join relationships between tables" },
@@ -236,153 +237,25 @@ function SpaceDetail() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between gap-4">
-        <div className="space-y-1">
-          <button
-            className="mb-2 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
-            onClick={() => navigate({ to: "/" })}
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back to Dashboard
-          </button>
+      <div className="space-y-1">
+        <button
+          className="mb-2 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+          onClick={() => navigate({ to: "/" })}
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Back to Dashboard
+        </button>
+        <div className="flex items-center gap-3">
           <h1 className="text-2xl font-bold">{space.name}</h1>
-        </div>
-        <div className="space-y-2 text-right">
-          <div className="inline-flex rounded-md border border-db-gray-border p-1">
-            <Button
-              type="button"
-              size="sm"
-              variant={applyMode === "genie_config" ? "default" : "ghost"}
-              onClick={() => setApplyMode("genie_config")}
-            >
-              Config Only
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant={applyMode === "both" ? "default" : "ghost"}
-              onClick={() => setApplyMode("both")}
-              disabled={!canStartWithWrites && !canStartOptimization}
-              title={
-                !canStartWithWrites
-                  ? "Write (MODIFY) permissions required — grant them in Settings"
-                  : undefined
-              }
-            >
-              Config + UC Write Backs
-            </Button>
-          </div>
-          <Collapsible defaultOpen className="w-64 text-left">
-            <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
-              <ChevronDown className="h-3 w-3" />
-              What will be optimized
-            </CollapsibleTrigger>
-            <CollapsibleContent className="mt-2 space-y-2">
-              {LEVERS.map((lever) => (
-                <label
-                  key={lever.id}
-                  className="flex items-start gap-2 cursor-pointer"
-                >
-                  <Checkbox
-                    checked={selectedLevers.has(lever.id)}
-                    onCheckedChange={() => toggleLever(lever.id)}
-                    className="mt-0.5"
-                  />
-                  <div>
-                    <span className="text-sm font-medium">{lever.label}</span>
-                    <p className="text-xs text-muted-foreground">{lever.desc}</p>
-                  </div>
-                </label>
-              ))}
-            </CollapsibleContent>
-          </Collapsible>
-          <Collapsible className="w-64 text-left">
-            <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
-              <ChevronDown className="h-3 w-3" />
-              Deployment target (optional)
-            </CollapsibleTrigger>
-            <CollapsibleContent className="mt-2">
-              <Input
-                placeholder="https://target-workspace.cloud.databricks.com"
-                value={deployTarget}
-                onChange={(e) => setDeployTarget(e.target.value)}
-                className="h-8 text-xs"
-              />
-              <p className="mt-1 text-[10px] text-muted-foreground">
-                Leave empty to skip cross-environment deployment.
-              </p>
-            </CollapsibleContent>
-          </Collapsible>
-          <div>
-            <Button
-              onClick={handleOptimize}
-              disabled={
-                triggerOpt.isPending ||
-                hasActiveRun ||
-                !canStartOptimization ||
-                selectedLevers.size === 0 ||
-                (applyMode === "both" && !canStartWithWrites)
-              }
-              className="bg-db-red hover:bg-db-red/90"
-              title={
-                hasActiveRun
-                  ? "An optimization run is already in progress"
-                  : !canStartOptimization
-                    ? "Required permissions are missing"
-                    : undefined
-              }
-            >
-              <Rocket className="mr-2 h-4 w-4" />
-              {triggerOpt.isPending
-                ? "Starting…"
-                : hasActiveRun
-                  ? "Optimization In Progress"
-                  : "Start Optimization"}
-            </Button>
-          </div>
-          {!canStartOptimization && !permsLoading && (
-            <p className="text-xs text-amber-600">
-              Missing permissions.{" "}
-              <Link
-                to="/settings"
-                search={{ spaceId }}
-                className="underline hover:text-amber-800"
-              >
-                Go to Settings
-              </Link>{" "}
-              to grant access.
-            </p>
-          )}
-          {permsLoading && (
-            <p className="text-xs text-muted-foreground">
-              Checking permissions…
-            </p>
-          )}
-          {canStartOptimization &&
-            !canStartWithWrites &&
-            applyMode === "both" && (
-              <p className="text-xs text-amber-600">
-                Write (MODIFY) access missing for some schemas.{" "}
-                <Link
-                  to="/settings"
-                  search={{ spaceId }}
-                  className="underline hover:text-amber-800"
-                >
-                  Grant in Settings
-                </Link>
-              </p>
-            )}
           {hasActiveRun && activeRunId && (
-            <div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => navigate({ to: "/runs/$runId", params: { runId: activeRunId } })}
-              >
-                View Active Run
-              </Button>
-            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => navigate({ to: "/runs/$runId", params: { runId: activeRunId } })}
+            >
+              View Active Run
+            </Button>
           )}
         </div>
       </div>
@@ -715,6 +588,209 @@ function SpaceDetail() {
           </Card>
         </TabsContent>
       </Tabs>
+
+      {/* ── Optimization Controls ─────────────────────────────────── */}
+      <Card className="border-db-gray-border bg-white">
+        <CardHeader>
+          <CardTitle className="text-sm font-semibold">Start Optimization</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap items-start gap-6">
+            {/* Apply mode toggle */}
+            <div className="space-y-2">
+              <p className="text-xs font-medium text-muted-foreground">Apply mode</p>
+              <div className="inline-flex rounded-md border border-db-gray-border p-1">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={applyMode === "genie_config" ? "default" : "ghost"}
+                  onClick={() => setApplyMode("genie_config")}
+                >
+                  Config Only
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={applyMode === "both" ? "default" : "ghost"}
+                  onClick={() => setApplyMode("both")}
+                  disabled={!canStartWithWrites && !canStartOptimization}
+                  title={
+                    !canStartWithWrites
+                      ? "Write (MODIFY) permissions required — grant them in Settings"
+                      : undefined
+                  }
+                >
+                  Config + UC Write Backs
+                </Button>
+              </div>
+            </div>
+
+            {/* Lever checkboxes */}
+            <div className="space-y-2">
+              <Collapsible defaultOpen>
+                <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+                  <ChevronDown className="h-3 w-3" />
+                  What will be optimized
+                </CollapsibleTrigger>
+                <CollapsibleContent className="mt-2 space-y-2">
+                  {LEVERS.map((lever) => (
+                    <label
+                      key={lever.id}
+                      className="flex items-start gap-2 cursor-pointer"
+                    >
+                      <Checkbox
+                        checked={selectedLevers.has(lever.id)}
+                        onCheckedChange={() => toggleLever(lever.id)}
+                        className="mt-0.5"
+                      />
+                      <div>
+                        <span className="text-sm font-medium">{lever.label}</span>
+                        <p className="text-xs text-muted-foreground">{lever.desc}</p>
+                      </div>
+                    </label>
+                  ))}
+                </CollapsibleContent>
+              </Collapsible>
+            </div>
+
+            {/* Deployment target */}
+            <div className="space-y-2">
+              <Collapsible>
+                <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+                  <ChevronDown className="h-3 w-3" />
+                  Deployment target (optional)
+                </CollapsibleTrigger>
+                <CollapsibleContent className="mt-2">
+                  <Input
+                    placeholder="https://target-workspace.cloud.databricks.com"
+                    value={deployTarget}
+                    onChange={(e) => setDeployTarget(e.target.value)}
+                    className="h-8 w-72 text-xs"
+                  />
+                  <p className="mt-1 text-[10px] text-muted-foreground">
+                    Leave empty to skip cross-environment deployment.
+                  </p>
+                </CollapsibleContent>
+              </Collapsible>
+            </div>
+          </div>
+
+          {/* Permission alerts */}
+          {!canStartOptimization && !permsLoading && (
+            <Alert variant="destructive" className="border-amber-300 bg-amber-50 text-amber-900 [&>svg]:text-amber-600">
+              <ShieldAlert className="h-4 w-4" />
+              <AlertTitle>Missing permissions</AlertTitle>
+              <AlertDescription className="space-y-2">
+                {!hasSpaceAccess && (
+                  <p>
+                    The app&apos;s service principal needs <strong>CAN_MANAGE</strong> on this Genie Space.
+                    {spacePerms?.spGrantInstructions && (
+                      <span className="block mt-1 font-mono text-xs bg-amber-100 rounded px-2 py-1">
+                        {spacePerms.spGrantInstructions}
+                      </span>
+                    )}
+                  </p>
+                )}
+                {hasSpaceAccess && !allReadGranted && spacePerms?.schemas && (
+                  <div>
+                    <p>Missing <strong>SELECT</strong> on:</p>
+                    <ul className="mt-1 space-y-1">
+                      {spacePerms.schemas.filter((s) => !s.readGranted).map((s) => (
+                        <li key={`${s.catalog}.${s.schema_name}`} className="font-mono text-xs bg-amber-100 rounded px-2 py-1">
+                          {s.readGrantCommand || `GRANT SELECT ON SCHEMA ${s.catalog}.${s.schema_name} TO ...`}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <p className="text-xs">
+                  <Link
+                    to="/settings"
+                    search={{ spaceId }}
+                    className="underline hover:text-amber-800"
+                  >
+                    Go to Settings
+                  </Link>{" "}
+                  for the full permission dashboard.
+                </p>
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {canStartOptimization && !canStartWithWrites && applyMode === "both" && (
+            <Alert variant="destructive" className="border-amber-300 bg-amber-50 text-amber-900 [&>svg]:text-amber-600">
+              <ShieldAlert className="h-4 w-4" />
+              <AlertTitle>Write permissions missing</AlertTitle>
+              <AlertDescription className="space-y-2">
+                <p>The <strong>Config + UC Write Backs</strong> mode requires MODIFY access.</p>
+                {spacePerms?.schemas && spacePerms.schemas.filter((s) => !s.writeGranted).length > 0 && (
+                  <ul className="mt-1 space-y-1">
+                    {spacePerms.schemas.filter((s) => !s.writeGranted).map((s) => (
+                      <li key={`${s.catalog}.${s.schema_name}-w`} className="font-mono text-xs bg-amber-100 rounded px-2 py-1">
+                        {s.writeGrantCommand || `GRANT MODIFY ON SCHEMA ${s.catalog}.${s.schema_name} TO ...`}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="text-xs">
+                  <Link
+                    to="/settings"
+                    search={{ spaceId }}
+                    className="underline hover:text-amber-800"
+                  >
+                    Grant in Settings
+                  </Link>
+                </p>
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {permsLoading && (
+            <p className="text-xs text-muted-foreground">
+              Checking permissions…
+            </p>
+          )}
+
+          {/* Start button */}
+          <div className="flex items-center gap-3">
+            <Button
+              onClick={handleOptimize}
+              disabled={
+                triggerOpt.isPending ||
+                hasActiveRun ||
+                !canStartOptimization ||
+                selectedLevers.size === 0 ||
+                (applyMode === "both" && !canStartWithWrites)
+              }
+              className="bg-db-red hover:bg-db-red/90"
+              title={
+                hasActiveRun
+                  ? "An optimization run is already in progress"
+                  : !canStartOptimization
+                    ? "Required permissions are missing"
+                    : undefined
+              }
+            >
+              <Rocket className="mr-2 h-4 w-4" />
+              {triggerOpt.isPending
+                ? "Starting…"
+                : hasActiveRun
+                  ? "Optimization In Progress"
+                  : "Start Optimization"}
+            </Button>
+            {hasActiveRun && activeRunId && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => navigate({ to: "/runs/$runId", params: { runId: activeRunId } })}
+              >
+                View Active Run
+              </Button>
+            )}
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }

@@ -34,7 +34,7 @@
 # MAGIC
 # MAGIC | Lever | Name | What It Optimizes | Example Patches | Risk |
 # MAGIC |:-----:|------|-------------------|-----------------|:----:|
-# MAGIC | 1 | **Tables & Columns** | Column descriptions, visibility, aliases, synonyms | `update_column_description`, `hide_column`, `add_column_synonym` | 🔵 Low–Med |
+# MAGIC | 1 | **Tables & Columns** | Column descriptions, aliases, synonyms | `update_column_description`, `add_column_synonym` | 🔵 Low–Med |
 # MAGIC | 2 | **Metric Views** | MV measures, dimensions, YAML definitions | `update_mv_measure`, `add_mv_dimension`, `update_mv_yaml` | 🟠 Med–High |
 # MAGIC | 3 | **Table-Valued Functions** | TVF SQL, parameters, signatures | `update_tvf_sql`, `add_tvf_parameter`, `add_tvf` | 🟠 Med–High |
 # MAGIC | 4 | **Join Specifications** | Table relationships, join columns (reactive + column-name discovery) | `add_join_spec`, `update_join_spec`, `remove_join_spec` | 🔵 Medium |

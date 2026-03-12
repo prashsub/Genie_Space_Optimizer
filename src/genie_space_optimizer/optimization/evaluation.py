@@ -1064,6 +1064,47 @@ def _set_sql_context(
         spark.sql(f"USE SCHEMA {_quote_identifier(schema)}")
 
 
+def _execute_sql_via_warehouse(
+    w: WorkspaceClient,
+    warehouse_id: str,
+    sql: str,
+    *,
+    catalog: str = "",
+    schema: str = "",
+    wait_timeout: str = "120s",
+) -> pd.DataFrame:
+    """Execute SQL via the SQL warehouse Statement Execution API.
+
+    Returns a pandas DataFrame on success (may be empty for DDL/EXPLAIN).
+    Raises ``RuntimeError`` on failure with the warehouse error message.
+    """
+    from databricks.sdk.service.sql import Disposition, Format, StatementState
+
+    resp = w.statement_execution.execute_statement(
+        warehouse_id=warehouse_id,
+        statement=sql,
+        catalog=catalog or None,
+        schema=schema or None,
+        wait_timeout=wait_timeout,
+        disposition=Disposition.INLINE,
+        format=Format.JSON_ARRAY,
+    )
+    if resp.status and resp.status.state == StatementState.SUCCEEDED:
+        manifest_schema = resp.manifest.schema if resp.manifest else None
+        schema_cols = manifest_schema.columns if manifest_schema else None
+        columns = [str(c.name or "") for c in (schema_cols or [])]
+        rows: list[dict] = []
+        if resp.result and resp.result.data_array:
+            for row_data in resp.result.data_array:
+                rows.append(dict(zip(columns, row_data)))
+        return pd.DataFrame(rows, columns=pd.Index(columns) if columns else None)
+
+    error_msg = ""
+    if resp.status and resp.status.error:
+        error_msg = resp.status.error.message or str(resp.status.error)
+    raise RuntimeError(error_msg or "SQL warehouse query failed")
+
+
 _SQL_PARAM_RE = re.compile(
     r"(?<![:\w])"     # not preceded by : or word char (avoids ::cast, timestamps)
     r":([a-zA-Z_]\w*)"  # :param_name
@@ -1137,6 +1178,8 @@ def _precheck_benchmarks_for_eval(
     known_functions: set[str],
     metric_view_names: set[str] | None = None,
     metric_view_measures: dict[str, set[str]] | None = None,
+    w: WorkspaceClient | None = None,
+    warehouse_id: str = "",
 ) -> tuple[list[dict], list[dict[str, Any]], dict[str, int]]:
     """Apply strict SQL + routine checks before entering mlflow.genai.evaluate()."""
     valid: list[dict] = []
@@ -1185,8 +1228,14 @@ def _precheck_benchmarks_for_eval(
                 continue
 
         try:
-            _set_sql_context(spark, catalog, gold_schema)
-            spark.sql(f"EXPLAIN {resolved_sql}")
+            if w and warehouse_id:
+                _execute_sql_via_warehouse(
+                    w, warehouse_id, f"EXPLAIN {resolved_sql}",
+                    catalog=catalog, schema=gold_schema,
+                )
+            else:
+                _set_sql_context(spark, catalog, gold_schema)
+                spark.sql(f"EXPLAIN {resolved_sql}")
         except Exception as exc:
             msg = str(exc)
             if "UNBOUND_SQL_PARAMETER" in msg:
@@ -1276,6 +1325,7 @@ def make_predict_fn(
     schema: str,
     metric_view_measures: dict[str, set[str]] | None = None,
     *,
+    warehouse_id: str = "",
     optimization_run_id: str = "",
     iteration: int | None = None,
     lever: int | None = None,
@@ -1367,22 +1417,6 @@ def make_predict_fn(
                     )
             statement_id = result.get("statement_id")
 
-            if genie_sql and not comparison.get("error"):
-                try:
-                    _set_sql_context(spark, catalog, schema)
-                    spark.sql(f"EXPLAIN {genie_sql}")
-                except Exception as _genie_explain_exc:
-                    _genie_msg = str(_genie_explain_exc)
-                    if "UNBOUND_SQL_PARAMETER" not in _genie_msg:
-                        comparison["error"] = (
-                            f"Genie SQL failed EXPLAIN: {_genie_msg[:400]}"
-                        )
-                        comparison["error_type"] = "genie_sql_invalid"
-                        logger.warning(
-                            "Genie SQL for '%s' failed EXPLAIN pre-check: %.200s",
-                            question[:60], _genie_msg,
-                        )
-
             if genie_sql and gt_sql:
                 _genie_sql_norm = genie_sql.strip().lower()
                 _gt_sql_norm = gt_sql.strip().lower()
@@ -1429,8 +1463,6 @@ def make_predict_fn(
 
                     if not comparison.get("error"):
                         try:
-                            _set_sql_context(spark, catalog, schema)
-
                             called_functions = _extract_sql_function_calls(gt_sql, catalog, schema)
                             missing_gt_functions = sorted(f for f in called_functions if f not in known_functions)
                             if missing_gt_functions:
@@ -1441,7 +1473,14 @@ def make_predict_fn(
                                 comparison["error_type"] = "permission_blocked"
                             else:
                                 try:
-                                    spark.sql(f"EXPLAIN {gt_sql}")
+                                    if warehouse_id:
+                                        _execute_sql_via_warehouse(
+                                            w, warehouse_id, f"EXPLAIN {gt_sql}",
+                                            catalog=catalog, schema=schema,
+                                        )
+                                    else:
+                                        _set_sql_context(spark, catalog, schema)
+                                        spark.sql(f"EXPLAIN {gt_sql}")
                                 except Exception as explain_exc:
                                     explain_msg = str(explain_exc)
                                     if "UNBOUND_SQL_PARAMETER" in explain_msg:
@@ -1456,7 +1495,15 @@ def make_predict_fn(
                                     comparison["sqlstate"] = _extract_sqlstate(explain_msg)
 
                                 if not comparison["error"]:
-                                    gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
+                                    if warehouse_id:
+                                        raw_gt_df = _execute_sql_via_warehouse(
+                                            w, warehouse_id, gt_sql,
+                                            catalog=catalog, schema=schema,
+                                        )
+                                        gt_df = normalize_result_df(raw_gt_df)
+                                    else:
+                                        _set_sql_context(spark, catalog, schema)
+                                        gt_df = normalize_result_df(spark.sql(gt_sql).toPandas())
 
                                 genie_df = None
                                 if statement_id:
@@ -3103,6 +3150,7 @@ def run_evaluation(
     scorers: list[Any],
     *,
     spark: SparkSession | None = None,
+    w: WorkspaceClient | None = None,
     catalog: str = "",
     gold_schema: str = "",
     uc_schema: str = "",
@@ -3171,6 +3219,7 @@ def run_evaluation(
         # by record-id and never deletes old rows.  Using eval_data guarantees
         # the evaluation runs exactly the deduped benchmark set.
 
+        _wh_id = warehouse_id or os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "")
         if spark is not None:
             known_functions = _load_known_functions(spark, catalog, gold_schema)
             filtered, quarantined_benchmarks, precheck_counts = _precheck_benchmarks_for_eval(
@@ -3181,6 +3230,8 @@ def run_evaluation(
                 known_functions=known_functions,
                 metric_view_names=metric_view_names,
                 metric_view_measures=metric_view_measures,
+                w=w,
+                warehouse_id=_wh_id,
             )
         else:
             filtered = list(scope_filtered)

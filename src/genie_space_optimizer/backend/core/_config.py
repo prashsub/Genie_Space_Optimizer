@@ -31,6 +31,7 @@ class AppConfig(BaseSettings):
     catalog: str = Field(default="", description="Unity Catalog name")
     schema_name: str = Field(default="", validation_alias=f"{app_slug.upper()}_SCHEMA", description="Gold schema name")
     warehouse_id: str = Field(default="", description="SQL Warehouse ID")
+    job_id: int | None = Field(default=None, description="Bundle-managed runner job ID")
 
     @property
     def static_assets_path(self) -> Path:

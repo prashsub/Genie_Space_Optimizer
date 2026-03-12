@@ -94,6 +94,7 @@
 # COMMAND ----------
 
 import json
+import os
 import traceback
 from functools import partial
 from typing import Any, cast
@@ -191,7 +192,10 @@ _log("Benchmark dataset", uc_schema=uc_schema, domain=domain, benchmark_count=le
 # COMMAND ----------
 
 _ensure_sql_context(spark, catalog, schema)
-predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
+predict_fn = make_predict_fn(
+    w, space_id, spark, catalog, schema,
+    warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
+)
 scorers = make_all_scorers(w, spark, catalog, schema)
 
 # COMMAND ----------
@@ -219,7 +223,7 @@ try:
         space_id, experiment_name, iteration, benchmarks,
         domain, model_id, eval_scope,
         predict_fn, scorers,
-        catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+        spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
     )
     _log(
         "Evaluation complete",

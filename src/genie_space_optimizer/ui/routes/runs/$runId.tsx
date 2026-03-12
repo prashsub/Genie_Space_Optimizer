@@ -598,9 +598,13 @@ function PipelineView() {
             summary={step.summary}
           >
             <StepInsights step={step} links={run.links ?? []} />
+            {step.name === "Proactive Enrichment" &&
+              run.levers.filter(l => l.lever === 0).length > 0 && (
+                <LeverProgress levers={run.levers.filter(l => l.lever === 0)} links={run.links ?? []} runId={run.runId} />
+              )}
             {step.name === "Adaptive Optimization" &&
-              run.levers.length > 0 && (
-                <LeverProgress levers={run.levers} links={run.links ?? []} runId={run.runId} />
+              run.levers.filter(l => l.lever !== 0).length > 0 && (
+                <LeverProgress levers={run.levers.filter(l => l.lever !== 0)} links={run.links ?? []} runId={run.runId} />
               )}
           </PipelineStepCard>
         ))}

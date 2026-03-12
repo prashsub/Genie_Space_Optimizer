@@ -365,6 +365,7 @@ def baseline_setup_scorers(
     )
     predict_fn = make_predict_fn(
         w, space_id, spark, catalog, schema,
+        warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
         instruction_prompt_name=_instr_prompt,
     )
     scorers = make_all_scorers(w, spark, catalog, schema)
@@ -394,6 +395,7 @@ def baseline_run_evaluation(
     schema: str,
     benchmarks: list[dict],
     setup_ctx: dict,
+    w: WorkspaceClient | None = None,
 ) -> dict:
     """Sub-step 2b: Run 9-judge evaluation with retry."""
     _ensure_sql_context(spark, catalog, schema)
@@ -403,7 +405,7 @@ def baseline_run_evaluation(
         setup_ctx["space_id"], setup_ctx["exp_name"], 0, benchmarks,
         setup_ctx["domain"], setup_ctx["model_id"], "full",
         setup_ctx["predict_fn"], setup_ctx["scorers"],
-        spark=spark, catalog=catalog, gold_schema=schema,
+        spark=spark, w=w, catalog=catalog, gold_schema=schema,
         uc_schema=f"{catalog}.{schema}",
     )
     return eval_result
@@ -537,7 +539,7 @@ def _run_baseline(
             w, spark, space_id, run_id, catalog, schema, exp_name, model_id, domain,
         )
         eval_result = baseline_run_evaluation(
-            spark, run_id, catalog, schema, benchmarks, setup_ctx,
+            spark, run_id, catalog, schema, benchmarks, setup_ctx, w=w,
         )
         scorecard = baseline_display_scorecard(eval_result)
         return baseline_persist_state(
@@ -3260,7 +3262,7 @@ def _run_gate_checks(
             space_id, exp_name, iteration_counter, slice_benchmarks,
             domain, prev_model_id, "slice",
             predict_fn, scorers,
-            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+            spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
             patched_objects=patched_objects,
             reference_sqls=reference_sqls if reference_sqls else None,
         )
@@ -3336,7 +3338,7 @@ def _run_gate_checks(
             space_id, exp_name, iteration_counter, p0_benchmarks,
             domain, prev_model_id, "p0",
             predict_fn, scorers,
-            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+            spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
             reference_sqls=reference_sqls if reference_sqls else None,
         )
         try:
@@ -3388,7 +3390,7 @@ def _run_gate_checks(
         space_id, exp_name, iteration_counter, benchmarks,
         domain, new_model_id, "full",
         predict_fn, scorers,
-        spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+        spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
         reference_sqls=reference_sqls if reference_sqls else None,
     )
 
@@ -3412,7 +3414,7 @@ def _run_gate_checks(
             space_id, exp_name, iteration_counter, benchmarks,
             domain, new_model_id, "full_confirm",
             predict_fn, scorers,
-            spark=spark, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
+            spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
             reference_sqls=reference_sqls if reference_sqls else None,
         )
         scores_2 = full_result_2.get("scores", {})
@@ -3691,6 +3693,7 @@ def _run_lever_loop(
     predict_fn = make_predict_fn(
         w, space_id, spark, catalog, schema,
         metric_view_measures=_mv_measures,
+        warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
         optimization_run_id=run_id,
         triggered_by=triggered_by,
         instruction_prompt_name=_instr_prompt,
@@ -5007,7 +5010,10 @@ def _run_finalize(
             )
 
             _ensure_sql_context(spark, catalog, schema)
-            predict_fn = make_predict_fn(w, space_id, spark, catalog, schema)
+            predict_fn = make_predict_fn(
+                w, space_id, spark, catalog, schema,
+                warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
+            )
 
             rep_pcts: list[float] = []
             try:

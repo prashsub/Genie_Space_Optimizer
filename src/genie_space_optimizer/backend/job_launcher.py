@@ -1,8 +1,11 @@
-"""Persistent Databricks Job launcher for optimization pipelines.
+"""Databricks Job launcher for optimization and deployment pipelines.
 
-The app uploads a runner notebook + wheel, ensures a reusable named Databricks Job
-exists, then triggers each optimization run via ``jobs.run_now()``. This keeps
-all optimization runs visible under a single Workflow job in the UI.
+The main optimization runner job is declared in ``databricks.yml`` and managed
+by the Databricks bundle (Terraform).  The app receives the job ID via the
+``GENIE_SPACE_OPTIMIZER_JOB_ID`` environment variable and triggers runs with
+``jobs.run_now()``.
+
+Per-space deployment jobs are still created at runtime.
 """
 
 from __future__ import annotations
@@ -26,7 +29,6 @@ from databricks.sdk.service.jobs import (
     JobSettings,
     NotebookTask,
     QueueSettings,
-    TaskDependency,
     Source,
     Task,
 )
@@ -36,29 +38,7 @@ logger = logging.getLogger(__name__)
 
 _WS_BASE = "/Workspace/Shared/genie-space-optimizer"
 _VOLUME_NAME = "app_artifacts"
-_PERSISTENT_JOB_NAME = "genie-space-optimizer-runner"
-_JOB_ENVIRONMENT_CLIENT_VERSION = "4"
-_DAG_TASK_KEYS = {
-    "preflight": "preflight",
-    "baseline": "baseline_eval",
-    "enrichment": "enrichment",
-    "lever_loop": "lever_loop",
-    "finalize": "finalize",
-    "deploy": "deploy",
-}
-_JOB_PARAM_DEFAULTS = {
-    "run_id": "",
-    "space_id": "",
-    "domain": "default",
-    "catalog": "",
-    "schema": "",
-    "apply_mode": "genie_config",
-    "levers": "[1,2,3,4,5]",
-    "max_iterations": "5",
-    "triggered_by": "",
-    "experiment_name": "",
-    "deploy_target": "",
-}
+_PERSISTENT_JOB_NAME = "genie-space-optimizer-job"
 
 _NOTEBOOK_SOURCES = {
     "run_preflight": Path(__file__).resolve().parent.parent / "jobs" / "run_preflight.py",
@@ -75,14 +55,14 @@ _DEPLOY_JOB_ENVIRONMENT_CLIENT_VERSION = "4"
 
 _cached_wheel_path: str | None = None
 _cached_wheel_hash: str | None = None
-_cached_job_id: int | None = None
-_cached_job_wheel_path: str | None = None
 _volume_ensured: bool = False
 _legacy_cleaned: bool = False
-# Only guards single-process races; with multiple uvicorn workers cross-process
-# safety relies on the Databricks idempotency_token passed to run_now().
 _job_submit_lock = threading.Lock()
 
+
+# ---------------------------------------------------------------------------
+# Shared utilities (used by deployment jobs AND submit_optimization)
+# ---------------------------------------------------------------------------
 
 def _volume_wheel_dir(catalog: str, schema: str) -> str:
     """Return the Volume-based directory path for wheel storage."""
@@ -90,10 +70,7 @@ def _volume_wheel_dir(catalog: str, schema: str) -> str:
 
 
 def _ensure_volume(ws: WorkspaceClient, catalog: str, schema: str) -> None:
-    """Create the managed Volume for app artifacts if it doesn't already exist.
-
-    Idempotent and cached per process — only attempts creation once.
-    """
+    """Create the managed Volume for app artifacts if it doesn't already exist."""
     global _volume_ensured
     if _volume_ensured:
         return
@@ -117,29 +94,10 @@ def _ensure_volume(ws: WorkspaceClient, catalog: str, schema: str) -> None:
     _volume_ensured = True
 
 
-def _cleanup_legacy_workspace_wheels(ws: WorkspaceClient) -> None:
-    """One-time removal of the old workspace-based wheel directory.
-
-    After migrating to UC Volumes, the legacy ``/Workspace/Shared/.../dist/``
-    tree is no longer used.  Best-effort, non-fatal.
-    """
-    global _legacy_cleaned
-    if _legacy_cleaned:
-        return
-    _legacy_cleaned = True
-    legacy_dir = f"{_WS_BASE}/dist"
-    try:
-        ws.workspace.delete(legacy_dir, recursive=True)
-        logger.info("Cleaned up legacy workspace wheel directory: %s", legacy_dir)
-    except Exception:
-        logger.debug("No legacy workspace wheel directory to clean up", exc_info=True)
-
-
 def _build_idempotency_token(*, run_id: str, space_id: str, triggered_by: str) -> str:
     """Build a stable <=64-char idempotency token for run_now."""
     raw = f"{space_id}|{triggered_by}|{run_id}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    # Databricks enforces a 64-char max.
     return f"gso-{digest[:60]}"
 
 
@@ -157,9 +115,7 @@ def _resolve_project_root() -> Path:
 def _find_wheel() -> Path:
     """Locate the newest project wheel across ALL search directories.
 
-    Scans every candidate directory and picks the globally-newest wheel by
-    filename (which embeds a build timestamp).  Falls back to building from
-    source in dev environments.
+    Falls back to building from source in dev environments.
     """
     app_source = Path("/app/python/source_code")
     project_root = _resolve_project_root()
@@ -216,11 +172,7 @@ def _find_wheel() -> Path:
 
 
 def _cleanup_stale_wheels(ws: WorkspaceClient, dist_dir: str, keep_path: str) -> None:
-    """Remove old hash-bucketed wheel directories from the Volume dist directory.
-
-    Wheels are stored as ``{dist_dir}/{hash[:8]}/{filename}.whl``.
-    This deletes any sibling hash directories that don't contain the current wheel.
-    """
+    """Remove old hash-bucketed wheel directories from the Volume dist directory."""
     keep_dir = keep_path.rsplit("/", 1)[0] if "/" in keep_path else keep_path
     try:
         for entry in ws.files.list_directory_contents(dist_dir):
@@ -235,19 +187,51 @@ def _cleanup_stale_wheels(ws: WorkspaceClient, dist_dir: str, keep_path: str) ->
         logger.debug("Could not list %s for cleanup", dist_dir, exc_info=True)
 
 
+def _cleanup_legacy_workspace_wheels(ws: WorkspaceClient) -> None:
+    """One-time removal of the old workspace-based wheel directory."""
+    global _legacy_cleaned
+    if _legacy_cleaned:
+        return
+    _legacy_cleaned = True
+    legacy_dir = f"{_WS_BASE}/dist"
+    try:
+        ws.workspace.delete(legacy_dir, recursive=True)
+        logger.info("Cleaned up legacy workspace wheel directory: %s", legacy_dir)
+    except Exception:
+        logger.debug("No legacy workspace wheel directory to clean up", exc_info=True)
+
+
+def _resolve_sp_client_id(ws: WorkspaceClient) -> str:
+    return ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
+
+
+def _ensure_job_visibility(ws: WorkspaceClient, job_id: int) -> None:
+    """Best-effort permission update so users can view job runs in the UI."""
+    try:
+        ws.permissions.update(
+            "jobs",
+            str(job_id),
+            access_control_list=[
+                AccessControlRequest(
+                    group_name="users",
+                    permission_level=PermissionLevel.CAN_VIEW,
+                )
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not set CAN_VIEW permissions on job %s: %s",
+            job_id,
+            exc,
+        )
+
+
 def _ensure_artifacts(
     ws: WorkspaceClient, catalog: str, schema: str,
 ) -> tuple[str, str]:
     """Upload wheel to a UC Volume and runner notebooks to the workspace.
 
-    The wheel is stored in a managed Volume at
-    ``/Volumes/{catalog}/{schema}/app_artifacts/dist/{hash[:8]}/{filename}``.
-    Notebooks remain in the workspace (required by ``NotebookTask``).
-
-    Always re-discovers the local wheel and computes a content hash so that
-    new wheels are detected even if the app process was not restarted after a
-    deploy.
-
+    Used by per-space deployment jobs which are still runtime-created.
     Returns ``(vol_wheel_path, wheel_hash)``.
     """
     global _cached_wheel_path, _cached_wheel_hash
@@ -304,275 +288,180 @@ def _ensure_artifacts(
     return vol_wheel_path, wheel_hash
 
 
-def _job_settings(
-    ws_wheel_path: str, wheel_hash: str = "", sp_client_id: str = "",
-) -> JobSettings:
-    def _job_param_ref(name: str) -> str:
-        return f"{{{{job.parameters.{name}}}}}"
+# ---------------------------------------------------------------------------
+# Main optimization job — bundle-managed, triggered via run_now()
+# ---------------------------------------------------------------------------
 
-    run_as = JobRunAs(service_principal_name=sp_client_id) if sp_client_id else None
+def _resolve_job_id(ws: WorkspaceClient, job_id: int | None) -> int:
+    """Return the configured job ID, falling back to a tag-filtered name lookup.
 
-    return JobSettings(
-        name=_PERSISTENT_JOB_NAME,
-        run_as=run_as,
-        description=(
-            "Persistent DAG optimization runner managed by Genie Space Optimizer app "
-            "(preflight → baseline_eval → enrichment → lever_loop → finalize → deploy). "
-            "SP executes with granted privileges on user schemas."
-        ),
-        max_concurrent_runs=20,
-        queue=QueueSettings(enabled=True),
-        parameters=[
-            JobParameterDefinition(name=name, default=default)
-            for name, default in _JOB_PARAM_DEFAULTS.items()
-        ],
-        tasks=[
-            Task(
-                task_key=_DAG_TASK_KEYS["preflight"],
-                notebook_task=NotebookTask(
-                    notebook_path=_WS_NOTEBOOKS["run_preflight"],
-                    source=Source.WORKSPACE,
-                    base_parameters={
-                        "run_id": _job_param_ref("run_id"),
-                        "space_id": _job_param_ref("space_id"),
-                        "domain": _job_param_ref("domain"),
-                        "catalog": _job_param_ref("catalog"),
-                        "schema": _job_param_ref("schema"),
-                        "apply_mode": _job_param_ref("apply_mode"),
-                        "levers": _job_param_ref("levers"),
-                        "max_iterations": _job_param_ref("max_iterations"),
-                        "experiment_name": _job_param_ref("experiment_name"),
-                        "deploy_target": _job_param_ref("deploy_target"),
-                    },
-                ),
-                environment_key="default",
-                timeout_seconds=7200,
-                max_retries=0,
-            ),
-            Task(
-                task_key=_DAG_TASK_KEYS["baseline"],
-                depends_on=[TaskDependency(task_key=_DAG_TASK_KEYS["preflight"])],
-                notebook_task=NotebookTask(
-                    notebook_path=_WS_NOTEBOOKS["run_baseline"],
-                    source=Source.WORKSPACE,
-                ),
-                environment_key="default",
-                timeout_seconds=7200,
-                max_retries=0,
-            ),
-            Task(
-                task_key=_DAG_TASK_KEYS["enrichment"],
-                depends_on=[TaskDependency(task_key=_DAG_TASK_KEYS["baseline"])],
-                notebook_task=NotebookTask(
-                    notebook_path=_WS_NOTEBOOKS["run_enrichment"],
-                    source=Source.WORKSPACE,
-                ),
-                environment_key="default",
-                timeout_seconds=7200,
-                max_retries=0,
-            ),
-            Task(
-                task_key=_DAG_TASK_KEYS["lever_loop"],
-                depends_on=[TaskDependency(task_key=_DAG_TASK_KEYS["enrichment"])],
-                notebook_task=NotebookTask(
-                    notebook_path=_WS_NOTEBOOKS["run_lever_loop"],
-                    source=Source.WORKSPACE,
-                ),
-                environment_key="default",
-                timeout_seconds=7200,
-                max_retries=0,
-            ),
-            Task(
-                task_key=_DAG_TASK_KEYS["finalize"],
-                depends_on=[TaskDependency(task_key=_DAG_TASK_KEYS["lever_loop"])],
-                notebook_task=NotebookTask(
-                    notebook_path=_WS_NOTEBOOKS["run_finalize"],
-                    source=Source.WORKSPACE,
-                ),
-                environment_key="default",
-                timeout_seconds=7200,
-                max_retries=0,
-            ),
-            Task(
-                task_key=_DAG_TASK_KEYS["deploy"],
-                depends_on=[TaskDependency(task_key=_DAG_TASK_KEYS["finalize"])],
-                notebook_task=NotebookTask(
-                    notebook_path=_WS_NOTEBOOKS["run_deploy"],
-                    source=Source.WORKSPACE,
-                ),
-                environment_key="default",
-                timeout_seconds=7200,
-                max_retries=0,
-            ),
-        ],
-        environments=[
-            JobEnvironment(
-                environment_key="default",
-                spec=Environment(
-                    client=_JOB_ENVIRONMENT_CLIENT_VERSION,
-                    dependencies=[
-                        ws_wheel_path,
-                        "mlflow[databricks]>=3.4.0",
-                        "databricks-sdk>=0.40.0",
-                    ],
-                ),
-            ),
-        ],
-        tags={
-            "app": "genie-space-optimizer",
-            "managed-by": "backend-job-launcher",
-            "pattern": "persistent-dag",
-            "wheel-hash": wheel_hash[:12] if wheel_hash else "unknown",
-        },
-    )
-
-
-def _ensure_job_visibility(ws: WorkspaceClient, job_id: int) -> None:
-    """Best-effort permission update so users can view job runs in the UI."""
-    try:
-        ws.permissions.update(
-            "jobs",
-            str(job_id),
-            access_control_list=[
-                AccessControlRequest(
-                    group_name="users",
-                    permission_level=PermissionLevel.CAN_VIEW,
-                )
-            ],
-        )
-    except Exception as exc:
-        logger.warning(
-            "Could not set CAN_VIEW permissions on job %s: %s",
-            job_id,
-            exc,
-        )
-
-
-def _resolve_sp_client_id(ws: WorkspaceClient) -> str:
-    return ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
-
-
-def _is_owner_current(owner_ref: str, sp_client_id: str) -> bool:
-    """True if *owner_ref* matches the current SP."""
-    return bool(sp_client_id) and sp_client_id in owner_ref
-
-
-def _ensure_persistent_job(
-    ws: WorkspaceClient,
-    ws_wheel_path: str,
-    wheel_hash: str = "",
-    sp_client_id: str = "",
-) -> int:
-    """Find or create the persistent optimization job and return job_id.
-
-    If an existing job is found but its owner is orphaned or belongs to a
-    stale service principal, the job is deleted and recreated so the current
-    SP owns it.  ``run_as`` is always set explicitly.
+    The name lookup uses a substring match (which handles DABs dev-mode
+    prefixes like ``[dev user] genie-space-optimizer-job``), then filters
+    by the ``managed-by: databricks-bundle`` tag to avoid picking up stale
+    runtime-created jobs with similar names.
     """
-    global _cached_job_id, _cached_job_wheel_path
-
-    if _cached_job_id is not None and _cached_job_wheel_path == ws_wheel_path:
-        return _cached_job_id
-
-    settings = _job_settings(
-        ws_wheel_path, wheel_hash=wheel_hash, sp_client_id=sp_client_id,
+    if job_id:
+        return job_id
+    for j in ws.jobs.list(name=_PERSISTENT_JOB_NAME):
+        tags = (j.settings.tags if j.settings else None) or {}
+        if tags.get("managed-by") == "databricks-bundle" and j.job_id:
+            logger.info("Resolved runner job by tag: id=%s", j.job_id)
+            return j.job_id
+    raise RuntimeError(
+        "Runner job not found. Set GENIE_SPACE_OPTIMIZER_JOB_ID or run deploy.sh."
     )
 
-    if _cached_job_id is not None:
-        try:
-            ws.jobs.reset(_cached_job_id, new_settings=settings)
-            _cached_job_wheel_path = ws_wheel_path
-            return _cached_job_id
-        except Exception:
-            logger.warning(
-                "Failed to reset cached job %s, rediscovering by name",
-                _cached_job_id,
-            )
-            _cached_job_id = None
 
-    existing_job_id: int | None = None
-    for job in ws.jobs.list(name=_PERSISTENT_JOB_NAME, limit=1):
-        if job.job_id is not None:
-            existing_job_id = int(job.job_id)
-            break
+def submit_optimization(
+    ws: WorkspaceClient,
+    *,
+    job_id: int | None,
+    run_id: str,
+    space_id: str,
+    domain: str,
+    catalog: str,
+    schema: str,
+    apply_mode: str = "genie_config",
+    levers: str = "[1,2,3,4,5]",
+    max_iterations: str = "5",
+    triggered_by: str = "",
+    experiment_name: str = "",
+    deploy_target: str = "",
+) -> tuple[str, int]:
+    """Trigger a run on the bundle-managed optimization job.
 
-    if existing_job_id is not None and sp_client_id:
-        try:
-            job_detail = ws.jobs.get(existing_job_id)
-            creator = job_detail.creator_user_name or ""
-            run_as_name = job_detail.run_as_user_name or ""
-            owner_ref = run_as_name or creator
-            owner_is_orphaned = not owner_ref
-
-            if owner_is_orphaned or not _is_owner_current(owner_ref, sp_client_id):
-                logger.warning(
-                    "Job %s owned by '%s' (current SP: %s) — "
-                    "deleting orphaned/stale job and recreating.",
-                    existing_job_id, owner_ref, sp_client_id,
-                )
-                try:
-                    ws.jobs.delete(existing_job_id)
-                except Exception as del_exc:
-                    logger.warning(
-                        "Could not delete orphaned job %s: %s",
-                        existing_job_id, del_exc,
-                    )
-                existing_job_id = None
-        except Exception:
-            logger.warning(
-                "Could not inspect job %s ownership — will try reset",
-                existing_job_id,
-            )
-
-    if existing_job_id is not None:
-        try:
-            ws.jobs.reset(existing_job_id, new_settings=settings)
-            job_id = existing_job_id
-            logger.info("Updated persistent optimization job %s", job_id)
-        except Exception as exc:
-            logger.warning(
-                "Could not update existing job %s (%s); creating app-owned job instead",
-                existing_job_id,
-                exc,
-            )
-            existing_job_id = None
-            created = ws.jobs.create(
-                name=settings.name,
-                description=settings.description,
-                max_concurrent_runs=settings.max_concurrent_runs,
-                queue=settings.queue,
-                parameters=settings.parameters,
-                tasks=settings.tasks,
-                environments=settings.environments,
-                tags=settings.tags,
-                run_as=settings.run_as,
-            )
-            if created.job_id is None:
-                raise RuntimeError("Job creation returned no job_id")
-            job_id = int(created.job_id)
-            logger.info("Created persistent optimization job %s", job_id)
-    else:
-        created = ws.jobs.create(
-            name=settings.name,
-            description=settings.description,
-            max_concurrent_runs=settings.max_concurrent_runs,
-            queue=settings.queue,
-            parameters=settings.parameters,
-            tasks=settings.tasks,
-            environments=settings.environments,
-            tags=settings.tags,
-            run_as=settings.run_as,
+    The job is declared in ``databricks.yml`` and its ID is provided by
+    the ``GENIE_SPACE_OPTIMIZER_JOB_ID`` environment variable.  Falls back
+    to looking up the job by name if the env var is not set.
+    """
+    resolved_job_id = _resolve_job_id(ws, job_id)
+    with _job_submit_lock:
+        waiter = ws.jobs.run_now(
+            job_id=resolved_job_id,
+            idempotency_token=_build_idempotency_token(
+                run_id=run_id,
+                space_id=space_id,
+                triggered_by=triggered_by,
+            ),
+            job_parameters={
+                "run_id": run_id,
+                "space_id": space_id,
+                "domain": domain,
+                "catalog": catalog,
+                "schema": schema,
+                "apply_mode": apply_mode,
+                "levers": levers,
+                "max_iterations": max_iterations,
+                "triggered_by": triggered_by,
+                "experiment_name": experiment_name,
+                "deploy_target": deploy_target,
+            },
         )
-        if created.job_id is None:
-            raise RuntimeError("Job creation returned no job_id")
-        job_id = int(created.job_id)
-        logger.info("Created persistent optimization job %s", job_id)
 
-    _ensure_job_visibility(ws, job_id)
-    _cached_job_id = job_id
-    _cached_job_wheel_path = ws_wheel_path
-    return job_id
+    job_run_id = str(waiter.run_id)
+    logger.info(
+        "Triggered optimization run %s on bundle-managed job %s (job run %s)",
+        run_id,
+        resolved_job_id,
+        job_run_id,
+    )
+    return job_run_id, resolved_job_id
 
+
+# ---------------------------------------------------------------------------
+# Job URL and health checks
+# ---------------------------------------------------------------------------
+
+def get_job_url(ws: WorkspaceClient, job_id: int | None = None) -> str | None:
+    """Resolve the URL to the persistent optimization job."""
+    if job_id is None:
+        try:
+            for job in ws.jobs.list(name=_PERSISTENT_JOB_NAME):
+                tags = (job.settings.tags if job.settings else None) or {}
+                if tags.get("managed-by") == "databricks-bundle" and job.job_id is not None:
+                    job_id = int(job.job_id)
+                    break
+        except Exception:
+            return None
+    if job_id is None:
+        return None
+    host = (ws.config.host or "").rstrip("/")
+    if not host:
+        return None
+    return f"{host}/jobs/{job_id}"
+
+
+def check_job_health(ws: WorkspaceClient, sp_client_id: str, job_id: int | None = None) -> tuple[bool, str]:
+    """Check if the optimization job exists and is accessible.
+
+    For a bundle-managed job, ownership is set by ``deploy.sh`` and
+    verified/repaired by ``_JobRunAsBootstrap`` at startup.  This check
+    is lighter than the old orphan-detection logic.
+    """
+    try:
+        if job_id is not None:
+            detail = ws.jobs.get(job_id)
+            run_as_name = detail.run_as_user_name or ""
+            if sp_client_id and run_as_name and sp_client_id not in run_as_name:
+                return False, (
+                    f"Runner job {job_id} run_as is '{run_as_name}' but the "
+                    f"current app SP is '{sp_client_id}'. Restart the app "
+                    f"to auto-repair, or re-run deploy.sh."
+                )
+            return True, ""
+
+        for job in ws.jobs.list(name=_PERSISTENT_JOB_NAME):
+            tags = (job.settings.tags if job.settings else None) or {}
+            if tags.get("managed-by") == "databricks-bundle" and job.job_id is not None:
+                return True, ""
+        return False, (
+            "Runner job not found. Run deploy.sh to create it, "
+            "or check the GENIE_SPACE_OPTIMIZER_JOB_ID env var."
+        )
+    except Exception:
+        return True, ""
+
+
+# ---------------------------------------------------------------------------
+# run_as self-healing (used by _JobRunAsBootstrap in app.py)
+# ---------------------------------------------------------------------------
+
+def ensure_job_run_as(ws: WorkspaceClient, job_id: int, sp_client_id: str) -> None:
+    """Verify the bundle-managed job's ``run_as`` matches the current SP.
+
+    If not, update it.  This provides self-healing after fresh deploys
+    where ``deploy.sh`` may not have been run yet.
+    """
+    try:
+        detail = ws.jobs.get(job_id)
+        run_as_name = detail.run_as_user_name or ""
+        if sp_client_id and sp_client_id in run_as_name:
+            logger.debug("Job %s run_as already set to SP %s", job_id, sp_client_id)
+            return
+
+        logger.info(
+            "Updating job %s run_as from '%s' to SP '%s'",
+            job_id, run_as_name, sp_client_id,
+        )
+        ws.jobs.update(
+            job_id=job_id,
+            new_settings=JobSettings(
+                run_as=JobRunAs(service_principal_name=sp_client_id),
+            ),
+        )
+        logger.info("Job %s run_as updated to SP %s", job_id, sp_client_id)
+    except Exception:
+        logger.warning(
+            "Could not verify/update run_as on job %s — "
+            "run deploy.sh to set permissions manually",
+            job_id,
+            exc_info=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-space deployment jobs (still runtime-created)
+# ---------------------------------------------------------------------------
 
 def ensure_deployment_job(
     ws: WorkspaceClient,
@@ -675,110 +564,3 @@ def ensure_deployment_job(
     _ensure_job_visibility(ws, job_id)
     logger.info("Created deployment job %s (id=%s) for space %s", job_name, job_id, space_id)
     return job_id
-
-
-def submit_optimization(
-    ws: WorkspaceClient,
-    *,
-    run_id: str,
-    space_id: str,
-    domain: str,
-    catalog: str,
-    schema: str,
-    apply_mode: str = "genie_config",
-    levers: str = "[1,2,3,4,5]",
-    max_iterations: str = "5",
-    triggered_by: str = "",
-    experiment_name: str = "",
-    deploy_target: str = "",
-) -> tuple[str, int]:
-    """Trigger a run on a persistent serverless optimization job.
-
-    The job runs as the SP which has been granted SELECT/EXECUTE on user
-    schemas via the Data Access Settings page.
-    """
-    sp_client_id = _resolve_sp_client_id(ws)
-    ws_wheel_path, wheel_hash = _ensure_artifacts(ws, catalog=catalog, schema=schema)
-    job_id = _ensure_persistent_job(
-        ws, ws_wheel_path, wheel_hash=wheel_hash, sp_client_id=sp_client_id,
-    )
-
-    with _job_submit_lock:
-        waiter = ws.jobs.run_now(
-            job_id=job_id,
-            idempotency_token=_build_idempotency_token(
-                run_id=run_id,
-                space_id=space_id,
-                triggered_by=triggered_by,
-            ),
-            job_parameters={
-                "run_id": run_id,
-                "space_id": space_id,
-                "domain": domain,
-                "catalog": catalog,
-                "schema": schema,
-                "apply_mode": apply_mode,
-                "levers": levers,
-                "max_iterations": max_iterations,
-                "triggered_by": triggered_by,
-                "experiment_name": experiment_name,
-                "deploy_target": deploy_target,
-            },
-        )
-
-    job_run_id = str(waiter.run_id)
-    logger.info(
-        "Triggered optimization run %s on persistent job %s (job run %s)",
-        run_id,
-        job_id,
-        job_run_id,
-    )
-    return job_run_id, job_id
-
-
-def get_job_url(ws: WorkspaceClient) -> str | None:
-    """Resolve the URL to the persistent optimization job, if it exists."""
-    job_id = _cached_job_id
-    if job_id is None:
-        try:
-            for job in ws.jobs.list(name=_PERSISTENT_JOB_NAME, limit=1):
-                if job.job_id is not None:
-                    job_id = int(job.job_id)
-                    break
-        except Exception:
-            return None
-    if job_id is None:
-        return None
-    host = (ws.config.host or "").rstrip("/")
-    if not host:
-        return None
-    return f"{host}/jobs/{job_id}"
-
-
-def check_job_health(ws: WorkspaceClient, sp_client_id: str) -> tuple[bool, str]:
-    """Check if the persistent runner job exists and is owned by the current SP.
-
-    Returns ``(is_healthy, message)``.  Never raises.
-    """
-    try:
-        for job in ws.jobs.list(name=_PERSISTENT_JOB_NAME, limit=1):
-            if job.job_id is None:
-                continue
-            detail = ws.jobs.get(int(job.job_id))
-            owner = detail.run_as_user_name or detail.creator_user_name or ""
-            if not owner:
-                return False, (
-                    f"Runner job {job.job_id} has no owner (orphaned). "
-                    f"Start an optimization run to auto-repair it, "
-                    f"or restart the app."
-                )
-            if sp_client_id and not _is_owner_current(owner, sp_client_id):
-                return False, (
-                    f"Runner job {job.job_id} is owned by '{owner}' but the "
-                    f"current app SP is '{sp_client_id}'. Start an optimization "
-                    f"run to auto-repair it, or restart the app."
-                )
-            return True, ""
-        return True, ""
-    except Exception:
-        return True, ""

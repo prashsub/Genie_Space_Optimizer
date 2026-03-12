@@ -15,6 +15,7 @@ _ENV_MAP = {
     "GENIE_SPACE_OPTIMIZER_CATALOG": "catalog",
     "GENIE_SPACE_OPTIMIZER_SCHEMA": "schema",
     "GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID": "warehouse_id",
+    "GENIE_SPACE_OPTIMIZER_JOB_ID": "job_id",
 }
 
 
@@ -44,22 +45,25 @@ def main() -> int:
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--schema", required=True)
     parser.add_argument("--warehouse-id", required=True)
+    parser.add_argument("--job-id", default="", help="Bundle-managed runner job ID")
     args = parser.parse_args()
 
     if not args.app_yml.exists():
         print(f"[patch-app-yml] {args.app_yml} not found, skipping", file=sys.stderr)
         return 0
 
-    overrides = {
+    overrides: dict[str, str] = {
         "GENIE_SPACE_OPTIMIZER_CATALOG": args.catalog,
         "GENIE_SPACE_OPTIMIZER_SCHEMA": args.schema,
         "GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID": args.warehouse_id,
     }
+    if args.job_id:
+        overrides["GENIE_SPACE_OPTIMIZER_JOB_ID"] = args.job_id
     _patch(args.app_yml, overrides)
-    print(
-        f"[patch-app-yml] Patched {args.app_yml}: "
-        f"catalog={args.catalog}, schema={args.schema}, warehouse_id={args.warehouse_id}"
-    )
+    parts = [f"catalog={args.catalog}", f"schema={args.schema}", f"warehouse_id={args.warehouse_id}"]
+    if args.job_id:
+        parts.append(f"job_id={args.job_id}")
+    print(f"[patch-app-yml] Patched {args.app_yml}: {', '.join(parts)}")
     return 0
 
 

@@ -84,6 +84,32 @@ CLI equivalents (use MCP tools above when available):
 | `apx dev logs -f` | Follow/stream logs live |
 | `apx build` | Build for production |
 
+## Deployment
+
+The optimization runner job is declared in `databricks.yml` and managed by the Databricks bundle. Use the wrapper scripts instead of raw `databricks bundle` commands:
+
+| Command | Description |
+|---------|-------------|
+| `./deploy.sh` | Build, deploy bundle, resolve SP, apply UC grants, configure job `run_as` |
+| `./destroy.sh` | Clean up deployment jobs, then destroy the bundle |
+
+Environment variables for deploy/destroy (all have sensible defaults):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GENIE_APP_NAME` | `genie-space-optimizer` | Databricks App name |
+| `GENIE_CATALOG` | `main` | Unity Catalog name |
+| `GENIE_SCHEMA` | `genie_optimization` | Schema for optimization tables |
+| `GENIE_WAREHOUSE_ID` | (empty) | SQL Warehouse ID |
+| `GENIE_DEPLOY_PROFILE` | `DEFAULT` | Databricks CLI profile |
+
+Extra arguments are forwarded to `databricks bundle deploy/destroy`:
+```bash
+./deploy.sh --var warehouse_id=abc123def
+```
+
+The bundle passes `GENIE_SPACE_OPTIMIZER_JOB_ID` to the app automatically via the app's environment variables. The app reads this at startup to trigger optimization runs on the bundle-managed job.
+
 ## Backlog-Driven Development
 
 This project uses an incremental, multi-session agent workflow:

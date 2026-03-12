@@ -21,29 +21,6 @@ from .routes import suggestions as _suggestions  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
-class _WheelHealthCheck(LifespanDependency):
-    """Log the resolved wheel at startup for immediate deploy verification."""
-
-    @asynccontextmanager
-    async def lifespan(self, app: FastAPI) -> AsyncGenerator[None, None]:
-        try:
-            from .job_launcher import _find_wheel
-
-            wheel = _find_wheel()
-            logger.info(
-                "Wheel health: %s (size=%d bytes)",
-                wheel.name,
-                wheel.stat().st_size,
-            )
-        except Exception:
-            logger.warning("Wheel health check failed — no wheel found", exc_info=True)
-        yield
-
-    @staticmethod
-    def __call__() -> None:
-        return None
-
-
 class _DeltaTableBootstrap(LifespanDependency):
     """Create optimization Delta tables on app startup so read paths never 404."""
 
@@ -154,8 +131,12 @@ class _UCGrantBootstrap(LifespanDependency):
         return None
 
 
-class _JobOwnershipBootstrap(LifespanDependency):
-    """Ensure the persistent runner job is owned by the current SP at startup."""
+class _JobRunAsBootstrap(LifespanDependency):
+    """Verify the bundle-managed runner job's run_as matches the current SP.
+
+    This provides self-healing after fresh deploys where deploy.sh may not
+    have been run, or when the app's SP rotates.
+    """
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI) -> AsyncGenerator[None, None]:
@@ -163,23 +144,23 @@ class _JobOwnershipBootstrap(LifespanDependency):
             ws = app.state.workspace_client
             config = app.state.config
             sp_client_id = ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
-            cat = config.catalog or "main"
-            sch = config.schema_name or "genie_optimization"
-            if sp_client_id:
-                from .job_launcher import _ensure_artifacts, _ensure_persistent_job
+            job_id = getattr(config, "job_id", None)
+            if sp_client_id and job_id:
+                from .job_launcher import ensure_job_run_as
 
-                wheel_path, wheel_hash = _ensure_artifacts(ws, catalog=cat, schema=sch)
-                _ensure_persistent_job(
-                    ws, wheel_path, wheel_hash=wheel_hash, sp_client_id=sp_client_id,
+                ensure_job_run_as(ws, job_id, sp_client_id)
+                logger.info("Job run_as verified at startup (job=%s, SP=%s)", job_id, sp_client_id)
+            elif not job_id:
+                logger.warning(
+                    "Job run_as check skipped — GENIE_SPACE_OPTIMIZER_JOB_ID not set"
                 )
-                logger.info("Job ownership verified/repaired at startup (SP: %s)", sp_client_id)
             else:
                 logger.warning(
-                    "Job ownership check skipped — could not determine SP client ID"
+                    "Job run_as check skipped — could not determine SP client ID"
                 )
         except Exception:
             logger.warning(
-                "Job ownership check failed at startup — will repair on first optimization run",
+                "Job run_as check failed at startup — run deploy.sh to set permissions",
                 exc_info=True,
             )
         yield

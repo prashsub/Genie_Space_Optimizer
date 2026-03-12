@@ -227,7 +227,7 @@ def get_permission_dashboard(
     if metadata_only:
         sp_id = _get_sp_principal(sp_ws)
         from ..job_launcher import get_job_url
-        job_url = get_job_url(sp_ws)
+        job_url = get_job_url(sp_ws, job_id=config.job_id)
         host = (sp_ws.config.host or "").rstrip("/")
         workspace_id: int | str | None = None
         try:
@@ -242,7 +242,7 @@ def get_permission_dashboard(
             frameworkCatalog=config.catalog,
             frameworkSchema=config.schema_name,
             experimentBasePath="/Shared/genie-space-optimizer/",
-            jobName="genie-space-optimizer-runner",
+            jobName="genie-space-optimizer-job",
             jobUrl=job_url,
             workspaceHost=ws_host_with_o,
         )
@@ -408,7 +408,7 @@ def get_permission_dashboard(
     sp_id = _get_sp_principal(sp_ws)
 
     from ..job_launcher import get_job_url
-    job_url = get_job_url(sp_ws)
+    job_url = get_job_url(sp_ws, job_id=config.job_id)
 
     host = (sp_ws.config.host or "").rstrip("/")
     workspace_id: int | str | None = None
@@ -425,7 +425,7 @@ def get_permission_dashboard(
         frameworkCatalog=config.catalog,
         frameworkSchema=config.schema_name,
         experimentBasePath="/Shared/genie-space-optimizer/",
-        jobName="genie-space-optimizer-runner",
+        jobName="genie-space-optimizer-job",
         jobUrl=job_url,
         workspaceHost=ws_host_with_o,
     )

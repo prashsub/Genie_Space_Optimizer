@@ -1040,6 +1040,7 @@ def do_start_optimization(
     try:
         job_run_id, job_id = submit_optimization(
             sp_ws,
+            job_id=config.job_id,
             run_id=run_id,
             space_id=space_id,
             domain=domain,

@@ -6,5 +6,7 @@ env:
     value: "genie_optimization"
   - name: GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID
     value: "02c1885622661afa"
+  - name: GENIE_SPACE_OPTIMIZER_JOB_ID
+    value: ""
   - name: PGAPPNAME
     value: "genie-space-optimizer"

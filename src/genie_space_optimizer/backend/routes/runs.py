@@ -259,13 +259,13 @@ _STEP_DEFINITIONS: list[_StepDefinition] = [
         "stepNumber": 2,
         "name": "Baseline Evaluation",
         "stage_prefixes": ["BASELINE_EVAL"],
-        "summary_template": "Evaluated {questions} benchmark questions with 9 judges. Baseline score: {score}%",
+        "summary_template": "Evaluated {questions} benchmark questions with 9 judges. Baseline score: {score}% ({correct}/{questions} correct)",
     },
     {
         "stepNumber": 3,
         "name": "Proactive Enrichment",
         "stage_prefixes": ["ENRICHMENT", "PROMPT_MATCH", "DESCRIPTION_ENRICHMENT", "JOIN_DISCOVERY", "SPACE_METADATA", "INSTRUCTION_SEED", "PROACTIVE_INSTRUCTION", "EXAMPLE_SQL"],
-        "summary_template": "Applied {total} proactive enrichments: {descriptions} descriptions, {joins} joins, {examples} example SQLs",
+        "summary_template": "Applied {total} proactive enrichments: {descriptions} descriptions, {joins} joins, {instructions} instructions, {examples} example SQLs",
     },
     {
         "stepNumber": 4,
@@ -580,7 +580,7 @@ def _build_step_io(
         baseline_iter = next(
             (
                 r for r in iterations_rows
-                if (_safe_int(r.get("iteration")) or -1) == 0
+                if _safe_int(r.get("iteration")) == 0
                 and str(r.get("eval_scope", "")).lower() == "full"
             ),
             None,
@@ -795,19 +795,23 @@ def _build_step_summary(
         )
         score = "?"
         questions = "?"
+        correct = "?"
         if baseline_iter:
             score = f"{_finite(baseline_iter.get('overall_accuracy', 0)):.1f}"
             questions = str(baseline_iter.get("total_questions", "?"))
-        return defn["summary_template"].format(questions=questions, score=score)
+            correct = str(_safe_int(baseline_iter.get("correct_count")) or "?")
+        return defn["summary_template"].format(questions=questions, score=score, correct=correct)
     if step_name == "Proactive Enrichment":
         descriptions = _safe_int(detail.get("descriptions_enriched")) or 0
         joins = _safe_int(detail.get("joins_discovered")) or 0
         examples = _safe_int(detail.get("examples_mined")) or 0
-        total = _safe_int(detail.get("total_enrichments")) or (descriptions + joins + examples)
+        instructions = 1 if detail.get("instructions_seeded") else 0
+        total = _safe_int(detail.get("total_enrichments")) or (descriptions + joins + instructions + examples)
         return defn["summary_template"].format(
             total=total,
             descriptions=descriptions,
             joins=joins,
+            instructions=instructions,
             examples=examples,
         )
     if step_name == "Adaptive Optimization":
@@ -1152,7 +1156,7 @@ def _get_baseline_and_best_accuracy(iters_rows: list[dict]) -> tuple[float | Non
     if not full_rows:
         return None, None
 
-    baseline_row = next((r for r in full_rows if (_safe_int(r.get("iteration")) or -1) == 0), None)
+    baseline_row = next((r for r in full_rows if _safe_int(r.get("iteration")) == 0), None)
     baseline = _safe_float(baseline_row.get("overall_accuracy")) if baseline_row else None
 
     scores = [_safe_float(r.get("overall_accuracy")) for r in full_rows]

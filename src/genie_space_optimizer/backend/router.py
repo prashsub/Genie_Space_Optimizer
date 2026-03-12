@@ -249,10 +249,10 @@ def health_check(config: Dependencies.Config, ws: Dependencies.Client):
                 **base,
             )
 
-    # ── Job ownership ───────────────────────────────────────────────
+    # ── Job health ────────────────────────────────────────────────
     from .job_launcher import check_job_health
 
-    job_ok, job_msg = check_job_health(ws, sp_client_id)
+    job_ok, job_msg = check_job_health(ws, sp_client_id, job_id=config.job_id)
     if not job_ok:
         return HealthStatus(
             healthy=False,
