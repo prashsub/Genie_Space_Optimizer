@@ -321,6 +321,16 @@ dbutils.jobs.taskValues.set(
     value=finalize_out.get("terminal_reason", finalize_out["convergence_reason"]),
 )
 
+_uc_reg = finalize_out.get("uc_registration")
+if _uc_reg:
+    dbutils.jobs.taskValues.set(key="uc_model_name", value=_uc_reg.get("uc_model_name", ""))
+    dbutils.jobs.taskValues.set(key="uc_model_version", value=_uc_reg.get("version", ""))
+    dbutils.jobs.taskValues.set(key="uc_champion_promoted", value=_uc_reg.get("promoted_to_champion", False))
+else:
+    dbutils.jobs.taskValues.set(key="uc_model_name", value="")
+    dbutils.jobs.taskValues.set(key="uc_model_version", value="")
+    dbutils.jobs.taskValues.set(key="uc_champion_promoted", value=False)
+
 _log(
     "Task values published",
     status=finalize_out["status"],
@@ -328,6 +338,32 @@ _log(
     terminal_reason=finalize_out.get("terminal_reason", finalize_out["convergence_reason"]),
     repeatability_pct=finalize_out["repeatability_pct"],
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## UC Model Registration Result
+
+# COMMAND ----------
+
+_banner("UC Model Registration")
+if _uc_reg:
+    _log(
+        "UC model registered",
+        uc_model=_uc_reg["uc_model_name"],
+        version=_uc_reg["version"],
+        promoted_to_champion=_uc_reg["promoted_to_champion"],
+        previous_champion=_uc_reg.get("previous_champion_version"),
+    )
+    if _uc_reg.get("comparison"):
+        _log("Metric comparison (new vs existing champion)")
+        for _judge, _scores in _uc_reg["comparison"].items():
+            _log(f"  {_judge}", new=f"{_scores['new']:.1f}", existing=f"{_scores['existing']:.1f}")
+else:
+    _log("UC model registration skipped or failed")
+
+# COMMAND ----------
+
 _banner("Task 4 Completed")
 dbutils.notebook.exit(json.dumps({
     "status": finalize_out["status"],

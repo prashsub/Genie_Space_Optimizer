@@ -196,19 +196,85 @@ def promote_best_model(
     return best_model_id
 
 
+_EVAL_JUDGES = [
+    "eval_result_correctness", "eval_syntax_validity",
+    "eval_schema_accuracy", "eval_logical_accuracy",
+    "eval_semantic_equivalence", "eval_completeness",
+    "eval_response_quality", "eval_asset_routing",
+]
+
+
+class _GenieConfigSnapshot(mlflow.pyfunc.PythonModel):
+    """Minimal pyfunc wrapper so the config snapshot can be registered to UC.
+
+    UC model registration requires a valid MLflow model directory with an
+    ``MLmodel`` file.  This wrapper satisfies that requirement while the
+    real value lives in the embedded ``space_config.json`` artifact.
+    """
+
+    def predict(self, context, model_input, params=None):
+        if context and context.artifacts:
+            cfg_path = context.artifacts.get("space_config", "")
+            if cfg_path:
+                return json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+        return {"status": "config_snapshot_only"}
+
+
+def _register_uc_version(
+    *,
+    client: Any,
+    uc_model_name: str,
+    source_run_id: str,
+    best_iteration: int,
+    space_config: dict,
+    space_id: str,
+    domain: str,
+) -> Any:
+    """Create a pyfunc model with embedded config and register it to UC."""
+    with tempfile.TemporaryDirectory(prefix="genie-uc-") as tmp:
+        config_path = Path(tmp) / "space_config.json"
+        config_path.write_text(
+            json.dumps(space_config, default=str, indent=2), encoding="utf-8",
+        )
+
+        model_dir = str(Path(tmp) / "pyfunc_model")
+        mlflow.pyfunc.save_model(
+            path=model_dir,
+            python_model=_GenieConfigSnapshot(),
+            artifacts={"space_config": str(config_path)},
+        )
+
+        tracking_client = mlflow.tracking.MlflowClient()
+        tracking_client.log_artifacts(source_run_id, model_dir, "uc_model")
+        logger.info(
+            "Logged pyfunc model with config artifact to run %s at uc_model/",
+            source_run_id,
+        )
+
+    model_uri = f"runs:/{source_run_id}/uc_model"
+    mv = mlflow.register_model(model_uri, uc_model_name)
+    logger.info(
+        "Registered UC version %s via pyfunc wrapper (run=%s)",
+        mv.version, source_run_id,
+    )
+    return mv
+
+
 def register_uc_model(
     spark: "SparkSession",
     run_id: str,
     catalog: str,
     schema: str,
     ws: "WorkspaceClient | None" = None,
-) -> str | None:
+) -> dict | None:
     """Register champion LoggedModel as a UC Registered Model version.
 
-    If *ws* is provided, also creates/finds a deployment job and links it
-    to the registered model.
+    Creates/updates the UC registered model with Genie Space metadata,
+    registers a new version from the best iteration's eval run, and
+    promotes to ``@champion`` only if metrics exceed the existing champion.
 
-    Returns the model version number as a string, or None on failure.
+    Returns a dict with ``uc_model_name``, ``version``,
+    ``promoted_to_champion``, and ``comparison`` (or ``None`` on failure).
     """
     from genie_space_optimizer.common.config import (
         ENABLE_UC_MODEL_REGISTRATION,
@@ -227,9 +293,47 @@ def register_uc_model(
 
     best_model_id = run_row.get("best_model_id")
     space_id = run_row.get("space_id", "")
+    domain = run_row.get("domain", "")
+    best_accuracy = float(run_row.get("best_accuracy", 0.0))
+    best_iteration = int(run_row.get("best_iteration", 0))
+    convergence_reason = run_row.get("convergence_reason", "")
+
     if not best_model_id:
         logger.warning("No best_model_id for run %s, skipping UC registration", run_id)
         return None
+
+    iterations_df = load_iterations(spark, run_id, catalog, schema)
+    best_iter_rows = iterations_df[
+        (iterations_df["iteration"] == best_iteration)
+        & (iterations_df["eval_scope"] == "full")
+    ]
+    source_run_id = ""
+    if not best_iter_rows.empty:
+        source_run_id = str(best_iter_rows.iloc[0].get("mlflow_run_id", ""))
+    if not source_run_id:
+        logger.warning("No mlflow_run_id for best iteration %d, skipping UC registration", best_iteration)
+        return None
+
+    baseline_rows = iterations_df[
+        (iterations_df["iteration"] == 0) & (iterations_df["eval_scope"] == "full")
+    ]
+    baseline_accuracy = (
+        float(baseline_rows.iloc[0].get("overall_accuracy", 0.0))
+        if not baseline_rows.empty else None
+    )
+
+    space_name = ""
+    space_description = ""
+    _space_config: dict = {}
+    if ws:
+        try:
+            from genie_space_optimizer.common.genie_client import fetch_space_config
+            _cfg = fetch_space_config(ws, space_id)
+            _space_config = _cfg
+            space_name = _cfg.get("title", _cfg.get("name", ""))
+            space_description = _cfg.get("description", "")
+        except Exception:
+            logger.debug("Could not fetch space config for UC description", exc_info=True)
 
     uc_model_name = format_mlflow_template(
         UC_REGISTERED_MODEL_TEMPLATE,
@@ -237,42 +341,142 @@ def register_uc_model(
     )
 
     try:
-        mlflow.set_registry_uri("databricks-uc")
-        model_uri = f"models:/{best_model_id}"
-        mv = mlflow.register_model(model_uri, uc_model_name)
-        version = str(mv.version)
-
-        from mlflow import MlflowClient
-
+        from mlflow.tracking import MlflowClient
+        from mlflow import set_registry_uri as _set_registry_uri
+        _set_registry_uri("databricks-uc")
         client = MlflowClient(registry_uri="databricks-uc")
-        client.set_registered_model_alias(uc_model_name, "champion", str(version))
 
-        logger.info(
-            "Registered UC model %s version %s with @champion alias",
-            uc_model_name, version,
+        # ── 1. Ensure UC registered model with description + model-level tags ──
+        model_description = (
+            f"Optimization snapshots for Genie Space: {space_name}\n\n"
+            f"{space_description}"
+        ).strip() if (space_name or space_description) else "Genie Space optimization model"
+
+        try:
+            client.get_registered_model(uc_model_name)
+            client.update_registered_model(uc_model_name, description=model_description)
+        except Exception:
+            client.create_registered_model(uc_model_name, description=model_description)
+
+        _model_tags = {
+            "genie.space_id": space_id,
+            "genie.space_name": space_name,
+            "genie.domain": domain,
+            "genie.managed_by": "genie_space_optimizer",
+        }
+        for k, v in _model_tags.items():
+            if v:
+                try:
+                    client.set_registered_model_tag(uc_model_name, k, v)
+                except Exception:
+                    logger.debug("Failed to set model tag %s", k, exc_info=True)
+
+        # ── 2. Register a new version ──
+        # UC requires a valid MLflow model directory with an MLmodel file.
+        # Our snapshots are raw JSON, so we wrap them in a minimal pyfunc
+        # model and embed the config as an artifact inside it.
+        mv = _register_uc_version(
+            client=client,
+            uc_model_name=uc_model_name,
+            source_run_id=source_run_id,
+            best_iteration=best_iteration,
+            space_config=_space_config,
+            space_id=space_id,
+            domain=domain,
         )
 
+        version = str(mv.version)
+
+        # ── 3. Version-level tags ──
+        _version_tags = {
+            "genie.optimization_run_id": run_id,
+            "genie.iteration": str(best_iteration),
+            "genie.accuracy": f"{best_accuracy:.1f}",
+            "genie.convergence_reason": convergence_reason,
+            "genie.source_run_id": source_run_id,
+        }
+        if baseline_accuracy is not None:
+            _version_tags["genie.baseline_accuracy"] = f"{baseline_accuracy:.1f}"
+        for k, v in _version_tags.items():
+            if v:
+                try:
+                    client.set_model_version_tag(uc_model_name, version, k, v)
+                except Exception:
+                    logger.debug("Failed to set version tag %s", k, exc_info=True)
+
+        # ── 4. Metric-based gating for @champion alias ──
+        should_promote = True
+        existing_scores: dict[str, float] = {}
+        new_scores: dict[str, float] = {}
+        prev_champion_version: str | None = None
+        comparison: dict | None = None
+
+        try:
+            existing_mv = client.get_model_version_by_alias(uc_model_name, "champion")
+            prev_champion_version = str(existing_mv.version)
+            if existing_mv.run_id:
+                existing_run_data = client.get_run(existing_mv.run_id).data
+                new_run_data = client.get_run(source_run_id).data
+
+                existing_scores = {j: existing_run_data.metrics.get(j, 0.0) for j in _EVAL_JUDGES}
+                new_scores = {j: new_run_data.metrics.get(j, 0.0) for j in _EVAL_JUDGES}
+
+                comparison = {
+                    j: {"new": new_scores[j], "existing": existing_scores[j]}
+                    for j in _EVAL_JUDGES
+                }
+
+                new_rc = new_scores.get("eval_result_correctness", 0.0)
+                existing_rc = existing_scores.get("eval_result_correctness", 0.0)
+                if new_rc < existing_rc:
+                    should_promote = False
+                    logger.info(
+                        "Gating: result_correctness %.1f < existing %.1f",
+                        new_rc, existing_rc,
+                    )
+
+                existing_avg = sum(existing_scores.values()) / max(len(existing_scores), 1)
+                new_avg = sum(new_scores.values()) / max(len(new_scores), 1)
+                if new_avg < existing_avg:
+                    should_promote = False
+                    logger.info(
+                        "Gating: avg judge score %.1f < existing %.1f",
+                        new_avg, existing_avg,
+                    )
+        except Exception:
+            logger.info("No existing @champion or error fetching metrics — promoting by default")
+
+        if should_promote:
+            client.set_registered_model_alias(uc_model_name, "champion", version)
+            logger.info("Promoted UC model %s version %s as @champion", uc_model_name, version)
+        else:
+            logger.info(
+                "UC model %s version %s registered but NOT promoted "
+                "(existing champion v%s is better)",
+                uc_model_name, version, prev_champion_version,
+            )
+
+        # ── 5. Link deployment job (optional) ──
         if ws is not None:
             try:
                 from genie_space_optimizer.backend.job_launcher import ensure_deployment_job
-
                 deploy_job_id = ensure_deployment_job(
                     ws, space_id=space_id, catalog=catalog, schema=schema,
                 )
                 client.update_registered_model(
                     uc_model_name, deployment_job_id=str(deploy_job_id),
                 )
-                logger.info(
-                    "Linked deployment job %s to UC model %s",
-                    deploy_job_id, uc_model_name,
-                )
+                logger.info("Linked deployment job %s to UC model %s", deploy_job_id, uc_model_name)
             except Exception:
-                logger.exception(
-                    "Failed to link deployment job to UC model %s (non-fatal)",
-                    uc_model_name,
-                )
+                logger.exception("Failed to link deployment job (non-fatal)")
 
-        return version
+        return {
+            "uc_model_name": uc_model_name,
+            "version": version,
+            "promoted_to_champion": should_promote,
+            "previous_champion_version": prev_champion_version,
+            "comparison": comparison,
+        }
     except Exception:
         logger.exception("Failed to register UC model %s", uc_model_name)
         return None

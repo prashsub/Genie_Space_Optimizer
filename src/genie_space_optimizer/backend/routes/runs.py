@@ -709,6 +709,9 @@ def _build_step_io(
                 "bestAccuracy": _safe_float(run_data.get("best_accuracy")),
                 "repeatability": _safe_float(run_data.get("best_repeatability")),
                 "convergenceReason": run_data.get("convergence_reason"),
+                "ucModelName": detail.get("uc_model_name") or None,
+                "ucModelVersion": detail.get("uc_model_version") or None,
+                "ucChampionPromoted": detail.get("uc_champion_promoted", False),
                 "stageEvents": timeline,
             },
         )
@@ -854,13 +857,24 @@ def _build_levers(
         except (TypeError, ValueError):
             continue
 
-    # Map iteration → lever from iterations table so we can assign AG stages
-    iter_to_lever: dict[int, int] = {}
+    # Build iteration → levers mapping from multiple sources so AG_* stages
+    # get assigned to the correct lever(s) even when genie_opt_iterations
+    # has lever=0 (hardcoded by older harness versions).
+    iter_to_levers: dict[int, set[int]] = {}
+
+    # Source 1: patches table (always has the correct lever column)
+    for p in patches_rows or []:
+        it = _safe_int(p.get("iteration"))
+        lv = _safe_int(p.get("lever"))
+        if it is not None and lv is not None:
+            iter_to_levers.setdefault(it, set()).add(lv)
+
+    # Source 2: iterations table (correct after forward harness fix)
     for row in iterations_rows or []:
         it = _safe_int(row.get("iteration"))
         lv = _safe_int(row.get("lever"))
-        if it is not None and lv is not None:
-            iter_to_lever.setdefault(it, lv)
+        if it is not None and lv is not None and lv != 0:
+            iter_to_levers.setdefault(it, set()).add(lv)
 
     for s in stages_rows:
         stage_name = str(s.get("stage", ""))
@@ -887,20 +901,28 @@ def _build_levers(
             lever_data[lever_num]["detail"].update(_parse_detail(s))
             continue
 
-        # Match AG_* stages — map to lever via iteration number
+        # Match AG_* stages — map to lever via multi-source mapping
         if stage_name.startswith("AG_"):
             iteration = _safe_int(s.get("iteration"))
             if iteration is None:
                 continue
-            lever_num_mapped = iter_to_lever.get(iteration)
-            if lever_num_mapped is None:
-                continue
-            if lever_num_mapped not in lever_data:
-                lever_data[lever_num_mapped] = {"stages": [], "detail": {}, "patches": []}
-            lever_data[lever_num_mapped]["stages"].append(s)
+            # Source 3: stage detail "levers" field (written by harness)
             detail = _parse_detail(s)
-            if detail:
-                lever_data[lever_num_mapped]["detail"].update(detail)
+            target_levers: set[int] = set(iter_to_levers.get(iteration, set()))
+            if detail and "levers" in detail:
+                for lk in detail["levers"]:
+                    try:
+                        target_levers.add(int(lk))
+                    except (TypeError, ValueError):
+                        pass
+            if not target_levers:
+                continue
+            for lever_num in target_levers:
+                if lever_num not in lever_data:
+                    lever_data[lever_num] = {"stages": [], "detail": {}, "patches": []}
+                lever_data[lever_num]["stages"].append(s)
+                if detail:
+                    lever_data[lever_num]["detail"].update(detail)
 
     for p in patches_rows or []:
         lever_num = _safe_int(p.get("lever"))
@@ -985,12 +1007,31 @@ def _build_lever_iterations(
     """Build iteration-by-iteration transparency payload for one lever."""
     by_iter: dict[int, dict[str, Any]] = {}
 
-    # Collect iterations that belong to this lever from iterations_rows
+    # Collect iterations that belong to this lever from multiple sources.
+    # The iterations table may have lever=0 (hardcoded by older harness),
+    # so also check the patches table which always has the correct lever.
     lever_iterations: set[int] = set()
     for row in iterations_rows:
         if _safe_int(row.get("lever")) == lever_num:
             it = _safe_int(row.get("iteration"))
             if it is not None:
+                lever_iterations.add(it)
+
+    # Guard: when building lever 0 (Proactive Enrichment), skip iterations
+    # that are already assigned to a non-zero lever in the iterations table.
+    # This handles old data where write_patch hardcoded lever=0 for all patches.
+    _non_zero_lever_iters: set[int] = set()
+    if lever_num == 0:
+        for row in iterations_rows:
+            lv = _safe_int(row.get("lever"))
+            it = _safe_int(row.get("iteration"))
+            if lv is not None and lv != 0 and it is not None:
+                _non_zero_lever_iters.add(it)
+
+    for p in patches_rows:
+        if _safe_int(p.get("lever")) == lever_num:
+            it = _safe_int(p.get("iteration"))
+            if it is not None and it not in _non_zero_lever_iters:
                 lever_iterations.add(it)
 
     for stage in lever_stages:
@@ -1015,11 +1056,13 @@ def _build_lever_iterations(
         if detail:
             entry["detail"].update(detail)
 
+    # Match iteration rows — check both lever column and patches-based set
     for row in iterations_rows:
-        if _safe_int(row.get("lever")) != lever_num:
-            continue
+        row_lever = _safe_int(row.get("lever"))
         iteration = _safe_int(row.get("iteration"))
         if iteration is None:
+            continue
+        if row_lever != lever_num and iteration not in lever_iterations:
             continue
         entry = by_iter.setdefault(iteration, {"stages": [], "detail": {}, "patches": [], "rows": []})
         entry["rows"].append(row)

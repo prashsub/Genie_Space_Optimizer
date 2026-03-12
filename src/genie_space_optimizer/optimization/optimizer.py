@@ -2726,7 +2726,8 @@ def _extract_metadata_for_blame(
                     tname = table.get("name") or table.get("identifier", "")
                     sections.append(f"Column {tname}.{col_name}: {desc}")
 
-    instructions = metadata_snapshot.get("general_instructions", "")
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
+    instructions = _get_general_instructions(metadata_snapshot)
     if instructions and any("instruction" in b for b in blame_lower):
         sections.append(f"Instructions: {instructions[:500]}")
 
@@ -3749,8 +3750,9 @@ def _build_schema_data(
     if not isinstance(ds, dict):
         ds = {}
     tables = ds.get("tables", []) or metadata_snapshot.get("tables", [])
+    mvs = ds.get("metric_views", []) or []
     result: list[dict] = []
-    for tbl in tables:
+    for tbl in list(tables) + list(mvs):
         identifier = tbl.get("identifier", "")
         if filter_tables is not None:
             tbl_id = (identifier or "").lower()
@@ -4243,6 +4245,8 @@ def _build_context_data(
     suggestions_text: str,
 ) -> dict:
     """Assemble all context sections as a single Python dict for JSON serialization."""
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
+
     relevant_tables = _extract_tables_from_clusters(clusters + soft_signal_clusters)
 
     return {
@@ -4271,7 +4275,7 @@ def _build_context_data(
             "functions": _build_structured_function_data(metadata_snapshot),
         },
         "join_specifications": _build_join_specs_data(metadata_snapshot),
-        "current_instructions": metadata_snapshot.get("general_instructions", "") or None,
+        "current_instructions": _get_general_instructions(metadata_snapshot) or None,
         "existing_example_sqls": _build_example_sqls_data(metadata_snapshot),
         "blamed_column_values": _build_blamed_values_data(
             clusters, metadata_snapshot.get("_data_profile", {}),
@@ -4363,6 +4367,8 @@ def _call_llm_for_proposal(
     For lever 5 the response may also contain ``instruction_type``,
     ``example_question``, ``example_sql``, ``target_table``, etc.
     """
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
+
     prompt_map = {
         1: LEVER_1_2_COLUMN_PROMPT,
         2: LEVER_1_2_COLUMN_PROMPT,
@@ -4427,11 +4433,11 @@ def _call_llm_for_proposal(
         "string_column_count": metadata_snapshot.get("string_column_count", 0),
         "max_value_dictionary_cols": MAX_VALUE_DICTIONARY_COLUMNS,
         "current_dictionary_count": current_dict_count,
-        "current_instructions": metadata_snapshot.get("general_instructions", ""),
+        "current_instructions": _get_general_instructions(metadata_snapshot),
         "existing_example_sqls": existing_example_sqls,
         "instruction_char_budget": max(
             0,
-            24500 - len(metadata_snapshot.get("general_instructions", "")),
+            24500 - len(_get_general_instructions(metadata_snapshot)),
         ),
         "table_names": [
             t.get("name") or t.get("identifier", "")
@@ -5029,6 +5035,8 @@ def _call_llm_for_holistic_instructions(
 
     Returns ``{"instruction_text": str, "example_sql_proposals": list, "rationale": str}``.
     """
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
+
     ds = metadata_snapshot.get("data_sources", {})
     if not isinstance(ds, dict):
         ds = {}
@@ -5043,7 +5051,7 @@ def _call_llm_for_holistic_instructions(
     if not space_desc:
         space_desc = "(No description set for this Genie Space.)"
 
-    current_instructions = metadata_snapshot.get("general_instructions", "")
+    current_instructions = _get_general_instructions(metadata_snapshot)
     existing_example_sqls = _format_existing_example_sqls(metadata_snapshot)
 
     resolved_ids: set[str] = set()
@@ -5315,6 +5323,7 @@ def _call_llm_for_strategy(
     Sends the full STRATEGIST_PROMPT with compressed context (top-5 clusters,
     SQL truncated to 300 chars) to stay within timeout bounds.
     """
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
     from genie_space_optimizer.optimization.evaluation import (
         _extract_json,
         _link_prompt_to_trace,
@@ -5340,7 +5349,7 @@ def _call_llm_for_strategy(
         ),
         "current_join_specs": _format_join_specs_context(metadata_snapshot),
         "current_instructions": (
-            metadata_snapshot.get("general_instructions", "") or "(No current instructions.)"
+            _get_general_instructions(metadata_snapshot) or "(No current instructions.)"
         ),
         "existing_example_sqls": _format_existing_example_sqls(metadata_snapshot),
         "blamed_column_values": _format_blamed_column_values(
@@ -5468,6 +5477,7 @@ def _call_llm_for_adaptive_strategy(
     adaptive lever loop where this call is made every iteration with
     fresh evaluation results.
     """
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
     from genie_space_optimizer.optimization.evaluation import (
         _extract_json,
         _link_prompt_to_trace,
@@ -5727,6 +5737,7 @@ def _call_llm_for_triage(
     Returns action group *skeletons* with ``levers_needed``, ``focus_tables``,
     and ``focus_columns`` — no actual lever directives yet.
     """
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
     from genie_space_optimizer.optimization.evaluation import (
         _extract_json,
         _link_prompt_to_trace,
@@ -5736,7 +5747,7 @@ def _call_llm_for_triage(
     cluster_summaries = _format_compact_cluster_summaries(clusters)
     soft_summary = _format_soft_signal_summary(soft_signal_clusters)
     join_summary = _format_join_specs_context(metadata_snapshot)
-    current_instr = metadata_snapshot.get("general_instructions", "") or "(No current instructions.)"
+    current_instr = _get_general_instructions(metadata_snapshot) or "(No current instructions.)"
     instruction_summary = current_instr[:1500]
     if len(current_instr) > 1500:
         instruction_summary += f" ... ({len(current_instr) - 1500} chars omitted)"
@@ -5830,6 +5841,7 @@ def _call_llm_for_ag_detail(
     Receives the skeleton from triage plus *only* the relevant clusters and
     metadata scoped to ``focus_tables``/``focus_columns``.
     """
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
     from genie_space_optimizer.optimization.evaluation import (
         _extract_json,
         _link_prompt_to_trace,
@@ -5874,7 +5886,7 @@ def _call_llm_for_ag_detail(
         structured_fn_ctx = _format_structured_function_context(metadata_snapshot, lever=3)
 
     join_specs = _format_join_specs_context(metadata_snapshot)
-    current_instr = metadata_snapshot.get("general_instructions", "") or "(No current instructions.)"
+    current_instr = _get_general_instructions(metadata_snapshot) or "(No current instructions.)"
     example_sqls = _format_existing_example_sqls(metadata_snapshot)
 
     skeleton_json = json.dumps(ag_skeleton, indent=2, default=str)
@@ -5993,6 +6005,8 @@ def _generate_holistic_strategy(
     import mlflow
     from mlflow.entities import SpanType
 
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
+
     hard = [c for c in clusters if c.get("cluster_id")]
     soft = [c for c in soft_signal_clusters if c.get("cluster_id")]
 
@@ -6080,7 +6094,7 @@ def _generate_holistic_strategy(
 
         # ── Merge instruction contributions (structure-aware) ────────
         global_guidance = triage_result.get("global_instruction_guidance", "")
-        existing_instr = metadata_snapshot.get("general_instructions", "") or ""
+        existing_instr = _get_general_instructions(metadata_snapshot)
 
         if instruction_contributions or global_guidance:
             global_rewrite = _merge_structured_instructions(

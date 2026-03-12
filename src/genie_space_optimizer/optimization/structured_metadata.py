@@ -99,9 +99,10 @@ _SECTION_RE = re.compile(
     re.MULTILINE,
 )
 
-# Regex that matches plain-text ``LABEL:`` on its own line (ALL-CAPS header)
+# Regex that matches plain-text ALL-CAPS headers.  Supports both
+# ``LABEL:\n`` (value on subsequent lines) and ``LABEL: value`` (inline).
 _PLAINTEXT_SECTION_RE = re.compile(
-    r"^(?P<label>[A-Z][A-Z ]+?):\s*$",
+    r"^(?P<label>[A-Z][A-Z ]+?):\s*(?P<value>.*)$",
 )
 
 
@@ -127,11 +128,13 @@ _MEASURE_PREFIXES = (
 def parse_structured_description(text: str | list[str] | None) -> dict[str, str]:
     """Parse structured description sections from a description string.
 
-    Supports two formats:
+    Supports three formats:
 
     * **Legacy Markdown**: ``**Purpose:** value`` (inline on one line)
-    * **Plain-text ALL-CAPS**: ``PURPOSE:\\nvalue`` (header on own line,
-      value on subsequent lines)
+    * **Plain-text ALL-CAPS (multi-line)**: ``PURPOSE:\\nvalue`` (header on
+      own line, value on subsequent lines)
+    * **Plain-text ALL-CAPS (inline)**: ``PURPOSE: value`` (header and value
+      on the same line)
 
     Returns a dict mapping section keys (e.g. ``"purpose"``, ``"definition"``)
     to their values.  Any text that does not belong to a recognized section is
@@ -182,7 +185,8 @@ def parse_structured_description(text: str | list[str] | None) -> dict[str, str]
             if resolved_key is not None:
                 _flush()
                 current_key = resolved_key
-                current_lines = []
+                inline_val = m_pt.group("value").strip()
+                current_lines = [inline_val] if inline_val else []
             else:
                 if current_key is not None:
                     current_lines.append(line)

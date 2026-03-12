@@ -55,6 +55,17 @@ function shortenStageName(stage: string): string {
     .join(" ");
 }
 
+function formatStatusSuffix(status?: string): string {
+  if (!status) return "";
+  const s = status.toLowerCase();
+  if (s === "complete" || s === "completed") return "Done";
+  if (s === "failed" || s === "error") return "Failed";
+  if (s === "started" || s === "running") return "Running";
+  if (s === "rolled_back") return "Rolled Back";
+  if (s === "skipped") return "Skipped";
+  return status;
+}
+
 export function formatStageDisplayName(stage: string, status?: string): string {
   const base = shortenStageName(stage);
   const s = (status ?? "").toLowerCase();
@@ -68,12 +79,14 @@ export function formatStageDisplayName(stage: string, status?: string): string {
 }
 
 function getStatusColor(status?: string): string {
-  if (!status) return "hsl(var(--chart-4))";
+  if (!status) return "var(--chart-4)";
   const s = status.toLowerCase();
-  if (s === "complete" || s === "completed") return "hsl(var(--chart-2))";
-  if (s === "failed") return "hsl(var(--chart-5))";
-  if (s === "started" || s === "running") return "hsl(var(--chart-1))";
-  return "hsl(var(--chart-4))";
+  if (s === "complete" || s === "completed") return "var(--chart-2)";
+  if (s === "failed" || s === "error") return "var(--chart-5)";
+  if (s === "started" || s === "running") return "var(--chart-1)";
+  if (s === "rolled_back") return "var(--chart-3)";
+  if (s === "skipped") return "var(--muted-foreground)";
+  return "var(--chart-4)";
 }
 
 function formatDateTime(iso?: string | null): string {
@@ -89,7 +102,7 @@ function formatDateTime(iso?: string | null): string {
 export function StageTimeline({ stageEvents }: StageTimelineProps) {
   const [open, setOpen] = useState(stageEvents.length > 0);
 
-  const chartData = stageEvents
+  const rawData = stageEvents
     .map((e) => {
       let duration = e.durationSeconds;
       if ((duration == null || duration <= 0) && e.startedAt && e.completedAt) {
@@ -105,6 +118,17 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
       };
     })
     .filter((e) => e.durationSeconds > 0);
+
+  // Deduplicate labels: append status suffix when multiple entries share a name
+  const nameCounts = new Map<string, number>();
+  for (const d of rawData) nameCounts.set(d.shortStage, (nameCounts.get(d.shortStage) ?? 0) + 1);
+  const chartData = rawData.map((d) => ({
+    ...d,
+    shortStage:
+      (nameCounts.get(d.shortStage) ?? 1) > 1
+        ? `${d.shortStage} (${formatStatusSuffix(d.status)})`
+        : d.shortStage,
+  }));
 
   const hasData = chartData.length > 0;
   const chartHeight = Math.max(300, chartData.length * 32);
@@ -147,7 +171,7 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
                   <YAxis
                     type="category"
                     dataKey="shortStage"
-                    width={130}
+                    width={180}
                     tick={{ fontSize: 11 }}
                   />
                   <ChartTooltip

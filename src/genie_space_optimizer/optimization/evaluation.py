@@ -3774,6 +3774,14 @@ def run_evaluation(
             except Exception:
                 logger.warning("Failed to link scores to model %s", model_id, exc_info=True)
 
+        if run.info.run_id:
+            try:
+                from mlflow.tracking import MlflowClient as _EvalMlflowClient
+                _eval_client = _EvalMlflowClient()
+                _eval_client.log_metric(run.info.run_id, "overall_accuracy", arbiter_adjusted_accuracy)
+            except Exception:
+                logger.debug("Failed to log overall_accuracy metric", exc_info=True)
+
         output: dict[str, Any] = {
             "run_id": run.info.run_id,
             "mlflow_run_id": run.info.run_id,

@@ -844,6 +844,9 @@ def preflight_collect_uc_metadata(
                 spark, table_names, uc_columns_dicts,
             )
             config["_data_profile"] = data_profile
+            _ps = config.get("_parsed_space")
+            if isinstance(_ps, dict):
+                _ps["_data_profile"] = data_profile
             profiled_tables = len(data_profile)
             total_cols_profiled = sum(
                 len(t.get("columns", {})) for t in data_profile.values()
@@ -871,6 +874,9 @@ def preflight_collect_uc_metadata(
         except Exception:
             logger.warning("Data profiling failed — continuing without profile", exc_info=True)
             config["_data_profile"] = {}
+            _ps = config.get("_parsed_space")
+            if isinstance(_ps, dict):
+                _ps["_data_profile"] = {}
             write_stage(
                 spark, run_id, "DATA_PROFILING", "COMPLETE",
                 task_key="preflight", catalog=catalog, schema=schema,
@@ -878,6 +884,20 @@ def preflight_collect_uc_metadata(
             )
     else:
         config["_data_profile"] = {}
+        _ps = config.get("_parsed_space")
+        if isinstance(_ps, dict):
+            _ps["_data_profile"] = {}
+
+    try:
+        _update_run_status(
+            spark, run_id, catalog, schema,
+            config_snapshot=config,
+        )
+    except Exception:
+        logger.warning(
+            "Could not update config_snapshot with data profile for %s",
+            run_id, exc_info=True,
+        )
 
     if uc_fk_dicts:
         try:

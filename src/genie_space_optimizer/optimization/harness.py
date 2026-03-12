@@ -1685,6 +1685,7 @@ def _run_enrichment(
 
         uc_columns = config.get("_uc_columns", [])
         metadata_snapshot = config.get("_parsed_space", config)
+        data_profile = metadata_snapshot.get("_data_profile", {})
         if uc_columns:
             enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -1702,6 +1703,7 @@ def _run_enrichment(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -1712,6 +1714,7 @@ def _run_enrichment(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -1722,6 +1725,7 @@ def _run_enrichment(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -1732,6 +1736,7 @@ def _run_enrichment(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -1749,6 +1754,7 @@ def _run_enrichment(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -3202,6 +3208,7 @@ def _run_gate_checks(
     reference_sqls: dict[str, str],
     noise_floor: float,
     affected_question_ids: set[str] | None = None,
+    lever_keys: list[str] | None = None,
 ) -> dict:
     """Run slice → P0 → full eval gate sequence for an action group.
 
@@ -3299,7 +3306,8 @@ def _run_gate_checks(
             write_iteration(
                 spark, run_id, iteration_counter, slice_result,
                 catalog=catalog, schema=schema,
-                lever=0, eval_scope="slice", model_id=prev_model_id,
+                lever=int(lever_keys[0]) if lever_keys else 0,
+                eval_scope="slice", model_id=prev_model_id,
             )
         except Exception:
             logger.debug("Failed to write slice iteration", exc_info=True)
@@ -3362,7 +3370,8 @@ def _run_gate_checks(
             write_iteration(
                 spark, run_id, iteration_counter, p0_result,
                 catalog=catalog, schema=schema,
-                lever=0, eval_scope="p0", model_id=prev_model_id,
+                lever=int(lever_keys[0]) if lever_keys else 0,
+                eval_scope="p0", model_id=prev_model_id,
             )
         except Exception:
             logger.debug("Failed to write P0 iteration", exc_info=True)
@@ -3455,7 +3464,8 @@ def _run_gate_checks(
     write_iteration(
         spark, run_id, iteration_counter, full_result,
         catalog=catalog, schema=schema,
-        lever=0, eval_scope="full", model_id=new_model_id,
+        lever=int(lever_keys[0]) if lever_keys else 0,
+        eval_scope="full", model_id=new_model_id,
     )
 
     effective_regression_tol = max(REGRESSION_THRESHOLD, noise_floor)
@@ -3719,6 +3729,10 @@ def _run_lever_loop(
     scorers = make_all_scorers(w, spark, catalog, schema)
     uc_schema = f"{catalog}.{schema}"
     metadata_snapshot = config.get("_parsed_space", config)
+    data_profile = (
+        metadata_snapshot.get("_data_profile", {})
+        or config.get("_data_profile", {})
+    )
 
     uc_columns = config.get("_uc_columns", [])
     if uc_columns:
@@ -3745,6 +3759,7 @@ def _run_lever_loop(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -3756,6 +3771,7 @@ def _run_lever_loop(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -3767,6 +3783,7 @@ def _run_lever_loop(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -3778,6 +3795,7 @@ def _run_lever_loop(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -3804,6 +3822,7 @@ def _run_lever_loop(
         uc_columns = get_columns_for_tables_rest(w, table_refs) if table_refs else []
         config["_uc_columns"] = uc_columns
         metadata_snapshot = config.get("_parsed_space", config)
+        metadata_snapshot["_data_profile"] = data_profile
         if uc_columns:
             enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
         if enrichment_model_id:
@@ -3873,6 +3892,7 @@ def _run_lever_loop(
             config = fetch_space_config(w, space_id)
             config["_uc_columns"] = uc_columns
             metadata_snapshot = config.get("_parsed_space", config)
+            metadata_snapshot["_data_profile"] = data_profile
             if uc_columns:
                 enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
@@ -4286,10 +4306,11 @@ def _run_lever_loop(
                         apply_mode=apply_mode,
                         force_apply=True,
                     )
+                    _tvf_lever = int(lever_keys[0]) if lever_keys else 3
                     for idx, entry in enumerate(_tvf_apply_log.get("applied", [])):
                         write_patch(
-                            spark, run_id, iteration_counter, 0, idx,
-                            _build_patch_record(entry, 0, apply_mode),
+                            spark, run_id, iteration_counter, _tvf_lever, idx,
+                            _build_patch_record(entry, _tvf_lever, apply_mode),
                             catalog, schema,
                         )
                     if _tvf_apply_log.get("patch_deployed", False):
@@ -4406,7 +4427,7 @@ def _run_lever_loop(
             write_stage(
                 spark, run_id, f"AG_{ag_id}_STARTED", "SKIPPED",
                 task_key="lever_loop", iteration=iteration_counter,
-                detail={"reason": "no_proposals"},
+                detail={"reason": "no_proposals", "levers": lever_keys},
                 catalog=catalog, schema=schema,
             )
             reflection_buffer.append(_build_reflection_entry(
@@ -4425,10 +4446,11 @@ def _run_lever_loop(
             w, space_id, patches, metadata_snapshot, apply_mode=apply_mode,
         )
 
+        _primary_lever = int(lever_keys[0]) if lever_keys else 0
         for idx, entry in enumerate(apply_log.get("applied", [])):
             write_patch(
-                spark, run_id, iteration_counter, 0, idx,
-                _build_patch_record(entry, 0, apply_mode),
+                spark, run_id, iteration_counter, _primary_lever, idx,
+                _build_patch_record(entry, _primary_lever, apply_mode),
                 catalog, schema,
             )
 
@@ -4545,6 +4567,7 @@ def _run_lever_loop(
             reference_sqls=reference_sqls,
             noise_floor=noise_floor,
             affected_question_ids=set(ag.get("affected_questions", [])),
+            lever_keys=lever_keys,
         )
 
         # ── 3B.7: Accept or rollback ────────────────────────────────
@@ -4564,7 +4587,7 @@ def _run_lever_loop(
             write_stage(
                 spark, run_id, f"AG_{ag_id}_STARTED", "ROLLED_BACK",
                 task_key="lever_loop", iteration=iteration_counter,
-                detail={"reason": reason},
+                detail={"reason": reason, "levers": lever_keys},
                 catalog=catalog, schema=schema,
             )
             _failed_eval = gate_result.get("failed_eval_result", {})
@@ -5271,7 +5294,18 @@ def _run_finalize(
         promoted_model = promote_best_model(spark, run_id, catalog, schema)
 
         from genie_space_optimizer.optimization.models import register_uc_model
-        register_uc_model(spark, run_id, catalog, schema, ws=w)
+        uc_result = register_uc_model(spark, run_id, catalog, schema, ws=w)
+
+        if uc_result:
+            _uc_lines = [_section("FINALIZE — UC MODEL REGISTRATION", "-")]
+            _uc_lines.append(_kv("UC Model", uc_result["uc_model_name"]))
+            _uc_lines.append(_kv("Version", uc_result["version"]))
+            _uc_lines.append(_kv("Champion", "YES" if uc_result["promoted_to_champion"] else "NO (existing champion is better)"))
+            if uc_result.get("comparison"):
+                for _judge, _cmp in uc_result["comparison"].items():
+                    _uc_lines.append(_kv(f"  {_judge}", f"new={_cmp['new']:.1f} vs existing={_cmp['existing']:.1f}"))
+            _uc_lines.append(_bar("-"))
+            print("\n".join(_uc_lines))
 
         _check_timeout("generate_report")
         _emit_heartbeat("generate_report", force=True)
@@ -5370,6 +5404,9 @@ def _run_finalize(
                 "repeatability_pct": repeatability_pct,
                 "terminal_reason": terminal_reason,
                 "heartbeat_count": heartbeat_count,
+                "uc_model_name": (uc_result or {}).get("uc_model_name", ""),
+                "uc_model_version": (uc_result or {}).get("version", ""),
+                "uc_champion_promoted": (uc_result or {}).get("promoted_to_champion", False),
             },
             catalog=catalog, schema=schema,
         )
@@ -5394,6 +5431,7 @@ def _run_finalize(
             "terminal_reason": terminal_reason,
             "benchmark_publish_count": benchmark_publish_count,
             "labeling_session": session_info,
+            "uc_registration": uc_result,
             "elapsed_seconds": round(_elapsed_seconds(), 1),
             "heartbeat_count": heartbeat_count,
         }
