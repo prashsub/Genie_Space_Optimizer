@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './../routes/__root'
 import { Route as SettingsRouteImport } from './../routes/settings'
+import { Route as HowItWorksRouteImport } from './../routes/how-it-works'
 import { Route as IndexRouteImport } from './../routes/index'
 import { Route as SpacesSpaceIdRouteImport } from './../routes/spaces/$spaceId'
 import { Route as RunsRunIdRouteImport } from './../routes/runs/$runId'
@@ -18,6 +19,11 @@ import { Route as RunsRunIdComparisonRouteImport } from './../routes/runs/$runId
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const HowItWorksRoute = HowItWorksRouteImport.update({
+  id: '/how-it-works',
+  path: '/how-it-works',
   getParentRoute: () => rootRouteImport,
 } as any)
 const IndexRoute = IndexRouteImport.update({
@@ -43,6 +49,7 @@ const RunsRunIdComparisonRoute = RunsRunIdComparisonRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/how-it-works': typeof HowItWorksRoute
   '/settings': typeof SettingsRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/spaces/$spaceId': typeof SpacesSpaceIdRoute
@@ -50,6 +57,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/how-it-works': typeof HowItWorksRoute
   '/settings': typeof SettingsRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/spaces/$spaceId': typeof SpacesSpaceIdRoute
@@ -58,6 +66,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/how-it-works': typeof HowItWorksRoute
   '/settings': typeof SettingsRoute
   '/runs/$runId': typeof RunsRunIdRouteWithChildren
   '/spaces/$spaceId': typeof SpacesSpaceIdRoute
@@ -67,6 +76,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/how-it-works'
     | '/settings'
     | '/runs/$runId'
     | '/spaces/$spaceId'
@@ -74,6 +84,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/how-it-works'
     | '/settings'
     | '/runs/$runId'
     | '/spaces/$spaceId'
@@ -81,6 +92,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/how-it-works'
     | '/settings'
     | '/runs/$runId'
     | '/spaces/$spaceId'
@@ -89,6 +101,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  HowItWorksRoute: typeof HowItWorksRoute
   SettingsRoute: typeof SettingsRoute
   RunsRunIdRoute: typeof RunsRunIdRouteWithChildren
   SpacesSpaceIdRoute: typeof SpacesSpaceIdRoute
@@ -101,6 +114,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/how-it-works': {
+      id: '/how-it-works'
+      path: '/how-it-works'
+      fullPath: '/how-it-works'
+      preLoaderRoute: typeof HowItWorksRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/': {
@@ -148,6 +168,7 @@ const RunsRunIdRouteWithChildren = RunsRunIdRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  HowItWorksRoute: HowItWorksRoute,
   SettingsRoute: SettingsRoute,
   RunsRunIdRoute: RunsRunIdRouteWithChildren,
   SpacesSpaceIdRoute: SpacesSpaceIdRoute,

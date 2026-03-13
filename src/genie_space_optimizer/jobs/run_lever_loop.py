@@ -217,6 +217,11 @@ max_iterations = int(dbutils.jobs.taskValues.get(taskKey="preflight", key="max_i
 levers = json.loads(dbutils.jobs.taskValues.get(taskKey="preflight", key="levers"))
 apply_mode = dbutils.jobs.taskValues.get(taskKey="preflight", key="apply_mode")
 
+import os as _os
+_warehouse_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="warehouse_id", default="")
+if _warehouse_id:
+    _os.environ["GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID"] = _warehouse_id
+
 triggered_by = dbutils.jobs.taskValues.get(taskKey="preflight", key="triggered_by", default="")
 human_corrections = json.loads(dbutils.jobs.taskValues.get(taskKey="preflight", key="human_corrections", default="[]"))
 

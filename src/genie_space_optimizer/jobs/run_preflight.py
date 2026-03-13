@@ -174,6 +174,7 @@ dbutils.widgets.text("max_iterations", str(MAX_ITERATIONS))
 dbutils.widgets.text("levers", "[1,2,3,4,5]")
 dbutils.widgets.text("apply_mode", "genie_config")
 dbutils.widgets.text("deploy_target", "")
+dbutils.widgets.text("warehouse_id", "")
 dbutils.widgets.text("triggered_by", "")
 
 run_id = dbutils.widgets.get("run_id")
@@ -247,7 +248,12 @@ configure_connection_pool(w, CONNECTION_POOL_SIZE)
 configure_mlflow_connection_pool(CONNECTION_POOL_SIZE)
 
 import os as _os
-warehouse_id = _os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "")
+warehouse_id = (
+    dbutils.widgets.get("warehouse_id").strip()
+    or _os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "")
+)
+if warehouse_id:
+    _os.environ["GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID"] = warehouse_id
 _log("SQL warehouse", warehouse_id=warehouse_id or "(not set — using Spark SQL)")
 
 _banner("Ensuring Delta State Tables")
@@ -519,6 +525,7 @@ dbutils.jobs.taskValues.set(key="max_iterations", value=max_iterations)
 dbutils.jobs.taskValues.set(key="levers", value=json.dumps(levers))
 dbutils.jobs.taskValues.set(key="apply_mode", value=apply_mode)
 dbutils.jobs.taskValues.set(key="deploy_target", value=deploy_target or "")
+dbutils.jobs.taskValues.set(key="warehouse_id", value=warehouse_id)
 dbutils.jobs.taskValues.set(key="triggered_by", value=triggered_by)
 dbutils.jobs.taskValues.set(key="human_corrections", value=json.dumps(preflight_out.get("human_corrections", []), default=str))
 

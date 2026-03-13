@@ -23,7 +23,6 @@ from genie_space_optimizer.optimization.state import (
 )
 
 if TYPE_CHECKING:
-    import pandas as pd
     from databricks.sdk import WorkspaceClient
     from pyspark.sql import SparkSession
 
@@ -205,6 +204,9 @@ _EVAL_JUDGES = [
 ]
 
 
+import pandas as pd  # runtime import — MLflow introspects predict() type hints
+
+
 class _GenieConfigSnapshot(mlflow.pyfunc.PythonModel):
     """Minimal pyfunc wrapper so the config snapshot can be registered to UC.
 
@@ -216,14 +218,15 @@ class _GenieConfigSnapshot(mlflow.pyfunc.PythonModel):
     def predict(
         self,
         context: mlflow.pyfunc.PythonModelContext,
-        model_input: "pd.DataFrame",
+        model_input: pd.DataFrame,
         params: dict[str, Any] | None = None,
-    ) -> dict:
+    ) -> pd.DataFrame:
+        result: dict = {"status": "config_snapshot_only"}
         if context and context.artifacts:
             cfg_path = context.artifacts.get("space_config", "")
             if cfg_path:
-                return json.loads(Path(cfg_path).read_text(encoding="utf-8"))
-        return {"status": "config_snapshot_only"}
+                result = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+        return pd.DataFrame([result])
 
 
 def _extract_space_dimensions(space_config: dict) -> dict[str, Any]:

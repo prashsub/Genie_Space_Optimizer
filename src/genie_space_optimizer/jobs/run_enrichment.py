@@ -76,6 +76,11 @@ catalog = dbutils.jobs.taskValues.get(taskKey="preflight", key="catalog")
 schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
 
+import os as _os
+_warehouse_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="warehouse_id", default="")
+if _warehouse_id:
+    _os.environ["GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID"] = _warehouse_id
+
 thresholds_met_raw = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="thresholds_met")
 thresholds_met = str(thresholds_met_raw).lower() in ("true", "1")
 baseline_model_id = dbutils.jobs.taskValues.get(taskKey="baseline_eval", key="model_id")

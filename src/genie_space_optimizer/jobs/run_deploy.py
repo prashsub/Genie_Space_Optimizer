@@ -137,6 +137,11 @@ schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
 deploy_target = dbutils.jobs.taskValues.get(taskKey="preflight", key="deploy_target") or None
 
+import os as _os
+_warehouse_id = dbutils.jobs.taskValues.get(taskKey="preflight", key="warehouse_id", default="")
+if _warehouse_id:
+    _os.environ["GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID"] = _warehouse_id
+
 import mlflow
 mlflow.set_experiment(exp_name)
 

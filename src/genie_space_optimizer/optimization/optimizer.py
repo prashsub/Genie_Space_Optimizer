@@ -5312,6 +5312,39 @@ def _repair_truncated_strategy_json(text: str) -> dict:
     return result
 
 
+def _normalize_instruction_rewrite(raw: Any) -> dict | str:
+    """Normalize ``global_instruction_rewrite`` from an LLM response.
+
+    The prompt schema asks for a JSON object (``{section: text}``), but
+    the LLM may return a plain string, a list, or ``None``.  This helper
+    ensures downstream code always receives either a validated ``dict``
+    or a sanitized ``str``.
+    """
+    if isinstance(raw, dict):
+        valid_keys = set(INSTRUCTION_SECTION_ORDER)
+        return {k: str(v) for k, v in raw.items() if k in valid_keys and v is not None}
+    if isinstance(raw, list):
+        raw = "\n".join(str(item) for item in raw)
+    if isinstance(raw, str) and raw.strip():
+        sanitized = _sanitize_plaintext_instructions(raw)
+        if len(sanitized) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+            sanitized = sanitized[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+        return sanitized
+    return ""
+
+
+def _preview_instruction_rewrite(rewrite: dict | str, max_chars: int = 200) -> str:
+    """Human-readable preview of an instruction rewrite for logging."""
+    if isinstance(rewrite, dict):
+        parts = [
+            f"{k}: {v[:60]}..." if len(str(v)) > 60 else f"{k}: {v}"
+            for k, v in rewrite.items() if v
+        ]
+        preview = "; ".join(parts)
+        return preview[:max_chars] + ("..." if len(preview) > max_chars else "")
+    return str(rewrite)[:max_chars]
+
+
 def _call_llm_for_strategy(
     clusters: list[dict],
     soft_signal_clusters: list[dict],
@@ -5414,28 +5447,25 @@ def _call_llm_for_strategy(
     action_groups = result.get("action_groups", [])
     if not isinstance(action_groups, list):
         action_groups = []
-    global_rewrite = result.get("global_instruction_rewrite", "")
-    if isinstance(global_rewrite, str) and global_rewrite:
-        global_rewrite = _sanitize_plaintext_instructions(global_rewrite)
-    if isinstance(global_rewrite, str) and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
-        logger.warning(
-            "Strategist instruction rewrite exceeds %d chars (%d), truncating",
-            MAX_HOLISTIC_INSTRUCTION_CHARS, len(global_rewrite),
-        )
-        global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+    global_rewrite = _normalize_instruction_rewrite(result.get("global_instruction_rewrite"))
     rationale = result.get("rationale", "")
 
+    _rewrite_preview = _preview_instruction_rewrite(global_rewrite)
+    _rewrite_desc = (
+        f"{len(global_rewrite)} sections" if isinstance(global_rewrite, dict)
+        else f"{len(global_rewrite)} chars"
+    )
     logger.info(
         "\n┌─── LLM Response [STRATEGIST] ────────────────────────────────────────\n"
         "│ Action groups: %d\n"
-        "│ Global instruction rewrite: %d chars\n"
+        "│ Global instruction rewrite: %s\n"
         "│ Rationale: %s\n"
         "└─────────────────────────────────────────────────────────────────────────",
-        len(action_groups), len(global_rewrite), str(rationale)[:300],
+        len(action_groups), _rewrite_desc, str(rationale)[:300],
     )
     print(
         f"\n  Strategy produced {len(action_groups)} action group(s), "
-        f"{len(global_rewrite)} chars instruction rewrite"
+        f"{_rewrite_desc} instruction rewrite"
     )
     for i, ag in enumerate(action_groups):
         levers = sorted(ag.get("lever_directives", {}).keys())
@@ -5670,21 +5700,22 @@ def _call_llm_for_adaptive_strategy(
     action_groups = result.get("action_groups", [])
     if not isinstance(action_groups, list):
         action_groups = []
-    global_rewrite = result.get("global_instruction_rewrite", "")
-    if isinstance(global_rewrite, str) and global_rewrite:
-        global_rewrite = _sanitize_plaintext_instructions(global_rewrite)
-    if isinstance(global_rewrite, str) and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
-        global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+    global_rewrite = _normalize_instruction_rewrite(result.get("global_instruction_rewrite"))
     rationale = result.get("rationale", "")
 
+    _rewrite_preview = _preview_instruction_rewrite(global_rewrite)
+    _rewrite_desc = (
+        f"{len(global_rewrite)} sections" if isinstance(global_rewrite, dict)
+        else f"{len(global_rewrite)} chars"
+    )
     logger.info(
         "\n┌─── LLM Response [ADAPTIVE STRATEGIST] ──────────────────────────────\n"
         "│ Action groups: %d\n"
-        "│ Global instruction rewrite: %d chars\n"
+        "│ Global instruction rewrite: %s\n"
         "│ Rationale: %s\n"
         "└─────────────────────────────────────────────────────────────────────────",
         len(action_groups),
-        len(global_rewrite),
+        _rewrite_desc,
         str(rationale)[:300],
     )
     _out_lines = [
@@ -5702,7 +5733,7 @@ def _call_llm_for_adaptive_strategy(
         _out_lines.append(f"|  {'Escalation:':<28s} {ag.get('escalation', 'none') or 'none'}")
         _out_lines.append(f"|  {'Rationale:':<28s} {str(rationale)[:200]}")
         if global_rewrite:
-            _out_lines.append(f"|  {'Instruction Rewrite:':<28s} {global_rewrite[:200]}...")
+            _out_lines.append(f"|  {'Instruction Rewrite:':<28s} {_rewrite_preview}...")
     else:
         _out_lines.append("|  No action group produced")
         if rationale:

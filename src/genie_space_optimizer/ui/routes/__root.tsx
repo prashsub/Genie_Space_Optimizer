@@ -9,7 +9,7 @@ import {
   useRouterState,
 } from "@tanstack/react-router";
 import { Toaster } from "sonner";
-import { AlertTriangle, ClipboardCopy, Settings, X } from "lucide-react";
+import { AlertTriangle, BookOpen, ClipboardCopy, Settings, X } from "lucide-react";
 import { useCallback, useState } from "react";
 
 export const Route = createRootRouteWithContext<{
@@ -147,6 +147,17 @@ function RootLayout() {
                   }`}
                 >
                   Dashboard
+                </Link>
+                <Link
+                  to="/how-it-works"
+                  className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                    pathname === "/how-it-works"
+                      ? "bg-white/15 text-white"
+                      : "text-white/70 hover:bg-white/10 hover:text-white"
+                  }`}
+                >
+                  <BookOpen className="h-3.5 w-3.5" />
+                  How It Works
                 </Link>
                 <Link
                   to="/settings"

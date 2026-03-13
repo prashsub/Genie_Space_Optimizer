@@ -1051,6 +1051,7 @@ def do_start_optimization(
             triggered_by=current_user,
             experiment_name=experiment_name or "",
             deploy_target=deploy_target or "",
+            warehouse_id=config.warehouse_id or "",
         )
 
         if use_warehouse_fallback:
