@@ -20,6 +20,14 @@ import {
   UserCheck,
   PenLine,
   Camera,
+  Eye,
+  Target,
+  GitBranch,
+  Filter,
+  Layers,
+  ShieldCheck,
+  TrendingUp,
+  CheckCheck,
 } from "lucide-react";
 import type {
   PipelineStage,
@@ -37,6 +45,8 @@ import type {
   EscalationType,
   ReviewField,
   ClusterImpactWeights,
+  WalkthroughStage,
+  FictionalExample,
 } from "./types";
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1112,3 +1122,123 @@ export const ASI_MODEL_FIELDS = [
   { name: "counterfactual_fix", type: "string?", example: '"Add synonym \'revenue\' to total_sales"' },
   { name: "ambiguity_detected", type: "boolean", example: "false" },
 ];
+
+/* ═══════════════════════════════════════════════════════════════════
+   PIPELINE GROUP COLORS
+   ═══════════════════════════════════════════════════════════════════ */
+
+export const PIPELINE_GROUP_COLORS: Record<string, { bg: string; border: string; dot: string }> = {
+  neutral: { bg: "bg-muted/30", border: "border-l-muted-foreground", dot: "bg-muted-foreground" },
+  preflight: { bg: "bg-blue-50/30", border: "border-l-db-blue", dot: "bg-db-blue" },
+  baseline: { bg: "bg-purple-50/30", border: "border-l-purple-500", dot: "bg-purple-500" },
+  enrichment: { bg: "bg-teal-50/30", border: "border-l-teal-500", dot: "bg-teal-500" },
+  leverLoop: { bg: "bg-amber-50/30", border: "border-l-db-orange", dot: "bg-db-orange" },
+  finalize: { bg: "bg-green-50/30", border: "border-l-db-green", dot: "bg-db-green" },
+};
+
+/* ═══════════════════════════════════════════════════════════════════
+   WALKTHROUGH STAGES (12 granular steps)
+   ═══════════════════════════════════════════════════════════════════ */
+
+export const WALKTHROUGH_STAGES: WalkthroughStage[] = [
+  { id: "overview", title: "The Big Picture", subtitle: "How Genie Space Optimizer works end-to-end", pipelineGroup: "neutral", icon: Eye },
+  { id: "preflight", title: "Preflight", subtitle: "Collect metadata, profile data, prepare the run", pipelineGroup: "preflight", icon: Shield },
+  { id: "benchmarks", title: "Generating Benchmarks", subtitle: "Create and validate evaluation questions", pipelineGroup: "preflight", icon: Target },
+  { id: "baseline", title: "Baseline Evaluation", subtitle: "Establish quality with 9 judges", pipelineGroup: "baseline", icon: BarChart3 },
+  { id: "judges", title: "The 9 Judges", subtitle: "How each judge evaluates SQL quality", pipelineGroup: "baseline", icon: ShieldCheck },
+  { id: "enrichment", title: "Enrichment", subtitle: "Proactively fill metadata gaps", pipelineGroup: "enrichment", icon: Sparkles },
+  { id: "lever-loop", title: "The Optimization Loop", subtitle: "Iteratively improve via targeted patches", pipelineGroup: "leverLoop", icon: RefreshCw },
+  { id: "failure-analysis", title: "Failure Analysis", subtitle: "Diagnose and cluster root causes", pipelineGroup: "leverLoop", icon: Filter },
+  { id: "levers", title: "The 5 Levers", subtitle: "Targeted tools for specific problem types", pipelineGroup: "leverLoop", icon: Layers },
+  { id: "three-gates", title: "The 3-Gate Pattern", subtitle: "Validate improvements, catch regressions", pipelineGroup: "leverLoop", icon: GitBranch },
+  { id: "convergence", title: "Convergence & Safety", subtitle: "Know when to stop, prevent harm", pipelineGroup: "finalize", icon: TrendingUp },
+  { id: "finalize", title: "Finalize & Deploy", subtitle: "Test, promote, and optionally deploy", pipelineGroup: "finalize", icon: CheckCheck },
+];
+
+/* ═══════════════════════════════════════════════════════════════════
+   FICTIONAL EXAMPLE — "Revenue Analytics" space (used throughout walkthrough)
+   ═══════════════════════════════════════════════════════════════════ */
+
+export const FICTIONAL_EXAMPLE: FictionalExample = {
+  spaceName: "Revenue Analytics",
+  tables: [
+    {
+      fqn: "main.analytics.fact_sales",
+      alias: "fact_sales",
+      columns: [
+        { name: "sale_id", type: "BIGINT" },
+        { name: "product_id", type: "BIGINT" },
+        { name: "date_key", type: "INT" },
+        { name: "total_revenue_usd", type: "DECIMAL(18,2)" },
+        { name: "quantity", type: "INT" },
+        { name: "region", type: "STRING" },
+      ],
+    },
+    {
+      fqn: "main.analytics.dim_product",
+      alias: "dim_product",
+      columns: [
+        { name: "product_id", type: "BIGINT" },
+        { name: "product_name", type: "STRING" },
+        { name: "category", type: "STRING" },
+        { name: "subcategory", type: "STRING" },
+        { name: "brand", type: "STRING" },
+      ],
+    },
+    {
+      fqn: "main.analytics.dim_date",
+      alias: "dim_date",
+      columns: [
+        { name: "date_key", type: "INT" },
+        { name: "calendar_date", type: "DATE" },
+        { name: "month_name", type: "STRING" },
+        { name: "quarter", type: "STRING" },
+        { name: "fiscal_year", type: "INT" },
+      ],
+    },
+  ],
+  benchmark: {
+    question: "What is the total revenue by product category?",
+    expectedSql:
+      "SELECT dp.category, SUM(fs.total_revenue_usd) AS total_revenue\\nFROM main.analytics.fact_sales fs\\nJOIN main.analytics.dim_product dp ON fs.product_id = dp.product_id\\nGROUP BY dp.category\\nORDER BY total_revenue DESC",
+    category: "aggregation",
+    expectedAsset: "TABLE",
+  },
+  failure: {
+    type: "wrong_column",
+    judgeMessage:
+      'SQL uses "revenue" but the column is named "total_revenue_usd". The alias is not recognized without a synonym.',
+    blameSet: ["fact_sales.total_revenue_usd"],
+    counterfactualFix: 'Add synonym "revenue" to the total_revenue_usd column description',
+  },
+  patch: {
+    actionType: "update_column_description",
+    target: "fact_sales.total_revenue_usd",
+    sections: {
+      DEFINITION: "Total gross revenue in USD for the transaction",
+      SYNONYMS: "revenue, total_sales, gross_revenue",
+      AGGREGATION: "SUM for totals, AVG for per-unit analysis",
+    },
+  },
+  cluster: {
+    id: "C001",
+    rootCause: "wrong_column",
+    questionCount: 3,
+    affectedQuestions: [
+      "What is the total revenue by product category?",
+      "Show revenue trends by quarter",
+      "Compare revenue across regions",
+    ],
+  },
+  enrichment: {
+    table: "dim_product",
+    column: "category",
+    before: "",
+    after: "VALUES:\nElectronics, Clothing, Home & Garden, Sports, Books\n\nSYNONYMS:\nproduct category, product type, product group",
+    sections: {
+      DEFINITION: "Product classification grouping",
+      VALUES: "Electronics, Clothing, Home & Garden, Sports, Books",
+      SYNONYMS: "product category, product type, product group",
+    },
+  },
+};

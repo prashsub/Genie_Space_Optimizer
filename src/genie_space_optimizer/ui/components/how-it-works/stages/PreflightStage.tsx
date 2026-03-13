@@ -1,28 +1,17 @@
 "use client";
 
-import {
-  Globe,
-  Database,
-  BrainCircuit,
-  CheckCircle2,
-  UserCheck,
-} from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import { ExpandableCard } from "../shared/ExpandableCard";
+import { motion, useReducedMotion } from "motion/react";
+import { StageScreen } from "../StageScreen";
 import { AnimatedChecklist } from "../shared/AnimatedChecklist";
-import { DataModelCard } from "../shared/DataModelCard";
-import { BENCHMARK_MODEL_FIELDS } from "../data";
+import { Badge } from "@/components/ui/badge";
 
-const LLM_CONTEXT_BLOCKS = [
-  "domain",
-  "valid_assets_context",
-  "tables_context",
-  "column_allowlist",
-  "metric_views_context",
-  "tvfs_context",
-  "instructions_context",
-  "sample_questions_context",
-  "data_profile_context",
+const PREFLIGHT_ITEMS = [
+  { id: "1", label: "Fetch Genie Space config" },
+  { id: "2", label: "Collect UC metadata" },
+  { id: "3", label: "Profile data columns" },
+  { id: "4", label: "Generate benchmarks" },
+  { id: "5", label: "Validate benchmarks" },
+  { id: "6", label: "Load human feedback & setup experiment" },
 ];
 
 const PROFILING_STEPS = [
@@ -33,103 +22,69 @@ const PROFILING_STEPS = [
   { id: "5", label: "Join overlap analysis via sampled FK/PK joins" },
 ];
 
-const VALIDATION_PHASES = [
-  {
-    id: "1",
-    label: "Phase 1: EXPLAIN — catches syntax errors and unresolvable columns",
-  },
-  {
-    id: "2",
-    label: "Phase 2: Table Existence — SELECT * FROM {table} LIMIT 0 for each reference",
-  },
-  {
-    id: "3",
-    label: "Phase 3: Execution Sanity — SELECT FROM (sql) LIMIT 1 verifies non-zero results",
-  },
-  {
-    id: "4",
-    label: "Phase 4: Alignment Check — LLM validates question matches SQL intent",
-  },
-];
-
 export function PreflightStage() {
-  return (
+  const prefersReducedMotion = useReducedMotion();
+  // Last item completes at ~(6-1)*400ms; show Ready badge after
+  const readyDelayMs = prefersReducedMotion ? 0 : 2200;
+
+  const visual = (
     <div className="space-y-4">
-      <ExpandableCard
-        title="Fetch Space Config"
-        icon={Globe}
-        accentColor="border-l-blue-500"
+      <AnimatedChecklist items={PREFLIGHT_ITEMS} staggerDelay={400} />
+      <motion.div
+        className="flex items-center gap-2 pt-2"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ delay: readyDelayMs / 1000, duration: 0.3 }}
       >
-        <p className="text-sm text-muted-foreground">
-          Fetches current Genie Space configuration via REST API, stores as
-          config_snapshot.
-        </p>
-      </ExpandableCard>
-
-      <ExpandableCard
-        title="Collect UC Metadata & Data Profile"
-        icon={Database}
-        accentColor="border-l-indigo-500"
-      >
-        <AnimatedChecklist items={PROFILING_STEPS} />
-        <div className="mt-4 rounded-lg border border-db-gray-border bg-db-gray-bg/50 p-3 text-sm text-muted-foreground">
-          Why profile data? The LLM uses actual cardinality, value ranges, and
-          distinct values to generate realistic benchmark questions with valid
-          filter conditions.
-        </div>
-      </ExpandableCard>
-
-      <ExpandableCard
-        title="Generate Benchmarks"
-        icon={BrainCircuit}
-        accentColor="border-l-purple-500"
-      >
-        <div className="space-y-4">
-          <div>
-            <span className="mb-2 block text-sm font-medium">LLM Context</span>
-            <div className="flex flex-wrap gap-2">
-              {LLM_CONTEXT_BLOCKS.map((block) => (
-                <Badge key={block} variant="secondary" className="font-mono text-xs">
-                  {block}
-                </Badge>
-              ))}
-            </div>
-          </div>
-          <DataModelCard
-            title="Benchmark Data Model"
-            fields={BENCHMARK_MODEL_FIELDS}
-          />
-          <p className="text-sm text-muted-foreground">
-            Coverage gap filling targets uncovered assets. Benchmarks are split
-            into train and held_out for evaluation.
-          </p>
-        </div>
-      </ExpandableCard>
-
-      <ExpandableCard
-        title="Validate Benchmarks"
-        icon={CheckCircle2}
-        accentColor="border-l-green-500"
-      >
-        <AnimatedChecklist items={VALIDATION_PHASES} />
-        <p className="mt-4 text-sm text-muted-foreground">
-          If less than 5 valid benchmarks remain, regeneration is triggered.
-        </p>
-      </ExpandableCard>
-
-      <ExpandableCard
-        title="Load Human Feedback & Setup Experiment"
-        icon={UserCheck}
-        accentColor="border-l-amber-500"
-      >
-        <p className="text-sm text-muted-foreground">
-          Corrections from prior sessions: benchmark SQL fixes (genie_correct
-          verdicts), judge overrides, and quarantines (excluding questions from
-          accuracy). Creates or resolves the MLflow experiment, registers the
-          evaluation dataset in Unity Catalog, and sets up the initial
-          instruction version.
-        </p>
-      </ExpandableCard>
+        <span className="text-sm text-muted-foreground">When complete:</span>
+        <Badge variant="outline" className="border-db-green bg-db-green/10 text-db-green">
+          Ready
+        </Badge>
+      </motion.div>
     </div>
+  );
+
+  return (
+    <StageScreen
+      title="Preflight"
+      subtitle="Collect metadata, profile data, prepare the run"
+      pipelineGroup="preflight"
+      visual={visual}
+      explanation={
+        <>
+          Before optimization begins, the system collects everything it needs: the current Genie
+          Space configuration, Unity Catalog metadata with column profiling, benchmark questions,
+          and any human feedback from prior runs.
+        </>
+      }
+      learnMore={[
+        {
+          id: "fetch-config",
+          title: "Fetch Genie Space Config",
+          content: (
+            <p className="text-sm">
+              REST API fetch stores the current configuration as config_snapshot — the rollback
+              baseline for safe optimization.
+            </p>
+          ),
+        },
+        {
+          id: "data-profiling",
+          title: "Data Profiling",
+          content: <AnimatedChecklist items={PROFILING_STEPS} />,
+        },
+        {
+          id: "human-feedback",
+          title: "Human Feedback & Experiment",
+          content: (
+            <p className="text-sm">
+              Correction types: benchmark SQL fixes (genie_correct verdicts), judge overrides, and
+              quarantines. MLflow experiment setup creates or resolves the experiment, registers
+              the evaluation dataset, and sets up the initial instruction version.
+            </p>
+          ),
+        },
+      ]}
+    />
   );
 }

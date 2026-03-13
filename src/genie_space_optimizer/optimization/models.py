@@ -272,8 +272,13 @@ def _register_uc_version(
     best_accuracy: float = 0.0,
     baseline_accuracy: float | None = None,
     best_iter_row: dict[str, Any] | None = None,
+    params: dict[str, str] | None = None,
 ) -> Any:
-    """Create a pyfunc model with embedded config and register it to UC."""
+    """Create a pyfunc model via log_model and register it to UC.
+
+    Uses ``mlflow.pyfunc.log_model(params=...)`` so that parameters
+    propagate to the UC model version (visible in Catalog Explorer).
+    """
     from mlflow.models.signature import ModelSignature
     from mlflow.types.schema import ColSpec, Schema
 
@@ -309,7 +314,18 @@ def _register_uc_version(
         outputs=Schema(output_cols),
     )
 
-    # ── Write artifacts and save pyfunc model ──
+    # ── Build an input example from actual config values ──
+    input_example = pd.DataFrame([{
+        "space_id": space_id,
+        "space_name": space_name,
+        "domain": domain,
+        "instruction_count": len(dims["text_instructions"]),
+        "join_spec_count": len(dims["join_specs"]),
+        "example_sql_count": len(dims["example_sqls"]),
+        "benchmark_count": len(dims["benchmarks"]),
+    }])
+
+    # ── Write artifacts and log pyfunc model ──
     with tempfile.TemporaryDirectory(prefix="genie-uc-") as tmp:
         config_path = Path(tmp) / "space_config.json"
         config_path.write_text(
@@ -343,27 +359,36 @@ def _register_uc_version(
             json.dumps(benchmark_summary, default=str, indent=2), encoding="utf-8",
         )
 
-        model_dir = str(Path(tmp) / "pyfunc_model")
-        mlflow.pyfunc.save_model(
-            path=model_dir,
-            python_model=_GenieConfigSnapshot(),
-            artifacts={
-                "space_config": str(config_path),
-                "uc_metadata": str(uc_metadata_path),
-                "benchmark_summary": str(benchmark_path),
-            },
-            signature=signature,
+        data_profile = space_config.get("_data_profile", {})
+        data_profile_path = Path(tmp) / "data_profile.json"
+        data_profile_path.write_text(
+            json.dumps(data_profile, default=str, indent=2), encoding="utf-8",
         )
 
-        tracking_client = mlflow.tracking.MlflowClient()
-        tracking_client.log_artifacts(source_run_id, model_dir, "uc_model")
+        artifacts = {
+            "space_config": str(config_path),
+            "uc_metadata": str(uc_metadata_path),
+            "benchmark_summary": str(benchmark_path),
+            "data_profile": str(data_profile_path),
+        }
+
+        with mlflow.start_run(run_id=source_run_id):
+            model_info = mlflow.pyfunc.log_model(
+                name="uc_model",
+                python_model=_GenieConfigSnapshot(),
+                artifacts=artifacts,
+                signature=signature,
+                input_example=input_example,
+                params=params or {},
+                pip_requirements=["mlflow[databricks]>=3.10.1", "pandas"],
+            )
+
         logger.info(
-            "Logged pyfunc model with config artifact to run %s at uc_model/",
+            "Logged pyfunc model with params + 4 artifacts to run %s",
             source_run_id,
         )
 
-    model_uri = f"runs:/{source_run_id}/uc_model"
-    mv = mlflow.register_model(model_uri, uc_model_name)
+    mv = mlflow.register_model(model_info.model_uri, uc_model_name)
     logger.info(
         "Registered UC version %s via pyfunc wrapper (run=%s)",
         mv.version, source_run_id,
@@ -490,27 +515,8 @@ def register_uc_model(
         if not best_iter_rows.empty:
             best_row_dict = best_iter_rows.iloc[0].to_dict()
 
-        # ── 3. Register a new version (pyfunc + artifacts + config signature) ──
-        mv = _register_uc_version(
-            client=client,
-            uc_model_name=uc_model_name,
-            source_run_id=source_run_id,
-            best_iteration=best_iteration,
-            space_config=_space_config,
-            space_id=space_id,
-            domain=domain,
-            space_name=space_name,
-            dimensions=dims,
-            best_accuracy=best_accuracy,
-            baseline_accuracy=baseline_accuracy,
-            best_iter_row=best_row_dict,
-        )
-
-        version = str(mv.version)
-
-        # ── 4. Log model parameters on the source eval run ──
-        tracking_client = mlflow.tracking.MlflowClient()
-        _params = {
+        # ── 3. Build params and register a new version ──
+        _params: dict[str, str] = {
             "space_id": space_id,
             "space_name": space_name,
             "domain": domain,
@@ -527,13 +533,27 @@ def register_uc_model(
             "example_sql_count": str(len(dims["example_sqls"])),
             "benchmark_count": str(len(dims["benchmarks"])),
         }
-        for k, v in _params.items():
-            try:
-                tracking_client.log_param(source_run_id, k, v)
-            except Exception:
-                logger.debug("Failed to log param %s (may already exist)", k)
 
-        # ── 5. Fetch per-judge eval scores from source run ──
+        mv = _register_uc_version(
+            client=client,
+            uc_model_name=uc_model_name,
+            source_run_id=source_run_id,
+            best_iteration=best_iteration,
+            space_config=_space_config,
+            space_id=space_id,
+            domain=domain,
+            space_name=space_name,
+            dimensions=dims,
+            best_accuracy=best_accuracy,
+            baseline_accuracy=baseline_accuracy,
+            best_iter_row=best_row_dict,
+            params=_params,
+        )
+
+        version = str(mv.version)
+
+        # ── 4. Fetch per-judge eval scores from source run ──
+        tracking_client = mlflow.tracking.MlflowClient()
         new_scores: dict[str, float] = {}
         try:
             new_run_data = tracking_client.get_run(source_run_id).data
@@ -546,7 +566,7 @@ def register_uc_model(
             if new_scores else 0.0
         )
 
-        # ── 6. Version-level tags (run metadata + per-judge scores) ──
+        # ── 5. Version-level tags (run metadata + per-judge scores) ──
         _version_tags: dict[str, str] = {
             "genie.optimization_run_id": run_id,
             "genie.iteration": str(best_iteration),
@@ -569,7 +589,7 @@ def register_uc_model(
                 except Exception:
                     logger.debug("Failed to set version tag %s", k, exc_info=True)
 
-        # ── 7. Metric-based gating for @champion alias ──
+        # ── 6. Metric-based gating for @champion alias ──
         should_promote = True
         existing_scores: dict[str, float] = {}
         prev_champion_version: str | None = None
@@ -616,7 +636,7 @@ def register_uc_model(
                 uc_model_name, version, prev_champion_version,
             )
 
-        # ── 8. Link deployment job (optional) ──
+        # ── 7. Link deployment job (optional) ──
         if ws is not None:
             try:
                 from genie_space_optimizer.backend.job_launcher import ensure_deployment_job

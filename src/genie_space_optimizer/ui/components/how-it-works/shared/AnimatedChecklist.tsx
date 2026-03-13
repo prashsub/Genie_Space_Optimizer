@@ -65,7 +65,7 @@ export function AnimatedChecklist({
                 : { opacity: 1, x: 0 }
             }
             transition={{
-              delay: prefersReducedMotion ? 0 : index * staggerDelay * 0.5,
+              delay: prefersReducedMotion ? 0 : (index * staggerDelay * 0.5) / 1000,
               duration: prefersReducedMotion ? 0 : 0.2,
             }}
             className="flex items-start gap-3"

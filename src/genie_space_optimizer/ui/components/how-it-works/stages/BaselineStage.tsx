@@ -1,20 +1,11 @@
 "use client";
 
 import { ArrowRight } from "lucide-react";
-import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { motion } from "motion/react";
 import { cn } from "@/lib/utils";
-import { ExpandableCard } from "../shared/ExpandableCard";
+import { StageScreen } from "../StageScreen";
 import { ScoreGauge } from "../shared/ScoreGauge";
-import { DataModelCard } from "../shared/DataModelCard";
-import { JUDGES, JUDGE_CATEGORY_COLORS, ASI_MODEL_FIELDS } from "../data";
-
-const EVALUATION_STEPS = [
-  "make_predict_fn() queries Genie Space for each benchmark",
-  "mlflow.genai.evaluate() runs all 9 scorers",
-  "Retry logic: up to 4 retries with 10s backoff, falls back to sequential",
-  "Per-judge scores normalized from 0-1 to 0-100",
-];
+import { JUDGES, JUDGE_CATEGORY_COLORS } from "../data";
 
 const FLOW_NODES = [
   "Benchmarks",
@@ -23,132 +14,110 @@ const FLOW_NODES = [
   "Aggregated Scores",
 ];
 
-const METHOD_BADGE_VARIANTS: Record<string, string> = {
-  CODE: "bg-blue-100 text-blue-800 border-blue-200",
-  LLM: "bg-indigo-100 text-indigo-800 border-indigo-200",
-  CONDITIONAL_LLM: "bg-amber-100 text-amber-800 border-amber-200",
+const EVALUATION_ORCHESTRATION_STEPS = [
+  "make_predict_fn closure — captures Genie Space config and benchmark dataset",
+  "run_evaluation DataFrame — builds input for mlflow.genai.evaluate",
+  "mlflow.genai.evaluate with 9 scorers — runs all judges per question",
+  "Retry logic: EVAL_MAX_ATTEMPTS=4 with exponential sleep on transient failures",
+  "Sequential fallback on total failure — falls back to per-question evaluation",
+];
+
+/** Abbreviations for judge icons (for layoutId animation to JudgesStage) */
+const JUDGE_ABBREVS: Record<string, string> = {
+  syntax_validity: "SV",
+  schema_accuracy: "SA",
+  logical_accuracy: "LA",
+  semantic_equivalence: "SE",
+  completeness: "CO",
+  response_quality: "RQ",
+  result_correctness: "RC",
+  asset_routing: "AR",
+  arbiter: "AB",
 };
 
 export function BaselineStage() {
   return (
-    <div className="space-y-8">
-      <section>
-        <h3 className="mb-4 text-lg font-semibold">Evaluation Orchestration</h3>
-        <div className="flex flex-wrap items-center gap-2">
-          {FLOW_NODES.map((label, i) => (
-            <div key={label} className="flex items-center gap-2">
-              <div className="rounded-lg border border-db-gray-border bg-db-gray-bg px-3 py-2 text-sm font-medium">
-                {label}
-              </div>
-              {i < FLOW_NODES.length - 1 && (
-                <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-              )}
-            </div>
-          ))}
-        </div>
-        <ol className="mt-6 grid list-none gap-3">
-          {EVALUATION_STEPS.map((step, i) => (
-            <li
-              key={i}
-              className="flex gap-3 rounded-lg border border-db-gray-border bg-white p-3"
-            >
-              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-db-blue text-xs font-semibold text-white">
-                {i + 1}
-              </span>
-              <span className="text-sm">{step}</span>
-            </li>
-          ))}
-        </ol>
-      </section>
-
-      <section>
-        <h3 className="mb-4 text-lg font-semibold">Judge Overview</h3>
-        <div className="grid grid-cols-3 gap-3">
-          {JUDGES.map((judge) => (
-            <Card key={judge.name} className="overflow-hidden">
-              <CardContent className="p-3">
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <span className="truncate text-sm font-semibold">
-                    {judge.displayName}
-                  </span>
-                  <Badge
-                    variant="outline"
-                    className={cn(
-                      "shrink-0 text-xs",
-                      METHOD_BADGE_VARIANTS[judge.method] ??
-                        "bg-gray-100 text-gray-800 border-gray-200"
-                    )}
+    <StageScreen
+      title="Baseline Evaluation"
+      subtitle="Establish quality with 9 judges"
+      pipelineGroup="baseline"
+      visual={
+        <div className="flex flex-col items-center gap-8">
+          {/* Animated flow: 4 nodes connected by arrows */}
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            {FLOW_NODES.map((label, i) => (
+              <div key={label} className="flex items-center gap-2">
+                <motion.div
+                  className="rounded-lg border border-db-gray-border bg-db-gray-bg px-4 py-2.5 text-sm font-medium"
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={{ delay: i * 0.15, duration: 0.3 }}
+                >
+                  {label}
+                </motion.div>
+                {i < FLOW_NODES.length - 1 && (
+                  <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ delay: i * 0.15 + 0.2 }}
                   >
-                    {judge.method.replace("_", " ")}
-                  </Badge>
-                </div>
-                <ScoreGauge
-                  value={judge.threshold >= 0 ? judge.threshold : 0}
-                  label="Threshold"
-                  threshold={judge.threshold >= 0 ? judge.threshold : undefined}
-                  color={
-                    judge.threshold >= 0 ? "bg-db-blue" : "bg-db-gray-border"
-                  }
-                />
-              </CardContent>
-            </Card>
-          ))}
+                    <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  </motion.div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* Baseline accuracy ScoreGauge */}
+          <div className="w-full max-w-xs">
+            <ScoreGauge
+              value={72}
+              label="Baseline accuracy"
+              threshold={72}
+              color="bg-purple-500"
+            />
+          </div>
+
+          {/* 9 judge icons — layoutId for animation to JudgesStage */}
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            {JUDGES.map((judge, i) => (
+              <motion.div
+                key={judge.name}
+                layoutId={`judge-${judge.name}`}
+                className={cn(
+                  "flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white",
+                  JUDGE_CATEGORY_COLORS[judge.category]?.replace("border-l-", "bg-") ?? "bg-gray-400"
+                )}
+                initial={{ opacity: 0, scale: 0.8 }}
+                animate={{ opacity: 1, scale: 1 }}
+                transition={{ delay: 0.5 + i * 0.05, duration: 0.25 }}
+              >
+                {JUDGE_ABBREVS[judge.name] ?? judge.number}
+              </motion.div>
+            ))}
+          </div>
         </div>
-      </section>
-
-      <section>
-        <ExpandableCard
-          title="Arbiter-Adjusted Accuracy"
-          subtitle="How a row counts as correct when arbiter disagrees with result_correctness"
-          accentColor={JUDGE_CATEGORY_COLORS.arbiter ?? "border-l-amber-500"}
-        >
-          <div className="space-y-4 text-sm">
-            <p>
-              A row is correct if{" "}
-              <code className="rounded bg-db-gray-bg px-1.5 py-0.5">
-                result_correctness == &quot;yes&quot;
-              </code>{" "}
-              OR (
-              <code className="rounded bg-db-gray-bg px-1.5 py-0.5">
-                result_correctness == &quot;no&quot;
-              </code>{" "}
-              AND arbiter in{" "}
-              <code className="rounded bg-db-gray-bg px-1.5 py-0.5">
-                genie_correct
-              </code>
-              ,{" "}
-              <code className="rounded bg-db-gray-bg px-1.5 py-0.5">
-                both_correct
-              </code>
-              ).
-            </p>
-            <p>
-              Quarantined, temporal-stale, and both_empty/genie_result_unavailable
-              rows are excluded from the denominator.
-            </p>
-            <p>
-              When arbiter says Genie correct: logical_accuracy,
-              semantic_equivalence, completeness, and schema_accuracy also pass.
-            </p>
-          </div>
-        </ExpandableCard>
-      </section>
-
-      <section>
-        <ExpandableCard
-          title="Actionable Side Information (ASI)"
-          subtitle="Structured judge feedback that drives the optimization loop"
-        >
-          <div className="space-y-4">
-            <DataModelCard title="ASI Model" fields={ASI_MODEL_FIELDS} />
-            <p className="rounded-lg border border-db-blue/30 bg-db-blue/5 p-4 text-sm">
-              ASI is what makes the optimization loop intelligent. Each judge
-              doesn&apos;t just say pass/fail — it says why it failed and what
-              metadata change would fix it.
-            </p>
-          </div>
-        </ExpandableCard>
-      </section>
-    </div>
+      }
+      explanation={
+        <p>
+          Every benchmark question is sent to the Genie Space, and the response is
+          evaluated by 9 specialized judges. The result is a baseline accuracy
+          score that tells us how good the space is before optimization.
+        </p>
+      }
+      learnMore={[
+        {
+          id: "evaluation-orchestration",
+          title: "Evaluation Orchestration",
+          content: (
+            <ol className="list-decimal space-y-2 pl-4">
+              {EVALUATION_ORCHESTRATION_STEPS.map((step, i) => (
+                <li key={i}>{step}</li>
+              ))}
+            </ol>
+          ),
+        },
+      ]}
+    />
   );
 }

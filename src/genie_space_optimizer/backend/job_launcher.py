@@ -189,6 +189,40 @@ def _cleanup_stale_wheels(ws: WorkspaceClient, dist_dir: str, keep_path: str) ->
         logger.debug("Could not list %s for cleanup", dist_dir, exc_info=True)
 
 
+def _find_volume_wheel(ws: WorkspaceClient, catalog: str, schema: str) -> str | None:
+    """Look for an existing wheel in the UC Volume dist directory.
+
+    Used when running inside a Databricks Job cluster where the local
+    filesystem doesn't have the wheel file.  Returns the Volume path
+    to the newest wheel, or ``None`` if nothing is found.
+    """
+    dist_dir = _volume_wheel_dir(catalog, schema)
+    try:
+        best_path: str | None = None
+        for entry in ws.files.list_directory_contents(dist_dir):
+            path = entry.path or ""
+            if path.endswith(".whl") and "genie_space_optimizer" in path:
+                if best_path is None or path > best_path:
+                    best_path = path
+            elif entry.is_directory:
+                try:
+                    for sub in ws.files.list_directory_contents(path):
+                        sub_path = sub.path or ""
+                        if sub_path.endswith(".whl") and "genie_space_optimizer" in sub_path:
+                            if best_path is None or sub_path > best_path:
+                                best_path = sub_path
+                except Exception:
+                    pass
+        if best_path:
+            if not best_path.startswith("/"):
+                best_path = f"/{best_path}"
+            logger.info("Found existing wheel in Volume: %s", best_path)
+            return best_path
+    except Exception:
+        logger.debug("Could not search Volume for existing wheel", exc_info=True)
+    return None
+
+
 def _cleanup_legacy_workspace_wheels(ws: WorkspaceClient) -> None:
     """One-time removal of the old workspace-based wheel directory."""
     global _legacy_cleaned
@@ -492,7 +526,11 @@ def ensure_deployment_job(
             logger.info("Found existing deployment job %s (id=%s)", job_name, job.job_id)
             return int(job.job_id)
 
-    ws_wheel_path, _ = _ensure_artifacts(ws, catalog=catalog, schema=schema)
+    vol_wheel = _find_volume_wheel(ws, catalog, schema)
+    if vol_wheel:
+        ws_wheel_path = vol_wheel
+    else:
+        ws_wheel_path, _ = _ensure_artifacts(ws, catalog=catalog, schema=schema)
     sp_client_id = _resolve_sp_client_id(ws)
     run_as = JobRunAs(service_principal_name=sp_client_id) if sp_client_id else None
 

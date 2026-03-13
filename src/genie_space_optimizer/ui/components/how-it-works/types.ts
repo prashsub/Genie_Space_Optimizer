@@ -124,3 +124,23 @@ export interface ClusterImpactWeights {
   severity: Record<string, number>;
   fixability: { withCounterfactual: number; without: number };
 }
+
+export type PipelineGroup = "preflight" | "baseline" | "enrichment" | "leverLoop" | "finalize";
+
+export interface WalkthroughStage {
+  id: string;
+  title: string;
+  subtitle: string;
+  pipelineGroup: PipelineGroup | "neutral";
+  icon: LucideIcon;
+}
+
+export interface FictionalExample {
+  spaceName: string;
+  tables: { fqn: string; alias: string; columns: { name: string; type: string }[] }[];
+  benchmark: { question: string; expectedSql: string; category: string; expectedAsset: string };
+  failure: { type: string; judgeMessage: string; blameSet: string[]; counterfactualFix: string };
+  patch: { actionType: string; target: string; sections: Record<string, string> };
+  cluster: { id: string; rootCause: string; questionCount: number; affectedQuestions: string[] };
+  enrichment: { table: string; column: string; before: string; after: string; sections: Record<string, string> };
+}

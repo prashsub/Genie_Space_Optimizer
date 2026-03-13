@@ -1,63 +1,45 @@
+import type React from "react";
 import { createFileRoute } from "@tanstack/react-router";
-import { useRef, useState } from "react";
-import { motion } from "motion/react";
-import { PipelineOverview } from "@/components/how-it-works/PipelineOverview";
-import { StageDeepDive } from "@/components/how-it-works/StageDeepDive";
-import { DataFlowDiagram } from "@/components/how-it-works/DataFlowDiagram";
-import { JudgeGrid } from "@/components/how-it-works/JudgeGrid";
-import { ConvergenceStateMachine } from "@/components/how-it-works/ConvergenceStateMachine";
-import { FailureTaxonomyExplorer } from "@/components/how-it-works/FailureTaxonomyExplorer";
-import { HumanReviewLoop } from "@/components/how-it-works/HumanReviewLoop";
+import { WalkthroughShell } from "@/components/how-it-works/WalkthroughShell";
+import { OverviewStage } from "@/components/how-it-works/stages/OverviewStage";
+import { PreflightStage } from "@/components/how-it-works/stages/PreflightStage";
+import { BenchmarksStage } from "@/components/how-it-works/stages/BenchmarksStage";
+import { BaselineStage } from "@/components/how-it-works/stages/BaselineStage";
+import { JudgesStage } from "@/components/how-it-works/stages/JudgesStage";
+import { EnrichmentStage } from "@/components/how-it-works/stages/EnrichmentStage";
+import { LeverLoopStage } from "@/components/how-it-works/stages/LeverLoopStage";
+import { FailureAnalysisStage } from "@/components/how-it-works/stages/FailureAnalysisStage";
+import { LeversStage } from "@/components/how-it-works/stages/LeversStage";
+import { ThreeGatesStage } from "@/components/how-it-works/stages/ThreeGatesStage";
+import { ConvergenceStage } from "@/components/how-it-works/stages/ConvergenceStage";
+import { FinalizeDeployStage } from "@/components/how-it-works/stages/FinalizeDeployStage";
 
 export const Route = createFileRoute("/how-it-works")({
   component: HowItWorksPage,
 });
 
+const STAGE_COMPONENTS: Record<string, () => React.ReactNode> = {
+  overview: OverviewStage,
+  preflight: PreflightStage,
+  benchmarks: BenchmarksStage,
+  baseline: BaselineStage,
+  judges: JudgesStage,
+  enrichment: EnrichmentStage,
+  "lever-loop": LeverLoopStage,
+  "failure-analysis": FailureAnalysisStage,
+  levers: LeversStage,
+  "three-gates": ThreeGatesStage,
+  convergence: ConvergenceStage,
+  finalize: FinalizeDeployStage,
+};
+
 function HowItWorksPage() {
-  const [activeStage, setActiveStage] = useState("preflight");
-  const deepDiveRef = useRef<HTMLDivElement>(null);
-
-  const handleStageClick = (stageId: string) => {
-    setActiveStage(stageId);
-    deepDiveRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
-  const sectionProps = {
-    initial: { opacity: 0, y: 30 },
-    whileInView: { opacity: 1, y: 0 },
-    viewport: { once: true, margin: "-100px" },
-    transition: { duration: 0.4 },
-  };
-
   return (
-    <div className="space-y-12 pb-12">
-      <motion.div {...sectionProps}>
-        <PipelineOverview activeStage={activeStage} onStageClick={handleStageClick} />
-      </motion.div>
-
-      <motion.div ref={deepDiveRef} id="stage-deep-dive" {...sectionProps}>
-        <StageDeepDive activeStage={activeStage} onStageChange={setActiveStage} />
-      </motion.div>
-
-      <motion.div {...sectionProps}>
-        <DataFlowDiagram />
-      </motion.div>
-
-      <motion.div {...sectionProps}>
-        <JudgeGrid />
-      </motion.div>
-
-      <motion.div {...sectionProps}>
-        <ConvergenceStateMachine />
-      </motion.div>
-
-      <motion.div {...sectionProps}>
-        <FailureTaxonomyExplorer />
-      </motion.div>
-
-      <motion.div {...sectionProps}>
-        <HumanReviewLoop />
-      </motion.div>
-    </div>
+    <WalkthroughShell>
+      {(stageId) => {
+        const Component = STAGE_COMPONENTS[stageId];
+        return Component ? <Component /> : null;
+      }}
+    </WalkthroughShell>
   );
 }

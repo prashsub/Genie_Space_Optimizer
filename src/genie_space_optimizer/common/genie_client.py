@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from typing import Any, cast
 
 from databricks.sdk import WorkspaceClient
@@ -814,6 +815,7 @@ def _benchmarks_to_genie_format(benchmarks: list[dict]) -> list[dict]:
 
     genie_questions: list[dict] = []
     seen: set[str] = set()
+    skipped_no_answer = 0
     for b in ordered:
         question = str(b.get("question", "")).strip()
         if not question:
@@ -823,15 +825,24 @@ def _benchmarks_to_genie_format(benchmarks: list[dict]) -> list[dict]:
             continue
         seen.add(q_lower)
 
-        import uuid
+        expected_sql = str(b.get("expected_sql", "")).strip()
+        if not expected_sql:
+            skipped_no_answer += 1
+            continue
+
         entry: dict[str, Any] = {
             "id": uuid.uuid4().hex,
             "question": [question],
+            "answer": [{"format": "SQL", "content": [expected_sql]}],
         }
-        expected_sql = str(b.get("expected_sql", "")).strip()
-        if expected_sql:
-            entry["answer"] = [{"format": "SQL", "content": [expected_sql]}]
         genie_questions.append(entry)
+
+    if skipped_no_answer:
+        logger.warning(
+            "Skipped %d benchmark(s) without expected_sql "
+            "(Genie requires exactly 1 answer per question)",
+            skipped_no_answer,
+        )
 
     return genie_questions
 
