@@ -994,29 +994,37 @@ export const HIGH_RISK_PATCH_TYPES = [
 
 export const CLUSTER_IMPACT_WEIGHTS: ClusterImpactWeights = {
   causal: {
+    syntax_validity: 5.0,
     schema_accuracy: 4.0,
+    asset_routing: 3.5,
     logical_accuracy: 3.0,
+    semantic_equivalence: 2.0,
     completeness: 1.5,
     result_correctness: 1.0,
-    semantic_equivalence: 1.0,
-    syntax_validity: 1.0,
     response_quality: 0.5,
-    asset_routing: 1.0,
-    arbiter: 1.0,
   },
   severity: {
     wrong_table: 1.0,
+    wrong_column: 0.9,
     wrong_join: 0.9,
-    wrong_column: 0.8,
+    missing_join_spec: 0.85,
+    wrong_join_spec: 0.85,
+    wrong_aggregation: 0.8,
+    wrong_measure: 0.8,
+    asset_routing_error: 0.9,
     missing_filter: 0.7,
-    missing_join_spec: 0.7,
-    wrong_aggregation: 0.7,
-    asset_routing_error: 0.6,
-    description_mismatch: 0.6,
-    missing_synonym: 0.5,
-    tvf_parameter_error: 0.5,
-    ambiguous_question: 0.4,
-    missing_instruction: 0.4,
+    missing_temporal_filter: 0.7,
+    tvf_parameter_error: 0.7,
+    missing_instruction: 0.6,
+    compliance_violation: 0.5,
+    repeatability_issue: 0.4,
+    description_mismatch: 0.4,
+    missing_synonym: 0.3,
+    ambiguous_question: 0.3,
+    stale_data: 0.3,
+    data_freshness: 0.3,
+    missing_format_assistance: 0.3,
+    missing_entity_matching: 0.3,
   },
   fixability: {
     withCounterfactual: 1.0,
@@ -1127,13 +1135,16 @@ export const ASI_MODEL_FIELDS = [
    PIPELINE GROUP COLORS
    ═══════════════════════════════════════════════════════════════════ */
 
-export const PIPELINE_GROUP_COLORS: Record<string, { bg: string; border: string; dot: string }> = {
-  neutral: { bg: "bg-muted/30", border: "border-l-muted-foreground", dot: "bg-muted-foreground" },
-  preflight: { bg: "bg-blue-50/30", border: "border-l-db-blue", dot: "bg-db-blue" },
-  baseline: { bg: "bg-purple-50/30", border: "border-l-purple-500", dot: "bg-purple-500" },
-  enrichment: { bg: "bg-teal-50/30", border: "border-l-teal-500", dot: "bg-teal-500" },
-  leverLoop: { bg: "bg-amber-50/30", border: "border-l-db-orange", dot: "bg-db-orange" },
-  finalize: { bg: "bg-green-50/30", border: "border-l-db-green", dot: "bg-db-green" },
+export const PIPELINE_GROUP_COLORS: Record<
+  string,
+  { bg: string; border: string; dot: string; iconBg: string; iconText: string; ring: string; accent: string; fadedDot: string }
+> = {
+  neutral: { bg: "bg-slate-50/60", border: "border-l-slate-400", dot: "bg-slate-500", fadedDot: "bg-slate-200", iconBg: "bg-slate-100", iconText: "text-slate-600", ring: "ring-slate-300", accent: "text-slate-600" },
+  preflight: { bg: "bg-blue-50/80", border: "border-l-blue-500", dot: "bg-blue-500", fadedDot: "bg-blue-200", iconBg: "bg-blue-100", iconText: "text-blue-700", ring: "ring-blue-300", accent: "text-blue-700" },
+  baseline: { bg: "bg-purple-50/80", border: "border-l-purple-500", dot: "bg-purple-500", fadedDot: "bg-purple-200", iconBg: "bg-purple-100", iconText: "text-purple-700", ring: "ring-purple-300", accent: "text-purple-700" },
+  enrichment: { bg: "bg-teal-50/80", border: "border-l-teal-500", dot: "bg-teal-500", fadedDot: "bg-teal-200", iconBg: "bg-teal-100", iconText: "text-teal-700", ring: "ring-teal-300", accent: "text-teal-700" },
+  leverLoop: { bg: "bg-amber-50/80", border: "border-l-amber-500", dot: "bg-amber-500", fadedDot: "bg-amber-200", iconBg: "bg-amber-100", iconText: "text-amber-700", ring: "ring-amber-300", accent: "text-amber-700" },
+  finalize: { bg: "bg-emerald-50/80", border: "border-l-emerald-500", dot: "bg-emerald-500", fadedDot: "bg-emerald-200", iconBg: "bg-emerald-100", iconText: "text-emerald-700", ring: "ring-emerald-300", accent: "text-emerald-700" },
 };
 
 /* ═══════════════════════════════════════════════════════════════════

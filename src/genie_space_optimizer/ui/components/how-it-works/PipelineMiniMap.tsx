@@ -17,31 +17,52 @@ interface PipelineMiniMapProps {
 
 export function PipelineMiniMap({ currentGroup }: PipelineMiniMapProps) {
   return (
-    <div className="flex items-center justify-center gap-1.5 border-b border-db-gray-border px-4 py-2">
+    <div className="flex items-center justify-center gap-0 border-b border-slate-100 bg-white/80 px-4 py-2.5 backdrop-blur-sm">
       {PIPELINE_GROUPS.map((group, i) => {
-        const colors = PIPELINE_GROUP_COLORS[group.id] ?? PIPELINE_GROUP_COLORS.neutral;
+        const colors = PIPELINE_GROUP_COLORS[group.id];
         const isActive = currentGroup === group.id;
+        const isPast =
+          PIPELINE_GROUPS.findIndex((g) => g.id === currentGroup) >
+          PIPELINE_GROUPS.findIndex((g) => g.id === group.id);
+
         return (
-          <div key={group.id} className="flex items-center gap-1.5">
-            <div className="flex items-center gap-1">
+          <div key={group.id} className="flex items-center">
+            <div
+              className={cn(
+                "flex items-center gap-1.5 rounded-full px-2.5 py-1 transition-all",
+                isActive && `${colors.bg} ring-1 ${colors.ring}`,
+              )}
+            >
               <span
                 className={cn(
-                  "inline-block h-2.5 w-2.5 rounded-full transition-all",
-                  isActive ? `${colors.dot} scale-125 ring-2 ring-offset-1 ring-current` : "bg-db-gray-border",
+                  "inline-block h-2 w-2 rounded-full transition-all",
+                  isActive
+                    ? `${colors.dot} ring-2 ring-offset-1 ring-current`
+                    : isPast
+                      ? colors.dot
+                      : colors.fadedDot,
                 )}
-                title={group.label}
               />
               <span
                 className={cn(
-                  "hidden text-[10px] sm:inline",
-                  isActive ? "font-semibold text-foreground" : "text-muted-foreground",
+                  "hidden text-[11px] font-medium sm:inline",
+                  isActive
+                    ? colors.accent
+                    : isPast
+                      ? "text-slate-500"
+                      : "text-slate-400",
                 )}
               >
                 {group.label}
               </span>
             </div>
             {i < PIPELINE_GROUPS.length - 1 && (
-              <span className="h-px w-4 bg-db-gray-border sm:w-6" />
+              <div
+                className={cn(
+                  "mx-1 h-px w-6 sm:w-8",
+                  isPast ? "bg-slate-300" : "bg-slate-200",
+                )}
+              />
             )}
           </div>
         );

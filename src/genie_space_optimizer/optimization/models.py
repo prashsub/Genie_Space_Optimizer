@@ -314,16 +314,25 @@ def _register_uc_version(
         outputs=Schema(output_cols),  # type: ignore[arg-type]
     )
 
-    # ── Build an input example from actual config values ──
-    input_example = pd.DataFrame([{
+    # ── Build an input example matching the full signature ──
+    _example_row: dict[str, object] = {
         "space_id": space_id,
         "space_name": space_name,
         "domain": domain,
+    }
+    for t in dims["tables"]:
+        _example_row[f"table:{t}"] = t
+    for mv in dims["metric_views"]:
+        _example_row[f"metric_view:{mv}"] = mv
+    for fn in dims["functions"]:
+        _example_row[f"function:{fn}"] = fn
+    _example_row.update({
         "instruction_count": len(dims["text_instructions"]),
         "join_spec_count": len(dims["join_specs"]),
         "example_sql_count": len(dims["example_sqls"]),
         "benchmark_count": len(dims["benchmarks"]),
-    }])
+    })
+    input_example = pd.DataFrame([_example_row])
 
     # ── Write artifacts and log pyfunc model ──
     with tempfile.TemporaryDirectory(prefix="genie-uc-") as tmp:

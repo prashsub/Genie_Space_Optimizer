@@ -2,7 +2,12 @@
 
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
-import { Accordion, AccordionItem, AccordionTrigger, AccordionContent } from "@/components/ui/accordion";
+import {
+  Accordion,
+  AccordionItem,
+  AccordionTrigger,
+  AccordionContent,
+} from "@/components/ui/accordion";
 import { PIPELINE_GROUP_COLORS } from "./data";
 
 interface LearnMoreItem {
@@ -30,44 +35,54 @@ export function StageScreen({
   learnMore,
   children,
 }: StageScreenProps) {
-  const colors = PIPELINE_GROUP_COLORS[pipelineGroup] ?? PIPELINE_GROUP_COLORS.neutral;
+  const colors =
+    PIPELINE_GROUP_COLORS[pipelineGroup] ?? PIPELINE_GROUP_COLORS.neutral;
 
   return (
-    <div className={cn("space-y-6 rounded-lg border-l-4 p-4 lg:p-6", colors.border, colors.bg)}>
-      {/* Header */}
-      <div>
-        <h2 className="text-2xl font-bold tracking-tight">{title}</h2>
-        <p className="mt-1 text-sm text-muted-foreground">{subtitle}</p>
+    <div className="space-y-8">
+      {/* Header with colored accent */}
+      <div className={cn("rounded-xl border-l-4 py-5 pl-5 pr-4", colors.border, colors.bg)}>
+        <h2 className={cn("text-2xl font-bold tracking-tight", colors.accent)}>
+          {title}
+        </h2>
+        <p className="mt-1.5 text-sm text-muted-foreground">{subtitle}</p>
       </div>
 
       {/* Primary visual (hero) */}
-      <div className="min-h-[40vh]">{visual}</div>
+      <div className="rounded-xl border border-slate-100 bg-white p-6 shadow-sm">
+        {visual}
+      </div>
 
       {/* Explanation */}
-      <div className="max-w-prose text-sm leading-relaxed text-muted-foreground">
+      <div className="max-w-prose text-[15px] leading-relaxed text-slate-600">
         {explanation}
       </div>
 
-      {/* Extra children slot */}
       {children}
 
       {/* Learn more accordions */}
       {learnMore && learnMore.length > 0 && (
-        <div className="space-y-2">
-          <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Learn more
-          </p>
+        <div className="space-y-3 pt-2">
+          <div className="flex items-center gap-2">
+            <div className={cn("h-px flex-1", `bg-slate-200`)} />
+            <p className="shrink-0 text-[11px] font-semibold uppercase tracking-widest text-slate-400">
+              Deep Dive
+            </p>
+            <div className={cn("h-px flex-1", `bg-slate-200`)} />
+          </div>
           <Accordion type="multiple" className="space-y-2">
             {learnMore.map((item) => (
               <AccordionItem
                 key={item.id}
                 value={item.id}
-                className="rounded-lg border border-db-gray-border bg-white px-4"
+                className={cn(
+                  "overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm transition-shadow hover:shadow-md",
+                )}
               >
-                <AccordionTrigger className="text-sm font-medium">
+                <AccordionTrigger className="px-5 py-3.5 text-sm font-semibold hover:no-underline">
                   {item.title}
                 </AccordionTrigger>
-                <AccordionContent className="text-sm text-muted-foreground">
+                <AccordionContent className="border-t border-slate-100 bg-slate-50/50 px-5 pb-4 pt-3 text-sm leading-relaxed text-slate-600">
                   {item.content}
                 </AccordionContent>
               </AccordionItem>

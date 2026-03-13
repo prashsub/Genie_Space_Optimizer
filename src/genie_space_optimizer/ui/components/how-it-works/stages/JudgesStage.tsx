@@ -1,8 +1,6 @@
 "use client";
 
 import { motion } from "motion/react";
-import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { StageScreen } from "../StageScreen";
 import { ExpandableCard } from "../shared/ExpandableCard";
@@ -14,10 +12,32 @@ import {
   ASI_MODEL_FIELDS,
 } from "../data";
 
+/** Card left border by category (syntax=blue, schema=indigo, logic=purple, quality=slate, execution=green, routing=orange, arbiter=amber) */
+const JUDGE_CARD_BORDER: Record<string, string> = {
+  syntax: "border-l-blue-500",
+  schema: "border-l-indigo-500",
+  logic: "border-l-purple-500",
+  quality: "border-l-slate-400",
+  execution: "border-l-green-500",
+  routing: "border-l-orange-500",
+  arbiter: "border-l-amber-500",
+};
+
+/** Gauge fill color to match card accent */
+const JUDGE_GAUGE_COLOR: Record<string, string> = {
+  syntax: "bg-blue-500",
+  schema: "bg-indigo-500",
+  logic: "bg-purple-500",
+  quality: "bg-slate-500",
+  execution: "bg-green-500",
+  routing: "bg-orange-500",
+  arbiter: "bg-amber-500",
+};
+
 const METHOD_BADGE_COLORS: Record<string, string> = {
-  CODE: "bg-blue-100 text-blue-800 border-blue-200",
-  LLM: "bg-indigo-100 text-indigo-800 border-indigo-200",
-  CONDITIONAL_LLM: "bg-amber-100 text-amber-800 border-amber-200",
+  CODE: "bg-blue-100 text-blue-800 border border-blue-200",
+  LLM: "bg-indigo-100 text-indigo-800 border border-indigo-200",
+  CONDITIONAL_LLM: "bg-amber-100 text-amber-800 border border-amber-200",
 };
 
 export function JudgesStage() {
@@ -27,45 +47,42 @@ export function JudgesStage() {
       subtitle="How each judge evaluates SQL quality"
       pipelineGroup="baseline"
       visual={
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-3 gap-4">
           {JUDGES.map((judge) => (
             <motion.div
               key={judge.name}
               layoutId={`judge-${judge.name}`}
-              className="cursor-default transition-shadow hover:shadow-md"
+              className={cn(
+                "cursor-default overflow-hidden rounded-xl border border-slate-200 bg-white border-l-4 shadow-sm transition-shadow hover:shadow-lg",
+                JUDGE_CARD_BORDER[judge.category] ?? "border-l-slate-400"
+              )}
             >
-              <Card
-                className={cn(
-                  "overflow-hidden border-l-4",
-                  JUDGE_CATEGORY_COLORS[judge.category] ?? "border-l-gray-400"
-                )}
-              >
-                <CardContent className="p-3">
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <span className="truncate text-sm font-semibold">
+              <div className="p-4">
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <span className="truncate text-sm font-semibold text-slate-800">
                     {judge.displayName}
                   </span>
-                  <Badge
-                    variant="outline"
+                  <span
                     className={cn(
-                      "shrink-0 text-xs",
+                      "shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-medium",
                       METHOD_BADGE_COLORS[judge.method] ??
-                        "bg-gray-100 text-gray-800 border-gray-200"
+                        "bg-slate-100 text-slate-700 border border-slate-200"
                     )}
                   >
                     {judge.method.replace("_", " ")}
-                  </Badge>
+                  </span>
                 </div>
                 <ScoreGauge
                   value={judge.threshold >= 0 ? judge.threshold : 0}
                   label="Threshold"
                   threshold={judge.threshold >= 0 ? judge.threshold : undefined}
                   color={
-                    judge.threshold >= 0 ? "bg-db-blue" : "bg-db-gray-border"
+                    judge.threshold >= 0
+                      ? JUDGE_GAUGE_COLOR[judge.category] ?? "bg-slate-600"
+                      : "bg-slate-300"
                   }
                 />
-              </CardContent>
-            </Card>
+              </div>
             </motion.div>
           ))}
         </div>

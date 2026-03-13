@@ -363,7 +363,7 @@ def _rewrite_measure_refs(
     sql: str,
     metric_view_measures: dict[str, set[str]],
 ) -> str:
-    """Wrap bare metric view measure names in ORDER BY with MEASURE().
+    """Wrap bare metric view measure names with MEASURE() in SELECT and ORDER BY.
 
     Only applies when the SQL references a metric view in its FROM clause.
     ``metric_view_measures`` maps lowercased short table names to sets of
@@ -384,12 +384,7 @@ def _rewrite_measure_refs(
     if not relevant_measures:
         return sql
 
-    order_match = re.search(r"\bORDER\s+BY\b", sql, re.IGNORECASE)
-    if not order_match:
-        return sql
-
-    prefix = sql[: order_match.end()]
-    tail = sql[order_match.end() :]
+    already_measured = re.compile(r"\bMEASURE\s*\(", re.IGNORECASE)
 
     def _wrap(m: re.Match) -> str:
         col = m.group(1)
@@ -397,7 +392,34 @@ def _rewrite_measure_refs(
             return f"MEASURE({col})"
         return col
 
-    already_measured = re.compile(r"\bMEASURE\s*\(", re.IGNORECASE)
+    # Rewrite bare measures in SELECT clause
+    select_match = re.search(r"\bSELECT\b", sql, re.IGNORECASE)
+    from_match = re.search(r"\bFROM\b", sql, re.IGNORECASE)
+    if select_match and from_match and select_match.end() < from_match.start():
+        select_clause = sql[select_match.end() : from_match.start()]
+        rewritten_select = re.sub(
+            r"\b([A-Za-z_]\w*)\b(?!\s*\()",
+            lambda m: (
+                m.group(0)
+                if already_measured.search(
+                    sql[
+                        max(0, select_match.end() + m.start() - 10) : select_match.end() + m.start()
+                    ]
+                )
+                else _wrap(m)
+            ),
+            select_clause,
+        )
+        sql = sql[: select_match.end()] + rewritten_select + sql[from_match.start() :]
+
+    # Rewrite bare measures in ORDER BY clause
+    order_match = re.search(r"\bORDER\s+BY\b", sql, re.IGNORECASE)
+    if not order_match:
+        return sql
+
+    prefix = sql[: order_match.end()]
+    tail = sql[order_match.end() :]
+
     rewritten_tail = re.sub(
         r"\b([A-Za-z_]\w*)\b(?!\s*\()",
         lambda m: m.group(0) if already_measured.search(sql[max(0, order_match.end() + m.start() - 10) : order_match.end() + m.start()]) else _wrap(m),
@@ -430,6 +452,32 @@ def build_metric_view_measures(config: dict) -> dict[str, set[str]]:
         if measures:
             result[short_name] = measures
     return result
+
+
+_SELECT_STAR_RE = re.compile(r"\bSELECT\s+\*\s+FROM\b", re.IGNORECASE)
+
+
+def _guard_mv_select_star(
+    sql: str,
+    metric_view_names: set[str],
+) -> tuple[bool, str]:
+    """Reject ``SELECT *`` queries that target metric views.
+
+    Returns ``(is_ok, reason)``.  When *is_ok* is False the benchmark
+    should be sent to the correction pipeline or quarantined.
+    """
+    if not _SELECT_STAR_RE.search(sql):
+        return True, ""
+    sql_lower = sql.lower()
+    mv_leaves = {n.lower().split(".")[-1] for n in metric_view_names}
+    for mv in mv_leaves:
+        if mv in sql_lower:
+            return (
+                False,
+                f"SELECT * not supported on metric view '{mv}' "
+                "— must explicitly list dimensions and MEASURE() columns",
+            )
+    return True, ""
 
 
 @dataclass(frozen=True)
@@ -4610,8 +4658,51 @@ def _build_schema_contexts(
         f"- {c.get('table_name', '')}.{c.get('column_name', '')} ({c.get('data_type', '')}): {c.get('comment', '')}"
         for c in uc_columns
     )
-    mvs = config.get("_metric_views", [])
-    metric_views_context = "\n".join(f"- {mv}" for mv in mvs) if mvs else "(none)"
+
+    # -- Metric views: enrich with measure/dimension column detail --
+    mvs_raw = config.get("_metric_views", [])
+    parsed_space = config.get("_parsed_space", {})
+    if not isinstance(parsed_space, dict):
+        parsed_space = {}
+    ds = parsed_space.get("data_sources", {})
+    if not isinstance(ds, dict):
+        ds = {}
+    mv_sources = ds.get("metric_views", [])
+
+    mv_detail: dict[str, dict] = {}
+    for mv in (mv_sources if isinstance(mv_sources, list) else []):
+        ident = mv.get("identifier", "")
+        if not ident:
+            continue
+        measures: list[str] = []
+        dimensions: list[str] = []
+        for cc in mv.get("column_configs", []):
+            col = cc.get("column_name", "")
+            if not col:
+                continue
+            if str(cc.get("column_type", "")).lower() == "measure" or cc.get("is_measure"):
+                measures.append(col)
+            else:
+                dimensions.append(col)
+        mv_detail[ident] = {"measures": measures, "dimensions": dimensions}
+
+    if mvs_raw:
+        mv_lines: list[str] = []
+        for mv_ident in mvs_raw:
+            detail = mv_detail.get(mv_ident, {})
+            m = detail.get("measures", [])
+            d = detail.get("dimensions", [])
+            parts = [f"- {mv_ident}"]
+            if m:
+                parts.append(f"  Measures (use MEASURE() syntax): {', '.join(m)}")
+            if d:
+                parts.append(f"  Dimensions (for GROUP BY / WHERE): {', '.join(d)}")
+            if not m and not d:
+                parts.append("  (no column detail available)")
+            mv_lines.append("\n".join(parts))
+        metric_views_context = "\n".join(mv_lines)
+    else:
+        metric_views_context = "(none)"
 
     tvfs = config.get("_functions", [])
     tvfs_context = "\n".join(
@@ -4620,6 +4711,32 @@ def _build_schema_contexts(
     ) if uc_routines else (
         "\n".join(f"- {t}" for t in tvfs) if tvfs else "(none)"
     )
+
+    # -- Join specifications --
+    inst = parsed_space.get("instructions", {})
+    if not isinstance(inst, dict):
+        inst = {}
+    ds_js = parsed_space.get("data_sources", {})
+    if not isinstance(ds_js, dict):
+        ds_js = {}
+    join_specs = (
+        inst.get("join_specs", []) if isinstance(inst.get("join_specs"), list) else []
+    ) or (
+        ds_js.get("join_specs", []) if isinstance(ds_js.get("join_specs"), list) else []
+    )
+    if join_specs:
+        js_lines: list[str] = []
+        for js in join_specs:
+            left = js.get("left", {})
+            right = js.get("right", {})
+            sql_parts = js.get("sql", [])
+            predicate = sql_parts[0] if isinstance(sql_parts, list) and sql_parts else str(sql_parts)
+            js_lines.append(
+                f"- {left.get('identifier', '?')} <-> {right.get('identifier', '?')}: {predicate[:200]}"
+            )
+        join_specs_context = "\n".join(js_lines)
+    else:
+        join_specs_context = "(No join specifications configured.)"
 
     instructions = config.get("_instructions", [])
     instructions_context = "\n".join(
@@ -4651,6 +4768,7 @@ def _build_schema_contexts(
         "tables_context": tables_context,
         "metric_views_context": metric_views_context,
         "tvfs_context": tvfs_context,
+        "join_specs_context": join_specs_context,
         "instructions_context": instructions_context,
         "sample_questions_context": sample_questions_context,
         "valid_assets_context": _build_valid_assets_context(config),
@@ -4874,6 +4992,26 @@ def _extract_sql_asset_references(sql: str) -> set[str]:
     return refs
 
 
+_JOIN_TABLE_RE = re.compile(
+    r"\bFROM\s+[`\"]?(\w+(?:\.\w+)*)[`\"]?"
+    r"|\bJOIN\s+[`\"]?(\w+(?:\.\w+)*)[`\"]?",
+    re.IGNORECASE,
+)
+
+
+def _extract_join_pairs(sql: str) -> set[tuple[str, str]]:
+    """Extract normalized ``(table_a, table_b)`` pairs from JOIN clauses."""
+    refs = [
+        (m.group(1) or m.group(2)).replace("`", "").split(".")[-1].lower()
+        for m in _JOIN_TABLE_RE.finditer(sql)
+    ]
+    pairs: set[tuple[str, str]] = set()
+    for i in range(1, len(refs)):
+        a, b = sorted([refs[0], refs[i]])
+        pairs.add((a, b))
+    return pairs
+
+
 def _compute_asset_coverage(
     benchmarks: list[dict],
     config: dict,
@@ -4885,15 +5023,18 @@ def _compute_asset_coverage(
     list from the Genie Space config.
 
     Returns a dict with ``covered``, ``uncovered_tables``,
-    ``uncovered_mvs``, and ``uncovered_functions`` sets (leaf-name normalised).
+    ``uncovered_mvs``, ``uncovered_functions``, and ``uncovered_joins``
+    sets (leaf-name normalised).
     """
     covered: set[str] = set()
+    covered_join_pairs: set[tuple[str, str]] = set()
     for b in benchmarks:
         for tbl in b.get("required_tables", []):
             covered.update(_identifier_candidates(str(tbl)))
         sql = str(b.get("expected_sql") or "")
         if sql:
             covered.update(_extract_sql_asset_references(sql))
+            covered_join_pairs.update(_extract_join_pairs(sql))
 
     def _leaf(name: str) -> str:
         parts = name.replace("`", "").strip().split(".")
@@ -4905,11 +5046,34 @@ def _compute_asset_coverage(
 
     covered_leaves = {_leaf(c) for c in covered if c}
 
+    # Configured join pairs from Genie Space join specs
+    parsed_space = config.get("_parsed_space", {})
+    if not isinstance(parsed_space, dict):
+        parsed_space = {}
+    _inst = parsed_space.get("instructions", {})
+    if not isinstance(_inst, dict):
+        _inst = {}
+    _ds = parsed_space.get("data_sources", {})
+    if not isinstance(_ds, dict):
+        _ds = {}
+    join_specs = (
+        _inst.get("join_specs", []) if isinstance(_inst.get("join_specs"), list) else []
+    ) or (
+        _ds.get("join_specs", []) if isinstance(_ds.get("join_specs"), list) else []
+    )
+    configured_join_pairs: set[tuple[str, str]] = set()
+    for js in join_specs:
+        l_name = _leaf(js.get("left", {}).get("identifier", ""))
+        r_name = _leaf(js.get("right", {}).get("identifier", ""))
+        if l_name and r_name:
+            configured_join_pairs.add(tuple(sorted([l_name, r_name])))
+
     return {
         "covered": covered_leaves,
         "uncovered_tables": all_tables - covered_leaves,
         "uncovered_mvs": all_mvs - covered_leaves,
         "uncovered_functions": all_functions - covered_leaves,
+        "uncovered_joins": configured_join_pairs - covered_join_pairs,
     }
 
 
@@ -4957,12 +5121,13 @@ def _fill_coverage_gaps(
     uncovered_tables = coverage["uncovered_tables"]
     uncovered_mvs = coverage["uncovered_mvs"]
     uncovered_functions = coverage["uncovered_functions"]
+    uncovered_joins: set[tuple[str, str]] = coverage.get("uncovered_joins", set())
 
-    if not uncovered_tables and not uncovered_mvs and not uncovered_functions:
-        logger.info("All Genie Space assets already covered by benchmarks")
+    if not uncovered_tables and not uncovered_mvs and not uncovered_functions and not uncovered_joins:
+        logger.info("All Genie Space assets and join paths already covered by benchmarks")
         return []
 
-    # Prioritise MVs and TVFs (higher routing-issue risk), then tables.
+    # Prioritise MVs and TVFs (higher routing-issue risk), then tables, then joins.
     budget = soft_cap - len(benchmarks)
     ordered_uncovered: list[str] = []
     for mv in sorted(uncovered_mvs):
@@ -4971,16 +5136,18 @@ def _fill_coverage_gaps(
         ordered_uncovered.append(f"FUNCTION: {fn}")
     for tbl in sorted(uncovered_tables):
         ordered_uncovered.append(f"TABLE: {tbl}")
+    for left, right in sorted(uncovered_joins):
+        ordered_uncovered.append(f"JOIN PATH: {left} <-> {right}")
 
     # Each uncovered asset targets ~2 questions; trim to budget.
     max_assets = max(budget // 2, 1)
     targeted = ordered_uncovered[:max_assets]
 
     logger.info(
-        "Coverage gap-fill: %d uncovered assets (%d tables, %d MVs, %d functions). "
+        "Coverage gap-fill: %d uncovered items (%d tables, %d MVs, %d functions, %d join paths). "
         "Targeting %d within budget of %d.",
         len(ordered_uncovered), len(uncovered_tables),
-        len(uncovered_mvs), len(uncovered_functions),
+        len(uncovered_mvs), len(uncovered_functions), len(uncovered_joins),
         len(targeted), budget,
     )
 
@@ -5085,6 +5252,16 @@ def _fill_coverage_gaps(
                 str(benchmark.get("question", ""))[:60],
             )
             continue
+
+        _mv_names = set(config.get("_metric_views", []))
+        _is_star_ok, _ = _guard_mv_select_star(expected_sql, _mv_names)
+        if not _is_star_ok:
+            continue
+
+        _mv_measures = build_metric_view_measures(config)
+        if _mv_measures:
+            expected_sql = _rewrite_measure_refs(expected_sql, _mv_measures)
+            benchmark["expected_sql"] = expected_sql
 
         is_valid, err = _validate_benchmark_sql(
             expected_sql, spark, catalog, schema,
@@ -5415,6 +5592,22 @@ def generate_benchmarks(
                 reason_message,
             )
             continue
+
+        # MV guard: reject SELECT * on metric views
+        _mv_names = set(config.get("_metric_views", []))
+        _is_star_ok, _star_reason = _guard_mv_select_star(expected_sql, _mv_names)
+        if not _is_star_ok:
+            benchmark["validation_status"] = "invalid"
+            benchmark["validation_reason_code"] = "mv_select_star"
+            benchmark["validation_error"] = _star_reason
+            invalid_benchmarks.append(benchmark)
+            continue
+
+        # MV auto-fix: wrap bare measures in MEASURE()
+        _mv_measures = build_metric_view_measures(config)
+        if _mv_measures:
+            expected_sql = _rewrite_measure_refs(expected_sql, _mv_measures)
+            benchmark["expected_sql"] = expected_sql
 
         is_valid, err = _validate_benchmark_sql(
             expected_sql, spark, catalog, schema, execute=True,

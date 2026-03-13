@@ -838,3 +838,326 @@ class TestGenerateBenchmarksValidation:
         mock_validate("SELECT 1", mock_spark, "cat", "schema", execute=True)
         assert mock_validate.call_count == 1
         assert mock_validate_call_kwargs.get("execute") is True
+
+
+# ---------------------------------------------------------------------------
+# Benchmark categories — "multi-table"
+# ---------------------------------------------------------------------------
+
+class TestBenchmarkCategories:
+    def test_multi_table_category_present(self):
+        from genie_space_optimizer.common.config import BENCHMARK_CATEGORIES
+        assert "multi-table" in BENCHMARK_CATEGORIES
+
+
+# ---------------------------------------------------------------------------
+# _build_schema_contexts — join specs context
+# ---------------------------------------------------------------------------
+
+class TestBuildSchemaContextsJoinSpecs:
+    def test_includes_join_specs_from_instructions(self):
+        from genie_space_optimizer.optimization.evaluation import _build_schema_contexts
+
+        config = {
+            "_metric_views": [],
+            "_functions": [],
+            "_instructions": [],
+            "_parsed_space": {
+                "instructions": {
+                    "join_specs": [
+                        {
+                            "left": {"identifier": "cat.sch.orders", "alias": "orders"},
+                            "right": {"identifier": "cat.sch.customers", "alias": "customers"},
+                            "sql": ["`orders`.`customer_id` = `customers`.`customer_id`"],
+                        }
+                    ],
+                },
+            },
+        }
+        ctx = _build_schema_contexts(config, [], [])
+        assert "orders" in ctx["join_specs_context"]
+        assert "customers" in ctx["join_specs_context"]
+        assert "customer_id" in ctx["join_specs_context"]
+
+    def test_fallback_to_data_sources_join_specs(self):
+        from genie_space_optimizer.optimization.evaluation import _build_schema_contexts
+
+        config = {
+            "_metric_views": [],
+            "_functions": [],
+            "_instructions": [],
+            "_parsed_space": {
+                "instructions": {},
+                "data_sources": {
+                    "join_specs": [
+                        {
+                            "left": {"identifier": "cat.sch.a", "alias": "a"},
+                            "right": {"identifier": "cat.sch.b", "alias": "b"},
+                            "sql": ["`a`.`id` = `b`.`id`"],
+                        }
+                    ],
+                },
+            },
+        }
+        ctx = _build_schema_contexts(config, [], [])
+        assert "cat.sch.a" in ctx["join_specs_context"]
+        assert "cat.sch.b" in ctx["join_specs_context"]
+
+    def test_no_join_specs_shows_fallback_text(self):
+        from genie_space_optimizer.optimization.evaluation import _build_schema_contexts
+
+        config = {
+            "_metric_views": [],
+            "_functions": [],
+            "_instructions": [],
+            "_parsed_space": {"instructions": {}},
+        }
+        ctx = _build_schema_contexts(config, [], [])
+        assert ctx["join_specs_context"] == "(No join specifications configured.)"
+
+
+# ---------------------------------------------------------------------------
+# _build_schema_contexts — enriched metric views
+# ---------------------------------------------------------------------------
+
+class TestBuildSchemaContextsMetricViews:
+    def test_includes_measure_and_dimension_detail(self):
+        from genie_space_optimizer.optimization.evaluation import _build_schema_contexts
+
+        config = {
+            "_metric_views": ["cat.sch.mv_sales"],
+            "_functions": [],
+            "_instructions": [],
+            "_parsed_space": {
+                "instructions": {},
+                "data_sources": {
+                    "metric_views": [
+                        {
+                            "identifier": "cat.sch.mv_sales",
+                            "column_configs": [
+                                {"column_name": "region", "column_type": "dimension"},
+                                {"column_name": "total_revenue", "column_type": "measure"},
+                                {"column_name": "avg_order_value", "is_measure": True},
+                            ],
+                        }
+                    ],
+                },
+            },
+        }
+        ctx = _build_schema_contexts(config, [], [])
+        mv_ctx = ctx["metric_views_context"]
+        assert "cat.sch.mv_sales" in mv_ctx
+        assert "MEASURE()" in mv_ctx
+        assert "total_revenue" in mv_ctx
+        assert "avg_order_value" in mv_ctx
+        assert "region" in mv_ctx
+        assert "Dimensions" in mv_ctx
+
+    def test_name_only_when_no_column_configs(self):
+        from genie_space_optimizer.optimization.evaluation import _build_schema_contexts
+
+        config = {
+            "_metric_views": ["cat.sch.mv_revenue"],
+            "_functions": [],
+            "_instructions": [],
+            "_parsed_space": {
+                "instructions": {},
+                "data_sources": {"metric_views": []},
+            },
+        }
+        ctx = _build_schema_contexts(config, [], [])
+        assert "cat.sch.mv_revenue" in ctx["metric_views_context"]
+        assert "no column detail available" in ctx["metric_views_context"]
+
+    def test_no_metric_views(self):
+        from genie_space_optimizer.optimization.evaluation import _build_schema_contexts
+
+        config = {
+            "_metric_views": [],
+            "_functions": [],
+            "_instructions": [],
+            "_parsed_space": {"instructions": {}},
+        }
+        ctx = _build_schema_contexts(config, [], [])
+        assert ctx["metric_views_context"] == "(none)"
+
+
+# ---------------------------------------------------------------------------
+# _guard_mv_select_star
+# ---------------------------------------------------------------------------
+
+class TestGuardMvSelectStar:
+    def test_rejects_select_star_on_mv(self):
+        from genie_space_optimizer.optimization.evaluation import _guard_mv_select_star
+        ok, reason = _guard_mv_select_star(
+            "SELECT * FROM cat.sch.mv_sales",
+            {"cat.sch.mv_sales"},
+        )
+        assert ok is False
+        assert "mv_sales" in reason
+
+    def test_allows_select_star_on_table(self):
+        from genie_space_optimizer.optimization.evaluation import _guard_mv_select_star
+        ok, _ = _guard_mv_select_star(
+            "SELECT * FROM cat.sch.orders",
+            {"cat.sch.mv_sales"},
+        )
+        assert ok is True
+
+    def test_allows_explicit_columns_on_mv(self):
+        from genie_space_optimizer.optimization.evaluation import _guard_mv_select_star
+        ok, _ = _guard_mv_select_star(
+            "SELECT region, MEASURE(total_revenue) FROM cat.sch.mv_sales GROUP BY region",
+            {"cat.sch.mv_sales"},
+        )
+        assert ok is True
+
+    def test_empty_mv_set(self):
+        from genie_space_optimizer.optimization.evaluation import _guard_mv_select_star
+        ok, _ = _guard_mv_select_star("SELECT * FROM foo", set())
+        assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# _rewrite_measure_refs — SELECT clause rewriting
+# ---------------------------------------------------------------------------
+
+class TestRewriteMeasureRefsSelect:
+    def test_wraps_bare_measure_in_select(self):
+        from genie_space_optimizer.optimization.evaluation import _rewrite_measure_refs
+        sql = "SELECT region, total_revenue FROM mv_sales GROUP BY region"
+        result = _rewrite_measure_refs(sql, {"mv_sales": {"total_revenue"}})
+        assert "MEASURE(total_revenue)" in result
+        assert result.count("MEASURE") >= 1
+
+    def test_skips_already_wrapped_in_select(self):
+        from genie_space_optimizer.optimization.evaluation import _rewrite_measure_refs
+        sql = "SELECT region, MEASURE(total_revenue) FROM mv_sales GROUP BY region"
+        result = _rewrite_measure_refs(sql, {"mv_sales": {"total_revenue"}})
+        assert result.count("MEASURE") == 1
+
+    def test_order_by_still_works(self):
+        from genie_space_optimizer.optimization.evaluation import _rewrite_measure_refs
+        sql = "SELECT region FROM mv_sales ORDER BY total_revenue DESC"
+        result = _rewrite_measure_refs(sql, {"mv_sales": {"total_revenue"}})
+        assert "ORDER BY MEASURE(total_revenue)" in result
+
+    def test_both_select_and_order_by(self):
+        from genie_space_optimizer.optimization.evaluation import _rewrite_measure_refs
+        sql = "SELECT region, total_revenue FROM mv_sales ORDER BY total_revenue DESC"
+        result = _rewrite_measure_refs(sql, {"mv_sales": {"total_revenue"}})
+        assert result.count("MEASURE(total_revenue)") == 2
+
+    def test_no_op_for_non_mv(self):
+        from genie_space_optimizer.optimization.evaluation import _rewrite_measure_refs
+        sql = "SELECT total_revenue FROM orders ORDER BY total_revenue"
+        result = _rewrite_measure_refs(sql, {"mv_sales": {"total_revenue"}})
+        assert result == sql
+
+
+# ---------------------------------------------------------------------------
+# _extract_join_pairs
+# ---------------------------------------------------------------------------
+
+class TestExtractJoinPairs:
+    def test_single_join(self):
+        from genie_space_optimizer.optimization.evaluation import _extract_join_pairs
+        sql = "SELECT * FROM orders JOIN customers ON orders.cid = customers.id"
+        pairs = _extract_join_pairs(sql)
+        assert ("customers", "orders") in pairs
+
+    def test_multi_join(self):
+        from genie_space_optimizer.optimization.evaluation import _extract_join_pairs
+        sql = (
+            "SELECT * FROM orders "
+            "JOIN customers ON orders.cid = customers.id "
+            "JOIN products ON orders.pid = products.id"
+        )
+        pairs = _extract_join_pairs(sql)
+        assert ("customers", "orders") in pairs
+        assert ("orders", "products") in pairs
+
+    def test_no_join(self):
+        from genie_space_optimizer.optimization.evaluation import _extract_join_pairs
+        sql = "SELECT * FROM orders WHERE status = 'active'"
+        pairs = _extract_join_pairs(sql)
+        assert len(pairs) == 0
+
+    def test_fqn_normalized_to_leaf(self):
+        from genie_space_optimizer.optimization.evaluation import _extract_join_pairs
+        sql = "SELECT * FROM cat.sch.orders JOIN cat.sch.customers ON 1=1"
+        pairs = _extract_join_pairs(sql)
+        assert ("customers", "orders") in pairs
+
+
+# ---------------------------------------------------------------------------
+# _compute_asset_coverage — uncovered joins
+# ---------------------------------------------------------------------------
+
+class TestComputeAssetCoverageJoins:
+    def test_uncovered_joins_detected(self):
+        from genie_space_optimizer.optimization.evaluation import _compute_asset_coverage
+
+        config = {
+            "_tables": ["cat.sch.orders", "cat.sch.customers"],
+            "_metric_views": [],
+            "_functions": [],
+            "_parsed_space": {
+                "instructions": {
+                    "join_specs": [
+                        {
+                            "left": {"identifier": "cat.sch.orders"},
+                            "right": {"identifier": "cat.sch.customers"},
+                            "sql": ["`orders`.`cid` = `customers`.`id`"],
+                        }
+                    ],
+                },
+            },
+        }
+        benchmarks = [
+            {"question": "q1", "expected_sql": "SELECT * FROM orders", "required_tables": ["orders"]},
+        ]
+        result = _compute_asset_coverage(benchmarks, config)
+        assert ("customers", "orders") in result["uncovered_joins"]
+
+    def test_no_uncovered_when_join_covered(self):
+        from genie_space_optimizer.optimization.evaluation import _compute_asset_coverage
+
+        config = {
+            "_tables": ["cat.sch.orders", "cat.sch.customers"],
+            "_metric_views": [],
+            "_functions": [],
+            "_parsed_space": {
+                "instructions": {
+                    "join_specs": [
+                        {
+                            "left": {"identifier": "cat.sch.orders"},
+                            "right": {"identifier": "cat.sch.customers"},
+                            "sql": ["`orders`.`cid` = `customers`.`id`"],
+                        }
+                    ],
+                },
+            },
+        }
+        benchmarks = [
+            {
+                "question": "q1",
+                "expected_sql": "SELECT * FROM orders JOIN customers ON orders.cid = customers.id",
+                "required_tables": ["orders", "customers"],
+            },
+        ]
+        result = _compute_asset_coverage(benchmarks, config)
+        assert len(result["uncovered_joins"]) == 0
+
+    def test_no_join_specs_means_empty(self):
+        from genie_space_optimizer.optimization.evaluation import _compute_asset_coverage
+
+        config = {
+            "_tables": ["cat.sch.orders"],
+            "_metric_views": [],
+            "_functions": [],
+            "_parsed_space": {"instructions": {}},
+        }
+        benchmarks = [{"question": "q1", "expected_sql": "SELECT 1", "required_tables": []}]
+        result = _compute_asset_coverage(benchmarks, config)
+        assert len(result["uncovered_joins"]) == 0

@@ -1,16 +1,66 @@
 "use client";
 
-import { ArrowDownRight } from "lucide-react";
+import { motion } from "motion/react";
+import { ArrowDown, ArrowDownRight, RotateCcw } from "lucide-react";
+import { cn } from "@/lib/utils";
 import { StageScreen } from "../StageScreen";
-import { GateFunnel } from "../shared/GateFunnel";
 import { GATE_DEFINITIONS } from "../data";
+
+const GATES = [
+  { name: "Slice", subtitle: "Quick check", width: "w-[92%]", bg: "bg-blue-50", border: "border-blue-200", text: "text-blue-800" },
+  { name: "P0", subtitle: "Critical questions", width: "w-[72%]", bg: "bg-amber-50", border: "border-amber-200", text: "text-amber-800" },
+  { name: "Full", subtitle: "Comprehensive", width: "w-[52%]", bg: "bg-emerald-50", border: "border-emerald-200", text: "text-emerald-800" },
+] as const;
 
 export function ThreeGatesStage() {
   const visual = (
-    <div className="flex flex-col items-center gap-6">
-      <GateFunnel className="w-full max-w-md" />
-      <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm">
-        <ArrowDownRight className="h-5 w-5 text-amber-600 shrink-0" aria-hidden />
+    <div className="flex flex-col items-center gap-0">
+      {GATES.map((gate, index) => (
+        <div key={gate.name} className="flex w-full flex-col items-center">
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: index * 0.15, duration: 0.3 }}
+            className={cn(
+              "flex flex-col items-center justify-center rounded-xl border px-6 py-4 shadow-sm transition-shadow hover:shadow-md",
+              gate.width,
+              gate.bg,
+              gate.border
+            )}
+          >
+            <span className={cn("text-sm font-semibold", gate.text)}>
+              {gate.name} Gate
+            </span>
+            <p className={cn("mt-0.5 text-xs", gate.text.replace("800", "600"))}>
+              {gate.subtitle}
+            </p>
+          </motion.div>
+          {index < GATES.length - 1 && (
+            <div className="flex w-full items-center justify-between px-2 py-2">
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ delay: 0.3 + index * 0.15, duration: 0.25 }}
+                className="flex items-center gap-1.5 text-xs font-medium text-emerald-600"
+              >
+                <ArrowDown className="h-4 w-4 shrink-0" />
+                <span>Pass</span>
+              </motion.div>
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ delay: 0.35 + index * 0.15, duration: 0.25 }}
+                className="flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs font-medium text-red-700"
+              >
+                <RotateCcw className="h-3.5 w-3.5 shrink-0" />
+                <span>Fail → Rollback</span>
+              </motion.div>
+            </div>
+          )}
+        </div>
+      ))}
+      <div className="mt-4 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm">
+        <ArrowDownRight className="h-5 w-5 shrink-0 text-amber-600" aria-hidden />
         <span className="text-amber-800">
           <strong>Fast fail:</strong> Slice Gate failure skips P0 and Full gates — saving compute and catching regressions early
         </span>

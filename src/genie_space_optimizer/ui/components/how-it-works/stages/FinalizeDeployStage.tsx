@@ -2,72 +2,78 @@
 
 import { motion } from "motion/react";
 import { CheckCheck, Award, Rocket, Lock } from "lucide-react";
-import { Card, CardContent } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 import { StageScreen } from "../StageScreen";
 import {
   REVIEW_SESSION_FIELDS,
   FEEDBACK_INGESTION_STEPS,
 } from "../data";
 
+const CARDS = [
+  {
+    title: "Repeatability",
+    subtitle: "2 eval passes compared",
+    iconArea: (
+      <div className="flex gap-2">
+        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-100">
+          <CheckCheck className="h-5 w-5 text-blue-600" />
+        </div>
+        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-100">
+          <CheckCheck className="h-5 w-5 text-blue-600" />
+        </div>
+      </div>
+    ),
+    topBorder: "border-t-4 border-t-blue-400",
+    accent: "text-blue-700",
+  },
+  {
+    title: "Champion",
+    subtitle: "Best model crowned",
+    iconArea: (
+      <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-amber-100 shadow-sm ring-2 ring-amber-200/60">
+        <Award className="h-7 w-7 text-amber-600" />
+      </div>
+    ),
+    topBorder: "border-t-4 border-t-amber-400",
+    accent: "text-amber-700",
+  },
+  {
+    title: "Deploy",
+    subtitle: "Source → Target",
+    iconArea: (
+      <div className="flex items-center gap-2">
+        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-100">
+          <Rocket className="h-5 w-5 text-emerald-600" />
+        </div>
+        <Lock className="h-5 w-5 text-slate-500" aria-hidden />
+      </div>
+    ),
+    topBorder: "border-t-4 border-t-emerald-400",
+    accent: "text-emerald-700",
+  },
+] as const;
+
 export function FinalizeDeployStage() {
   const visual = (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0, duration: 0.25 }}
-      >
-        <Card className="h-full overflow-hidden">
-          <CardContent className="flex flex-col items-center p-6 text-center">
-            <div className="mb-3 flex gap-2">
-              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-db-green/20">
-                <CheckCheck className="h-5 w-5 text-db-green" />
-              </div>
-              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-db-green/20">
-                <CheckCheck className="h-5 w-5 text-db-green" />
-              </div>
-            </div>
-            <h3 className="font-semibold">Repeatability Test</h3>
-            <p className="mt-1 text-sm text-muted-foreground">2 passes compared</p>
-          </CardContent>
-        </Card>
-      </motion.div>
-
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.08, duration: 0.25 }}
-      >
-        <Card className="h-full overflow-hidden">
-          <CardContent className="flex flex-col items-center p-6 text-center">
-            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-amber-100">
-              <Award className="h-6 w-6 text-amber-600" />
-            </div>
-            <h3 className="font-semibold">Champion Promotion</h3>
-            <p className="mt-1 text-sm text-muted-foreground">Best model promoted</p>
-          </CardContent>
-        </Card>
-      </motion.div>
-
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.16, duration: 0.25 }}
-      >
-        <Card className="h-full overflow-hidden">
-          <CardContent className="flex flex-col items-center p-6 text-center">
-            <div className="mb-3 flex items-center gap-2">
-              <Rocket className="h-6 w-6 text-db-blue" />
-              <Lock className="h-4 w-4 text-muted-foreground" />
-            </div>
-            <h3 className="font-semibold">Deploy (optional)</h3>
-            <p className="mt-1 text-sm text-muted-foreground">Source → Target</p>
-            <p className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
-              <Lock className="h-3 w-3" /> approval gate
-            </p>
-          </CardContent>
-        </Card>
-      </motion.div>
+      {CARDS.map((card, index) => (
+        <motion.div
+          key={card.title}
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: index * 0.08, duration: 0.3, ease: "easeOut" }}
+          className={cn(
+            "overflow-hidden rounded-xl border border-slate-200 bg-white pt-4 shadow-sm transition-shadow hover:shadow-md",
+            card.topBorder
+          )}
+        >
+          <div className="flex flex-col items-center p-6 pb-5 text-center">
+            <div className="mb-3 flex justify-center">{card.iconArea}</div>
+            <h3 className={cn("font-semibold", card.accent)}>{card.title}</h3>
+            <p className="mt-1 text-sm text-slate-600">{card.subtitle}</p>
+          </div>
+        </motion.div>
+      ))}
     </div>
   );
 

@@ -1,48 +1,64 @@
 "use client";
 
 import { motion } from "motion/react";
-import { ArrowDown } from "lucide-react";
-import { Card, CardContent } from "@/components/ui/card";
+import { ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { StageScreen } from "../StageScreen";
 import { ExpandableCard } from "../shared/ExpandableCard";
 import { RUN_STATUSES, CONVERGENCE_CONDITIONS, SAFETY_CONSTANTS } from "../data";
 
-const STATUS_COLOR_CLASSES: Record<string, string> = {
-  green: "border-l-db-green bg-db-green/5",
-  red: "border-l-red-500 bg-red-50/50",
-  yellow: "border-l-yellow-500 bg-yellow-50/50",
-  gray: "border-l-gray-400 bg-gray-50/50",
-  blue: "border-l-db-blue bg-db-blue/5",
+const STATUS_COLOR_MAP: Record<string, { bg: string; border: string; text: string }> = {
+  QUEUED: { bg: "bg-amber-50", border: "border-amber-300", text: "text-amber-800" },
+  IN_PROGRESS: { bg: "bg-amber-50", border: "border-amber-300", text: "text-amber-800" },
+  CONVERGED: { bg: "bg-emerald-50", border: "border-emerald-400", text: "text-emerald-800" },
+  APPLIED: { bg: "bg-emerald-50", border: "border-emerald-400", text: "text-emerald-800" },
+  STALLED: { bg: "bg-slate-100", border: "border-slate-300", text: "text-slate-700" },
+  MAX_ITERATIONS: { bg: "bg-slate-100", border: "border-slate-300", text: "text-slate-700" },
+  DISCARDED: { bg: "bg-slate-100", border: "border-slate-300", text: "text-slate-700" },
+  CANCELLED: { bg: "bg-slate-100", border: "border-slate-300", text: "text-slate-700" },
+  FAILED: { bg: "bg-red-50", border: "border-red-300", text: "text-red-800" },
 };
+
+function AnimatedDownArrow({ delay }: { delay: number }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ delay, duration: 0.3 }}
+      className="flex justify-center py-1"
+    >
+      <ChevronDown className="h-5 w-5 text-slate-400" />
+    </motion.div>
+  );
+}
 
 export function ConvergenceStage() {
   const statusMap = new Map(RUN_STATUSES.map((s) => [s.name, s]));
 
   const visual = (
-    <div className="space-y-6">
-      <div className="text-sm font-medium text-muted-foreground">
+    <div className="space-y-2">
+      <div className="text-sm font-medium text-slate-500">
         Run status state machine
       </div>
-      <div className="flex flex-col items-center gap-4">
+      <div className="flex flex-col items-center">
         {/* Row 1: QUEUED → IN_PROGRESS */}
         <div className="flex flex-wrap justify-center gap-2">
           {["QUEUED", "IN_PROGRESS"].map((name, i) => (
             <StatusNode key={name} name={name} statusMap={statusMap} delay={i * 0.05} />
           ))}
         </div>
-        <ArrowDown className="h-5 w-5 text-muted-foreground" />
+        <AnimatedDownArrow delay={0.15} />
         {/* Row 2: CONVERGED, STALLED, MAX_ITERATIONS, FAILED, CANCELLED */}
         <div className="flex flex-wrap justify-center gap-2">
           {["CONVERGED", "STALLED", "MAX_ITERATIONS", "FAILED", "CANCELLED"].map((name, i) => (
-            <StatusNode key={name} name={name} statusMap={statusMap} delay={0.15 + i * 0.05} />
+            <StatusNode key={name} name={name} statusMap={statusMap} delay={0.2 + i * 0.05} />
           ))}
         </div>
-        <ArrowDown className="h-5 w-5 text-muted-foreground" />
+        <AnimatedDownArrow delay={0.5} />
         {/* Row 3: APPLIED, DISCARDED */}
         <div className="flex flex-wrap justify-center gap-2">
           {["APPLIED", "DISCARDED"].map((name, i) => (
-            <StatusNode key={name} name={name} statusMap={statusMap} delay={0.4 + i * 0.05} />
+            <StatusNode key={name} name={name} statusMap={statusMap} delay={0.55 + i * 0.05} />
           ))}
         </div>
       </div>
@@ -118,20 +134,26 @@ function StatusNode({
   delay: number;
 }) {
   const status = statusMap.get(name);
-  if (!status) return null;
-  const colorClass = STATUS_COLOR_CLASSES[status.color] ?? "border-l-gray-400 bg-gray-50/50";
+  const colors = STATUS_COLOR_MAP[name] ?? {
+    bg: "bg-slate-100",
+    border: "border-slate-300",
+    text: "text-slate-700",
+  };
 
   return (
     <motion.div
       initial={{ opacity: 0, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
-      transition={{ delay, duration: 0.2 }}
+      transition={{ delay, duration: 0.25 }}
+      className={cn(
+        "min-w-[120px] rounded-xl border px-4 py-2.5 text-center shadow-sm",
+        colors.bg,
+        colors.border
+      )}
     >
-      <Card className={cn("min-w-[120px] border-l-4", colorClass)}>
-        <CardContent className="py-2 px-3 text-center">
-          <span className="text-sm font-semibold">{status.name}</span>
-        </CardContent>
-      </Card>
+      <span className={cn("text-sm font-semibold", colors.text)}>
+        {status?.name ?? name}
+      </span>
     </motion.div>
   );
 }

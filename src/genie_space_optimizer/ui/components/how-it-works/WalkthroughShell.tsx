@@ -16,7 +16,6 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
   const [direction, setDirection] = useState(0);
   const prefersReducedMotion = useReducedMotion();
 
-  // URL hash sync — read on mount
   useEffect(() => {
     const hash = window.location.hash.slice(1);
     if (hash) {
@@ -25,7 +24,6 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
     }
   }, []);
 
-  // URL hash sync — write on change
   useEffect(() => {
     const stage = WALKTHROUGH_STAGES[currentStage];
     if (stage) {
@@ -42,13 +40,22 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
     [currentStage],
   );
 
-  const goNext = useCallback(() => goTo(currentStage + 1), [goTo, currentStage]);
-  const goPrev = useCallback(() => goTo(currentStage - 1), [goTo, currentStage]);
+  const goNext = useCallback(
+    () => goTo(currentStage + 1),
+    [goTo, currentStage],
+  );
+  const goPrev = useCallback(
+    () => goTo(currentStage - 1),
+    [goTo, currentStage],
+  );
 
-  // Keyboard navigation
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement
+      )
+        return;
       switch (e.key) {
         case "ArrowRight":
           e.preventDefault();
@@ -66,7 +73,6 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
           if (/^[0-9]$/.test(e.key)) {
             e.preventDefault();
             const num = parseInt(e.key, 10);
-            // 1-9 -> stages 1-9, 0 -> stage 10
             const target = num === 0 ? 10 : num;
             if (target < WALKTHROUGH_STAGES.length) goTo(target);
           }
@@ -79,18 +85,22 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
   const stage = WALKTHROUGH_STAGES[currentStage];
 
   const slideVariants = prefersReducedMotion
-    ? { enter: { opacity: 0 }, center: { opacity: 1 }, exit: { opacity: 0 } }
+    ? {
+        enter: { opacity: 0 },
+        center: { opacity: 1 },
+        exit: { opacity: 0 },
+      }
     : {
-        enter: (d: number) => ({ x: d > 0 ? 300 : -300, opacity: 0 }),
+        enter: (d: number) => ({ x: d > 0 ? 200 : -200, opacity: 0 }),
         center: { x: 0, opacity: 1 },
-        exit: (d: number) => ({ x: d > 0 ? -300 : 300, opacity: 0 }),
+        exit: (d: number) => ({ x: d > 0 ? -200 : 200, opacity: 0 }),
       };
 
   return (
-    <div className="flex min-h-[calc(100vh-8rem)] gap-0">
-      {/* Left progress rail — hidden on small screens */}
-      <aside className="hidden shrink-0 lg:block lg:w-56">
-        <div className="sticky top-20 max-h-[calc(100vh-6rem)] overflow-y-auto py-4 pr-4">
+    <div className="flex min-h-[calc(100vh-4rem)]">
+      {/* Left progress rail */}
+      <aside className="hidden shrink-0 border-r border-slate-100 bg-slate-50/50 lg:block lg:w-52">
+        <div className="sticky top-16 max-h-[calc(100vh-5rem)] overflow-y-auto px-4 py-6">
           <ProgressRail
             stages={WALKTHROUGH_STAGES}
             currentIndex={currentStage}
@@ -100,17 +110,25 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
       </aside>
 
       {/* Main content */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col bg-white">
         {/* Mini-map */}
-        <PipelineMiniMap currentGroup={stage?.pipelineGroup ?? "neutral"} />
+        <div className="sticky top-16 z-20">
+          <PipelineMiniMap
+            currentGroup={stage?.pipelineGroup ?? "neutral"}
+          />
+        </div>
 
-        {/* Mobile progress indicator */}
-        <div className="flex items-center justify-between border-b border-db-gray-border px-4 py-2 text-xs text-muted-foreground lg:hidden">
-          <button onClick={goPrev} disabled={currentStage === 0} className="disabled:opacity-30">
+        {/* Mobile progress */}
+        <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2 text-xs text-slate-400 lg:hidden">
+          <button
+            onClick={goPrev}
+            disabled={currentStage === 0}
+            className="disabled:opacity-30"
+          >
             &larr; Prev
           </button>
-          <span>
-            Stage {currentStage + 1} of {WALKTHROUGH_STAGES.length}
+          <span className="font-medium">
+            {currentStage + 1} of {WALKTHROUGH_STAGES.length}
           </span>
           <button
             onClick={goNext}
@@ -121,8 +139,8 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
           </button>
         </div>
 
-        {/* Stage content with directional transitions */}
-        <div className="relative flex-1 overflow-x-hidden overflow-y-auto px-4 py-6 lg:px-8">
+        {/* Stage content */}
+        <div className="relative flex-1 overflow-x-hidden overflow-y-auto">
           <AnimatePresence mode="wait" custom={direction}>
             <motion.div
               key={stage?.id}
@@ -131,8 +149,11 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
               initial="enter"
               animate="center"
               exit="exit"
-              transition={{ duration: prefersReducedMotion ? 0 : 0.3, ease: "easeInOut" }}
-              className="w-full"
+              transition={{
+                duration: prefersReducedMotion ? 0 : 0.25,
+                ease: "easeOut",
+              }}
+              className="mx-auto w-full max-w-4xl px-4 py-8 lg:px-8"
             >
               {stage && children(stage.id, currentStage)}
             </motion.div>
@@ -140,12 +161,14 @@ export function WalkthroughShell({ children }: WalkthroughShellProps) {
         </div>
 
         {/* Bottom navigation */}
-        <StageNav
-          stages={WALKTHROUGH_STAGES}
-          currentIndex={currentStage}
-          onNext={goNext}
-          onPrev={goPrev}
-        />
+        <div className="sticky bottom-0 z-20">
+          <StageNav
+            stages={WALKTHROUGH_STAGES}
+            currentIndex={currentStage}
+            onNext={goNext}
+            onPrev={goPrev}
+          />
+        </div>
       </div>
     </div>
   );

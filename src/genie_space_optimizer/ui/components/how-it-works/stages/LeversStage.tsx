@@ -2,45 +2,75 @@
 
 import { motion } from "motion/react";
 import { Settings2, BarChart3, Code, Link2, BookOpen } from "lucide-react";
-import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { StageScreen } from "../StageScreen";
 import { LEVERS, FICTIONAL_EXAMPLE } from "../data";
+import { cn } from "@/lib/utils";
 
 const LEVER_ICONS = [Settings2, BarChart3, Code, Link2, BookOpen] as const;
+
+const LEVER_ACCENTS: Record<number, string> = {
+  1: "from-blue-500/90 to-blue-400/70",
+  2: "from-indigo-500/90 to-indigo-400/70",
+  3: "from-emerald-500/90 to-emerald-400/70",
+  4: "from-orange-500/90 to-orange-400/70",
+  5: "from-purple-500/90 to-purple-400/70",
+};
+
+const LEVER_PILL_COLORS: Record<number, string> = {
+  1: "bg-blue-100 text-blue-700 border-blue-200",
+  2: "bg-indigo-100 text-indigo-700 border-indigo-200",
+  3: "bg-emerald-100 text-emerald-700 border-emerald-200",
+  4: "bg-orange-100 text-orange-700 border-orange-200",
+  5: "bg-purple-100 text-purple-700 border-purple-200",
+};
 
 export function LeversStage() {
   const visual = (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-5">
       {LEVERS.map((lever, index) => {
         const Icon = LEVER_ICONS[lever.number - 1];
+        const accent = LEVER_ACCENTS[lever.number] ?? "from-slate-500 to-slate-400";
+        const pillColor = LEVER_PILL_COLORS[lever.number] ?? "bg-slate-100 text-slate-700 border-slate-200";
         return (
           <motion.div
             key={lever.number}
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ delay: index * 0.05, duration: 0.25 }}
+            whileHover={{ scale: 1.02, y: -2 }}
+            className="h-full"
           >
-            <Card className="h-full overflow-hidden">
-              <CardContent className="flex flex-col gap-2 p-4">
-                <div className="flex items-center gap-2">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-db-gray-bg">
-                    <Icon className="h-4 w-4 text-muted-foreground" />
+            <div className="flex h-full min-h-[140px] flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition-shadow hover:shadow-md">
+              <div className={cn("h-1.5 w-full bg-gradient-to-r", accent)} />
+              <div className="flex flex-1 flex-col gap-3 p-4">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-100 font-bold text-slate-700">
+                    {lever.number}
                   </div>
-                  <div className="min-w-0">
-                    <span className="text-xs text-muted-foreground">L{lever.number}</span>
-                    <h3 className="truncate font-semibold">{lever.name}</h3>
+                  <div className="min-w-0 flex-1">
+                    <h3 className="truncate font-semibold text-slate-800">
+                      {lever.name}
+                    </h3>
+                    <Icon className="mt-0.5 h-4 w-4 text-slate-400" />
                   </div>
                 </div>
-                <div className="mt-1 flex flex-wrap gap-1">
+                <div className="flex flex-wrap gap-1.5">
                   {lever.failureTypes.map((ft) => (
-                    <Badge key={ft} variant="secondary" className="text-xs">
-                      {ft}
+                    <Badge
+                      key={ft}
+                      variant="outline"
+                      className={cn(
+                        "text-[10px] font-medium",
+                        pillColor,
+                      )}
+                    >
+                      {ft.replace(/_/g, " ")}
                     </Badge>
                   ))}
                 </div>
-              </CardContent>
-            </Card>
+              </div>
+            </div>
           </motion.div>
         );
       })}

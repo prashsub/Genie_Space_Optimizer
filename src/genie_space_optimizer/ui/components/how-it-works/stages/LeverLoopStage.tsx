@@ -16,6 +16,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { StageScreen } from "../StageScreen";
 import { LoopDiagram } from "../shared/LoopDiagram";
+import { PIPELINE_GROUP_COLORS } from "../data";
+import { cn } from "@/lib/utils";
 
 const LOOP_STEPS = [
   { label: "Extract Failures", icon: Search },
@@ -31,6 +33,8 @@ const LOOP_STEPS = [
   { label: "Check Convergence", icon: CircleDot },
 ];
 
+const colors = PIPELINE_GROUP_COLORS.leverLoop;
+
 export function LeverLoopStage() {
   return (
     <StageScreen
@@ -39,13 +43,31 @@ export function LeverLoopStage() {
       pipelineGroup="leverLoop"
       visual={
         <div className="space-y-4">
-          <div className="overflow-x-auto pb-2">
+          <p className="text-center text-sm font-semibold uppercase tracking-wider text-slate-500">
+            The Optimization Cycle
+          </p>
+          <div
+            className={cn(
+              "overflow-x-auto rounded-xl p-6",
+              colors.bg,
+            )}
+          >
             <LoopDiagram steps={LOOP_STEPS} className="min-w-max" />
           </div>
-          <div className="flex justify-center">
-            <Badge variant="secondary" className="text-muted-foreground">
+          <div className="flex flex-col items-center gap-3">
+            <Badge
+              variant="secondary"
+              className={cn(
+                "border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium",
+                colors.accent,
+              )}
+            >
               Iteration 1 of up to 5
             </Badge>
+            <p className="max-w-md text-center text-xs text-slate-500">
+              Each step is detailed in the next stages — from failure extraction
+              through clustering, ranking, strategizing, and 3-gate validation.
+            </p>
           </div>
         </div>
       }

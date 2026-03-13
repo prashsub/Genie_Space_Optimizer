@@ -1,18 +1,23 @@
 "use client";
 
-import { ArrowRight } from "lucide-react";
+import {
+  FileText,
+  Globe,
+  ShieldCheck,
+  BarChart3,
+} from "lucide-react";
 import { motion } from "motion/react";
 import { cn } from "@/lib/utils";
 import { StageScreen } from "../StageScreen";
 import { ScoreGauge } from "../shared/ScoreGauge";
-import { JUDGES, JUDGE_CATEGORY_COLORS } from "../data";
+import { JUDGES, PIPELINE_GROUP_COLORS } from "../data";
 
 const FLOW_NODES = [
-  "Benchmarks",
-  "Genie Space API",
-  "9 Judges",
-  "Aggregated Scores",
-];
+  { label: "Benchmarks", icon: FileText },
+  { label: "Genie Space API", icon: Globe },
+  { label: "9 Judges", icon: ShieldCheck },
+  { label: "Aggregated Scores", icon: BarChart3 },
+] as const;
 
 const EVALUATION_ORCHESTRATION_STEPS = [
   "make_predict_fn closure — captures Genie Space config and benchmark dataset",
@@ -35,58 +40,109 @@ const JUDGE_ABBREVS: Record<string, string> = {
   arbiter: "AB",
 };
 
+function AnimatedArrow() {
+  return (
+    <motion.div
+      className="flex shrink-0 items-center"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ delay: 0.3, duration: 0.4 }}
+    >
+      <svg
+        width="36"
+        height="20"
+        viewBox="0 0 36 20"
+        fill="none"
+        className="text-slate-300"
+      >
+        <motion.line
+          x1="0"
+          y1="10"
+          x2="24"
+          y2="10"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeDasharray="6 4"
+          initial={{ strokeDashoffset: 20 }}
+          animate={{ strokeDashoffset: 0 }}
+          transition={{ duration: 1.2, repeat: Infinity, ease: "linear" }}
+        />
+        <path
+          d="M24 10 L34 10 L28 4 M34 10 L28 16"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          fill="none"
+        />
+      </svg>
+    </motion.div>
+  );
+}
+
 export function BaselineStage() {
+  const baselineColors = PIPELINE_GROUP_COLORS.baseline;
+
   return (
     <StageScreen
       title="Baseline Evaluation"
       subtitle="Establish quality with 9 judges"
       pipelineGroup="baseline"
       visual={
-        <div className="flex flex-col items-center gap-8">
-          {/* Animated flow: 4 nodes connected by arrows */}
-          <div className="flex flex-wrap items-center justify-center gap-2">
-            {FLOW_NODES.map((label, i) => (
-              <div key={label} className="flex items-center gap-2">
+        <div className="flex flex-col items-center gap-10">
+          {/* Animated flow: 4 nodes as rich cards with icons, connected by arrows */}
+          <div className="flex flex-wrap items-center justify-center gap-1">
+            {FLOW_NODES.map(({ label, icon: Icon }, i) => (
+              <div key={label} className="flex items-center">
                 <motion.div
-                  className="rounded-lg border border-db-gray-border bg-db-gray-bg px-4 py-2.5 text-sm font-medium"
+                  className={cn(
+                    "flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 shadow-sm transition-shadow hover:shadow",
+                    "min-w-[140px]"
+                  )}
                   initial={{ opacity: 0, scale: 0.9 }}
                   animate={{ opacity: 1, scale: 1 }}
-                  transition={{ delay: i * 0.15, duration: 0.3 }}
+                  transition={{ delay: i * 0.12, duration: 0.3 }}
                 >
-                  {label}
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600">
+                    <Icon className="h-4.5 w-4.5" />
+                  </div>
+                  <span className="text-sm font-medium text-slate-700">
+                    {label}
+                  </span>
                 </motion.div>
-                {i < FLOW_NODES.length - 1 && (
-                  <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    transition={{ delay: i * 0.15 + 0.2 }}
-                  >
-                    <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-                  </motion.div>
-                )}
+                {i < FLOW_NODES.length - 1 && <AnimatedArrow />}
               </div>
             ))}
           </div>
 
-          {/* Baseline accuracy ScoreGauge */}
-          <div className="w-full max-w-xs">
+          {/* Baseline ScoreGauge — prominent with "Baseline: 72%" label */}
+          <div className="w-full max-w-[280px] [&_.relative]:!h-5 [&_.h-full]:!h-5">
+            <div className="mb-3 text-center">
+              <span className="text-xl font-semibold tabular-nums text-slate-800">
+                Baseline: 72%
+              </span>
+            </div>
             <ScoreGauge
               value={72}
-              label="Baseline accuracy"
+              label="Overall accuracy"
               threshold={72}
-              color="bg-purple-500"
+              color={baselineColors.dot}
             />
           </div>
 
-          {/* 9 judge icons — layoutId for animation to JudgesStage */}
-          <div className="flex flex-wrap items-center justify-center gap-2">
+          {/* 9 judge icons — layoutId for shared-element animation to JudgesStage, purple accent */}
+          <div className="flex flex-wrap items-center justify-center gap-2.5">
             {JUDGES.map((judge, i) => (
               <motion.div
                 key={judge.name}
                 layoutId={`judge-${judge.name}`}
                 className={cn(
-                  "flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white",
-                  JUDGE_CATEGORY_COLORS[judge.category]?.replace("border-l-", "bg-") ?? "bg-gray-400"
+                  "flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-xs font-semibold",
+                  "border shadow-sm transition-shadow hover:shadow",
+                  baselineColors.iconBg,
+                  baselineColors.iconText,
+                  "border-purple-200"
                 )}
                 initial={{ opacity: 0, scale: 0.8 }}
                 animate={{ opacity: 1, scale: 1 }}

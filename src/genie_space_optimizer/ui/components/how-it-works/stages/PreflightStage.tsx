@@ -3,7 +3,6 @@
 import { motion, useReducedMotion } from "motion/react";
 import { StageScreen } from "../StageScreen";
 import { AnimatedChecklist } from "../shared/AnimatedChecklist";
-import { Badge } from "@/components/ui/badge";
 
 const PREFLIGHT_ITEMS = [
   { id: "1", label: "Fetch Genie Space config" },
@@ -28,18 +27,29 @@ export function PreflightStage() {
   const readyDelayMs = prefersReducedMotion ? 0 : 2200;
 
   const visual = (
-    <div className="space-y-4">
-      <AnimatedChecklist items={PREFLIGHT_ITEMS} staggerDelay={400} />
+    <div className="space-y-5">
+      <AnimatedChecklist
+        items={PREFLIGHT_ITEMS}
+        staggerDelay={400}
+        variant="card"
+        accentBorderClass="border-l-blue-500"
+      />
       <motion.div
-        className="flex items-center gap-2 pt-2"
+        className="flex flex-wrap items-center gap-3 pt-1"
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
-        transition={{ delay: readyDelayMs / 1000, duration: 0.3 }}
+        transition={{ delay: readyDelayMs / 1000, duration: 0.4 }}
       >
-        <span className="text-sm text-muted-foreground">When complete:</span>
-        <Badge variant="outline" className="border-db-green bg-db-green/10 text-db-green">
-          Ready
-        </Badge>
+        <span
+          className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200/80 bg-emerald-50/90 px-3 py-1 text-sm font-medium text-emerald-700 shadow-[0_0_12px_rgba(16,185,129,0.15)]"
+          aria-label="System ready"
+        >
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-hidden />
+          System Ready
+        </span>
+        <span className="text-xs text-slate-500">
+          Preflight Duration: ~30–60s
+        </span>
       </motion.div>
     </div>
   );

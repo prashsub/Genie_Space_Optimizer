@@ -1,6 +1,7 @@
 "use client";
 
 import { motion } from "motion/react";
+import { Database } from "lucide-react";
 import { StageScreen } from "../StageScreen";
 import { AnimatedChecklist } from "../shared/AnimatedChecklist";
 import { DataModelCard } from "../shared/DataModelCard";
@@ -9,7 +10,7 @@ import {
   FICTIONAL_EXAMPLE,
 } from "../data";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 
 const LLM_CONTEXT_BLOCKS = [
   "domain",
@@ -36,52 +37,83 @@ export function BenchmarksStage() {
 
   const visual = (
     <div className="grid gap-6 lg:grid-cols-2">
+      {/* Table schema — database table card */}
       <motion.div
         initial={{ opacity: 0, x: -20 }}
         animate={{ opacity: 1, x: 0 }}
         transition={{ duration: 0.4 }}
       >
-        <Card className="overflow-hidden border border-db-gray-border">
-          <CardHeader className="py-3">
-            <p className="text-sm font-semibold">Schema: {factSales?.fqn ?? "fact_sales"}</p>
-          </CardHeader>
-          <CardContent className="pt-0">
-            <div className="space-y-1.5">
-              {factSales?.columns.map((col) => (
-                <div
-                  key={col.name}
-                  className="flex justify-between gap-2 font-mono text-xs"
+        <div
+          className={cn(
+            "overflow-hidden rounded-xl border border-slate-200 bg-slate-50",
+          )}
+        >
+          <div className="flex items-center gap-2 border-b border-slate-200 bg-slate-100/80 px-4 py-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-100 text-blue-600">
+              <Database className="h-4 w-4" />
+            </div>
+            <p className="font-mono text-sm font-semibold text-slate-800">
+              {factSales?.fqn ?? "fact_sales"}
+            </p>
+          </div>
+          <div className="divide-y divide-slate-100 px-4 py-2">
+            {factSales?.columns.map((col) => (
+              <div
+                key={col.name}
+                className="flex items-center justify-between gap-3 py-2 font-mono text-xs"
+              >
+                <span className="text-slate-700">{col.name}</span>
+                <Badge
+                  variant="secondary"
+                  className="font-mono text-[10px] font-medium text-slate-600"
                 >
-                  <span className="text-foreground">{col.name}</span>
-                  <span className="text-muted-foreground">{col.type}</span>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
+                  {col.type}
+                </Badge>
+              </div>
+            ))}
+          </div>
+        </div>
       </motion.div>
+
+      {/* Benchmark — evaluation card with slide-in from right */}
       <motion.div
-        initial={{ opacity: 0, x: 20 }}
+        initial={{ opacity: 0, x: 24 }}
         animate={{ opacity: 1, x: 0 }}
-        transition={{ duration: 0.4, delay: 0.15 }}
+        transition={{ duration: 0.5, delay: 0.2 }}
       >
-        <Card className="overflow-hidden border-l-4 border-l-db-blue">
-          <CardHeader className="py-3">
-            <p className="text-sm font-semibold">Benchmark</p>
-          </CardHeader>
-          <CardContent className="pt-0 space-y-3">
-            <div>
-              <p className="text-xs font-medium text-muted-foreground">Question</p>
-              <p className="text-sm">{benchmark.question}</p>
+        <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+          <div className="border-b border-slate-100 px-4 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge
+                variant="outline"
+                className="border-slate-200 bg-slate-50 text-slate-600"
+              >
+                {benchmark.category}
+              </Badge>
+              <Badge
+                variant="outline"
+                className="border-blue-200 bg-blue-50/80 text-blue-700"
+              >
+                {benchmark.expectedAsset}
+              </Badge>
+            </div>
+          </div>
+          <div className="space-y-3 p-4">
+            <div className="rounded-lg border border-amber-200/80 bg-amber-50/90 px-3 py-2.5">
+              <p className="text-sm font-medium leading-relaxed text-amber-900/90">
+                &quot;{benchmark.question}&quot;
+              </p>
             </div>
             <div>
-              <p className="text-xs font-medium text-muted-foreground">Expected SQL</p>
-              <pre className="overflow-x-auto rounded bg-db-gray-bg p-2 text-xs">
+              <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                Expected SQL
+              </p>
+              <pre className="overflow-x-auto rounded-lg border border-slate-200 bg-slate-900 px-3 py-2.5 font-mono text-xs leading-relaxed text-slate-100">
                 {benchmark.expectedSql.replace(/\\n/g, "\n")}
               </pre>
             </div>
-          </CardContent>
-        </Card>
+          </div>
+        </div>
       </motion.div>
     </div>
   );
