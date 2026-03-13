@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 _LLM_TIMEOUT_SECONDS = 600
 _EXAMPLE_SQL_SIMILARITY_THRESHOLD = 0.85
+_INSTR_LOSS_THRESHOLD = 0.5
 
 
 def _ws_with_timeout(
@@ -1190,7 +1191,24 @@ def _collect_blank_columns(
     return blanks
 
 
-def _format_enrichment_context(blanks: list[dict]) -> str:
+def _lookup_table_profile(data_profile: dict, table_fqn: str) -> dict:
+    """Find a table's profile entry by FQN or leaf name."""
+    if not data_profile:
+        return {}
+    hit = data_profile.get(table_fqn) or data_profile.get(table_fqn.lower())
+    if hit:
+        return hit
+    leaf = table_fqn.split(".")[-1].strip("`").lower()
+    for key, val in data_profile.items():
+        if key.split(".")[-1].strip("`").lower() == leaf:
+            return val
+    return {}
+
+
+def _format_enrichment_context(
+    blanks: list[dict],
+    data_profile: dict | None = None,
+) -> str:
     """Format blank columns into a context string grouped by table."""
     by_table: dict[str, list[dict]] = {}
     for b in blanks:
@@ -1203,12 +1221,28 @@ def _format_enrichment_context(blanks: list[dict]) -> str:
         target_names = {c["column"] for c in cols}
         sibling_context = [s for s in siblings if s not in target_names]
 
-        lines.append(f"Table: {tbl_id} ({tbl_desc[:200]})")
+        tbl_profile = _lookup_table_profile(data_profile or {}, tbl_id)
+        row_count = tbl_profile.get("row_count")
+        tbl_header = f"Table: {tbl_id} ({tbl_desc[:200]})"
+        if row_count is not None and row_count >= 0:
+            tbl_header += f" [~{row_count} rows]"
+        lines.append(tbl_header)
         lines.append("  Columns needing descriptions:")
         for c in cols:
-            lines.append(
-                f"    - {c['column']} ({c['data_type'] or 'UNKNOWN'}) [{c['entity_type']}]"
-            )
+            col_line = f"    - {c['column']} ({c['data_type'] or 'UNKNOWN'}) [{c['entity_type']}]"
+            col_info = tbl_profile.get("columns", {}).get(c["column"], {})
+            if col_info:
+                hints: list[str] = []
+                if col_info.get("cardinality"):
+                    hints.append(f"cardinality={col_info['cardinality']}")
+                if col_info.get("distinct_values"):
+                    vals = col_info["distinct_values"][:10]
+                    hints.append(f"values={vals}")
+                if col_info.get("min") is not None:
+                    hints.append(f"range=[{col_info['min']}, {col_info['max']}]")
+                if hints:
+                    col_line += f" — {', '.join(hints)}"
+            lines.append(col_line)
         if sibling_context:
             lines.append(f"  Sibling columns (for context): {', '.join(sibling_context[:20])}")
         lines.append("")
@@ -1216,9 +1250,32 @@ def _format_enrichment_context(blanks: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_data_profile_for_prompt(data_profile: dict | None) -> str:
+    """Render data profile as a compact string for enrichment prompt templates."""
+    if not data_profile:
+        return "(no data profile available)"
+    lines: list[str] = []
+    for table, tinfo in sorted(data_profile.items()):
+        row_count = tinfo.get("row_count", "?")
+        lines.append(f"### {table} (~{row_count} rows)")
+        for col, cinfo in sorted(tinfo.get("columns", {}).items()):
+            card = cinfo.get("cardinality", "?")
+            vals = cinfo.get("distinct_values")
+            minv = cinfo.get("min")
+            maxv = cinfo.get("max")
+            parts = [f"cardinality={card}"]
+            if vals:
+                parts.append(f"values={vals}")
+            if minv is not None:
+                parts.append(f"range=[{minv}, {maxv}]")
+            lines.append(f"  - {col}: {', '.join(parts)}")
+    return "\n".join(lines)
+
+
 def _enrich_blank_descriptions(
     metadata_snapshot: dict,
     w: WorkspaceClient | None = None,
+    data_profile: dict | None = None,
 ) -> list[dict]:
     """Generate structured descriptions for columns that have no description anywhere.
 
@@ -1241,6 +1298,7 @@ def _enrich_blank_descriptions(
 
     allowlist = _build_identifier_allowlist(metadata_snapshot)
     allowlist_str = _format_identifier_allowlist(allowlist)
+    profile_context_str = _format_data_profile_for_prompt(data_profile)
 
     if len(blanks) <= _ENRICHMENT_BATCH_THRESHOLD:
         batches = [blanks]
@@ -1251,12 +1309,14 @@ def _enrich_blank_descriptions(
         batches = list(by_table.values())
 
     all_patches: list[dict] = []
+    system_msg = "You generate structured column descriptions for a Databricks Genie Space."
 
-    for batch in batches:
-        context_str = _format_enrichment_context(batch)
+    for batch_idx, batch in enumerate(batches):
+        context_str = _format_enrichment_context(batch, data_profile=data_profile)
         format_kwargs: dict[str, Any] = {
             "columns_context": context_str,
             "identifier_allowlist": allowlist_str,
+            "data_profile_context": profile_context_str,
         }
         format_kwargs = _truncate_to_budget(
             format_kwargs, DESCRIPTION_ENRICHMENT_PROMPT,
@@ -1265,29 +1325,11 @@ def _enrich_blank_descriptions(
         prompt = format_mlflow_template(DESCRIPTION_ENRICHMENT_PROMPT, **format_kwargs)
 
         try:
-            wc = _ws_with_timeout(w)
-            response = wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
-                messages=[
-                    ChatMessage(
-                        role=ChatMessageRole.SYSTEM,
-                        content="You generate structured column descriptions for a Databricks Genie Space.",
-                    ),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
-                ],
-                temperature=LLM_TEMPERATURE,
+            text, _response = _traced_llm_call(
+                w, system_msg, prompt,
+                span_name=f"enrich_column_descriptions_batch_{batch_idx}",
                 max_tokens=4096,
             )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                logger.warning("Description enrichment: empty LLM response for batch of %d columns", len(batch))
-                continue
-            message = choices[0].message if hasattr(choices[0], "message") else choices[0]
-            content = getattr(message, "content", None)
-            if not content:
-                logger.warning("Description enrichment: LLM content is empty")
-                continue
-            text = str(content).strip()
             result = _extract_json(text)
         except Exception:
             logger.warning("Description enrichment: LLM call failed for batch", exc_info=True)
@@ -1389,14 +1431,21 @@ def _collect_insufficient_tables(
     return insufficient
 
 
-def _format_table_enrichment_context(tables: list[dict]) -> str:
+def _format_table_enrichment_context(
+    tables: list[dict],
+    data_profile: dict | None = None,
+) -> str:
     """Format insufficient tables into a context string for the LLM prompt."""
     lines: list[str] = []
     for t in tables:
         cur = t.get("current_description", "")
         desc_label = f"({cur[:80]})" if cur else "(none)"
+        tbl_profile = _lookup_table_profile(data_profile or {}, t["table"])
+        row_count = tbl_profile.get("row_count")
         lines.append(f"Table: {t['table']}")
         lines.append(f"  Current description: {desc_label}")
+        if row_count is not None and row_count >= 0:
+            lines.append(f"  Row count: ~{row_count}")
         col_parts = []
         for cname in t.get("column_names", [])[:30]:
             ctype = t.get("column_types", {}).get(cname, "")
@@ -1408,6 +1457,20 @@ def _format_table_enrichment_context(tables: list[dict]) -> str:
                 lines.append(f"  (+{remaining} more columns)")
         if t.get("is_metric_view"):
             lines.append("  Type: Metric View")
+        col_profiles = tbl_profile.get("columns", {})
+        if col_profiles:
+            profile_hints: list[str] = []
+            for cname, cinfo in list(col_profiles.items())[:15]:
+                parts: list[str] = []
+                if cinfo.get("distinct_values"):
+                    vals = cinfo["distinct_values"][:8]
+                    parts.append(f"values={vals}")
+                elif cinfo.get("min") is not None:
+                    parts.append(f"range=[{cinfo['min']}, {cinfo['max']}]")
+                if parts:
+                    profile_hints.append(f"{cname}: {', '.join(parts)}")
+            if profile_hints:
+                lines.append(f"  Data profile: {'; '.join(profile_hints)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -1415,6 +1478,7 @@ def _format_table_enrichment_context(tables: list[dict]) -> str:
 def _enrich_table_descriptions(
     metadata_snapshot: dict,
     w: WorkspaceClient | None = None,
+    data_profile: dict | None = None,
 ) -> list[dict]:
     """Generate structured descriptions for tables that have insufficient descriptions.
 
@@ -1436,6 +1500,7 @@ def _enrich_table_descriptions(
 
     allowlist = _build_identifier_allowlist(metadata_snapshot)
     allowlist_str = _format_identifier_allowlist(allowlist)
+    profile_context_str = _format_data_profile_for_prompt(data_profile)
 
     if len(tables) <= _ENRICHMENT_BATCH_THRESHOLD:
         batches = [tables]
@@ -1443,12 +1508,14 @@ def _enrich_table_descriptions(
         batches = [[t] for t in tables]
 
     all_patches: list[dict] = []
+    system_msg = "You generate structured table descriptions for a Databricks Genie Space."
 
-    for batch in batches:
-        context_str = _format_table_enrichment_context(batch)
+    for batch_idx, batch in enumerate(batches):
+        context_str = _format_table_enrichment_context(batch, data_profile=data_profile)
         format_kwargs: dict[str, Any] = {
             "tables_context": context_str,
             "identifier_allowlist": allowlist_str,
+            "data_profile_context": profile_context_str,
         }
         format_kwargs = _truncate_to_budget(
             format_kwargs, TABLE_DESCRIPTION_ENRICHMENT_PROMPT,
@@ -1457,29 +1524,11 @@ def _enrich_table_descriptions(
         prompt = format_mlflow_template(TABLE_DESCRIPTION_ENRICHMENT_PROMPT, **format_kwargs)
 
         try:
-            wc = _ws_with_timeout(w)
-            response = wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
-                messages=[
-                    ChatMessage(
-                        role=ChatMessageRole.SYSTEM,
-                        content="You generate structured table descriptions for a Databricks Genie Space.",
-                    ),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
-                ],
-                temperature=LLM_TEMPERATURE,
+            text, _response = _traced_llm_call(
+                w, system_msg, prompt,
+                span_name=f"enrich_table_descriptions_batch_{batch_idx}",
                 max_tokens=4096,
             )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                logger.warning("Table description enrichment: empty LLM response for batch of %d tables", len(batch))
-                continue
-            message = choices[0].message if hasattr(choices[0], "message") else choices[0]
-            content = getattr(message, "content", None)
-            if not content:
-                logger.warning("Table description enrichment: LLM content is empty")
-                continue
-            text = str(content).strip()
             result = _extract_json(text)
         except Exception:
             logger.warning("Table description enrichment: LLM call failed for batch", exc_info=True)
@@ -1606,31 +1655,14 @@ def _generate_space_description(
         priority_keys=["tables_context"],
     )
     prompt = format_mlflow_template(SPACE_DESCRIPTION_PROMPT, **format_kwargs)
+    system_msg = "You generate structured descriptions for Databricks Genie Spaces."
 
     try:
-        wc = _ws_with_timeout(w)
-        response = wc.serving_endpoints.query(
-            name=LLM_ENDPOINT,
-            messages=[
-                ChatMessage(
-                    role=ChatMessageRole.SYSTEM,
-                    content="You generate structured descriptions for Databricks Genie Spaces.",
-                ),
-                ChatMessage(role=ChatMessageRole.USER, content=prompt),
-            ],
-            temperature=LLM_TEMPERATURE,
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt,
+            span_name="generate_space_description",
             max_tokens=2048,
         )
-        choices = getattr(response, "choices", None) or []
-        if not choices:
-            logger.warning("Space description generation: empty LLM response")
-            return ""
-        message = choices[0].message if hasattr(choices[0], "message") else choices[0]
-        content = getattr(message, "content", None)
-        if not content:
-            logger.warning("Space description generation: LLM content is empty")
-            return ""
-        text = str(content).strip()
         text = re.sub(r"```[a-z]*\n?", "", text).strip().rstrip("`")
         if len(text) < 30:
             logger.warning("Space description generation: result too short (%d chars)", len(text))
@@ -1672,31 +1704,14 @@ def _generate_proactive_instructions(
         priority_keys=["tables_context"],
     )
     prompt = format_mlflow_template(PROACTIVE_INSTRUCTION_PROMPT, **format_kwargs)
+    system_msg = "You generate routing instructions for Databricks Genie Spaces."
 
     try:
-        wc = _ws_with_timeout(w)
-        response = wc.serving_endpoints.query(
-            name=LLM_ENDPOINT,
-            messages=[
-                ChatMessage(
-                    role=ChatMessageRole.SYSTEM,
-                    content="You generate routing instructions for Databricks Genie Spaces.",
-                ),
-                ChatMessage(role=ChatMessageRole.USER, content=prompt),
-            ],
-            temperature=LLM_TEMPERATURE,
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt,
+            span_name="generate_proactive_instructions",
             max_tokens=2048,
         )
-        choices = getattr(response, "choices", None) or []
-        if not choices:
-            logger.warning("Proactive instruction generation: empty LLM response")
-            return ""
-        message = choices[0].message if hasattr(choices[0], "message") else choices[0]
-        content = getattr(message, "content", None)
-        if not content:
-            logger.warning("Proactive instruction generation: LLM content is empty")
-            return ""
-        text = str(content).strip()
         text = re.sub(r"```[a-z]*\n?", "", text).strip().rstrip("`")
         if len(text) < 50:
             logger.warning("Proactive instruction generation: result too short (%d chars)", len(text))
@@ -1731,31 +1746,14 @@ def _generate_sample_questions(
         priority_keys=["tables_context"],
     )
     prompt = format_mlflow_template(SAMPLE_QUESTIONS_PROMPT, **format_kwargs)
+    system_msg = "You generate sample questions for Databricks Genie Spaces."
 
     try:
-        wc = _ws_with_timeout(w)
-        response = wc.serving_endpoints.query(
-            name=LLM_ENDPOINT,
-            messages=[
-                ChatMessage(
-                    role=ChatMessageRole.SYSTEM,
-                    content="You generate sample questions for Databricks Genie Spaces.",
-                ),
-                ChatMessage(role=ChatMessageRole.USER, content=prompt),
-            ],
-            temperature=LLM_TEMPERATURE,
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt,
+            span_name="generate_sample_questions",
             max_tokens=2048,
         )
-        choices = getattr(response, "choices", None) or []
-        if not choices:
-            logger.warning("Sample question generation: empty LLM response")
-            return []
-        message = choices[0].message if hasattr(choices[0], "message") else choices[0]
-        content = getattr(message, "content", None)
-        if not content:
-            logger.warning("Sample question generation: LLM content is empty")
-            return []
-        text = str(content).strip()
         result = _extract_json(text)
     except Exception:
         logger.warning("Sample question generation: LLM call failed", exc_info=True)
@@ -4854,6 +4852,15 @@ _SECTION_HEADER_RE = re.compile(
 )
 _KNOWN_SECTIONS = set(INSTRUCTION_SECTION_ORDER)
 
+_INLINE_SECTION_NAMES: list[str] = sorted(
+    INSTRUCTION_SECTION_ORDER, key=lambda s: len(s), reverse=True
+)
+_INLINE_SECTION_RE = re.compile(
+    r'(?:^|\s)('
+    + '|'.join(re.escape(s) for s in _INLINE_SECTION_NAMES)
+    + r'):\s*'
+)
+
 
 def _parse_sections(text: str) -> tuple[dict[str, list[str]], list[str]]:
     """Parse structured plain-text into {SECTION_HEADER: [lines]} and preamble lines."""
@@ -5319,6 +5326,11 @@ def _normalize_instruction_rewrite(raw: Any) -> dict | str:
     the LLM may return a plain string, a list, or ``None``.  This helper
     ensures downstream code always receives either a validated ``dict``
     or a sanitized ``str``.
+
+    When the LLM returns a string that contains recognizable section
+    headers (e.g. ``QUERY RULES: - bullet ...``), the function attempts
+    to parse it into the preferred dict form so that downstream code
+    follows the safer section-level merge path.
     """
     if isinstance(raw, dict):
         valid_keys = set(INSTRUCTION_SECTION_ORDER)
@@ -5329,8 +5341,50 @@ def _normalize_instruction_rewrite(raw: Any) -> dict | str:
         sanitized = _sanitize_plaintext_instructions(raw)
         if len(sanitized) > MAX_HOLISTIC_INSTRUCTION_CHARS:
             sanitized = sanitized[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+        parsed = _try_parse_string_as_section_dict(sanitized)
+        if parsed is not None:
+            return parsed
         return sanitized
     return ""
+
+
+def _try_parse_string_as_section_dict(text: str) -> dict[str, str] | None:
+    """Attempt to parse a plain-text string into a ``{section: content}`` dict.
+
+    First tries ``_parse_sections`` (which requires headers on their own line).
+    If that fails, applies ``_INLINE_SECTION_RE`` to reformat inline
+    ``"SECTION: content"`` into newline-separated form and retries.
+
+    Returns ``None`` if no known section headers are found.
+    """
+    sections, preamble = _parse_sections(text)
+    if not sections:
+        reformatted = _INLINE_SECTION_RE.sub(r'\n\1:\n', text).strip()
+        if reformatted != text:
+            sections, preamble = _parse_sections(reformatted)
+
+    if not sections:
+        return None
+
+    valid_keys = set(INSTRUCTION_SECTION_ORDER)
+    result: dict[str, str] = {}
+    for k, lines in sections.items():
+        if k in valid_keys:
+            result[k] = "\n".join(lines)
+    if preamble:
+        non_blank = [ln for ln in preamble if ln.strip()]
+        if non_blank:
+            existing = result.get("CONSTRAINTS", "")
+            result["CONSTRAINTS"] = (
+                (existing + "\n" if existing else "") + "\n".join(non_blank)
+            )
+    if result:
+        logger.info(
+            "Coerced string instruction_rewrite to dict with %d section(s): %s",
+            len(result), sorted(result.keys()),
+        )
+        return result
+    return None
 
 
 def _preview_instruction_rewrite(rewrite: dict | str, max_chars: int = 200) -> str:
@@ -6616,6 +6670,11 @@ def _mine_benchmark_example_sqls(
             "Benchmark mining: skipping — slot budget already exhausted (%d/%d)",
             current_slots, MAX_INSTRUCTION_SLOTS,
         )
+        print(
+            f"\n-- BENCHMARK EXAMPLE SQL MINING {'─' * 40}\n"
+            f"  |  Slot budget exhausted:      {current_slots}/{MAX_INSTRUCTION_SLOTS} — skipping\n"
+            + "─" * 72
+        )
         return []
 
     existing_eqs_raw = (
@@ -6669,6 +6728,8 @@ def _mine_benchmark_example_sqls(
                         question, err,
                     )
                     skipped_invalid += 1
+                    if skipped_invalid <= 3:
+                        print(f"  |    [skip] '{question[:50]}': {err[:120]}")
                     continue
                 try:
                     test_rows = spark.sql(f"SELECT * FROM ({sql}) LIMIT 1").collect()
@@ -6681,9 +6742,11 @@ def _mine_benchmark_example_sqls(
                         continue
                 except Exception:
                     pass
-            except Exception:
+            except Exception as _val_exc:
                 logger.debug("Benchmark mining: validation error, skipping", exc_info=True)
                 skipped_invalid += 1
+                if skipped_invalid <= 3:
+                    print(f"  |    [skip] '{question[:50]}': {type(_val_exc).__name__}: {str(_val_exc)[:100]}")
                 continue
 
         if len(proposals) >= remaining_budget:
@@ -6732,6 +6795,17 @@ def _mine_benchmark_example_sqls(
         "Benchmark mining: %d proposals, %d skipped (no sql=%d, dup=%d, invalid=%d)",
         len(proposals), skipped_no_sql + skipped_dup + skipped_invalid,
         skipped_no_sql, skipped_dup, skipped_invalid,
+    )
+    print(
+        f"\n-- BENCHMARK EXAMPLE SQL MINING {'─' * 40}\n"
+        f"  |  Benchmarks scanned:         {len(benchmarks)}\n"
+        f"  |  Slot budget:                {current_slots}/{MAX_INSTRUCTION_SLOTS} "
+        f"(remaining: {remaining_budget})\n"
+        f"  |  Skipped (no SQL):           {skipped_no_sql}\n"
+        f"  |  Skipped (duplicate):        {skipped_dup}\n"
+        f"  |  Skipped (invalid SQL):      {skipped_invalid}\n"
+        f"  |  Proposals generated:        {len(proposals)}\n"
+        + "─" * 72
     )
     return proposals
 
@@ -7253,9 +7327,7 @@ def generate_proposals_from_strategy(
                         k: v for k, v in instruction_sections.items() if k in valid_keys
                     }
 
-                current_instructions = _get_general_instructions(
-                    metadata_snapshot.get("config") or metadata_snapshot
-                )
+                current_instructions = _get_general_instructions(metadata_snapshot)
                 existing_sections, _ = _parse_sections(
                     _sanitize_plaintext_instructions(current_instructions) if current_instructions else ""
                 )
@@ -7287,6 +7359,22 @@ def generate_proposals_from_strategy(
                     parts.append("")
                 merged_text = _sanitize_plaintext_instructions("\n".join(parts).strip())
 
+                if (
+                    current_instructions
+                    and merged_text
+                    and len(current_instructions.strip()) > 50
+                    and len(merged_text.strip()) < len(current_instructions.strip()) * _INSTR_LOSS_THRESHOLD
+                ):
+                    logger.warning(
+                        "Instruction rewrite would lose content (%d -> %d chars) "
+                        "— force-merging existing instructions",
+                        len(current_instructions), len(merged_text),
+                    )
+                    merged_text = _merge_structured_instructions(
+                        existing=current_instructions,
+                        contributions=[merged_text],
+                    )
+
                 proposals.append({
                     "proposal_id": f"P{len(proposals) + 1:03d}",
                     "cluster_id": ag_id,
@@ -7315,13 +7403,26 @@ def generate_proposals_from_strategy(
             elif instruction_guidance:
                 from genie_space_optimizer.optimization.applier import _get_general_instructions
 
-                current_instructions = _get_general_instructions(
-                    metadata_snapshot.get("config") or metadata_snapshot
-                )
+                current_instructions = _get_general_instructions(metadata_snapshot)
                 merged_text = _merge_structured_instructions(
                     existing=current_instructions,
                     contributions=[instruction_guidance],
                 )
+                if (
+                    current_instructions
+                    and merged_text
+                    and len(current_instructions.strip()) > 50
+                    and len(merged_text.strip()) < len(current_instructions.strip()) * _INSTR_LOSS_THRESHOLD
+                ):
+                    logger.warning(
+                        "Instruction rewrite would lose content (%d -> %d chars) "
+                        "— force-merging existing instructions",
+                        len(current_instructions), len(merged_text),
+                    )
+                    merged_text = _merge_structured_instructions(
+                        existing=current_instructions,
+                        contributions=[merged_text],
+                    )
                 proposals.append({
                     "proposal_id": f"P{len(proposals) + 1:03d}",
                     "cluster_id": ag_id,
@@ -7517,11 +7618,23 @@ def generate_metadata_proposals(
 
         from genie_space_optimizer.optimization.applier import _get_general_instructions
 
-        current_instructions = _get_general_instructions(
-            metadata_snapshot.get("config") or metadata_snapshot
-        )
+        current_instructions = _get_general_instructions(metadata_snapshot)
 
         if instruction_text:
+            if (
+                current_instructions
+                and len(current_instructions.strip()) > 50
+                and len(instruction_text.strip()) < len(current_instructions.strip()) * _INSTR_LOSS_THRESHOLD
+            ):
+                logger.warning(
+                    "Holistic instruction rewrite would lose content (%d -> %d chars) "
+                    "— force-merging existing instructions",
+                    len(current_instructions), len(instruction_text),
+                )
+                instruction_text = _merge_structured_instructions(
+                    existing=current_instructions,
+                    contributions=[instruction_text],
+                )
             total_q = sum(len(c.get("question_ids", [])) for c in all_lever5_clusters)
             holistic_traces = []
             for c in (all_lever5_clusters or clusters):

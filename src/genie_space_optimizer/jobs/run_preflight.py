@@ -348,7 +348,7 @@ if _data_profile:
                 "max": str(_dp_col_info.get("max", "-")),
             })
     if _dp_rows:
-        display(pd.DataFrame(_dp_rows))
+        display(pd.DataFrame(_dp_rows))  # type: ignore[name-defined]  # Databricks built-in
     else:
         print("  Data profile collected but no column details available.")
 else:

@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Any
 
 from databricks.sdk.service.iam import User as UserOut
 
@@ -33,7 +34,7 @@ def health_check(config: Dependencies.Config, ws: Dependencies.Client):
 
     sp_client_id = ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
     sp_ref = sp_client_id or "<service_principal_application_id>"
-    base = dict(catalog=cat, schema=sch, spClientId=sp_client_id or None)
+    base: dict[str, Any] = dict(catalog=cat, schema=sch, spClientId=sp_client_id or None)
 
     # ── Spark connectivity ──────────────────────────────────────────
     try:

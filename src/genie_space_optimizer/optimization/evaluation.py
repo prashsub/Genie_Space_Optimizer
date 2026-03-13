@@ -1093,7 +1093,7 @@ def _execute_sql_via_warehouse(
     *,
     catalog: str = "",
     schema: str = "",
-    wait_timeout: str = "120s",
+    wait_timeout: str = "50s",
 ) -> pd.DataFrame:
     """Execute SQL via the SQL warehouse Statement Execution API.
 

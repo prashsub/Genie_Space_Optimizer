@@ -923,8 +923,8 @@ def configure_mlflow_connection_pool(pool_size: int = 20) -> None:
     try:
         import requests.adapters as _ra
         if getattr(_ra, "DEFAULT_POOLSIZE", 10) < pool_size:
-            _ra.DEFAULT_POOLSIZE = pool_size
-            _ra.DEFAULT_POOLCONNECTIONS = pool_size
+            setattr(_ra, "DEFAULT_POOLSIZE", pool_size)
+            setattr(_ra, "DEFAULT_POOLCONNECTIONS", pool_size)
             logger.debug("Patched requests.adapters.DEFAULT_POOLSIZE=%d", pool_size)
     except Exception:
         logger.debug("Could not configure MLflow connection pool size", exc_info=True)

@@ -172,6 +172,7 @@ def _collect_data_profile(
     max_tables: int = 0,
     sample_size: int = 0,
     low_cardinality_threshold: int = 0,
+    metric_view_names: frozenset[str] = frozenset(),
     w: Any = None,
     warehouse_id: str = "",
     catalog: str = "",
@@ -233,6 +234,11 @@ def _collect_data_profile(
 
     profile: dict[str, dict] = {}
     for table_fqn in tables[:max_tables]:
+        _leaf = table_fqn.split(".")[-1].strip("`").lower()
+        if _leaf in metric_view_names or table_fqn.strip().lower() in metric_view_names:
+            logger.info("Data profiling: %s is a metric view, skipping", table_fqn)
+            continue
+
         tbl_key = table_fqn.strip().lower()
         tbl_cols = cols_by_table.get(tbl_key, [])
         if not tbl_cols:
@@ -896,6 +902,11 @@ def preflight_collect_uc_metadata(
     )
 
     table_names = list(config.get("_tables", [])) + list(config.get("_metric_views", []))
+    _mv_names = frozenset(
+        n.strip().lower().split(".")[-1]
+        for n in config.get("_metric_views", [])
+        if isinstance(n, str) and n.strip()
+    )
     if table_names and uc_columns_dicts:
         write_stage(
             spark, run_id, "DATA_PROFILING", "STARTED",
@@ -904,6 +915,7 @@ def preflight_collect_uc_metadata(
         try:
             data_profile = _collect_data_profile(
                 spark, table_names, uc_columns_dicts,
+                metric_view_names=_mv_names,
                 w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema,
             )
             config["_data_profile"] = data_profile

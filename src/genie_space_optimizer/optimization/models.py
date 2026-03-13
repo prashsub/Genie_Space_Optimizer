@@ -310,8 +310,8 @@ def _register_uc_version(
     ]
 
     signature = ModelSignature(
-        inputs=Schema(input_cols),
-        outputs=Schema(output_cols),
+        inputs=Schema(input_cols),  # type: ignore[arg-type]  # ColSpec is a valid subtype
+        outputs=Schema(output_cols),  # type: ignore[arg-type]
     )
 
     # ── Build an input example from actual config values ──

@@ -354,7 +354,7 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
       const reason = String(f.flag_reason || "");
       m.set(qid, {
         flag_reason: reason,
-        iterations_failed: f.iterations_failed ?? null,
+        iterations_failed: typeof f.iterations_failed === "number" ? f.iterations_failed : null,
         patches_tried: f.patches_tried ? String(f.patches_tried) : null,
         category: categorizeFlagReason(reason),
       });
