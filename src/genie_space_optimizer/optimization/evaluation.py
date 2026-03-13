@@ -3011,6 +3011,7 @@ def create_evaluation_dataset(
                 "required_columns": b.get("required_columns", []),
                 "temporal_stale": b.get("temporal_stale", False),
                 "asset_fingerprint": b.get("asset_fingerprint", ""),
+                "split": b.get("split", "train"),
             }
             expectations = {k: v for k, v in expectations.items() if v is not None}
             records.append(
@@ -5757,7 +5758,6 @@ def generate_benchmarks(
     for idx, b in enumerate(curated):
         question_id = f"{domain}_gs_{idx + 1:03d}"
         priority = "P0"
-        split = "train"
         expected_sql = str(b.get("expected_sql", "") or "")
         curated_status = "question_only" if not expected_sql else str(
             b.get("validation_status", "valid"),
@@ -5775,7 +5775,7 @@ def generate_benchmarks(
                 "required_columns": b.get("required_columns", []),
                 "expected_facts": b.get("expected_facts", []),
                 "priority": priority,
-                "split": split,
+                "split": "",
                 "source": b.get("source", "genie_space"),
                 "provenance": "curated",
                 "validation_status": curated_status,
@@ -5789,7 +5789,6 @@ def generate_benchmarks(
     for idx, b in enumerate(valid_benchmarks):
         question_id = f"{domain}_{offset + idx + 1:03d}"
         priority = "P0" if idx < 3 else "P1"
-        split = "held_out" if (idx + 1) % 5 == 0 else "train"
         _b_esql = b.get("expected_sql", "")
         all_benchmarks.append(
             {
@@ -5804,7 +5803,7 @@ def generate_benchmarks(
                 "required_columns": b.get("required_columns", []),
                 "expected_facts": b.get("expected_facts", []),
                 "priority": priority,
-                "split": split,
+                "split": "",
                 "source": b.get("source", "llm_generated"),
                 "provenance": b.get("provenance", "synthetic"),
                 "validation_status": b.get("validation_status", "valid"),
@@ -5837,7 +5836,6 @@ def generate_benchmarks(
     gap_fill_offset = len(curated) + len(valid_benchmarks)
     for idx, b in enumerate(gap_fill_benchmarks):
         question_id = f"{domain}_gf_{gap_fill_offset + idx + 1:03d}"
-        split = "held_out" if (idx + 1) % 5 == 0 else "train"
         _gf_esql = b.get("expected_sql", "")
         all_benchmarks.append(
             {
@@ -5852,7 +5850,7 @@ def generate_benchmarks(
                 "required_columns": b.get("required_columns", []),
                 "expected_facts": b.get("expected_facts", []),
                 "priority": "P1",
-                "split": split,
+                "split": "",
                 "source": "llm_generated",
                 "provenance": "coverage_gap_fill",
                 "validation_status": b.get("validation_status", "valid"),
@@ -5862,15 +5860,24 @@ def generate_benchmarks(
             }
         )
 
+    from genie_space_optimizer.optimization.benchmarks import assign_splits
+
+    all_benchmarks = assign_splits(all_benchmarks)
+    _train_n = sum(1 for b in all_benchmarks if b.get("split") == "train")
+    _held_n = len(all_benchmarks) - _train_n
+
     logger.info(
         "Final benchmark set: %d total (%d curated from Genie space, "
-        "%d synthetic, %d gap-fill, %d discarded out of %d raw generated)",
+        "%d synthetic, %d gap-fill, %d discarded out of %d raw generated, "
+        "split: %d train / %d held_out)",
         len(all_benchmarks),
         len(curated),
         len(valid_benchmarks),
         len(gap_fill_benchmarks),
         len(invalid_benchmarks),
         len(raw_benchmarks),
+        _train_n,
+        _held_n,
     )
     return all_benchmarks
 
@@ -5968,6 +5975,7 @@ def load_benchmarks_from_dataset(
                     "validation_reason_code": expectations.get("validation_reason_code", ""),
                     "validation_error": expectations.get("validation_error"),
                     "correction_source": expectations.get("correction_source", ""),
+                    "split": expectations.get("split", "train"),
                 }
             )
         pre_dedup = len(benchmarks)

@@ -59,9 +59,39 @@ class TestAssignSplits:
 
     def test_ratio_respected(self):
         benchmarks = [{"id": f"q{i}", "question": f"Question {i}"} for i in range(100)]
-        result = assign_splits(benchmarks, train_ratio=0.8, seed=42)
+        result = assign_splits(benchmarks, train_ratio=0.85, seed=42)
         train_count = sum(1 for b in result if b["split"] == "train")
-        assert 75 <= train_count <= 85
+        assert 82 <= train_count <= 88
+
+    def test_default_ratio_matches_held_out_ratio(self):
+        benchmarks = [{"id": f"q{i}", "question": f"Question {i}"} for i in range(100)]
+        result = assign_splits(benchmarks, seed=42)
+        train_count = sum(1 for b in result if b["split"] == "train")
+        assert 82 <= train_count <= 88
+
+    def test_curated_always_train(self):
+        benchmarks = [
+            {"id": f"q{i}", "question": f"Q{i}", "provenance": "curated"}
+            for i in range(10)
+        ]
+        result = assign_splits(benchmarks, train_ratio=0.5, seed=42)
+        assert all(b["split"] == "train" for b in result)
+
+    def test_curated_not_counted_for_ratio(self):
+        curated = [
+            {"id": f"c{i}", "question": f"C{i}", "provenance": "curated"}
+            for i in range(10)
+        ]
+        synthetic = [
+            {"id": f"s{i}", "question": f"S{i}", "provenance": "synthetic"}
+            for i in range(90)
+        ]
+        result = assign_splits(curated + synthetic, train_ratio=0.85, seed=42)
+        curated_splits = [b for b in result if b["provenance"] == "curated"]
+        synth_splits = [b for b in result if b["provenance"] == "synthetic"]
+        assert all(b["split"] == "train" for b in curated_splits)
+        synth_train = sum(1 for b in synth_splits if b["split"] == "train")
+        assert 73 <= synth_train <= 81  # ~85% of 90
 
     def test_empty_list(self):
         assert assign_splits([]) == []

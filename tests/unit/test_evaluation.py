@@ -1161,3 +1161,25 @@ class TestComputeAssetCoverageJoins:
         benchmarks = [{"question": "q1", "expected_sql": "SELECT 1", "required_tables": []}]
         result = _compute_asset_coverage(benchmarks, config)
         assert len(result["uncovered_joins"]) == 0
+
+
+class TestSplitPersistenceRoundTrip:
+    """Verify that the split field is persisted by create_evaluation_dataset
+    and read back by load_benchmarks_from_dataset."""
+
+    def test_build_eval_records_includes_split(self):
+        from genie_space_optimizer.optimization.benchmarks import build_eval_records
+
+        benchmarks = [
+            {"id": "q1", "question": "Q1", "expected_sql": "SELECT 1", "split": "held_out"},
+            {"id": "q2", "question": "Q2", "expected_sql": "SELECT 2", "split": "train"},
+        ]
+        records = build_eval_records(benchmarks)
+        assert records[0]["expectations"]["split"] == "held_out"
+        assert records[1]["expectations"]["split"] == "train"
+
+    def test_build_eval_records_defaults_split_to_train(self):
+        from genie_space_optimizer.optimization.benchmarks import build_eval_records
+
+        records = build_eval_records([{"id": "q1", "question": "Q1"}])
+        assert records[0]["expectations"]["split"] == "train"

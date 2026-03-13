@@ -212,7 +212,7 @@ class TestFinalizeReturnValueEquivalence:
             "status", "convergence_reason", "repeatability_pct", "report_path",
             "promoted_model", "terminal_reason", "benchmark_publish_count",
             "labeling_session", "elapsed_seconds", "heartbeat_count",
-            "uc_registration",
+            "uc_registration", "held_out_accuracy", "held_out_count",
         }
         assert set(result.keys()) == expected_keys
 

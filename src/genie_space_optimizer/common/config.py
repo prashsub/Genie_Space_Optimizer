@@ -125,10 +125,21 @@ LLM_MAX_RETRIES = 3
 
 # ── 5. Benchmark Generation ────────────────────────────────────────────
 
-TARGET_BENCHMARK_COUNT = 20
-MAX_BENCHMARK_COUNT = 25
+HELD_OUT_RATIO = 0.15
+"""Fraction of non-curated benchmarks reserved for held-out generalization
+check in Finalize.  The optimizer never sees these during the lever loop."""
+
+TARGET_BENCHMARK_COUNT = 24
+MAX_BENCHMARK_COUNT = 29
 """Hard ceiling on benchmark count.  No evaluation should ever run on more
-than this many questions, regardless of how many are generated or loaded."""
+than this many questions, regardless of how many are generated or loaded.
+With HELD_OUT_RATIO=0.15 the train split contains ~20 questions (same as
+the previous TARGET_BENCHMARK_COUNT) and ~4 are held out."""
+
+FINALIZE_REPEATABILITY_PASSES = 1
+"""Number of repeatability passes in Finalize.  Reduced from 2 to make room
+for a held-out generalization eval without increasing total Genie API calls."""
+
 COVERAGE_GAP_SOFT_CAP_FACTOR = 1.5
 
 BENCHMARK_CATEGORIES = [

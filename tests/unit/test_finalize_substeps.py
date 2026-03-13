@@ -104,7 +104,7 @@ class TestFinalizeReturnValue:
             "status", "convergence_reason", "repeatability_pct", "report_path",
             "promoted_model", "terminal_reason", "benchmark_publish_count",
             "labeling_session", "elapsed_seconds", "heartbeat_count",
-            "uc_registration",
+            "uc_registration", "held_out_accuracy", "held_out_count",
         }
         assert set(result.keys()) == expected_keys
         assert result["status"] == "CONVERGED"
@@ -130,3 +130,50 @@ class TestFinalizeReturnValue:
             run_repeatability=False, benchmarks=None, max_iterations=5,
         )
         assert result["status"] == "STALLED"
+
+    def test_held_out_none_when_no_held_out_benchmarks(self, _mock_finalize_deps):
+        from genie_space_optimizer.optimization.harness import _run_finalize
+
+        benchmarks = [
+            {"id": f"q{i}", "question": f"Q{i}", "split": "train"}
+            for i in range(5)
+        ]
+        result = _run_finalize(
+            MagicMock(), MagicMock(), "run-1", "space-1", "domain", "exp",
+            {"syntax_validity": 95.0}, "mv-1", 2, "cat", "gold",
+            run_repeatability=False, benchmarks=benchmarks,
+        )
+        assert result["held_out_accuracy"] is None
+        assert result["held_out_count"] == 0
+
+    @patch("genie_space_optimizer.optimization.harness.run_evaluation", return_value={"overall_accuracy": 66.7, "rows_json": []})
+    @patch("genie_space_optimizer.optimization.harness.write_iteration")
+    @patch("genie_space_optimizer.optimization.harness.make_predict_fn", return_value=MagicMock())
+    @patch("genie_space_optimizer.optimization.harness.make_all_scorers", return_value=[])
+    @patch("genie_space_optimizer.optimization.harness._ensure_sql_context")
+    def test_held_out_eval_runs_with_held_out_benchmarks(
+        self, _esc, _mas, _mpf, mock_write_iter, mock_run_eval, _mock_finalize_deps, capsys,
+    ):
+        from genie_space_optimizer.optimization.harness import _run_finalize
+
+        benchmarks = [
+            {"id": f"q{i}", "question": f"Q{i}", "split": "train"}
+            for i in range(5)
+        ] + [
+            {"id": f"ho{i}", "question": f"HO{i}", "split": "held_out"}
+            for i in range(2)
+        ]
+        result = _run_finalize(
+            MagicMock(), MagicMock(), "run-1", "space-1", "domain", "exp",
+            {"genie_correct": 85.0}, "mv-1", 2, "cat", "gold",
+            run_repeatability=False, benchmarks=benchmarks,
+        )
+        mock_run_eval.assert_called_once()
+        call_args = mock_run_eval.call_args
+        assert call_args[0][6] == "held_out"
+        assert len(call_args[0][3]) == 2  # held_out benchmarks only
+        assert result["held_out_accuracy"] == 66.7
+        assert result["held_out_count"] == 2
+
+        captured = capsys.readouterr()
+        assert "HELD-OUT GENERALIZATION CHECK" in captured.out

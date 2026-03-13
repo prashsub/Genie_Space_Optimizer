@@ -177,7 +177,10 @@ export function BenchmarksStage() {
           title: "Train/Held-Out Split",
           content: (
             <p className="text-sm">
-              Every 5th synthetic → held_out; curated shuffle with seed=42 at 80/20.
+              15% of synthetic/gap-fill benchmarks are held out (deterministic
+              seed=42). Curated questions always remain in train. The optimizer
+              never sees held-out questions — they are evaluated once in Finalize
+              as a directional generalization check.
             </p>
           ),
         },

@@ -14,7 +14,7 @@ import re as _re
 from contextlib import contextmanager
 from typing import Any
 
-from genie_space_optimizer.common.config import TEMPLATE_VARIABLES
+from genie_space_optimizer.common.config import HELD_OUT_RATIO, TEMPLATE_VARIABLES
 from genie_space_optimizer.common.genie_client import detect_asset_type
 
 logger = logging.getLogger(__name__)
@@ -635,19 +635,29 @@ def validate_question_sql_alignment(
 
 def assign_splits(
     benchmarks: list[dict],
-    train_ratio: float = 0.8,
+    train_ratio: float = 1.0 - HELD_OUT_RATIO,
     seed: int = 42,
 ) -> list[dict]:
     """Assign ``split`` field (``train`` or ``held_out``) to each benchmark.
 
-    Uses deterministic shuffle based on seed for reproducibility.
-    """
-    rng = random.Random(seed)
-    indices = list(range(len(benchmarks)))
-    rng.shuffle(indices)
-    cutoff = int(len(benchmarks) * train_ratio)
+    Curated benchmarks (``provenance == "curated"``) are always assigned to
+    ``train`` so the optimizer always sees user-authored questions.  Only
+    non-curated benchmarks participate in the random held-out split.
 
-    for rank, idx in enumerate(indices):
+    Uses deterministic shuffle based on *seed* for reproducibility.
+    """
+    curated_indices = {
+        i for i, b in enumerate(benchmarks) if b.get("provenance") == "curated"
+    }
+    splittable = [i for i in range(len(benchmarks)) if i not in curated_indices]
+
+    rng = random.Random(seed)
+    rng.shuffle(splittable)
+    cutoff = int(len(splittable) * train_ratio)
+
+    for i in curated_indices:
+        benchmarks[i]["split"] = "train"
+    for rank, idx in enumerate(splittable):
         benchmarks[idx]["split"] = "train" if rank < cutoff else "held_out"
 
     return benchmarks
@@ -693,6 +703,7 @@ def build_eval_records(benchmarks: list[dict]) -> list[dict]:
                     "required_tables": b.get("required_tables", []),
                     "required_columns": b.get("required_columns", []),
                     "category": b.get("category", ""),
+                    "split": b.get("split", "train"),
                 },
             }
         )

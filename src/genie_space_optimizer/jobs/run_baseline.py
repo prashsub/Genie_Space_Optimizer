@@ -243,8 +243,9 @@ _log(
 
 uc_schema = f"{catalog}.{schema}"
 benchmarks = load_benchmarks_from_dataset(spark, uc_schema, domain)
+benchmarks = [b for b in benchmarks if b.get("split") != "held_out"]
 _banner("Loaded Benchmarks")
-_log("Benchmark dataset", uc_schema=uc_schema, domain=domain, benchmark_count=len(benchmarks))
+_log("Benchmark dataset (train only)", uc_schema=uc_schema, domain=domain, benchmark_count=len(benchmarks))
 if not benchmarks:
     raise RuntimeError(f"No benchmarks found in {uc_schema}.genie_benchmarks_{domain}")
 

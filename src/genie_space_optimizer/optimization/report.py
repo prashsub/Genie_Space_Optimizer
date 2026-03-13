@@ -62,6 +62,7 @@ def generate_report(
         _build_patch_inventory(patches_df),
         _build_asi_summary(asi_df),
         _build_repeatability_report(iterations_df),
+        _build_generalization_section(iterations_df),
         _build_mlflow_links(run_row, iterations_df),
     ]
 
@@ -134,6 +135,18 @@ def _build_executive_summary(run_row: dict, iterations_df: pd.DataFrame) -> str:
             else:
                 rolled_back += 1
 
+    held_out_line = ""
+    if not iterations_df.empty:
+        ho_rows = iterations_df[iterations_df["eval_scope"] == "held_out"]
+        if not ho_rows.empty:
+            ho_acc = float(ho_rows.iloc[-1].get("overall_accuracy", 0.0))
+            ho_total = int(ho_rows.iloc[-1].get("total_questions", 0))
+            ho_delta = best_accuracy - ho_acc
+            held_out_line = (
+                f"- **Held-Out Accuracy:** {ho_acc:.1f}% "
+                f"({ho_total} questions) — {ho_delta:+.1f}pp vs train\n"
+            )
+
     return (
         f"## Executive Summary\n\n"
         f"- **Baseline Score:** {baseline_accuracy:.1f}%\n"
@@ -142,6 +155,7 @@ def _build_executive_summary(run_row: dict, iterations_df: pd.DataFrame) -> str:
         f"- **Total Iterations:** {total_iterations}\n"
         f"- **Levers Accepted:** {accepted}\n"
         f"- **Levers Rolled Back:** {rolled_back}\n"
+        + held_out_line
     )
 
 
@@ -350,6 +364,37 @@ def _build_repeatability_report(iterations_df: pd.DataFrame) -> str:
                     section += f"  - {cls}: {count} questions\n"
 
     return header + section
+
+
+def _build_generalization_section(iterations_df: pd.DataFrame) -> str:
+    """Render a held-out generalization check section when data is available."""
+    if iterations_df.empty:
+        return ""
+    ho_rows = iterations_df[iterations_df["eval_scope"] == "held_out"]
+    if ho_rows.empty:
+        return ""
+
+    ho_row = ho_rows.iloc[-1]
+    ho_acc = float(ho_row.get("overall_accuracy", 0.0))
+    ho_total = int(ho_row.get("total_questions", 0))
+
+    full_rows = iterations_df[iterations_df["eval_scope"] == "full"]
+    train_acc = float(full_rows.iloc[-1].get("overall_accuracy", 0.0)) if not full_rows.empty else 0.0
+    full_total = int(full_rows.iloc[-1].get("total_questions", 0)) if not full_rows.empty else 0
+    delta = train_acc - ho_acc
+
+    header = "## Generalization Check\n\n"
+    table = (
+        "| Metric | Train | Held-Out | Delta |\n"
+        "|--------|-------|----------|-------|\n"
+        f"| Accuracy | {train_acc:.1f}% ({full_total} Qs) | {ho_acc:.1f}% ({ho_total} Qs) | {delta:+.1f} pp |\n"
+    )
+    note = (
+        "\n> **Note:** Held-out questions were never seen by the optimizer. "
+        "A large delta may indicate instruction overfitting. "
+        f"With only {ho_total} held-out questions, this signal is directional.\n"
+    )
+    return header + table + note
 
 
 def _build_mlflow_links(run_row: dict, iterations_df: pd.DataFrame) -> str:

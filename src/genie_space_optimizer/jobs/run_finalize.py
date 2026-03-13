@@ -219,12 +219,14 @@ _log(
 
 uc_schema = f"{catalog}.{schema}"
 benchmarks = load_benchmarks_from_dataset(spark, uc_schema, domain)
-_banner("Loaded Benchmarks for Repeatability")
+_held_out_n = sum(1 for b in benchmarks if b.get("split") == "held_out")
+_banner("Loaded Benchmarks for Repeatability + Held-Out Eval")
 _log(
-    "Benchmark dataset",
+    "Benchmark dataset (train + held_out)",
     uc_schema=uc_schema,
     domain=domain,
     benchmark_count=len(benchmarks),
+    held_out_count=_held_out_n,
 )
 
 # COMMAND ----------
