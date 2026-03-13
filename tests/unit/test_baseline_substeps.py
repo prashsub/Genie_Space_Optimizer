@@ -112,11 +112,10 @@ class TestBaselineDisplayScorecard:
 
 class TestBaselinePersistState:
     @patch("genie_space_optimizer.optimization.harness.log_judge_verdicts_on_traces")
-    @patch("genie_space_optimizer.optimization.harness.link_eval_scores_to_model")
     @patch("genie_space_optimizer.optimization.harness.update_run_status")
     @patch("genie_space_optimizer.optimization.harness.write_iteration")
     @patch("genie_space_optimizer.optimization.harness.write_stage")
-    def test_returns_expected_keys(self, mock_ws, mock_wi, mock_ur, mock_link, mock_verdicts):
+    def test_returns_expected_keys(self, mock_ws, mock_wi, mock_ur, mock_verdicts):
         from genie_space_optimizer.optimization.harness import baseline_persist_state
 
         eval_result = {"scores": {"j1": 90.0}, "overall_accuracy": 90.0, "thresholds_met": True}
@@ -130,11 +129,10 @@ class TestBaselinePersistState:
         }
 
     @patch("genie_space_optimizer.optimization.harness.log_judge_verdicts_on_traces")
-    @patch("genie_space_optimizer.optimization.harness.link_eval_scores_to_model")
     @patch("genie_space_optimizer.optimization.harness.update_run_status")
     @patch("genie_space_optimizer.optimization.harness.write_iteration")
     @patch("genie_space_optimizer.optimization.harness.write_stage")
-    def test_writes_iteration_and_stage(self, mock_ws, mock_wi, mock_ur, mock_link, mock_verdicts):
+    def test_writes_iteration_and_stage(self, mock_ws, mock_wi, mock_ur, mock_verdicts):
         from genie_space_optimizer.optimization.harness import baseline_persist_state
 
         eval_result = {"scores": {}, "overall_accuracy": 0.0, "thresholds_met": False}
@@ -149,7 +147,6 @@ class TestBaselinePersistState:
 
 class TestBaselineWrapperEquivalence:
     @patch("genie_space_optimizer.optimization.harness.log_judge_verdicts_on_traces")
-    @patch("genie_space_optimizer.optimization.harness.link_eval_scores_to_model")
     @patch("genie_space_optimizer.optimization.harness.update_run_status")
     @patch("genie_space_optimizer.optimization.harness.write_iteration")
     @patch("genie_space_optimizer.optimization.harness.write_stage")
@@ -160,7 +157,7 @@ class TestBaselineWrapperEquivalence:
     @patch("genie_space_optimizer.optimization.harness.format_mlflow_template", return_value="tmpl")
     def test_wrapper_returns_same_keys_as_substeps(
         self, mock_fmt, mock_ctx, mock_pred, mock_scorers, mock_eval,
-        mock_ws, mock_wi, mock_ur, mock_link, mock_verdicts,
+        mock_ws, mock_wi, mock_ur, mock_verdicts,
     ):
         from genie_space_optimizer.optimization.harness import _run_baseline
 

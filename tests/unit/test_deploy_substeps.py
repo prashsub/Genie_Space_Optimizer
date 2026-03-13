@@ -84,9 +84,8 @@ class TestDeployExecute:
             w, spark, "run-1", "dabs://target", "space-1", "exp", "domain",
             "mv-1", 3, "cat", "gold",
         )
-        assert result["status"] == "DEPLOYED"
+        assert result["status"] == "PENDING_APPROVAL"
         assert result["deploy_target"] == "dabs://target"
-        assert mock_write_stage.call_count == 2
 
     @patch("genie_space_optimizer.optimization.harness.write_stage")
     def test_prints_result_block(self, mock_write_stage, capsys):

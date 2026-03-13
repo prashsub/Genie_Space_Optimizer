@@ -104,6 +104,7 @@ class TestFinalizeReturnValue:
             "status", "convergence_reason", "repeatability_pct", "report_path",
             "promoted_model", "terminal_reason", "benchmark_publish_count",
             "labeling_session", "elapsed_seconds", "heartbeat_count",
+            "uc_registration",
         }
         assert set(result.keys()) == expected_keys
         assert result["status"] == "CONVERGED"

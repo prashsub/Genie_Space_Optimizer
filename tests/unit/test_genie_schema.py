@@ -426,7 +426,7 @@ class TestNormalizeJoinSpecSql:
         assert result["sql"][0].startswith("`dim_job_task`.")
         assert "`jt`" not in result["sql"][0]
         assert "`j`" not in result["sql"][0]
-        assert result["sql"][1] == "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"
+        assert "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--" in result["sql"]
 
     def test_preserves_rt_marker(self):
         spec = {

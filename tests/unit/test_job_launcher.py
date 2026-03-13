@@ -103,6 +103,8 @@ class TestGetJobUrl:
         ws.config.host = "https://myworkspace.cloud.databricks.com"
         job = MagicMock()
         job.job_id = 789
+        job.settings = MagicMock()
+        job.settings.tags = {"managed-by": "databricks-bundle"}
         ws.jobs.list.return_value = [job]
 
         url = get_job_url(ws, job_id=None)
@@ -154,7 +156,12 @@ class TestCheckJobHealth:
         ws = MagicMock()
         job = MagicMock()
         job.job_id = 42
+        job.settings = MagicMock()
+        job.settings.tags = {"managed-by": "databricks-bundle"}
+        detail = MagicMock()
+        detail.run_as_user_name = "sp-1"
         ws.jobs.list.return_value = [job]
+        ws.jobs.get.return_value = detail
 
         ok, msg = check_job_health(ws, "sp-1", job_id=None)
         assert ok is True

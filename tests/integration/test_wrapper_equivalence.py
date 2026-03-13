@@ -85,7 +85,6 @@ class TestBaselineWrapperEquivalence:
         mock_persist.assert_called_once()
 
     @patch("genie_space_optimizer.optimization.harness.log_judge_verdicts_on_traces")
-    @patch("genie_space_optimizer.optimization.harness.link_eval_scores_to_model")
     @patch("genie_space_optimizer.optimization.harness.update_run_status")
     @patch("genie_space_optimizer.optimization.harness.write_iteration")
     @patch("genie_space_optimizer.optimization.harness.write_stage")
@@ -213,6 +212,7 @@ class TestFinalizeReturnValueEquivalence:
             "status", "convergence_reason", "repeatability_pct", "report_path",
             "promoted_model", "terminal_reason", "benchmark_publish_count",
             "labeling_session", "elapsed_seconds", "heartbeat_count",
+            "uc_registration",
         }
         assert set(result.keys()) == expected_keys
 
