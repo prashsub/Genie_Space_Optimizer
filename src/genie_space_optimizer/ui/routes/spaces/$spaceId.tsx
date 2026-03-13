@@ -153,7 +153,7 @@ function SpaceDetail() {
     })?.joins ?? []
   );
   const optimizationHistory = (
-    (space as {
+    (space as unknown as {
       optimizationHistory?: Array<{
         runId: string;
         status: string;

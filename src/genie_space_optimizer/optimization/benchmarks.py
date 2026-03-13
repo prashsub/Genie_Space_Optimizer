@@ -148,6 +148,44 @@ def fix_mv_alias_sort_collision(sql: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _normalize_benchmark_row(row: dict) -> dict:
+    """Flatten MLflow evaluation dataset nested structs to a flat benchmark dict.
+
+    MLflow ``genai.datasets`` stores records as ``{inputs: {...}, expectations: {...}}``.
+    All downstream consumers expect flat dicts with top-level ``question``,
+    ``expected_sql``, ``id``, etc.  This function handles both formats so the
+    loader is resilient to schema changes.
+    """
+    if "inputs" not in row and "expectations" not in row:
+        return row
+
+    flat: dict = {}
+
+    inputs = row.get("inputs")
+    if isinstance(inputs, dict):
+        flat.update(inputs)
+    elif hasattr(inputs, "asDict"):
+        flat.update(inputs.asDict())
+
+    expectations = row.get("expectations")
+    if isinstance(expectations, dict):
+        flat.update(expectations)
+    elif hasattr(expectations, "asDict"):
+        flat.update(expectations.asDict())
+
+    if not flat.get("expected_sql") and flat.get("expected_response"):
+        flat["expected_sql"] = flat["expected_response"]
+
+    if flat.get("question_id") and not flat.get("id"):
+        flat["id"] = flat["question_id"]
+
+    for k, v in row.items():
+        if k not in ("inputs", "expectations") and k not in flat:
+            flat[k] = v
+
+    return flat
+
+
 def load_benchmarks_from_dataset(
     spark_or_dataset: Any,
     uc_schema: str,
@@ -185,7 +223,10 @@ def load_benchmarks_from_dataset(
                     _safe_refresh(spark, _quote_identifier_fqn(table_name))
                     df = spark.table(table_name)
                     rows = df.collect()
-                    return [r.asDict() for r in rows]
+                    benchmarks = [_normalize_benchmark_row(r.asDict(recursive=True)) for r in rows]
+                    if rows and "inputs" in (rows[0].asDict()):
+                        logger.debug("Normalized %d benchmark rows from nested MLflow format", len(rows))
+                    return benchmarks
                 except Exception as read_err:
                     err_msg = str(read_err)
                     if "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS" in err_msg and attempt < _max_retries - 1:
@@ -201,7 +242,7 @@ def load_benchmarks_from_dataset(
         else:
             df = spark_or_dataset
             rows = df.collect()
-            return [r.asDict() for r in rows]
+            return [_normalize_benchmark_row(r.asDict(recursive=True)) for r in rows]
     except Exception:
         logger.exception("Failed to load benchmarks from %s", table_name)
         return []

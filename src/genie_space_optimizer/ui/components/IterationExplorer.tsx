@@ -155,27 +155,27 @@ function PatchFailedView({ iteration }: { iteration: IterationDetail }) {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3 text-xs">
-          {rootCause && (
+          {rootCause ? (
             <div className="flex items-center gap-2">
               <Target className="h-3.5 w-3.5 text-orange-500" />
               <span className="text-muted-foreground">Root cause targeted:</span>
               <span>{String(rootCause)}</span>
             </div>
-          )}
-          {rationale && (
+          ) : null}
+          {rationale ? (
             <div className="rounded border border-blue-200 bg-blue-50/50 p-2">
               <p className="mb-1 text-[10px] font-medium text-blue-700">Strategist Rationale</p>
               <p className="text-[11px] leading-relaxed">{String(rationale)}</p>
             </div>
-          )}
-          {patchError && (
+          ) : null}
+          {patchError ? (
             <div className="rounded border border-orange-200 bg-orange-50/50 p-2">
               <p className="mb-1 text-[10px] font-medium text-orange-700">Error</p>
               <pre className="whitespace-pre-wrap text-[10px] leading-relaxed text-orange-900">
                 {String(patchError)}
               </pre>
             </div>
-          )}
+          ) : null}
           <p className="text-muted-foreground">
             The strategist's proposed patches could not be applied. The optimizer
             automatically advanced to the next iteration with a different approach.
@@ -295,36 +295,40 @@ function IterationView({
                   <p className="text-[11px] leading-relaxed">{String(iteration.clusterInfo.rationale)}</p>
                 </div>
               )}
-              {iteration.clusterInfo.escalation && (
-                <div className="mt-1.5 rounded border border-amber-200 bg-amber-50/50 p-2">
-                  <div className="flex items-center gap-1.5 mb-1">
-                    <AlertTriangle className="h-3 w-3 text-amber-600" />
-                    <p className="text-[10px] font-medium text-amber-700">
-                      Escalation: {String(iteration.clusterInfo.escalation.type || "unknown")}
-                    </p>
-                    <Badge
-                      variant="outline"
-                      className={`ml-auto text-[9px] px-1.5 py-0 ${
-                        iteration.clusterInfo.escalation.handled
-                          ? "border-green-300 text-green-700"
-                          : "border-red-300 text-red-700"
-                      }`}
-                    >
-                      {iteration.clusterInfo.escalation.handled ? "Handled" : "Pending"}
-                    </Badge>
+              {(() => {
+                const esc = iteration.clusterInfo.escalation as { type?: string; handled?: boolean; detail?: unknown } | undefined;
+                if (!esc) return null;
+                return (
+                  <div className="mt-1.5 rounded border border-amber-200 bg-amber-50/50 p-2">
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <AlertTriangle className="h-3 w-3 text-amber-600" />
+                      <p className="text-[10px] font-medium text-amber-700">
+                        Escalation: {String(esc.type || "unknown")}
+                      </p>
+                      <Badge
+                        variant="outline"
+                        className={`ml-auto text-[9px] px-1.5 py-0 ${
+                          esc.handled
+                            ? "border-green-300 text-green-700"
+                            : "border-red-300 text-red-700"
+                        }`}
+                      >
+                        {esc.handled ? "Handled" : "Pending"}
+                      </Badge>
+                    </div>
+                    {esc.detail ? (
+                      <details className="text-[11px]">
+                        <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                          Escalation details
+                        </summary>
+                        <pre className="mt-1 rounded bg-muted p-1.5 text-[10px] overflow-x-auto">
+                          {JSON.stringify(esc.detail, null, 2)}
+                        </pre>
+                      </details>
+                    ) : null}
                   </div>
-                  {iteration.clusterInfo.escalation.detail && (
-                    <details className="text-[11px]">
-                      <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-                        Escalation details
-                      </summary>
-                      <pre className="mt-1 rounded bg-muted p-1.5 text-[10px] overflow-x-auto">
-                        {JSON.stringify(iteration.clusterInfo.escalation.detail, null, 2)}
-                      </pre>
-                    </details>
-                  )}
-                </div>
-              )}
+                );
+              })()}
               {iteration.clusterInfo.instruction_rewrite_preview && (
                 <details className="mt-1">
                   <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
