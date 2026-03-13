@@ -608,21 +608,24 @@ function SpaceDetail() {
                 >
                   Config Only
                 </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={applyMode === "both" ? "default" : "ghost"}
-                  onClick={() => setApplyMode("both")}
-                  disabled={!canStartWithWrites && !canStartOptimization}
-                  title={
-                    !canStartWithWrites
-                      ? "Write (MODIFY) permissions required — grant them in Settings"
-                      : undefined
-                  }
-                >
-                  Config + UC Write Backs
-                </Button>
+                <div className="relative">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled
+                    className="opacity-50"
+                  >
+                    Config + UC Write Backs
+                  </Button>
+                  <span className="absolute -top-2 -right-2 rounded-full bg-amber-100 text-amber-700 text-[10px] font-medium px-1.5 py-0.5 border border-amber-200">
+                    Coming soon
+                  </span>
+                </div>
               </div>
+              <p className="text-xs text-muted-foreground max-w-xs">
+                Changes will be applied only to the selected Genie Space configuration. Underlying Unity Catalog tables, columns, and descriptions will not be modified.
+              </p>
             </div>
 
             {/* Lever checkboxes */}
@@ -717,33 +720,7 @@ function SpaceDetail() {
             </Alert>
           )}
 
-          {canStartOptimization && !canStartWithWrites && applyMode === "both" && (
-            <Alert variant="destructive" className="border-amber-300 bg-amber-50 text-amber-900 [&>svg]:text-amber-600">
-              <ShieldAlert className="h-4 w-4" />
-              <AlertTitle>Write permissions missing</AlertTitle>
-              <AlertDescription className="space-y-2">
-                <p>The <strong>Config + UC Write Backs</strong> mode requires MODIFY access.</p>
-                {spacePerms?.schemas && spacePerms.schemas.filter((s) => !s.writeGranted).length > 0 && (
-                  <ul className="mt-1 space-y-1">
-                    {spacePerms.schemas.filter((s) => !s.writeGranted).map((s) => (
-                      <li key={`${s.catalog}.${s.schema_name}-w`} className="font-mono text-xs bg-amber-100 rounded px-2 py-1">
-                        {s.writeGrantCommand || `GRANT MODIFY ON SCHEMA ${s.catalog}.${s.schema_name} TO ...`}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <p className="text-xs">
-                  <Link
-                    to="/settings"
-                    search={{ spaceId }}
-                    className="underline hover:text-amber-800"
-                  >
-                    Grant in Settings
-                  </Link>
-                </p>
-              </AlertDescription>
-            </Alert>
-          )}
+          {/* UC Write Backs alert hidden — mode is disabled (coming soon) */}
 
           {permsLoading && (
             <p className="text-xs text-muted-foreground">

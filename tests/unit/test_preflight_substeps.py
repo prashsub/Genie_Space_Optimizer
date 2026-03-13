@@ -286,8 +286,6 @@ class TestPreflightLoadHumanFeedback:
 # ---------------------------------------------------------------------------
 
 class TestPreflightSetupExperiment:
-    @patch("genie_space_optimizer.optimization.preflight.create_genie_model_version", return_value="mv-1")
-    @patch("genie_space_optimizer.optimization.preflight.register_benchmark_prompts", return_value=["p1", "p2"])
     @patch("genie_space_optimizer.optimization.preflight.create_evaluation_dataset")
     @patch("genie_space_optimizer.optimization.preflight._drop_benchmark_table")
     @patch("genie_space_optimizer.optimization.preflight.compute_asset_fingerprint", return_value="fp123")
@@ -300,7 +298,7 @@ class TestPreflightSetupExperiment:
     @patch("genie_space_optimizer.optimization.preflight.write_stage")
     def test_returns_expected_keys(self, mock_ws, mock_resolve, mock_dir, mock_mlflow,
                                     mock_instr_fn, mock_reg_instr, mock_flag, mock_fp,
-                                    mock_drop, mock_create_ds, mock_reg_benchmark, mock_model):
+                                    mock_drop, mock_create_ds):
         from genie_space_optimizer.optimization.preflight import preflight_setup_experiment
 
         mock_exp = MagicMock()
@@ -313,9 +311,9 @@ class TestPreflightSetupExperiment:
             [], [], [], [],
         )
         assert set(result.keys()) == {
-            "model_id", "experiment_name", "experiment_id", "prompt_registrations",
+            "model_id", "experiment_name", "experiment_id",
         }
-        assert result["model_id"] == "mv-1"
+        assert result["model_id"] is None
         assert result["experiment_name"] == "/exp/path"
 
 
