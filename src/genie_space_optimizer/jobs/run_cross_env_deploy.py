@@ -75,7 +75,17 @@ if not model_name or not model_version:
     raise ValueError("model_name and model_version are required parameters")
 
 if not target_workspace_url:
-    raise ValueError("target_workspace_url is required")
+    _log("target_workspace_url empty, checking model version tags for fallback")
+    from mlflow import MlflowClient as _TagClient
+    _tag_client = _TagClient(registry_uri="databricks-uc")
+    _tag_mv = _tag_client.get_model_version(model_name, model_version)
+    _mv_tags = _tag_mv.tags or {}
+    target_workspace_url = _mv_tags.get("genie.deploy_target_url", "")
+    if target_workspace_url:
+        _log("Resolved target_workspace_url from model version tag", url=target_workspace_url)
+
+if not target_workspace_url:
+    raise ValueError("target_workspace_url is required (not in widget or model version tags)")
 
 # COMMAND ----------
 

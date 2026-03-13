@@ -1044,7 +1044,9 @@ function DeploymentBadge({
           ? "Deploy failed"
           : status === "SKIPPED"
             ? "Deploy skipped"
-            : status;
+            : status === "PENDING_APPROVAL"
+              ? "Awaiting approval"
+              : status;
 
   const className =
     status === "DEPLOYED"
@@ -1053,7 +1055,9 @@ function DeploymentBadge({
         ? "border-db-blue/30 text-db-blue"
         : status === "FAILED"
           ? "border-db-red-error/30 text-db-red-error"
-          : "text-muted-foreground";
+          : status === "PENDING_APPROVAL"
+            ? "border-amber-500/30 text-amber-500"
+            : "text-muted-foreground";
 
   const badge = (
     <Badge variant="outline" className={className}>

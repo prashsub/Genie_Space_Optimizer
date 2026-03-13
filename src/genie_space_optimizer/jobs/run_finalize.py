@@ -168,6 +168,7 @@ catalog = dbutils.jobs.taskValues.get(taskKey="preflight", key="catalog")
 schema = dbutils.jobs.taskValues.get(taskKey="preflight", key="schema")
 exp_name = dbutils.jobs.taskValues.get(taskKey="preflight", key="experiment_name")
 max_iterations = int(dbutils.jobs.taskValues.get(taskKey="preflight", key="max_iterations"))
+deploy_target = dbutils.jobs.taskValues.get(taskKey="preflight", key="deploy_target") or None
 
 import mlflow
 mlflow.set_experiment(exp_name)
@@ -195,6 +196,7 @@ _log(
     catalog=catalog,
     schema=schema,
     experiment_name=exp_name,
+    deploy_target=deploy_target,
     lever_skipped=bool(lever_skipped),
     prev_model_id=prev_model_id,
     iteration_counter=iteration_counter,
@@ -273,6 +275,7 @@ try:
         run_repeatability=True,
         benchmarks=benchmarks,
         max_iterations=max_iterations,
+        deploy_target=deploy_target,
     )
     _log(
         "Finalize finished",
@@ -326,6 +329,8 @@ if _uc_reg:
     dbutils.jobs.taskValues.set(key="uc_model_name", value=_uc_reg.get("uc_model_name", ""))
     dbutils.jobs.taskValues.set(key="uc_model_version", value=_uc_reg.get("version", ""))
     dbutils.jobs.taskValues.set(key="uc_champion_promoted", value=_uc_reg.get("promoted_to_champion", False))
+    if _uc_reg.get("deploy_target"):
+        dbutils.jobs.taskValues.set(key="uc_deploy_target", value=_uc_reg["deploy_target"])
 else:
     dbutils.jobs.taskValues.set(key="uc_model_name", value="")
     dbutils.jobs.taskValues.set(key="uc_model_version", value="")

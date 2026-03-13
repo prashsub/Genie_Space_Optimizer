@@ -123,12 +123,18 @@ _TEMPORAL_QUESTION_RE = re.compile(
 def _flag_stale_temporal_benchmarks(
     benchmarks: list[dict],
     spark: "SparkSession",
+    *,
+    w: Any = None,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Flag benchmarks whose GT SQL returns 0 rows due to stale temporal filters.
 
     Sets ``temporal_stale=True`` on benchmarks where the question contains
     temporal patterns and the GT SQL returns 0 rows.  Flagged benchmarks are
     excluded from accuracy scoring in ``_compute_arbiter_adjusted_accuracy``.
+
+    When *w* and *warehouse_id* are provided, routes the check through the
+    SQL warehouse; otherwise uses Spark SQL.
     """
     from genie_space_optimizer.optimization.benchmarks import _quiet_grpc_logs
 
@@ -142,14 +148,26 @@ def _flag_stale_temporal_benchmarks(
             continue
         try:
             with _quiet_grpc_logs():
-                df = spark.sql(sql).limit(1)
-                if df.count() == 0:
-                    b["temporal_stale"] = True
-                    flagged_count += 1
-                    logger.info(
-                        "Temporal benchmark '%s' returns 0 rows -- flagged as stale",
-                        q[:60],
+                if w and warehouse_id:
+                    result_df = _execute_sql_via_warehouse(
+                        w, warehouse_id, f"SELECT * FROM ({sql}) LIMIT 1",
                     )
+                    if result_df.empty:
+                        b["temporal_stale"] = True
+                        flagged_count += 1
+                        logger.info(
+                            "Temporal benchmark '%s' returns 0 rows -- flagged as stale",
+                            q[:60],
+                        )
+                else:
+                    df = spark.sql(sql).limit(1)
+                    if df.count() == 0:
+                        b["temporal_stale"] = True
+                        flagged_count += 1
+                        logger.info(
+                            "Temporal benchmark '%s' returns 0 rows -- flagged as stale",
+                            q[:60],
+                        )
         except Exception:
             pass
     if flagged_count:
@@ -1109,6 +1127,37 @@ def _execute_sql_via_warehouse(
     raise RuntimeError(error_msg or "SQL warehouse query failed")
 
 
+def _exec_sql(
+    sql: str,
+    spark: Any,
+    *,
+    w: Any = None,
+    warehouse_id: str = "",
+    catalog: str = "",
+    schema: str = "",
+) -> "pd.DataFrame":
+    """Execute SQL via warehouse (primary) or Spark (fallback).
+
+    Returns a pandas DataFrame in both cases.  When the warehouse is
+    available and *warehouse_id* is set, routes through the Statement
+    Execution API.  Otherwise falls back to ``spark.sql().toPandas()``.
+    """
+    if w and warehouse_id:
+        try:
+            return _execute_sql_via_warehouse(
+                w, warehouse_id, sql,
+                catalog=catalog, schema=schema,
+            )
+        except Exception:
+            logger.debug(
+                "Warehouse SQL failed, falling back to Spark: %s",
+                sql[:120], exc_info=True,
+            )
+    if catalog:
+        _set_sql_context(spark, catalog, schema)
+    return spark.sql(sql).toPandas()
+
+
 _SQL_PARAM_RE = re.compile(
     r"(?<![:\w])"     # not preceded by : or word char (avoids ::cast, timestamps)
     r":([a-zA-Z_]\w*)"  # :param_name
@@ -2020,6 +2069,76 @@ def register_instruction_version(
         return None
 
 
+def register_benchmark_prompts(
+    uc_schema: str,
+    domain: str,
+    experiment_name: str,
+) -> dict[str, dict]:
+    """Register only the benchmark prompts to MLflow Prompt Registry.
+
+    Called early in preflight (before benchmark generation) so that
+    ``_call_llm_for_scoring`` can link benchmark prompts to traces.
+    """
+    mlflow.set_experiment(experiment_name)
+    registered: dict[str, dict] = {}
+    for name, template in BENCHMARK_PROMPTS.items():
+        candidates = _prompt_name_candidates(
+            uc_schema=uc_schema, domain=domain, judge_name=name,
+        )
+        for prompt_name in candidates:
+            try:
+                version = mlflow.genai.register_prompt(
+                    name=prompt_name,
+                    template=template,
+                    commit_message=f"Genie benchmark: {name} (domain: {domain})",
+                    tags={"domain": domain, "type": "benchmark"},
+                )
+                mlflow.genai.set_prompt_alias(
+                    name=prompt_name,
+                    alias=PROMPT_ALIAS,
+                    version=version.version,
+                )
+                registered[name] = {
+                    "prompt_name": prompt_name,
+                    "version": str(version.version),
+                }
+                _REGISTERED_PROMPT_NAMES[name] = prompt_name
+                logger.info(
+                    "[Benchmark Prompt Registry] %s v%s",
+                    prompt_name, version.version,
+                )
+                break
+            except Exception as exc:
+                if _is_ownership_conflict(str(exc)) and _try_drop_prompt(prompt_name):
+                    try:
+                        version = mlflow.genai.register_prompt(
+                            name=prompt_name,
+                            template=template,
+                            commit_message=f"Genie benchmark: {name} (domain: {domain})",
+                            tags={"domain": domain, "type": "benchmark"},
+                        )
+                        mlflow.genai.set_prompt_alias(
+                            name=prompt_name,
+                            alias=PROMPT_ALIAS,
+                            version=version.version,
+                        )
+                        registered[name] = {
+                            "prompt_name": prompt_name,
+                            "version": str(version.version),
+                        }
+                        _REGISTERED_PROMPT_NAMES[name] = prompt_name
+                        break
+                    except Exception:
+                        pass
+                logger.debug(
+                    "Benchmark prompt registration failed for %s name=%s",
+                    name, prompt_name, exc_info=True,
+                )
+        if name not in registered:
+            logger.warning("Could not register benchmark prompt: %s", name)
+    return registered
+
+
 def register_judge_prompts(
     uc_schema: str,
     domain: str,
@@ -2136,6 +2255,12 @@ def register_judge_prompts(
             ("benchmark", BENCHMARK_PROMPTS, "benchmark"),
         ]:
             for name, template in prompt_dict.items():
+                if name in _REGISTERED_PROMPT_NAMES:
+                    _all_extra[name] = {
+                        "prompt_name": _REGISTERED_PROMPT_NAMES[name],
+                        "version": "pre-registered",
+                    }
+                    continue
                 candidates = _prompt_name_candidates(uc_schema=uc_schema, domain=domain, judge_name=name)
                 for prompt_name in candidates:
                     try:
@@ -4567,6 +4692,8 @@ def _attempt_benchmark_correction(
     schema: str,
     spark: SparkSession,
     allowlist: dict[str, Any],
+    *,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Send invalid benchmarks back to the LLM for correction.
 
@@ -4613,7 +4740,10 @@ def _attempt_benchmark_correction(
     )
 
     try:
-        response = _call_llm_for_scoring(w, prompt)
+        response = _call_llm_for_scoring(
+            w, prompt,
+            prompt_name=get_registered_prompt_name("benchmark_correction"),
+        )
         corrections: list[dict] = response if isinstance(response, list) else response.get("benchmarks", [])
     except Exception:
         logger.warning("Benchmark correction LLM call failed", exc_info=True)
@@ -4639,7 +4769,10 @@ def _attempt_benchmark_correction(
                 reason_message,
             )
             continue
-        is_valid, err = _validate_benchmark_sql(sql, spark, catalog, schema)
+        is_valid, err = _validate_benchmark_sql(
+            sql, spark, catalog, schema,
+            w=w, warehouse_id=warehouse_id,
+        )
         if is_valid:
             c["provenance"] = "auto_corrected"
             c["validation_status"] = "valid"
@@ -4793,6 +4926,8 @@ def _fill_coverage_gaps(
     domain: str,
     existing_questions: set[str],
     category_performance: dict[str, dict] | None = None,
+    *,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Generate targeted benchmarks for Genie Space assets with zero coverage.
 
@@ -4889,7 +5024,10 @@ def _fill_coverage_gaps(
     )
 
     try:
-        response = _call_llm_for_scoring(w, prompt)
+        response = _call_llm_for_scoring(
+            w, prompt,
+            prompt_name=get_registered_prompt_name("benchmark_coverage_gap"),
+        )
         raw: list[dict] = response if isinstance(response, list) else response.get("benchmarks", [])
     except Exception:
         logger.warning("Coverage gap-fill LLM call failed", exc_info=True)
@@ -4948,7 +5086,10 @@ def _fill_coverage_gaps(
             )
             continue
 
-        is_valid, err = _validate_benchmark_sql(expected_sql, spark, catalog, schema)
+        is_valid, err = _validate_benchmark_sql(
+            expected_sql, spark, catalog, schema,
+            w=w, warehouse_id=warehouse_id,
+        )
         if is_valid:
             valid.append(benchmark)
         else:
@@ -5103,6 +5244,7 @@ def generate_benchmarks(
     target_count: int = TARGET_BENCHMARK_COUNT,
     genie_space_benchmarks: list[dict] | None = None,
     existing_benchmarks: list[dict] | None = None,
+    warehouse_id: str = "",
 ) -> list[dict]:
     """Generate benchmark questions via LLM from Genie Space context.
 
@@ -5164,7 +5306,10 @@ def generate_benchmarks(
     if existing_questions_context:
         prompt += existing_questions_context
 
-    response = _call_llm_for_scoring(w, prompt)
+    response = _call_llm_for_scoring(
+        w, prompt,
+        prompt_name=get_registered_prompt_name("benchmark_generation"),
+    )
     raw_benchmarks: list[dict] = response if isinstance(response, list) else response.get("benchmarks", [])
 
     valid_benchmarks: list[dict] = []
@@ -5248,6 +5393,7 @@ def generate_benchmarks(
                     if candidate_ok:
                         is_candidate_valid, candidate_err = _validate_benchmark_sql(
                             corrected_sql, spark, catalog, schema,
+                            w=w, warehouse_id=warehouse_id,
                         )
                         if is_candidate_valid:
                             candidate["validation_status"] = "valid"
@@ -5272,15 +5418,8 @@ def generate_benchmarks(
 
         is_valid, err = _validate_benchmark_sql(
             expected_sql, spark, catalog, schema, execute=True,
+            w=w, warehouse_id=warehouse_id,
         )
-        if is_valid:
-            try:
-                test_rows = spark.sql(f"SELECT * FROM ({expected_sql}) LIMIT 1").collect()
-                if not test_rows:
-                    is_valid = False
-                    err = "Query returns 0 rows"
-            except Exception:
-                pass
         if is_valid:
             benchmark["validation_status"] = "valid"
             benchmark["validation_reason_code"] = "ok"
@@ -5338,6 +5477,7 @@ def generate_benchmarks(
                 continue
             candidate_valid, candidate_err = _validate_benchmark_sql(
                 corrected_sql, spark, catalog, schema,
+                w=w, warehouse_id=warehouse_id,
             )
             if candidate_valid:
                 candidate["validation_status"] = "valid"
@@ -5359,6 +5499,7 @@ def generate_benchmarks(
         corrected = _attempt_benchmark_correction(
             w, config, uc_columns, uc_routines,
             invalid_benchmarks, catalog, schema, spark, allowlist,
+            warehouse_id=warehouse_id,
         )
         for corrected_item in corrected:
             _register_valid(corrected_item)
@@ -5406,6 +5547,7 @@ def generate_benchmarks(
                 _alignment_corrected = _attempt_benchmark_correction(
                     w, config, uc_columns, uc_routines,
                     _newly_invalid, catalog, schema, spark, allowlist,
+                    warehouse_id=warehouse_id,
                 )
                 for c in _alignment_corrected:
                     _register_valid(c)
@@ -5497,6 +5639,7 @@ def generate_benchmarks(
         allowlist=allowlist,
         domain=domain,
         existing_questions=all_accepted_questions,
+        warehouse_id=warehouse_id,
     )
     gap_fill_offset = len(curated) + len(valid_benchmarks)
     for idx, b in enumerate(gap_fill_benchmarks):

@@ -114,6 +114,39 @@ class TestPreflightCollectUcMetadata:
         )
         assert set(result.keys()) == {"uc_columns", "uc_tags", "uc_routines", "uc_fk"}
 
+    @patch("genie_space_optimizer.optimization.preflight._compute_join_overlaps", return_value=[])
+    @patch("genie_space_optimizer.optimization.preflight._validate_core_access")
+    @patch("genie_space_optimizer.optimization.preflight.write_stage")
+    def test_without_warehouse_id_uses_spark(self, mock_ws_stage, mock_val, mock_join, mock_spark):
+        """Calling without warehouse_id preserves Spark-only behavior (R7)."""
+        from genie_space_optimizer.optimization.preflight import preflight_collect_uc_metadata
+
+        result = preflight_collect_uc_metadata(
+            MagicMock(), mock_spark, "run-1", "cat", "gold",
+            config={}, snapshot={}, genie_table_refs=[],
+        )
+        assert "uc_columns" in result
+
+    @patch("genie_space_optimizer.optimization.preflight._collect_data_profile")
+    @patch("genie_space_optimizer.optimization.preflight._compute_join_overlaps", return_value=[])
+    @patch("genie_space_optimizer.optimization.preflight._validate_core_access")
+    @patch("genie_space_optimizer.optimization.preflight.write_stage")
+    def test_with_warehouse_id_threads_to_profile(
+        self, mock_ws_stage, mock_val, mock_join, mock_profile, mock_spark
+    ):
+        """warehouse_id is forwarded to _collect_data_profile."""
+        from genie_space_optimizer.optimization.preflight import preflight_collect_uc_metadata
+
+        mock_profile.return_value = {}
+        preflight_collect_uc_metadata(
+            MagicMock(), mock_spark, "run-1", "cat", "gold",
+            config={}, snapshot={}, genie_table_refs=[],
+            warehouse_id="wh-123",
+        )
+        if mock_profile.called:
+            _, kwargs = mock_profile.call_args
+            assert kwargs.get("warehouse_id") == "wh-123"
+
 
 # ---------------------------------------------------------------------------
 # Step 3: preflight_generate_benchmarks
@@ -145,6 +178,34 @@ class TestPreflightGenerateBenchmarks:
         captured = capsys.readouterr()
         assert "BENCHMARK GENERATION" in captured.out
 
+    @patch("genie_space_optimizer.optimization.preflight._load_or_generate_benchmarks")
+    def test_without_warehouse_id_backward_compat(self, mock_gen):
+        """Calling without warehouse_id preserves existing behavior (R7)."""
+        from genie_space_optimizer.optimization.preflight import preflight_generate_benchmarks
+
+        mock_gen.return_value = ([{"question": "q1"}], False)
+        result = preflight_generate_benchmarks(
+            MagicMock(), MagicMock(), "run-1", "cat", "gold",
+            {}, [], [], [], "default",
+        )
+        assert "benchmarks" in result
+        _, kwargs = mock_gen.call_args
+        assert kwargs.get("warehouse_id", "") == ""
+
+    @patch("genie_space_optimizer.optimization.preflight._load_or_generate_benchmarks")
+    def test_with_warehouse_id_threads_through(self, mock_gen):
+        """warehouse_id is forwarded to _load_or_generate_benchmarks."""
+        from genie_space_optimizer.optimization.preflight import preflight_generate_benchmarks
+
+        mock_gen.return_value = ([{"question": "q1"}], False)
+        preflight_generate_benchmarks(
+            MagicMock(), MagicMock(), "run-1", "cat", "gold",
+            {}, [], [], [], "default",
+            warehouse_id="wh-456",
+        )
+        _, kwargs = mock_gen.call_args
+        assert kwargs.get("warehouse_id") == "wh-456"
+
 
 # ---------------------------------------------------------------------------
 # Step 4: preflight_validate_benchmarks
@@ -164,6 +225,36 @@ class TestPreflightValidateBenchmarks:
         )
         assert len(result["benchmarks"]) == 6
         assert result["pre_count"] == 7
+
+    @patch("genie_space_optimizer.optimization.preflight.validate_benchmarks")
+    def test_without_warehouse_id_backward_compat(self, mock_validate):
+        """Calling without warehouse_id preserves existing behavior (R7)."""
+        from genie_space_optimizer.optimization.preflight import preflight_validate_benchmarks
+
+        benchmarks = [{"question": f"q{i}", "id": f"b{i}"} for i in range(6)]
+        mock_validate.return_value = [{"valid": True}] * 6
+        result = preflight_validate_benchmarks(
+            MagicMock(), MagicMock(), "run-1", "cat", "gold", {},
+            benchmarks, [], [], [], "default",
+        )
+        assert "benchmarks" in result
+        _, kwargs = mock_validate.call_args
+        assert kwargs.get("warehouse_id", "") == ""
+
+    @patch("genie_space_optimizer.optimization.preflight.validate_benchmarks")
+    def test_with_warehouse_id_threads_through(self, mock_validate):
+        """warehouse_id is forwarded to validate_benchmarks."""
+        from genie_space_optimizer.optimization.preflight import preflight_validate_benchmarks
+
+        benchmarks = [{"question": f"q{i}", "id": f"b{i}"} for i in range(6)]
+        mock_validate.return_value = [{"valid": True}] * 6
+        preflight_validate_benchmarks(
+            MagicMock(), MagicMock(), "run-1", "cat", "gold", {},
+            benchmarks, [], [], [], "default",
+            warehouse_id="wh-789",
+        )
+        _, kwargs = mock_validate.call_args
+        assert kwargs.get("warehouse_id") == "wh-789"
 
 
 # ---------------------------------------------------------------------------

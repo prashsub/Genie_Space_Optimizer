@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from genie_space_optimizer.optimization.benchmarks import (
     assign_splits,
@@ -102,6 +102,51 @@ class TestValidateGroundTruthSql:
         valid, error = validate_ground_truth_sql("INVALID SQL", mock_spark)
         assert valid is False
         assert "parse error" in error
+
+    @patch("genie_space_optimizer.optimization.evaluation._execute_sql_via_warehouse")
+    def test_warehouse_path_used_when_configured(self, mock_wh, mock_spark):
+        mock_wh.return_value = MagicMock()
+        ws = MagicMock()
+        valid, error = validate_ground_truth_sql(
+            "SELECT 1", mock_spark, w=ws, warehouse_id="wh-123",
+        )
+        mock_wh.assert_called()
+        mock_spark.sql.assert_not_called()
+
+
+class TestVerifyTableExists:
+    @patch("genie_space_optimizer.optimization.evaluation._execute_sql_via_warehouse")
+    def test_warehouse_path_checks_existence(self, mock_wh):
+        from genie_space_optimizer.optimization.benchmarks import _verify_table_exists
+
+        mock_wh.return_value = MagicMock()
+        exists, err = _verify_table_exists(
+            MagicMock(), "cat.schema.orders",
+            w=MagicMock(), warehouse_id="wh-123",
+        )
+        assert exists is True
+        assert err == ""
+
+    @patch("genie_space_optimizer.optimization.evaluation._execute_sql_via_warehouse",
+           side_effect=RuntimeError("TABLE_OR_VIEW_NOT_FOUND: cat.schema.missing"))
+    def test_warehouse_table_not_found(self, mock_wh):
+        from genie_space_optimizer.optimization.benchmarks import _verify_table_exists
+
+        exists, err = _verify_table_exists(
+            MagicMock(), "cat.schema.missing",
+            w=MagicMock(), warehouse_id="wh-123",
+        )
+        assert exists is False
+        assert "does not exist" in err
+
+    def test_spark_fallback_preserves_existing_behavior(self):
+        from genie_space_optimizer.optimization.benchmarks import _verify_table_exists
+
+        mock_spark = MagicMock()
+        exists, err = _verify_table_exists(mock_spark, "cat.schema.orders")
+        mock_spark.sql.assert_called_once()
+        assert exists is True
+        assert err == ""
 
 
 class TestBuildEvalRecords:

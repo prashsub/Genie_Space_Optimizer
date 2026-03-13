@@ -237,16 +237,35 @@ def _extract_table_references(sql: str) -> list[tuple[str, bool]]:
     return [(ref, is_tvf) for ref, is_tvf in seen.items()]
 
 
-def _verify_table_exists(spark: Any, fqn: str, is_tvf: bool = False) -> tuple[bool, str]:
+def _verify_table_exists(
+    spark: Any,
+    fqn: str,
+    is_tvf: bool = False,
+    *,
+    w: Any = None,
+    warehouse_id: str = "",
+) -> tuple[bool, str]:
     """Check whether a table/view/metric-view exists via SELECT ... LIMIT 0.
 
     TVF references (``is_tvf=True``) are assumed valid since they cannot be
     verified with table-style SELECT syntax.
+
+    When *w* and *warehouse_id* are provided, routes the check through the
+    SQL warehouse Statement Execution API; otherwise uses Spark SQL.
     """
     if is_tvf:
         return True, ""
     try:
-        spark.sql(f"SELECT * FROM {_quote_identifier_fqn(fqn)} LIMIT 0")
+        if w and warehouse_id:
+            from genie_space_optimizer.optimization.evaluation import (
+                _execute_sql_via_warehouse,
+            )
+            _execute_sql_via_warehouse(
+                w, warehouse_id,
+                f"SELECT * FROM {_quote_identifier_fqn(fqn)} LIMIT 0",
+            )
+        else:
+            spark.sql(f"SELECT * FROM {_quote_identifier_fqn(fqn)} LIMIT 0")
         return True, ""
     except Exception as e:
         msg = str(e)
@@ -395,7 +414,10 @@ def validate_ground_truth_sql(
 
     table_refs = _extract_table_references(resolved)
     for ref, is_tvf in table_refs:
-        exists, err = _verify_table_exists(spark, ref, is_tvf=is_tvf)
+        exists, err = _verify_table_exists(
+            spark, ref, is_tvf=is_tvf,
+            w=w, warehouse_id=warehouse_id,
+        )
         if not exists:
             return False, err
 
@@ -518,6 +540,13 @@ def validate_question_sql_alignment(
         try:
             from databricks.sdk import WorkspaceClient
             from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+            from genie_space_optimizer.optimization.evaluation import (
+                _link_prompt_to_trace,
+                get_registered_prompt_name,
+            )
+
+            _link_prompt_to_trace(get_registered_prompt_name("benchmark_alignment_check"))
 
             w = WorkspaceClient()
             response = w.serving_endpoints.query(

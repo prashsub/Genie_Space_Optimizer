@@ -216,14 +216,43 @@ class _GenieConfigSnapshot(mlflow.pyfunc.PythonModel):
     def predict(
         self,
         context: mlflow.pyfunc.PythonModelContext,
-        model_input: pd.DataFrame,
+        model_input: "pd.DataFrame",
         params: dict[str, Any] | None = None,
-    ) -> list[dict]:
+    ) -> dict:
         if context and context.artifacts:
             cfg_path = context.artifacts.get("space_config", "")
             if cfg_path:
-                return [json.loads(Path(cfg_path).read_text(encoding="utf-8"))]
-        return [{"status": "config_snapshot_only"}]
+                return json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+        return {"status": "config_snapshot_only"}
+
+
+def _extract_space_dimensions(space_config: dict) -> dict[str, Any]:
+    """Extract configuration dimensions from a parsed Genie Space config."""
+    parsed = space_config.get("_parsed_space", space_config)
+    ds = parsed.get("data_sources", {}) if isinstance(parsed, dict) else {}
+    instr = parsed.get("instructions", {}) if isinstance(parsed, dict) else {}
+    benchmarks_block = parsed.get("benchmarks", {}) if isinstance(parsed, dict) else {}
+    cfg_block = parsed.get("config", {}) if isinstance(parsed, dict) else {}
+
+    tables = [t.get("identifier", "") for t in ds.get("tables", []) if isinstance(t, dict)]
+    metric_views = [m.get("identifier", "") for m in ds.get("metric_views", []) if isinstance(m, dict)]
+    functions = [f.get("identifier", "") for f in (
+        instr.get("sql_functions", []) or ds.get("functions", [])
+    ) if isinstance(f, dict)]
+
+    return {
+        "tables": tables,
+        "metric_views": metric_views,
+        "functions": functions,
+        "text_instructions": instr.get("text_instructions", []) or [],
+        "join_specs": instr.get("join_specs", []) or [],
+        "example_sqls": instr.get("example_question_sqls", []) or [],
+        "sql_snippets": instr.get("sql_snippets", {}),
+        "benchmarks": benchmarks_block.get("questions", []) or [],
+        "sample_questions": cfg_block.get("sample_questions", []) or [],
+        "ds_raw": ds,
+        "instr_raw": instr,
+    }
 
 
 def _register_uc_version(
@@ -235,27 +264,91 @@ def _register_uc_version(
     space_config: dict,
     space_id: str,
     domain: str,
+    space_name: str = "",
+    dimensions: dict[str, Any] | None = None,
+    best_accuracy: float = 0.0,
+    baseline_accuracy: float | None = None,
+    best_iter_row: dict[str, Any] | None = None,
 ) -> Any:
     """Create a pyfunc model with embedded config and register it to UC."""
+    from mlflow.models.signature import ModelSignature
+    from mlflow.types.schema import ColSpec, Schema
+
+    dims = dimensions or _extract_space_dimensions(space_config)
+
+    # ── Build configuration-aware signature ──
+    input_cols: list[ColSpec] = [
+        ColSpec("string", "space_id"),
+        ColSpec("string", "space_name"),
+        ColSpec("string", "domain"),
+    ]
+    for t in dims["tables"]:
+        input_cols.append(ColSpec("string", f"table:{t}"))
+    for mv in dims["metric_views"]:
+        input_cols.append(ColSpec("string", f"metric_view:{mv}"))
+    for fn in dims["functions"]:
+        input_cols.append(ColSpec("string", f"function:{fn}"))
+    input_cols += [
+        ColSpec("long", "instruction_count"),
+        ColSpec("long", "join_spec_count"),
+        ColSpec("long", "example_sql_count"),
+        ColSpec("long", "benchmark_count"),
+    ]
+
+    output_cols = [ColSpec("double", j) for j in _EVAL_JUDGES]
+    output_cols += [
+        ColSpec("double", "overall_accuracy"),
+        ColSpec("double", "baseline_accuracy"),
+    ]
+
+    signature = ModelSignature(
+        inputs=Schema(input_cols),
+        outputs=Schema(output_cols),
+    )
+
+    # ── Write artifacts and save pyfunc model ──
     with tempfile.TemporaryDirectory(prefix="genie-uc-") as tmp:
         config_path = Path(tmp) / "space_config.json"
         config_path.write_text(
             json.dumps(space_config, default=str, indent=2), encoding="utf-8",
         )
 
-        from mlflow.models.signature import ModelSignature
-        from mlflow.types.schema import ColSpec, Schema
+        uc_metadata = {
+            "tables": dims["ds_raw"].get("tables", []),
+            "metric_views": dims["ds_raw"].get("metric_views", []),
+            "functions": dims["instr_raw"].get("sql_functions", []),
+            "join_specs": dims["instr_raw"].get("join_specs", []),
+            "text_instructions": dims["instr_raw"].get("text_instructions", []),
+            "example_sqls": dims["instr_raw"].get("example_question_sqls", []),
+        }
+        uc_metadata_path = Path(tmp) / "uc_metadata.json"
+        uc_metadata_path.write_text(
+            json.dumps(uc_metadata, default=str, indent=2), encoding="utf-8",
+        )
 
-        signature = ModelSignature(
-            inputs=Schema([ColSpec("string", "command")]),
-            outputs=Schema([ColSpec("string", "config_json")]),
+        benchmark_summary: dict[str, Any] = {
+            "iteration": best_iteration,
+            "overall_accuracy": best_accuracy,
+            "baseline_accuracy": baseline_accuracy,
+        }
+        if best_iter_row:
+            rows_json = best_iter_row.get("rows_json")
+            if rows_json:
+                benchmark_summary["rows_json"] = rows_json
+        benchmark_path = Path(tmp) / "benchmark_summary.json"
+        benchmark_path.write_text(
+            json.dumps(benchmark_summary, default=str, indent=2), encoding="utf-8",
         )
 
         model_dir = str(Path(tmp) / "pyfunc_model")
         mlflow.pyfunc.save_model(
             path=model_dir,
             python_model=_GenieConfigSnapshot(),
-            artifacts={"space_config": str(config_path)},
+            artifacts={
+                "space_config": str(config_path),
+                "uc_metadata": str(uc_metadata_path),
+                "benchmark_summary": str(benchmark_path),
+            },
             signature=signature,
         )
 
@@ -281,6 +374,7 @@ def register_uc_model(
     catalog: str,
     schema: str,
     ws: "WorkspaceClient | None" = None,
+    deploy_target: str | None = None,
 ) -> dict | None:
     """Register champion LoggedModel as a UC Registered Model version.
 
@@ -386,10 +480,14 @@ def register_uc_model(
                 except Exception:
                     logger.debug("Failed to set model tag %s", k, exc_info=True)
 
-        # ── 2. Register a new version ──
-        # UC requires a valid MLflow model directory with an MLmodel file.
-        # Our snapshots are raw JSON, so we wrap them in a minimal pyfunc
-        # model and embed the config as an artifact inside it.
+        # ── 2. Extract space config dimensions ──
+        dims = _extract_space_dimensions(_space_config)
+
+        best_row_dict: dict[str, Any] = {}
+        if not best_iter_rows.empty:
+            best_row_dict = best_iter_rows.iloc[0].to_dict()
+
+        # ── 3. Register a new version (pyfunc + artifacts + config signature) ──
         mv = _register_uc_version(
             client=client,
             uc_model_name=uc_model_name,
@@ -398,20 +496,69 @@ def register_uc_model(
             space_config=_space_config,
             space_id=space_id,
             domain=domain,
+            space_name=space_name,
+            dimensions=dims,
+            best_accuracy=best_accuracy,
+            baseline_accuracy=baseline_accuracy,
+            best_iter_row=best_row_dict,
         )
 
         version = str(mv.version)
 
-        # ── 3. Version-level tags ──
-        _version_tags = {
+        # ── 4. Log model parameters on the source eval run ──
+        tracking_client = mlflow.tracking.MlflowClient()
+        _params = {
+            "space_id": space_id,
+            "space_name": space_name,
+            "domain": domain,
+            "best_accuracy": f"{best_accuracy:.1f}",
+            "baseline_accuracy": f"{baseline_accuracy:.1f}" if baseline_accuracy is not None else "n/a",
+            "accuracy_delta": f"{best_accuracy - (baseline_accuracy or 0):.1f}",
+            "best_iteration": str(best_iteration),
+            "convergence_reason": convergence_reason,
+            "tables_count": str(len(dims["tables"])),
+            "metric_views_count": str(len(dims["metric_views"])),
+            "tvf_count": str(len(dims["functions"])),
+            "instruction_count": str(len(dims["text_instructions"])),
+            "join_spec_count": str(len(dims["join_specs"])),
+            "example_sql_count": str(len(dims["example_sqls"])),
+            "benchmark_count": str(len(dims["benchmarks"])),
+        }
+        for k, v in _params.items():
+            try:
+                tracking_client.log_param(source_run_id, k, v)
+            except Exception:
+                logger.debug("Failed to log param %s (may already exist)", k)
+
+        # ── 5. Fetch per-judge eval scores from source run ──
+        new_scores: dict[str, float] = {}
+        try:
+            new_run_data = tracking_client.get_run(source_run_id).data
+            new_scores = {j: new_run_data.metrics.get(j, 0.0) for j in _EVAL_JUDGES}
+        except Exception:
+            logger.debug("Could not fetch eval metrics from source run", exc_info=True)
+
+        overall_judge_avg = (
+            sum(new_scores.values()) / max(len(new_scores), 1)
+            if new_scores else 0.0
+        )
+
+        # ── 6. Version-level tags (run metadata + per-judge scores) ──
+        _version_tags: dict[str, str] = {
             "genie.optimization_run_id": run_id,
             "genie.iteration": str(best_iteration),
             "genie.accuracy": f"{best_accuracy:.1f}",
             "genie.convergence_reason": convergence_reason,
             "genie.source_run_id": source_run_id,
+            "genie.overall_accuracy": f"{best_accuracy:.1f}",
+            "genie.overall_score": f"{overall_judge_avg:.2f}",
         }
         if baseline_accuracy is not None:
             _version_tags["genie.baseline_accuracy"] = f"{baseline_accuracy:.1f}"
+        if deploy_target:
+            _version_tags["genie.deploy_target_url"] = deploy_target
+        for judge, score in new_scores.items():
+            _version_tags[judge] = f"{score:.2f}"
         for k, v in _version_tags.items():
             if v:
                 try:
@@ -419,10 +566,9 @@ def register_uc_model(
                 except Exception:
                     logger.debug("Failed to set version tag %s", k, exc_info=True)
 
-        # ── 4. Metric-based gating for @champion alias ──
+        # ── 7. Metric-based gating for @champion alias ──
         should_promote = True
         existing_scores: dict[str, float] = {}
-        new_scores: dict[str, float] = {}
         prev_champion_version: str | None = None
         comparison: dict | None = None
 
@@ -430,14 +576,11 @@ def register_uc_model(
             existing_mv = client.get_model_version_by_alias(uc_model_name, "champion")
             prev_champion_version = str(existing_mv.version)
             if existing_mv.run_id:
-                existing_run_data = client.get_run(existing_mv.run_id).data
-                new_run_data = client.get_run(source_run_id).data
-
+                existing_run_data = tracking_client.get_run(existing_mv.run_id).data
                 existing_scores = {j: existing_run_data.metrics.get(j, 0.0) for j in _EVAL_JUDGES}
-                new_scores = {j: new_run_data.metrics.get(j, 0.0) for j in _EVAL_JUDGES}
 
                 comparison = {
-                    j: {"new": new_scores[j], "existing": existing_scores[j]}
+                    j: {"new": new_scores.get(j, 0.0), "existing": existing_scores[j]}
                     for j in _EVAL_JUDGES
                 }
 
@@ -451,12 +594,11 @@ def register_uc_model(
                     )
 
                 existing_avg = sum(existing_scores.values()) / max(len(existing_scores), 1)
-                new_avg = sum(new_scores.values()) / max(len(new_scores), 1)
-                if new_avg < existing_avg:
+                if overall_judge_avg < existing_avg:
                     should_promote = False
                     logger.info(
                         "Gating: avg judge score %.1f < existing %.1f",
-                        new_avg, existing_avg,
+                        overall_judge_avg, existing_avg,
                     )
         except Exception:
             logger.info("No existing @champion or error fetching metrics — promoting by default")
@@ -471,7 +613,7 @@ def register_uc_model(
                 uc_model_name, version, prev_champion_version,
             )
 
-        # ── 5. Link deployment job (optional) ──
+        # ── 8. Link deployment job (optional) ──
         if ws is not None:
             try:
                 from genie_space_optimizer.backend.job_launcher import ensure_deployment_job
@@ -491,6 +633,7 @@ def register_uc_model(
             "promoted_to_champion": should_promote,
             "previous_champion_version": prev_champion_version,
             "comparison": comparison,
+            "deploy_target": deploy_target,
         }
     except Exception:
         logger.exception("Failed to register UC model %s", uc_model_name)

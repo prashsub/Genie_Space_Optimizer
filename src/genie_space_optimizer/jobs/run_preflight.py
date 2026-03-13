@@ -246,6 +246,10 @@ from genie_space_optimizer.common.config import CONNECTION_POOL_SIZE
 configure_connection_pool(w, CONNECTION_POOL_SIZE)
 configure_mlflow_connection_pool(CONNECTION_POOL_SIZE)
 
+import os as _os
+warehouse_id = _os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "")
+_log("SQL warehouse", warehouse_id=warehouse_id or "(not set — using Spark SQL)")
+
 _banner("Ensuring Delta State Tables")
 ensure_optimization_tables(spark, catalog, schema)
 _log("State tables verified", catalog=catalog, schema=schema)
@@ -295,6 +299,7 @@ try:
         w, spark, run_id, catalog, schema, _config, _snapshot,
         _genie_table_refs, apply_mode=apply_mode,
         configured_cols=ctx_config.get("configured_cols", 0),
+        warehouse_id=warehouse_id,
     )
     _log("Metadata collected", columns=len(ctx_uc["uc_columns"]), tags=len(ctx_uc["uc_tags"]),
          routines=len(ctx_uc["uc_routines"]), fk=len(ctx_uc["uc_fk"]))
@@ -302,6 +307,46 @@ except Exception as exc:
     _banner("UC Metadata FAILED")
     _log("Failure details", error_type=type(exc).__name__, error_message=str(exc), traceback=traceback.format_exc())
     raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1b.1: Data Profile Summary
+# MAGIC
+# MAGIC Per-table column profiling results: row counts, cardinality, distinct values
+# MAGIC for low-cardinality columns, and min/max ranges for numeric/date columns.
+# MAGIC This profile feeds into benchmark generation to produce realistic filter values.
+
+# COMMAND ----------
+
+_data_profile = _config.get("_data_profile", {})
+if _data_profile:
+    import pandas as pd
+
+    _dp_rows = []
+    for _dp_tbl_fqn, _dp_tinfo in sorted(_data_profile.items()):
+        _dp_tbl_short = _dp_tbl_fqn.split(".")[-1] if "." in _dp_tbl_fqn else _dp_tbl_fqn
+        _dp_row_cnt = _dp_tinfo.get("row_count", "?")
+        for _dp_col_name, _dp_col_info in sorted(_dp_tinfo.get("columns", {}).items()):
+            _dp_vals = _dp_col_info.get("distinct_values")
+            _dp_vals_str = ", ".join(str(v) for v in _dp_vals[:8]) if _dp_vals else "-"
+            if _dp_vals and len(_dp_vals) > 8:
+                _dp_vals_str += f" ... (+{len(_dp_vals) - 8})"
+            _dp_rows.append({
+                "table": _dp_tbl_short,
+                "rows": _dp_row_cnt,
+                "column": _dp_col_name,
+                "cardinality": _dp_col_info.get("cardinality", "?"),
+                "distinct_values": _dp_vals_str,
+                "min": str(_dp_col_info.get("min", "-")),
+                "max": str(_dp_col_info.get("max", "-")),
+            })
+    if _dp_rows:
+        display(pd.DataFrame(_dp_rows))
+    else:
+        print("  Data profile collected but no column details available.")
+else:
+    print("  (No data profile collected — profiling may have been skipped or failed)")
 
 # COMMAND ----------
 
@@ -321,6 +366,9 @@ try:
         w, spark, run_id, catalog, schema, _config,
         ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
         _domain,
+        space_id=space_id,
+        experiment_name=experiment_name,
+        warehouse_id=warehouse_id,
     )
     _benchmarks = ctx_bench["benchmarks"]
     _log("Benchmarks loaded", count=len(_benchmarks), regenerated=ctx_bench["regenerated"])
@@ -346,6 +394,7 @@ try:
         w, spark, run_id, catalog, schema, _config, _benchmarks,
         ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
         _domain,
+        warehouse_id=warehouse_id,
     )
     _benchmarks = ctx_valid["benchmarks"]
     _log("Validation complete", valid=len(_benchmarks), pre_count=ctx_valid["pre_count"],

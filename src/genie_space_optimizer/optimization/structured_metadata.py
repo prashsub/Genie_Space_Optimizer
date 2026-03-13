@@ -114,6 +114,27 @@ _INJECT_NL_RE = re.compile(
     + r"):)",
 )
 
+_EMBEDDED_HEADER_PATTERN = re.compile(
+    r"(?:^|\s)(?:"
+    + "|".join(re.escape(k) for k in _SORTED_UPPER_LABELS)
+    + r"):",
+)
+
+
+def _contains_embedded_headers(section_key: str, value: str) -> list[str]:
+    """Return list of OTHER section headers found embedded in *value*.
+
+    Only flags headers that differ from the section being updated so that
+    e.g. ``"definition": "DEFINITION: ..."`` is not a false positive.
+    """
+    own_label = SECTION_LABELS.get(section_key, "").upper()
+    found: list[str] = []
+    for m in _EMBEDDED_HEADER_PATTERN.finditer(value):
+        header = m.group().strip().rstrip(":")
+        if header != own_label:
+            found.append(header)
+    return found
+
 
 # ---------------------------------------------------------------------------
 # Numeric / measure heuristics (mirrored from config.py to avoid circular)
@@ -336,13 +357,21 @@ def update_section(
 
     Returns the new description as a ``list[str]`` suitable for the Genie API.
 
-    Raises ``LeverOwnershipError`` if the lever does not own the section.
+    Raises ``LeverOwnershipError`` if the lever does not own the section
+    or if the value embeds other section headers inline.
     """
     allowed = LEVER_SECTION_OWNERSHIP.get(lever, set())
     if section not in allowed:
         raise LeverOwnershipError(
             f"Lever {lever} cannot modify section '{section}' "
             f"(allowed: {sorted(allowed)})"
+        )
+
+    embedded = _contains_embedded_headers(section, new_value)
+    if embedded:
+        raise LeverOwnershipError(
+            f"Lever {lever}: section '{section}' value embeds other headers "
+            f"{embedded} inline. Each section must be a separate key."
         )
 
     sections = parse_structured_description(current_description)
@@ -371,6 +400,20 @@ def update_sections(
             "Lever %d: skipping locked sections %s (allowed: %s)",
             lever, skipped, sorted(allowed),
         )
+
+    clean_applicable: dict[str, str] = {}
+    for key, new_val in applicable.items():
+        embedded = _contains_embedded_headers(key, new_val)
+        if embedded:
+            logger.warning(
+                "Lever %d: rejecting section '%s' — value embeds headers %s inline. "
+                "Each section must be a separate key.",
+                lever, key, embedded,
+            )
+        else:
+            clean_applicable[key] = new_val
+    applicable = clean_applicable
+
     if not applicable:
         raise LeverOwnershipError(
             f"Lever {lever} cannot modify any of the requested sections "

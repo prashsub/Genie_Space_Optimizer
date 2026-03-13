@@ -31,6 +31,7 @@ from databricks.sdk.service.jobs import (
     QueueSettings,
     Source,
     Task,
+    TaskDependency,
 )
 from databricks.sdk.service.workspace import ImportFormat, Language
 
@@ -48,6 +49,7 @@ _NOTEBOOK_SOURCES = {
     "run_finalize": Path(__file__).resolve().parent.parent / "jobs" / "run_finalize.py",
     "run_deploy": Path(__file__).resolve().parent.parent / "jobs" / "run_deploy.py",
     "run_cross_env_deploy": Path(__file__).resolve().parent.parent / "jobs" / "run_cross_env_deploy.py",
+    "run_deploy_approval": Path(__file__).resolve().parent.parent / "jobs" / "run_deploy_approval.py",
 }
 _WS_NOTEBOOKS = {name: f"{_WS_BASE}/{name}" for name in _NOTEBOOK_SOURCES}
 
@@ -509,7 +511,23 @@ def ensure_deployment_job(
         ],
         tasks=[
             Task(
+                task_key="Approval_Check",
+                notebook_task=NotebookTask(
+                    notebook_path=_WS_NOTEBOOKS["run_deploy_approval"],
+                    source=Source.WORKSPACE,
+                    base_parameters={
+                        "model_name": "{{job.parameters.model_name}}",
+                        "model_version": "{{job.parameters.model_version}}",
+                        "approval_tag_name": "{{task.name}}",
+                    },
+                ),
+                environment_key="default",
+                timeout_seconds=86400,
+                max_retries=0,
+            ),
+            Task(
                 task_key="cross_env_deploy",
+                depends_on=[TaskDependency(task_key="Approval_Check")],
                 notebook_task=NotebookTask(
                     notebook_path=_WS_NOTEBOOKS["run_cross_env_deploy"],
                     source=Source.WORKSPACE,

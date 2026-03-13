@@ -14,6 +14,7 @@ from genie_space_optimizer.optimization.structured_metadata import (
     TABLE_DESCRIPTION_SECTIONS,
     EntityType,
     LeverOwnershipError,
+    _contains_embedded_headers,
     classify_column,
     deduplicate_structured_description,
     entity_type_for_column,
@@ -519,3 +520,92 @@ class TestNewlineInjection:
         assert result.get("_preamble") == "Legacy text"
         assert result["purpose"] == "Fact table"
         assert result["grain"] == "One row"
+
+
+# ── Embedded Header Validation ────────────────────────────────────────
+
+
+class TestContainsEmbeddedHeaders:
+    def test_clean_value_returns_empty(self):
+        assert _contains_embedded_headers("purpose", "Fact table for job runs.") == []
+
+    def test_detects_best_for_in_purpose(self):
+        found = _contains_embedded_headers(
+            "purpose", "Fact table. BEST FOR: Duration analysis."
+        )
+        assert "BEST FOR" in found
+
+    def test_detects_multiple_embedded(self):
+        found = _contains_embedded_headers(
+            "purpose",
+            "Stores runs. BEST FOR: Analytics. GRAIN: One row per run. SCD: Type 2",
+        )
+        assert "BEST FOR" in found
+        assert "GRAIN" in found
+        assert "SCD" in found
+
+    def test_own_label_not_flagged(self):
+        assert _contains_embedded_headers(
+            "purpose", "PURPOSE: This is a valid description."
+        ) == []
+
+    def test_no_false_positive_without_colon(self):
+        assert _contains_embedded_headers(
+            "purpose", "This is the best for analysis of GRAIN patterns"
+        ) == []
+
+    def test_definition_with_values_header(self):
+        found = _contains_embedded_headers(
+            "definition", "Boolean flag. VALUES: TRUE, FALSE"
+        )
+        assert "VALUES" in found
+
+    def test_empty_value(self):
+        assert _contains_embedded_headers("purpose", "") == []
+
+
+class TestEmbeddedHeaderRejection:
+    """Test that update_section and update_sections reject embedded headers."""
+
+    def test_update_section_rejects_embedded(self):
+        with pytest.raises(LeverOwnershipError, match="embeds other headers"):
+            update_section(
+                "PURPOSE:\nOld text",
+                "purpose",
+                "New text. BEST FOR: Analytics. GRAIN: One row",
+                lever=1,
+                entity_type="table",
+            )
+
+    def test_update_section_accepts_clean(self):
+        result = update_section(
+            "PURPOSE:\nOld text",
+            "purpose",
+            "New fact table for job runs.",
+            lever=1,
+            entity_type="table",
+        )
+        assert any("New fact table" in line for line in result)
+
+    def test_update_sections_filters_embedded(self):
+        result = update_sections(
+            "PURPOSE:\nOld purpose\nBEST FOR:\nOld best for",
+            {
+                "purpose": "New purpose. GRAIN: One row per run",
+                "best_for": "Clean analytics value",
+            },
+            lever=1,
+            entity_type="table",
+        )
+        joined = "\n".join(result)
+        assert "Clean analytics value" in joined
+        assert "GRAIN: One row per run" not in joined
+
+    def test_update_sections_all_rejected_raises(self):
+        with pytest.raises(LeverOwnershipError):
+            update_sections(
+                "PURPOSE:\nOld",
+                {"purpose": "Bad. BEST FOR: X. GRAIN: Y"},
+                lever=1,
+                entity_type="table",
+            )

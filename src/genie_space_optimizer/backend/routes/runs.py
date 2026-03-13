@@ -1277,7 +1277,8 @@ def _resolve_deployment_status(
     """Derive deployment status and URL from DEPLOY stages.
 
     Returns (status, url) where status is one of:
-    None — no deploy configured, SKIPPED, RUNNING, DEPLOYED, FAILED.
+    None — no deploy configured, SKIPPED, RUNNING, DEPLOYED,
+    PENDING_APPROVAL, FAILED.
     """
     deploy_target = run_data.get("deploy_target")
     deploy_stages = [
@@ -1295,6 +1296,27 @@ def _resolve_deployment_status(
         return ("SKIPPED", None)
     if stage_status == "FAILED":
         return ("FAILED", None)
+
+    if "DELEGATED" in stage_name:
+        uc_model = ""
+        uc_version = ""
+        for s in stages_rows:
+            if str(s.get("stage", "")).startswith("FINALIZE") and str(s.get("status", "")).upper() == "COMPLETE":
+                fin_detail = safe_json_parse(s.get("detail_json"))
+                if isinstance(fin_detail, dict):
+                    uc_model = fin_detail.get("uc_model_name", "")
+                    uc_version = fin_detail.get("uc_model_version", "")
+                break
+        if uc_model and uc_version:
+            parts = uc_model.split(".")
+            if len(parts) == 3:
+                model_url = (
+                    f"{host.rstrip('/')}/explore/data/models/"
+                    f"{parts[0]}/{parts[1]}/{parts[2]}/version/{uc_version}"
+                )
+                return ("PENDING_APPROVAL", model_url)
+        return ("PENDING_APPROVAL", None)
+
     if stage_status == "COMPLETE":
         detail = safe_json_parse(latest.get("detail_json"))
         target = (

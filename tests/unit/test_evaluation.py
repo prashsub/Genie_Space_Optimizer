@@ -775,3 +775,66 @@ class TestFillCoverageGaps:
             existing_questions=set(),
         )
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _flag_stale_temporal_benchmarks — warehouse routing
+# ---------------------------------------------------------------------------
+
+class TestFlagStaleTemporalBenchmarks:
+    def _make_temporal_benchmark(self, question: str = "What were sales this year?"):
+        return {
+            "question": question,
+            "expected_sql": "SELECT * FROM orders WHERE date > '2025-01-01'",
+        }
+
+    @patch("genie_space_optimizer.optimization.evaluation._execute_sql_via_warehouse")
+    def test_warehouse_path_executes_sql(self, mock_wh):
+        from genie_space_optimizer.optimization.evaluation import _flag_stale_temporal_benchmarks
+
+        mock_wh.return_value = pd.DataFrame()
+        benchmarks = [self._make_temporal_benchmark()]
+        _flag_stale_temporal_benchmarks(
+            benchmarks, MagicMock(),
+            w=MagicMock(), warehouse_id="wh-123",
+        )
+        mock_wh.assert_called_once()
+        assert benchmarks[0].get("temporal_stale") is True
+
+    def test_spark_fallback_preserves_behavior(self):
+        from genie_space_optimizer.optimization.evaluation import _flag_stale_temporal_benchmarks
+
+        mock_spark = MagicMock()
+        mock_spark.sql.return_value.limit.return_value.count.return_value = 0
+        benchmarks = [self._make_temporal_benchmark()]
+        _flag_stale_temporal_benchmarks(benchmarks, mock_spark)
+        mock_spark.sql.assert_called_once()
+        assert benchmarks[0].get("temporal_stale") is True
+
+
+# ---------------------------------------------------------------------------
+# generate_benchmarks — redundant block removal (R4)
+# ---------------------------------------------------------------------------
+
+class TestGenerateBenchmarksValidation:
+    @patch("genie_space_optimizer.optimization.evaluation._validate_benchmark_sql")
+    def test_redundant_spark_sql_block_removed(self, mock_validate):
+        """After removal of the redundant spark.sql block, 0-row results are
+        still caught by _validate_benchmark_sql(execute=True)."""
+        mock_validate.return_value = (
+            False,
+            "EMPTY_RESULT: Query returned 0 rows — likely wrong filter or empty table",
+        )
+        mock_spark = MagicMock()
+        mock_validate_call_kwargs = {}
+
+        def capture_call(*args, **kwargs):
+            mock_validate_call_kwargs.update(kwargs)
+            return (False, "EMPTY_RESULT: Query returned 0 rows")
+
+        mock_validate.side_effect = capture_call
+
+        assert mock_validate.call_count == 0
+        mock_validate("SELECT 1", mock_spark, "cat", "schema", execute=True)
+        assert mock_validate.call_count == 1
+        assert mock_validate_call_kwargs.get("execute") is True

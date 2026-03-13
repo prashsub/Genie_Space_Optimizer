@@ -4099,11 +4099,18 @@ def _run_lever_loop(
             action_groups = strategy.get("action_groups", [])
             ag = action_groups[0] if action_groups else None
 
-            _global_rewrite = (strategy.get("global_instruction_rewrite") or "").strip()
-            if _global_rewrite and ag is not None:
-                ld = ag.setdefault("lever_directives", {})
-                l5 = ld.setdefault("5", {})
-                l5["instruction_guidance"] = _global_rewrite
+            _global_rewrite = strategy.get("global_instruction_rewrite")
+            if isinstance(_global_rewrite, dict):
+                non_empty = {k: v for k, v in _global_rewrite.items() if v is not None}
+                if non_empty and ag is not None:
+                    ld = ag.setdefault("lever_directives", {})
+                    l5 = ld.setdefault("5", {})
+                    l5["instruction_sections"] = non_empty
+            elif isinstance(_global_rewrite, str) and _global_rewrite.strip():
+                if ag is not None:
+                    ld = ag.setdefault("lever_directives", {})
+                    l5 = ld.setdefault("5", {})
+                    l5["instruction_guidance"] = _global_rewrite.strip()
 
             if ag is None and _iter_num == 1:
                 logger.info("Adaptive strategist returned 0 AGs on iter 1 — trying holistic fallback")
@@ -4926,6 +4933,7 @@ def _run_finalize(
     all_regression_trace_ids: list[str] | None = None,
     all_failure_question_ids: list[str] | None = None,
     max_iterations: int | None = None,
+    deploy_target: str | None = None,
 ) -> dict:
     """Stage 4: Repeatability test, promote model, generate report.
 
@@ -5294,7 +5302,7 @@ def _run_finalize(
         promoted_model = promote_best_model(spark, run_id, catalog, schema)
 
         from genie_space_optimizer.optimization.models import register_uc_model
-        uc_result = register_uc_model(spark, run_id, catalog, schema, ws=w)
+        uc_result = register_uc_model(spark, run_id, catalog, schema, ws=w, deploy_target=deploy_target)
 
         if uc_result:
             _uc_lines = [_section("FINALIZE — UC MODEL REGISTRATION", "-")]
@@ -5550,40 +5558,19 @@ def deploy_execute(
         return {"status": "SKIPPED", "reason": "no_deploy_target"}
 
     write_stage(
-        spark, run_id, "DEPLOY_STARTED", "STARTED",
-        task_key="deploy", catalog=catalog, schema=schema,
+        spark, run_id, "DEPLOY_DELEGATED", "COMPLETE",
+        task_key="deploy",
+        detail={"deploy_target": deploy_target, "mechanism": "mlflow_deployment_job"},
+        catalog=catalog, schema=schema,
     )
-
-    try:
-        logger.info("Deploy target: %s (placeholder — DABs integration pending)", deploy_target)
-
-        write_stage(
-            spark, run_id, "DEPLOY_STARTED", "COMPLETE",
-            task_key="deploy",
-            detail={"deploy_target": deploy_target},
-            catalog=catalog, schema=schema,
-        )
-        _lines = [_section("DEPLOY — RESULT", "-")]
-        _lines.append(_kv("Status", "DEPLOYED"))
-        _lines.append(_kv("Target", deploy_target))
-        _lines.append(_kv("Model ID", prev_model_id))
-        _lines.append(_bar("-"))
-        print("\n".join(_lines))
-        return {"status": "DEPLOYED", "deploy_target": deploy_target}
-
-    except Exception as exc:
-        write_stage(
-            spark, run_id, "DEPLOY_STARTED", "FAILED",
-            task_key="deploy",
-            error_message=str(exc)[:500],
-            catalog=catalog, schema=schema,
-        )
-        _lines = [_section("DEPLOY — RESULT", "-")]
-        _lines.append(_kv("Status", "FAILED"))
-        _lines.append(_kv("Error", str(exc)[:200]))
-        _lines.append(_bar("-"))
-        print("\n".join(_lines))
-        return {"status": "FAILED", "error": str(exc)}
+    _lines = [_section("DEPLOY — RESULT", "-")]
+    _lines.append(_kv("Status", "PENDING_APPROVAL"))
+    _lines.append(_kv("Target", deploy_target))
+    _lines.append(_kv("Model ID", prev_model_id))
+    _lines.append(_kv("Mechanism", "MLflow Deployment Job (Approval -> Cross-env Deploy)"))
+    _lines.append(_bar("-"))
+    print("\n".join(_lines))
+    return {"status": "PENDING_APPROVAL", "deploy_target": deploy_target}
 
 
 def _run_deploy(

@@ -3899,7 +3899,7 @@ def _build_structured_column_data(
             if "." in bl:
                 blame_lower.add(bl.rsplit(".", 1)[-1])
 
-    owned_sections = LEVER_SECTION_OWNERSHIP.get(1, set())
+    owned_sections = LEVER_SECTION_OWNERSHIP.get(1, set()) | LEVER_SECTION_OWNERSHIP.get(2, set())
     result: list[dict] = []
     columns_shown = 0
     max_columns = 40
@@ -5959,18 +5959,24 @@ def _call_llm_for_ag_detail(
     if not isinstance(lever_dirs, dict):
         lever_dirs = {}
     coord = result.get("coordination_notes", "")
-    instr_contrib = result.get("instruction_contribution", "")
+    raw_instr = result.get("instruction_contribution", "")
+    if isinstance(raw_instr, dict):
+        instr_contrib = raw_instr
+        instr_len = sum(len(str(v)) for v in raw_instr.values())
+    else:
+        instr_contrib = str(raw_instr) if raw_instr else ""
+        instr_len = len(instr_contrib)
     proposals = result.get("proposals", [])
     if not isinstance(proposals, list):
         proposals = []
 
     logger.info(
         "AG %s detail: %d lever directives, coordination=%d chars, instruction=%d chars, proposals=%d",
-        ag_id, len(lever_dirs), len(coord), len(instr_contrib), len(proposals),
+        ag_id, len(lever_dirs), len(coord), instr_len, len(proposals),
     )
     print(
         f"    {ag_id} detail: levers={sorted(lever_dirs.keys())}, "
-        f"coordination={len(coord)} chars, instruction={len(instr_contrib)} chars, "
+        f"coordination={len(coord)} chars, instruction={instr_len} chars, "
         f"proposals={len(proposals)}"
     )
 
@@ -6056,7 +6062,8 @@ def _generate_holistic_strategy(
         # ── Phase 1b: Detail per AG (CHAT_MODEL spans created inside _call_llm_for_ag_detail)
         per_ag_budget = max(2000, 24000 // max(len(triage_ags), 1))
         final_ags: list[dict] = []
-        instruction_contributions: list[str] = []
+        str_contributions: list[str] = []
+        dict_contributions: list[dict[str, str]] = []
 
         for i, skeleton in enumerate(triage_ags):
             if "id" not in skeleton:
@@ -6089,27 +6096,63 @@ def _generate_holistic_strategy(
             }
             final_ags.append(assembled_ag)
 
-            if instr_contrib:
-                instruction_contributions.append(instr_contrib)
+            if isinstance(instr_contrib, dict) and instr_contrib:
+                dict_contributions.append(instr_contrib)
+            elif isinstance(instr_contrib, str) and instr_contrib.strip():
+                str_contributions.append(instr_contrib)
 
         # ── Merge instruction contributions (structure-aware) ────────
         global_guidance = triage_result.get("global_instruction_guidance", "")
         existing_instr = _get_general_instructions(metadata_snapshot)
 
-        if instruction_contributions or global_guidance:
+        if dict_contributions:
+            existing_sections, _ = _parse_sections(
+                _sanitize_plaintext_instructions(existing_instr) if existing_instr else ""
+            )
+            merged_sections: dict[str, list[str]] = {
+                s: existing_sections.get(s, []) for s in INSTRUCTION_SECTION_ORDER
+            }
+            valid_keys = set(INSTRUCTION_SECTION_ORDER)
+            for dc in dict_contributions:
+                for key, value in dc.items():
+                    if key not in valid_keys:
+                        continue
+                    if value == "":
+                        merged_sections[key] = []
+                    elif isinstance(value, str):
+                        merged_sections[key] = [
+                            ln for ln in value.splitlines() if ln.strip()
+                        ]
+            parts: list[str] = []
+            for section in INSTRUCTION_SECTION_ORDER:
+                lines = merged_sections[section]
+                if not lines:
+                    continue
+                parts.append(f"{section}:")
+                for ln in lines:
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    if not s.startswith("- "):
+                        s = f"- {s}"
+                    parts.append(s)
+                parts.append("")
+            global_rewrite = _sanitize_plaintext_instructions("\n".join(parts).strip())
+        elif str_contributions or global_guidance:
             global_rewrite = _merge_structured_instructions(
                 existing=existing_instr,
-                contributions=instruction_contributions,
+                contributions=str_contributions,
                 global_guidance=global_guidance,
             )
-            if len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
-                global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
-                logger.warning(
-                    "Merged instruction rewrite truncated to %d chars",
-                    MAX_HOLISTIC_INSTRUCTION_CHARS,
-                )
         else:
             global_rewrite = ""
+
+        if global_rewrite and len(global_rewrite) > MAX_HOLISTIC_INSTRUCTION_CHARS:
+            global_rewrite = global_rewrite[:MAX_HOLISTIC_INSTRUCTION_CHARS]
+            logger.warning(
+                "Merged instruction rewrite truncated to %d chars",
+                MAX_HOLISTIC_INSTRUCTION_CHARS,
+            )
 
         strategy: dict[str, Any] = {
             "action_groups": final_ags,
@@ -7157,6 +7200,7 @@ def generate_proposals_from_strategy(
         # ── Lever 5: instructions + example SQL ──────────────────────────
         elif target_lever == 5:
             l5_dir = lever_dir or {}
+            instruction_sections = l5_dir.get("instruction_sections")
             instruction_guidance = (l5_dir.get("instruction_guidance") or "").strip()
 
             example_sqls_list = l5_dir.get("example_sqls", [])
@@ -7167,7 +7211,77 @@ def generate_proposals_from_strategy(
             if not isinstance(example_sqls_list, list):
                 example_sqls_list = [example_sqls_list] if isinstance(example_sqls_list, dict) else []
 
-            if instruction_guidance:
+            if isinstance(instruction_sections, dict) and instruction_sections:
+                from genie_space_optimizer.optimization.applier import _get_general_instructions
+
+                valid_keys = set(INSTRUCTION_SECTION_ORDER)
+                invalid = [k for k in instruction_sections if k not in valid_keys]
+                if invalid:
+                    logger.warning("Ignoring unknown instruction sections: %s", invalid)
+                    instruction_sections = {
+                        k: v for k, v in instruction_sections.items() if k in valid_keys
+                    }
+
+                current_instructions = _get_general_instructions(
+                    metadata_snapshot.get("config") or metadata_snapshot
+                )
+                existing_sections, _ = _parse_sections(
+                    _sanitize_plaintext_instructions(current_instructions) if current_instructions else ""
+                )
+                merged_secs: dict[str, list[str]] = {
+                    s: list(existing_sections.get(s, []))
+                    for s in INSTRUCTION_SECTION_ORDER
+                }
+                for key, value in instruction_sections.items():
+                    if not isinstance(value, str):
+                        continue
+                    if value == "":
+                        merged_secs[key] = []
+                    else:
+                        merged_secs[key] = [ln for ln in value.splitlines() if ln.strip()]
+
+                parts: list[str] = []
+                for section in INSTRUCTION_SECTION_ORDER:
+                    lines = merged_secs[section]
+                    if not lines:
+                        continue
+                    parts.append(f"{section}:")
+                    for ln in lines:
+                        s = ln.strip()
+                        if not s:
+                            continue
+                        if not s.startswith("- "):
+                            s = f"- {s}"
+                        parts.append(s)
+                    parts.append("")
+                merged_text = _sanitize_plaintext_instructions("\n".join(parts).strip())
+
+                proposals.append({
+                    "proposal_id": f"P{len(proposals) + 1:03d}",
+                    "cluster_id": ag_id,
+                    "lever": 5,
+                    "scope": "genie_config",
+                    "patch_type": "rewrite_instruction",
+                    "change_description": f"[{ag_id}] Instruction rewrite ({len(merged_text)} chars)",
+                    "proposed_value": merged_text,
+                    "old_value": current_instructions,
+                    "rationale": f"Strategy: {root_cause}. {coordination_notes}",
+                    "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                    "confidence": 0.85,
+                    "questions_fixed": q_fixed,
+                    "questions_at_risk": 0,
+                    "net_impact": max(q_fixed * 0.85, 1.0),
+                    "asi": {
+                        "failure_type": "missing_instruction",
+                        "blame_set": source_clusters,
+                        "severity": "major",
+                        "counterfactual_fixes": [],
+                        "ambiguity_detected": False,
+                    },
+                    "provenance": {**provenance_base, "patch_type": "rewrite_instruction"},
+                })
+
+            elif instruction_guidance:
                 from genie_space_optimizer.optimization.applier import _get_general_instructions
 
                 current_instructions = _get_general_instructions(

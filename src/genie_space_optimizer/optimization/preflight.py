@@ -46,6 +46,7 @@ from genie_space_optimizer.optimization.evaluation import (
     extract_genie_space_benchmarks,
     generate_benchmarks,
     load_benchmarks_from_dataset,
+    register_benchmark_prompts,
     register_instruction_version,
 )
 from genie_space_optimizer.optimization.state import (
@@ -171,25 +172,38 @@ def _collect_data_profile(
     max_tables: int = 0,
     sample_size: int = 0,
     low_cardinality_threshold: int = 0,
+    w: Any = None,
+    warehouse_id: str = "",
+    catalog: str = "",
+    schema: str = "",
 ) -> dict[str, dict]:
     """Profile actual data values for Genie Space tables.
 
     For each table (up to *max_tables*) runs a single TABLESAMPLE-bounded
-    Spark SQL query that collects per-column cardinality, distinct values
+    SQL query that collects per-column cardinality, distinct values
     for low-cardinality string columns, and min/max for numeric/date columns.
+
+    When *w* and *warehouse_id* are provided the queries are routed through
+    the SQL warehouse Statement Execution API; otherwise Spark SQL is used
+    as a fallback.
 
     Returns ``{table_fqn: {"row_count": N, "columns": {col: {...}}}}``.
     Failures on individual tables are logged and skipped.
     """
+    import json as _json
+
     from genie_space_optimizer.common.config import (
         LOW_CARDINALITY_THRESHOLD,
         MAX_PROFILE_TABLES,
         PROFILE_SAMPLE_SIZE,
     )
+    from genie_space_optimizer.optimization.evaluation import _exec_sql
 
     max_tables = max_tables or MAX_PROFILE_TABLES
     sample_size = sample_size or PROFILE_SAMPLE_SIZE
     low_cardinality_threshold = low_cardinality_threshold or LOW_CARDINALITY_THRESHOLD
+
+    _sql_kw: dict[str, Any] = dict(w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema)
 
     _NUMERIC_TYPES = frozenset({
         "int", "integer", "bigint", "smallint", "tinyint",
@@ -205,6 +219,17 @@ def _collect_data_profile(
         tbl = str(c.get("table_name") or "").strip()
         if tbl:
             cols_by_table.setdefault(tbl, []).append(c)
+
+    def _parse_collect_set(raw_vals: Any) -> list[str]:
+        """Handle COLLECT_SET result from warehouse (JSON string) or Spark (list)."""
+        if raw_vals is None:
+            return []
+        if isinstance(raw_vals, str):
+            try:
+                raw_vals = _json.loads(raw_vals)
+            except (ValueError, TypeError):
+                return [raw_vals]
+        return sorted(str(v) for v in raw_vals)
 
     profile: dict[str, dict] = {}
     for table_fqn in tables[:max_tables]:
@@ -224,8 +249,10 @@ def _collect_data_profile(
         fq_table = ".".join(f"`{p.strip()}`" for p in parts)
 
         try:
-            count_row = spark.sql(f"SELECT COUNT(*) AS cnt FROM {fq_table}").collect()
-            row_count = count_row[0]["cnt"] if count_row else 0
+            count_df = _exec_sql(
+                f"SELECT COUNT(*) AS cnt FROM {fq_table}", spark, **_sql_kw,
+            )
+            row_count = int(count_df.iloc[0]["cnt"]) if not count_df.empty else 0
         except Exception:
             logger.debug("Data profiling: COUNT(*) failed for %s", table_fqn, exc_info=True)
             row_count = -1
@@ -258,21 +285,21 @@ def _collect_data_profile(
         )
 
         try:
-            stats_row = spark.sql(query).collect()
+            stats_df = _exec_sql(query, spark, **_sql_kw)
         except Exception:
             fallback_query = (
                 f"SELECT {select_clause} "
                 f"FROM (SELECT * FROM {fq_table} LIMIT {sample_size})"
             )
             try:
-                stats_row = spark.sql(fallback_query).collect()
+                stats_df = _exec_sql(fallback_query, spark, **_sql_kw)
             except Exception:
                 logger.info("Data profiling: stats query failed for %s, skipping", table_fqn, exc_info=True)
                 continue
 
-        if not stats_row:
+        if stats_df.empty:
             continue
-        row = stats_row[0]
+        row = stats_df.iloc[0]
 
         columns_profile: dict[str, dict] = {}
         low_card_cols: list[tuple[str, str]] = []
@@ -308,10 +335,11 @@ def _collect_data_profile(
                 f"WHERE {escaped_col} IS NOT NULL"
             )
             try:
-                dv_rows = spark.sql(dv_query).collect()
-                if dv_rows and dv_rows[0]["vals"]:
-                    vals = sorted(str(v) for v in dv_rows[0]["vals"])
-                    columns_profile[col_name]["distinct_values"] = vals
+                dv_df = _exec_sql(dv_query, spark, **_sql_kw)
+                if not dv_df.empty and dv_df.iloc[0]["vals"] is not None:
+                    parsed = _parse_collect_set(dv_df.iloc[0]["vals"])
+                    if parsed:
+                        columns_profile[col_name]["distinct_values"] = parsed
             except Exception:
                 dv_fallback = (
                     f"SELECT COLLECT_SET({escaped_col}) AS vals "
@@ -319,10 +347,11 @@ def _collect_data_profile(
                     f"WHERE {escaped_col} IS NOT NULL"
                 )
                 try:
-                    dv_rows = spark.sql(dv_fallback).collect()
-                    if dv_rows and dv_rows[0]["vals"]:
-                        vals = sorted(str(v) for v in dv_rows[0]["vals"])
-                        columns_profile[col_name]["distinct_values"] = vals
+                    dv_df = _exec_sql(dv_fallback, spark, **_sql_kw)
+                    if not dv_df.empty and dv_df.iloc[0]["vals"] is not None:
+                        parsed = _parse_collect_set(dv_df.iloc[0]["vals"])
+                        if parsed:
+                            columns_profile[col_name]["distinct_values"] = parsed
                 except Exception:
                     logger.debug(
                         "Data profiling: COLLECT_SET failed for %s.%s",
@@ -346,6 +375,10 @@ def _compute_join_overlaps(
     fk_constraints: list[dict],
     *,
     sample_size: int = 1000,
+    w: Any = None,
+    warehouse_id: str = "",
+    catalog: str = "",
+    schema: str = "",
 ) -> list[dict]:
     """Compute FK-to-PK overlap ratios for known foreign-key pairs.
 
@@ -353,7 +386,14 @@ def _compute_join_overlaps(
     FK values actually match a PK value on the other side. Returns a list
     of ``{left_table, right_table, fk_column, pk_column, overlap_ratio}``
     dicts.  Failures are logged and skipped.
+
+    When *w* and *warehouse_id* are provided, queries are routed through
+    the SQL warehouse; otherwise Spark SQL is used.
     """
+    from genie_space_optimizer.optimization.evaluation import _exec_sql
+
+    _sql_kw: dict[str, Any] = dict(w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema)
+
     results: list[dict] = []
     for fk in fk_constraints:
         if not isinstance(fk, dict):
@@ -380,11 +420,13 @@ def _compute_join_overlaps(
             f"ON a.`{fk_col}` = b.`{pk_col}`"
         )
         try:
-            rows = spark.sql(query).collect()
-            if rows:
-                r = rows[0]
-                left_d = r["left_distinct"] or 0
-                overlap_ratio = (r["overlap"] / left_d) if left_d > 0 else 0.0
+            result_df = _exec_sql(query, spark, **_sql_kw)
+            if not result_df.empty:
+                r = result_df.iloc[0]
+                left_d = int(r["left_distinct"] or 0)
+                overlap_count = int(r["overlap"] or 0)
+                right_d = int(r["right_distinct"] or 0)
+                overlap_ratio = (overlap_count / left_d) if left_d > 0 else 0.0
                 results.append({
                     "left_table": left_table,
                     "right_table": right_table,
@@ -392,7 +434,7 @@ def _compute_join_overlaps(
                     "pk_column": pk_col,
                     "overlap_ratio": round(overlap_ratio, 3),
                     "left_distinct": left_d,
-                    "right_distinct": r["right_distinct"] or 0,
+                    "right_distinct": right_d,
                 })
         except Exception:
             logger.debug(
@@ -627,6 +669,8 @@ def preflight_collect_uc_metadata(
     genie_table_refs: list,
     apply_mode: str = "genie_config",
     configured_cols: int = 0,
+    *,
+    warehouse_id: str = "",
 ) -> dict:
     """Sub-step 2: Collect UC columns, tags, routines, FK constraints.
 
@@ -860,6 +904,7 @@ def preflight_collect_uc_metadata(
         try:
             data_profile = _collect_data_profile(
                 spark, table_names, uc_columns_dicts,
+                w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema,
             )
             config["_data_profile"] = data_profile
             _ps = config.get("_parsed_space")
@@ -875,11 +920,30 @@ def preflight_collect_uc_metadata(
                 for c in t.get("columns", {}).values()
                 if c.get("distinct_values")
             )
-            print(
-                f"\n  Data Profiling: {profiled_tables} tables, "
-                f"{total_cols_profiled} columns, "
-                f"{low_card_count} low-cardinality with value hints"
-            )
+            _dp_lines = [_pf_section("PREFLIGHT — DATA PROFILE")]
+            _dp_lines.append(_pf_kv("Tables profiled", profiled_tables))
+            _dp_lines.append(_pf_kv("Columns profiled", total_cols_profiled))
+            _dp_lines.append(_pf_kv("Low-cardinality cols", low_card_count))
+            _dp_lines.append(_pf_bar())
+            for _dp_table_fqn, _dp_tinfo in sorted(data_profile.items()):
+                _dp_row_count = _dp_tinfo.get("row_count", "?")
+                _dp_lines.append(f"  {_dp_table_fqn} (~{_dp_row_count} rows)")
+                for _dp_col, _dp_cinfo in sorted(_dp_tinfo.get("columns", {}).items()):
+                    _dp_card = _dp_cinfo.get("cardinality", "?")
+                    _dp_vals = _dp_cinfo.get("distinct_values")
+                    _dp_minv = _dp_cinfo.get("min")
+                    _dp_maxv = _dp_cinfo.get("max")
+                    _dp_parts: list[str] = [f"cardinality={_dp_card}"]
+                    if _dp_vals:
+                        _dp_shown = _dp_vals[:5]
+                        _dp_suffix = f" ... +{len(_dp_vals) - 5} more" if len(_dp_vals) > 5 else ""
+                        _dp_parts.append(f"values={_dp_shown}{_dp_suffix}")
+                    if _dp_minv is not None:
+                        _dp_parts.append(f"range=[{_dp_minv}, {_dp_maxv}]")
+                    _dp_lines.append(f"    {_dp_col}: {', '.join(_dp_parts)}")
+                _dp_lines.append("")
+            _dp_lines.append(_pf_bar())
+            print("\n".join(_dp_lines))
             write_stage(
                 spark, run_id, "DATA_PROFILING", "COMPLETE",
                 task_key="preflight", catalog=catalog, schema=schema,
@@ -919,7 +983,10 @@ def preflight_collect_uc_metadata(
 
     if uc_fk_dicts:
         try:
-            join_overlaps = _compute_join_overlaps(spark, uc_fk_dicts)
+            join_overlaps = _compute_join_overlaps(
+                spark, uc_fk_dicts,
+                w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema,
+            )
             config["_join_overlaps"] = join_overlaps
             if join_overlaps:
                 logger.info(
@@ -950,6 +1017,10 @@ def preflight_generate_benchmarks(
     uc_tags: list[dict],
     uc_routines: list[dict],
     domain: str,
+    *,
+    space_id: str = "",
+    experiment_name: str | None = None,
+    warehouse_id: str = "",
 ) -> dict:
     """Sub-step 3: Load existing or generate new benchmarks.
 
@@ -957,14 +1028,43 @@ def preflight_generate_benchmarks(
     """
     uc_schema = f"{catalog}.{schema}"
 
-    benchmarks, _benchmarks_regenerated = _load_or_generate_benchmarks(
-        w, spark, config, uc_columns, uc_tags, uc_routines,
-        domain, catalog, schema, uc_schema, run_id,
-    )
+    if experiment_name is None:
+        experiment_name = _resolve_experiment_path(
+            space_id=space_id, domain=domain,
+        )
+
+    try:
+        _ensure_experiment_parent_dir(w, experiment_name)
+        register_benchmark_prompts(uc_schema, domain, experiment_name)
+    except Exception:
+        logger.warning(
+            "Benchmark prompt registration failed — tracing will be limited",
+            exc_info=True,
+        )
+
+    with mlflow.start_run(run_name="benchmark_generation") as _bench_run:
+        mlflow.set_tags({
+            "genie.space_id": space_id,
+            "genie.domain": domain,
+            "genie.stage": "benchmark_generation",
+            "genie.run_id": run_id,
+        })
+
+        benchmarks, _benchmarks_regenerated = _load_or_generate_benchmarks(
+            w, spark, config, uc_columns, uc_tags, uc_routines,
+            domain, catalog, schema, uc_schema, run_id,
+            warehouse_id=warehouse_id,
+        )
+
+        mlflow.log_params({
+            "benchmark_count": len(benchmarks),
+            "regenerated": _benchmarks_regenerated,
+        })
 
     _lines = [_pf_section("PREFLIGHT — BENCHMARK GENERATION")]
     _lines.append(_pf_kv("Benchmarks loaded", len(benchmarks)))
     _lines.append(_pf_kv("Regenerated", _benchmarks_regenerated))
+    _lines.append(_pf_kv("MLflow run", _bench_run.info.run_id))
     _lines.append(_pf_bar())
     for bm in benchmarks[:10]:
         _bq = str(bm.get("question", ""))[:80]
@@ -990,6 +1090,8 @@ def preflight_validate_benchmarks(
     uc_tags: list[dict],
     uc_routines: list[dict],
     domain: str,
+    *,
+    warehouse_id: str = "",
 ) -> dict:
     """Sub-step 4: Validate benchmarks via EXPLAIN gating.
 
@@ -999,6 +1101,7 @@ def preflight_validate_benchmarks(
 
     validation_results = validate_benchmarks(
         benchmarks, spark, catalog=catalog, gold_schema=schema,
+        w=w, warehouse_id=warehouse_id,
     )
     pre_count = len(benchmarks)
     filtered_benchmarks: list[dict] = []
@@ -1099,6 +1202,7 @@ def preflight_validate_benchmarks(
         )
         genie_benchmarks_regen = extract_genie_space_benchmarks(
             config, spark, catalog=catalog, schema=schema,
+            w=w, warehouse_id=warehouse_id,
         )
         write_stage(
             spark, run_id, "BENCHMARK_REGENERATION", "STARTED",
@@ -1110,6 +1214,7 @@ def preflight_validate_benchmarks(
             domain, catalog, schema, spark,
             target_count=TARGET_BENCHMARK_COUNT,
             genie_space_benchmarks=genie_benchmarks_regen,
+            warehouse_id=warehouse_id,
         )
         write_stage(
             spark, run_id, "BENCHMARK_REGENERATION", "COMPLETE",
@@ -1257,7 +1362,11 @@ def preflight_setup_experiment(
             domain=domain,
         )
 
-    _flag_stale_temporal_benchmarks(benchmarks, spark)
+    import os as _os
+    _wh_id = _os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "")
+    _flag_stale_temporal_benchmarks(
+        benchmarks, spark, w=w, warehouse_id=_wh_id,
+    )
 
     _asset_fp = compute_asset_fingerprint(config)
     for _b in benchmarks:
@@ -1394,6 +1503,7 @@ def _load_or_generate_benchmarks(
     schema: str,
     uc_schema: str,
     run_id: str,
+    warehouse_id: str = "",
 ) -> tuple[list[dict], bool]:
     """Load existing benchmarks or generate new ones from Genie space + LLM.
 
@@ -1411,6 +1521,7 @@ def _load_or_generate_benchmarks(
     """
     genie_benchmarks = extract_genie_space_benchmarks(
         config, spark, catalog=catalog, schema=schema,
+        w=w, warehouse_id=warehouse_id,
     )
     curated_with_sql = sum(1 for b in genie_benchmarks if b.get("expected_sql"))
     curated_question_only = sum(1 for b in genie_benchmarks if not b.get("expected_sql"))
@@ -1435,6 +1546,7 @@ def _load_or_generate_benchmarks(
     if existing and len(existing) >= 5:
         validation_results = validate_benchmarks(
             existing, spark, catalog=catalog, gold_schema=schema,
+            w=w, warehouse_id=warehouse_id,
         )
         valid_existing = [
             b for b, v in zip(existing, validation_results)
@@ -1577,6 +1689,7 @@ def _load_or_generate_benchmarks(
                         target_count=TARGET_BENCHMARK_COUNT,
                         genie_space_benchmarks=genie_benchmarks,
                         existing_benchmarks=valid_existing,
+                        warehouse_id=warehouse_id,
                     )
                     write_stage(
                         spark, run_id, "BENCHMARK_GENERATION", "COMPLETE",
@@ -1632,6 +1745,7 @@ def _load_or_generate_benchmarks(
         domain, catalog, schema, spark,
         target_count=TARGET_BENCHMARK_COUNT,
         genie_space_benchmarks=genie_benchmarks,
+        warehouse_id=warehouse_id,
     )
 
     write_stage(
