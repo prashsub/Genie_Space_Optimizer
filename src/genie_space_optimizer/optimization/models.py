@@ -564,9 +564,13 @@ def register_uc_model(
         # ── 4. Fetch per-judge eval scores from source run ──
         tracking_client = mlflow.tracking.MlflowClient()
         new_scores: dict[str, float] = {}
+        held_out_acc: float | None = None
+        held_out_count: float | None = None
         try:
             new_run_data = tracking_client.get_run(source_run_id).data
             new_scores = {j: new_run_data.metrics.get(j, 0.0) for j in _EVAL_JUDGES}
+            held_out_acc = new_run_data.metrics.get("held_out_accuracy")
+            held_out_count = new_run_data.metrics.get("held_out_count")
         except Exception:
             logger.debug("Could not fetch eval metrics from source run", exc_info=True)
 
@@ -587,6 +591,10 @@ def register_uc_model(
         }
         if baseline_accuracy is not None:
             _version_tags["genie.baseline_accuracy"] = f"{baseline_accuracy:.1f}"
+        if held_out_acc is not None:
+            _version_tags["genie.held_out_accuracy"] = f"{held_out_acc:.1f}"
+        if held_out_count is not None:
+            _version_tags["genie.held_out_count"] = f"{int(held_out_count)}"
         if deploy_target:
             _version_tags["genie.deploy_target_url"] = deploy_target
         for judge, score in new_scores.items():

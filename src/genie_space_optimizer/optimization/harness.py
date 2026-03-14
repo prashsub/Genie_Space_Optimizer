@@ -5285,6 +5285,20 @@ def _run_finalize(
                     },
                     catalog=catalog, schema=schema,
                 )
+
+                _best_eval_run_id = (latest_iter or {}).get("mlflow_run_id", "")
+                if _best_eval_run_id:
+                    try:
+                        from mlflow.tracking import MlflowClient as _HoMlflowClient
+                        _ho_client = _HoMlflowClient()
+                        _ho_client.log_metric(_best_eval_run_id, "held_out_accuracy", held_out_accuracy)
+                        _ho_client.log_metric(_best_eval_run_id, "held_out_count", float(len(held_out_benchmarks)))
+                        logger.info(
+                            "Logged held-out metrics to eval run %s: accuracy=%.1f%%, count=%d",
+                            _best_eval_run_id, held_out_accuracy, len(held_out_benchmarks),
+                        )
+                    except Exception:
+                        logger.debug("Failed to log held-out metrics to eval run", exc_info=True)
             except TimeoutError:
                 raise
             except Exception:

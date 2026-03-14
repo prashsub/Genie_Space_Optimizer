@@ -276,7 +276,7 @@ _STEP_DEFINITIONS: list[_StepDefinition] = [
     {
         "stepNumber": 5,
         "name": "Finalization",
-        "stage_prefixes": ["FINALIZE", "REPEATABILITY"],
+        "stage_prefixes": ["FINALIZE", "REPEATABILITY", "HELD_OUT"],
         "summary_template": "Final evaluation complete. Optimized score: {score}%. Repeatability: {repeatability}%",
     },
     {
@@ -712,6 +712,10 @@ def _build_step_io(
                 "ucModelName": detail.get("uc_model_name") or None,
                 "ucModelVersion": detail.get("uc_model_version") or None,
                 "ucChampionPromoted": detail.get("uc_champion_promoted", False),
+                "heldOutAccuracy": _safe_float(detail.get("held_out_accuracy")),
+                "heldOutCount": _safe_int(detail.get("held_out_count")),
+                "trainAccuracy": _safe_float(detail.get("train_accuracy")),
+                "heldOutDeltaPp": _safe_float(detail.get("delta_pp")),
                 "stageEvents": timeline,
             },
         )
@@ -831,7 +835,11 @@ def _build_step_summary(
     if step_name == "Finalization":
         score = f"{_finite(run_data.get('best_accuracy', 0)):.1f}" if run_data.get("best_accuracy") else "?"
         rep = f"{_finite(run_data.get('best_repeatability', 0)):.1f}" if run_data.get("best_repeatability") else "?"
-        return defn["summary_template"].format(score=score, repeatability=rep)
+        summary = defn["summary_template"].format(score=score, repeatability=rep)
+        ho_acc = _safe_float(detail.get("held_out_accuracy"))
+        if ho_acc is not None:
+            summary += f" Held-out: {ho_acc:.1f}%"
+        return summary
     if step_name == "Deploy":
         status = detail.get("status", "pending")
         return defn["summary_template"].format(status=status)

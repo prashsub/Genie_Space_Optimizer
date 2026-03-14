@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "motion/react";
-import { CheckCheck, Award, Rocket, Lock } from "lucide-react";
+import { CheckCheck, Award, Rocket, Lock, ShieldCheck } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { StageScreen } from "../StageScreen";
 import {
@@ -12,19 +12,25 @@ import {
 const CARDS = [
   {
     title: "Repeatability",
-    subtitle: "2 eval passes compared",
+    subtitle: "1 eval pass verified",
     iconArea: (
-      <div className="flex gap-2">
-        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-100">
-          <CheckCheck className="h-5 w-5 text-blue-600" />
-        </div>
-        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-100">
-          <CheckCheck className="h-5 w-5 text-blue-600" />
-        </div>
+      <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-100">
+        <CheckCheck className="h-5 w-5 text-blue-600" />
       </div>
     ),
     topBorder: "border-t-4 border-t-blue-400",
     accent: "text-blue-700",
+  },
+  {
+    title: "Generalization",
+    subtitle: "Held-out questions tested",
+    iconArea: (
+      <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-purple-100">
+        <ShieldCheck className="h-5 w-5 text-purple-600" />
+      </div>
+    ),
+    topBorder: "border-t-4 border-t-purple-400",
+    accent: "text-purple-700",
   },
   {
     title: "Champion",
@@ -55,7 +61,7 @@ const CARDS = [
 
 export function FinalizeDeployStage() {
   const visual = (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
       {CARDS.map((card, index) => (
         <motion.div
           key={card.title}
@@ -79,7 +85,7 @@ export function FinalizeDeployStage() {
 
   const explanation = (
     <p>
-      The final stage validates that improvements are repeatable, promotes the best configuration to &quot;champion&quot; status, creates a human review session, and optionally deploys to a target workspace.
+      The final stage validates that improvements are repeatable, runs a held-out generalization check on questions the optimizer never saw, promotes the best configuration to &quot;champion&quot; status, creates a human review session, and optionally deploys to a target workspace.
     </p>
   );
 
@@ -89,7 +95,16 @@ export function FinalizeDeployStage() {
       title: "Repeatability Testing",
       content: (
         <div className="space-y-2 text-sm">
-          <p>Runs 2 passes; compares SQL hashes per benchmark. REPEATABILITY_TARGET=90%.</p>
+          <p>Runs 1 pass on train benchmarks; compares SQL hashes per benchmark. REPEATABILITY_TARGET=90%.</p>
+        </div>
+      ),
+    },
+    {
+      id: "held-out-check",
+      title: "Held-Out Generalization Check",
+      content: (
+        <div className="space-y-2 text-sm">
+          <p>Evaluates ~3-4 benchmark questions the optimizer never saw during the lever loop. Compares held-out accuracy to train accuracy. A gap over 15pp may indicate instruction overfitting. This check is directional only and does not affect optimization decisions.</p>
         </div>
       ),
     },
