@@ -30,7 +30,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Suspense, useState } from "react";
+import { type ReactNode, Suspense, useState } from "react";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Collapsible,
@@ -41,6 +41,8 @@ import { Input } from "@/components/ui/input";
 import {
   ArrowLeft,
   ChevronDown,
+  Check,
+  Copy,
   Rocket,
   ShieldAlert,
 } from "lucide-react";
@@ -683,29 +685,26 @@ function SpaceDetail() {
             <Alert variant="destructive" className="border-amber-300 bg-amber-50 text-amber-900 [&>svg]:text-amber-600">
               <ShieldAlert className="h-4 w-4" />
               <AlertTitle>Missing permissions</AlertTitle>
-              <AlertDescription className="space-y-2">
-                {!hasSpaceAccess && (
-                  <p>
-                    The app&apos;s service principal needs <strong>CAN_MANAGE</strong> on this Genie Space.
-                    {spacePerms?.spGrantInstructions && (
-                      <span className="block mt-1 font-mono text-xs bg-amber-100 rounded px-2 py-1">
-                        {spacePerms.spGrantInstructions}
-                      </span>
-                    )}
-                  </p>
-                )}
-                {hasSpaceAccess && !allReadGranted && spacePerms?.schemas && (
-                  <div>
-                    <p>Missing <strong>SELECT</strong> on:</p>
-                    <ul className="mt-1 space-y-1">
-                      {spacePerms.schemas.filter((s) => !s.readGranted).map((s) => (
-                        <li key={`${s.catalog}.${s.schema_name}`} className="font-mono text-xs bg-amber-100 rounded px-2 py-1">
-                          {s.readGrantCommand || `GRANT SELECT ON SCHEMA ${s.catalog}.${s.schema_name} TO ...`}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
+              <AlertDescription className="space-y-3">
+                <PermissionStep
+                  step={1}
+                  title="Grant Genie Space access"
+                  description={<>The app&apos;s service principal needs <strong>CAN_MANAGE</strong> on this Genie Space.</>}
+                  granted={hasSpaceAccess}
+                  code={spacePerms?.spGrantInstructions}
+                />
+                <PermissionStep
+                  step={2}
+                  title="Grant data access"
+                  description={<>The service principal needs <strong>SELECT</strong> and <strong>EXECUTE</strong> on the underlying schemas.</>}
+                  granted={allReadGranted}
+                  code={
+                    spacePerms?.schemas
+                      ?.filter((s) => !s.readGranted)
+                      .map((s) => s.readGrantCommand || `GRANT SELECT ON SCHEMA ${s.catalog}.${s.schema_name} TO '...';\nGRANT EXECUTE ON SCHEMA ${s.catalog}.${s.schema_name} TO '...';`)
+                      .join("\n\n") || undefined
+                  }
+                />
                 <p className="text-xs">
                   <Link
                     to="/settings"
@@ -768,6 +767,65 @@ function SpaceDetail() {
           </div>
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function PermissionStep({
+  step,
+  title,
+  description,
+  granted,
+  code,
+}: {
+  step: number;
+  title: string;
+  description: ReactNode;
+  granted: boolean;
+  code?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    if (!code) return;
+    navigator.clipboard.writeText(code).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  return (
+    <div className={`rounded-md border px-3 py-2 ${granted ? "border-green-300 bg-green-50" : "border-amber-300 bg-amber-50"}`}>
+      <div className="flex items-center gap-2">
+        <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${granted ? "bg-green-600 text-white" : "bg-amber-500 text-white"}`}>
+          {granted ? <Check className="h-3 w-3" /> : step}
+        </span>
+        <span className={`text-sm font-medium ${granted ? "text-green-800" : "text-amber-900"}`}>
+          {title}
+          {granted && <span className="ml-1.5 text-xs font-normal text-green-600">(granted)</span>}
+        </span>
+      </div>
+      {!granted && (
+        <>
+          <p className="mt-1 ml-7 text-xs text-amber-800">{description}</p>
+          {code && (
+            <div className="relative mt-2 ml-7">
+              <pre className="rounded bg-amber-100/80 px-3 py-2 pr-10 font-mono text-[11px] leading-relaxed text-amber-900 overflow-x-auto whitespace-pre-wrap break-all">
+                {code}
+              </pre>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="absolute right-1 top-1 h-6 w-6 text-amber-700 hover:bg-amber-200 hover:text-amber-900"
+                onClick={handleCopy}
+                title="Copy to clipboard"
+              >
+                {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+              </Button>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
