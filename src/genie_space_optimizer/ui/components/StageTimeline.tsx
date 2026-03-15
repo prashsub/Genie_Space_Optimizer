@@ -157,7 +157,7 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
         <CollapsibleContent>
           <CardContent className="pt-0">
             {!hasData ? (
-              <p className="text-sm text-muted-foreground py-6 text-center">
+              <p className="text-sm text-muted py-6 text-center">
                 No timeline data available
               </p>
             ) : (
@@ -182,7 +182,7 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
                           return (
                             <div className="grid gap-1.5 min-w-[200px]">
                               <div>
-                                <span className="text-muted-foreground">
+                                <span className="text-muted">
                                   Stage:{" "}
                                 </span>
                                 <span className="font-medium">
@@ -190,7 +190,7 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
                                 </span>
                               </div>
                               <div>
-                                <span className="text-muted-foreground">
+                                <span className="text-muted">
                                   Status:{" "}
                                 </span>
                                 <span className="font-medium capitalize">
@@ -198,7 +198,7 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
                                 </span>
                               </div>
                               <div>
-                                <span className="text-muted-foreground">
+                                <span className="text-muted">
                                   Duration:{" "}
                                 </span>
                                 <span className="font-medium tabular-nums">
@@ -206,7 +206,7 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
                                 </span>
                               </div>
                               <div>
-                                <span className="text-muted-foreground">
+                                <span className="text-muted">
                                   Started:{" "}
                                 </span>
                                 <span className="font-mono text-xs">
@@ -214,7 +214,7 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
                                 </span>
                               </div>
                               <div>
-                                <span className="text-muted-foreground">
+                                <span className="text-muted">
                                   Completed:{" "}
                                 </span>
                                 <span className="font-mono text-xs">
@@ -223,10 +223,10 @@ export function StageTimeline({ stageEvents }: StageTimelineProps) {
                               </div>
                               {payload.errorMessage && (
                                 <div>
-                                  <span className="text-muted-foreground">
+                                  <span className="text-muted">
                                     Error:{" "}
                                   </span>
-                                  <span className="text-destructive text-xs">
+                                  <span className="text-danger text-xs">
                                     {payload.errorMessage}
                                   </span>
                                 </div>

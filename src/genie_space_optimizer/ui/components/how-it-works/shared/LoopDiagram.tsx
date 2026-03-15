@@ -88,7 +88,7 @@ export function LoopDiagram({ steps, className }: LoopDiagramProps) {
           aria-hidden
         />
         <motion.span
-          className="text-xs text-muted-foreground"
+          className="text-xs text-muted"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ delay: 0.3 }}

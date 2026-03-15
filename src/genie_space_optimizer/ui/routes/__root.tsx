@@ -185,7 +185,7 @@ function RootLayout() {
           <Outlet />
         </main>
 
-        <footer className="border-t border-db-gray-border bg-white py-4 text-center text-xs text-muted-foreground">
+        <footer className="border-t border-db-gray-border bg-white py-4 text-center text-xs text-muted">
           &copy; {new Date().getFullYear()} Databricks &mdash; Genie Space
           Optimizer
         </footer>

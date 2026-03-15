@@ -5067,7 +5067,8 @@ def _compute_asset_coverage(
         l_name = _leaf(js.get("left", {}).get("identifier", ""))
         r_name = _leaf(js.get("right", {}).get("identifier", ""))
         if l_name and r_name:
-            configured_join_pairs.add(tuple(sorted([l_name, r_name])))
+            pair: tuple[str, str] = (min(l_name, r_name), max(l_name, r_name))
+            configured_join_pairs.add(pair)
 
     return {
         "covered": covered_leaves,

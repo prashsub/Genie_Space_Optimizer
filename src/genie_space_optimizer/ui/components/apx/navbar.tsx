@@ -9,7 +9,7 @@ interface NavbarProps {
 
 export function Navbar({ leftContent, rightContent }: NavbarProps) {
   return (
-    <header className="z-50 bg-background/80 backdrop-blur-sm border-b">
+    <header className="z-50 bg-surface/80 backdrop-blur-sm border-b">
       <div className="h-16 flex items-center justify-between px-4">
         {leftContent || <Logo />}
         <div className="flex-1" />

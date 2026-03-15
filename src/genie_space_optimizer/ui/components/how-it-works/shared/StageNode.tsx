@@ -35,7 +35,7 @@ export function StageNode({
       <div
         className={cn(
           "mb-2 flex h-10 w-10 shrink-0 items-center justify-center rounded-full",
-          isActive ? "bg-db-blue text-white" : "bg-db-gray-bg text-muted-foreground"
+          isActive ? "bg-db-blue text-white" : "bg-db-gray-bg text-muted"
         )}
       >
         <Icon className="h-5 w-5" />
@@ -43,12 +43,12 @@ export function StageNode({
       <span
         className={cn(
           "text-center text-sm font-semibold",
-          isActive ? "text-db-blue" : "text-foreground"
+          isActive ? "text-db-blue" : "text-primary"
         )}
       >
         {title}
       </span>
-      <p className="mt-1 line-clamp-2 text-center text-xs text-muted-foreground">
+      <p className="mt-1 line-clamp-2 text-center text-xs text-muted">
         {summary}
       </p>
     </motion.button>

@@ -49,8 +49,8 @@ const statusConfig: Record<
 > = {
   pending: {
     badge: "Pending",
-    badgeClass: "bg-muted text-muted-foreground border-muted-foreground/20",
-    ringClass: "border-muted-foreground/20 bg-muted/50 text-muted-foreground/40",
+    badgeClass: "bg-elevated text-muted border-muted-foreground/20",
+    ringClass: "border-muted-foreground/20 bg-elevated/50 text-muted/40",
   },
   running: {
     badge: "Running",
@@ -95,8 +95,8 @@ function StatusIndicator({ status }: { status: string }) {
     );
   }
   return (
-    <div className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-muted-foreground/20 bg-muted/50">
-      <Circle className="h-4 w-4 text-muted-foreground/30" />
+    <div className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-muted-foreground/20 bg-elevated/50">
+      <Circle className="h-4 w-4 text-muted" />
     </div>
   );
 }
@@ -145,25 +145,19 @@ export function PipelineStepCard({
 
             <div className="flex min-w-0 flex-1 flex-col gap-1">
               <div className="flex items-center gap-2">
-                <span className={`flex items-center gap-1 text-xs font-medium ${
-                  status === "pending" ? "text-muted-foreground/50" : "text-muted-foreground"
-                }`}>
+                <span className="flex items-center gap-1 text-xs font-medium text-muted">
                   {stepIcons[stepNumber]}
                   Step {stepNumber}
                 </span>
                 <span className={`text-sm font-semibold ${
-                  status === "pending" ? "text-muted-foreground/60" : ""
+                  status === "pending" ? "text-secondary" : ""
                 }`}>
                   {name}
                 </span>
               </div>
 
               {description && (
-                <p className={`text-xs leading-relaxed ${
-                  status === "pending"
-                    ? "text-muted-foreground/40"
-                    : "text-muted-foreground"
-                }`}>
+                <p className="text-xs leading-relaxed text-muted">
                   {description}
                 </p>
               )}
@@ -175,7 +169,7 @@ export function PipelineStepCard({
               )}
 
               {summary && status !== "pending" && (
-                <p className="text-xs font-medium text-muted-foreground">
+                <p className="text-xs font-medium text-muted">
                   {summary}
                 </p>
               )}
@@ -183,7 +177,7 @@ export function PipelineStepCard({
 
             <div className="flex shrink-0 items-center gap-2">
               {durationSeconds != null && (
-                <span className="text-xs tabular-nums text-muted-foreground">
+                <span className="text-xs tabular-nums text-muted">
                   {formatDuration(durationSeconds)}
                 </span>
               )}
@@ -195,7 +189,7 @@ export function PipelineStepCard({
               </Badge>
               {isExpandable && (
                 <ChevronDown
-                  className={`h-4 w-4 text-muted-foreground transition-transform duration-200 ${
+                  className={`h-4 w-4 text-muted transition-transform duration-200 ${
                     open ? "rotate-180" : ""
                   }`}
                 />

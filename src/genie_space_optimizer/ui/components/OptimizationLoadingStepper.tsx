@@ -117,43 +117,43 @@ export function OptimizationLoadingStepper({
                 key={i}
                 className={`flex items-center gap-3 rounded-md px-3 py-2 transition-all duration-300 ${
                   isActive
-                    ? "bg-accent"
+                    ? "bg-accent/10"
                     : isDone
-                      ? "opacity-70"
+                      ? ""
                       : isFailed
-                        ? "bg-destructive/10"
+                        ? "bg-danger/10"
                         : isFuture
-                          ? "opacity-30"
+                          ? ""
                           : ""
                 }`}
               >
                 <div className="flex h-8 w-8 shrink-0 items-center justify-center">
                   {isFailed ? (
-                    <XCircle className="h-5 w-5 text-destructive animate-in fade-in duration-300" />
+                    <XCircle className="h-5 w-5 text-danger animate-in fade-in duration-300" />
                   ) : isDone ? (
                     <CheckCircle className="h-5 w-5 text-db-green animate-in fade-in duration-300" />
                   ) : isActive ? (
                     <Loader2 className="h-5 w-5 animate-spin text-db-blue" />
                   ) : (
-                    <StepIcon className="h-5 w-5 text-muted-foreground" />
+                    <StepIcon className="h-5 w-5 text-muted" />
                   )}
                 </div>
                 <div className="min-w-0">
                   <p
                     className={`text-sm font-medium leading-tight ${
                       isFailed
-                        ? "text-destructive"
+                        ? "text-danger"
                         : isDone
-                          ? "text-foreground"
+                          ? "text-primary"
                           : isActive
-                            ? "text-foreground"
-                            : "text-muted-foreground"
+                            ? "text-accent"
+                            : "text-muted"
                     }`}
                   >
                     {step.label}
                   </p>
                   {(isActive || isFailed) && (
-                    <p className="mt-0.5 text-xs text-muted-foreground animate-in fade-in duration-200">
+                    <p className="mt-0.5 text-xs text-muted animate-in fade-in duration-200">
                       {isFailed ? error : step.description}
                     </p>
                   )}

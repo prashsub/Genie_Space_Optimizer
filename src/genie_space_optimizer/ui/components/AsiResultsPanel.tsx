@@ -79,7 +79,7 @@ export function AsiResultsPanel({
           <CardContent className="space-y-6 pt-0">
             {availableIterations.length > 1 && (
               <div className="flex items-center gap-2">
-                <span className="text-xs font-medium text-muted-foreground">
+                <span className="text-xs font-medium text-muted">
                   Iteration:
                 </span>
                 <div className="flex gap-1">
@@ -101,13 +101,13 @@ export function AsiResultsPanel({
             )}
 
             {isLoading && (
-              <p className="py-8 text-center text-sm text-muted-foreground">
+              <p className="py-8 text-center text-sm text-muted">
                 Loading judge feedback...
               </p>
             )}
 
             {isError && (
-              <p className="py-8 text-center text-sm text-destructive">
+              <p className="py-8 text-center text-sm text-danger">
                 Failed to load judge feedback
               </p>
             )}
@@ -123,7 +123,7 @@ export function AsiResultsPanel({
 function AsiContent({ data }: { data: AsiSummary }) {
   if (data.totalResults === 0) {
     return (
-      <p className="py-6 text-center text-sm text-muted-foreground">
+      <p className="py-6 text-center text-sm text-muted">
         No ASI results for this iteration
       </p>
     );
@@ -139,7 +139,7 @@ function AsiContent({ data }: { data: AsiSummary }) {
       {/* Summary cards */}
       <div className="grid grid-cols-3 gap-3">
         <div className="rounded-lg border p-3 text-center">
-          <p className="text-xs font-medium text-muted-foreground">
+          <p className="text-xs font-medium text-muted">
             Total Verdicts
           </p>
           <p className="text-2xl font-bold">{data.totalResults}</p>
@@ -180,17 +180,17 @@ function FailureTypeChart({
   if (chartData.length === 0) {
     return (
       <div className="rounded-lg border p-4">
-        <p className="text-xs font-medium text-muted-foreground">
+        <p className="text-xs font-medium text-muted">
           Failure Types
         </p>
-        <p className="mt-2 text-xs text-muted-foreground">No failures found</p>
+        <p className="mt-2 text-xs text-muted">No failures found</p>
       </div>
     );
   }
 
   return (
     <div className="rounded-lg border p-4">
-      <p className="mb-2 text-xs font-medium text-muted-foreground">
+      <p className="mb-2 text-xs font-medium text-muted">
         Failure Types
       </p>
       <ChartContainer config={failureChartConfig} className="h-[200px] w-full">
@@ -231,10 +231,10 @@ function BlameChart({
   if (chartData.length === 0) {
     return (
       <div className="rounded-lg border p-4">
-        <p className="text-xs font-medium text-muted-foreground">
+        <p className="text-xs font-medium text-muted">
           Blame Attribution
         </p>
-        <p className="mt-2 text-xs text-muted-foreground">
+        <p className="mt-2 text-xs text-muted">
           No blame data available
         </p>
       </div>
@@ -243,7 +243,7 @@ function BlameChart({
 
   return (
     <div className="rounded-lg border p-4">
-      <p className="mb-2 text-xs font-medium text-muted-foreground">
+      <p className="mb-2 text-xs font-medium text-muted">
         Blame Attribution
       </p>
       <ChartContainer config={blameChartConfig} className="h-[200px] w-full">
@@ -275,17 +275,17 @@ function JudgePassRateChart({ rates }: { rates: Record<string, number> }) {
   if (chartData.length === 0) {
     return (
       <div className="rounded-lg border p-4">
-        <p className="text-xs font-medium text-muted-foreground">
+        <p className="text-xs font-medium text-muted">
           Judge Pass Rates
         </p>
-        <p className="mt-2 text-xs text-muted-foreground">No judge data</p>
+        <p className="mt-2 text-xs text-muted">No judge data</p>
       </div>
     );
   }
 
   return (
     <div className="rounded-lg border p-4">
-      <p className="mb-2 text-xs font-medium text-muted-foreground">
+      <p className="mb-2 text-xs font-medium text-muted">
         Judge Pass Rates
       </p>
       <ChartContainer config={judgeChartConfig} className="h-[200px] w-full">
@@ -342,7 +342,7 @@ function QuestionTable({ results }: { results: AsiResult[] }) {
 
   return (
     <div className="space-y-2">
-      <p className="text-xs font-medium text-muted-foreground">
+      <p className="text-xs font-medium text-muted">
         Per-Question Results ({questions.length} questions)
       </p>
       <div className="max-h-[400px] overflow-auto rounded-md border">
@@ -401,7 +401,7 @@ function QuestionRow({
   return (
     <>
       <TableRow
-        className="cursor-pointer hover:bg-muted/50"
+        className="cursor-pointer hover:bg-elevated/50"
         onClick={() => setExpanded(!expanded)}
       >
         <TableCell className="font-mono text-xs">
@@ -435,13 +435,13 @@ function QuestionRow({
             )}
           </div>
         </TableCell>
-        <TableCell className="max-w-[200px] truncate text-xs text-muted-foreground">
+        <TableCell className="max-w-[200px] truncate text-xs text-muted">
           {mainFix ?? "—"}
         </TableCell>
       </TableRow>
       {expanded && failures.length > 0 && (
         <TableRow>
-          <TableCell colSpan={4} className="bg-muted/30 p-3">
+          <TableCell colSpan={4} className="bg-elevated/30 p-3">
             <div className="space-y-2">
               {failures.map((f, i) => (
                 <div
@@ -455,23 +455,23 @@ function QuestionRow({
                       <Badge variant="outline">{f.failureType}</Badge>
                     )}
                     {f.severity && (
-                      <span className="text-muted-foreground">
+                      <span className="text-muted">
                         severity: {f.severity}
                       </span>
                     )}
                   </div>
                   {f.wrongClause && (
-                    <p className="mt-1 text-muted-foreground">
+                    <p className="mt-1 text-muted">
                       Wrong clause: {f.wrongClause}
                     </p>
                   )}
                   {f.expectedValue && (
-                    <p className="text-muted-foreground">
+                    <p className="text-muted">
                       Expected: {f.expectedValue}
                     </p>
                   )}
                   {f.actualValue && (
-                    <p className="text-muted-foreground">
+                    <p className="text-muted">
                       Actual: {f.actualValue}
                     </p>
                   )}
@@ -481,7 +481,7 @@ function QuestionRow({
                     </p>
                   )}
                   {f.blameSet.length > 0 && (
-                    <p className="text-muted-foreground">
+                    <p className="text-muted">
                       Blame: {f.blameSet.join(", ")}
                     </p>
                   )}

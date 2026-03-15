@@ -147,6 +147,7 @@ export interface SpaceDetail {
 export type SpaceListResponse = Record<string, unknown>;
 export interface SpacePermissions {
     schemas: SchemaPermission[];
+    spDisplayName?: string | null;
     spGrantInstructions?: string | null;
     spHasManage: boolean;
     spaceId: string;

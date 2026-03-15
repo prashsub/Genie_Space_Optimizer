@@ -13,12 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import {
-  Accordion,
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger,
-} from "@/components/ui/accordion";
+import { AccordionItem } from "@/components/ui/accordion";
 import { ProcessFlow } from "@/components/ProcessFlow";
 import {
   Table,
@@ -261,10 +256,10 @@ function SettingsContent() {
       <TabsContent value="permissions">
         <div className="space-y-6">
           <div>
-            <h1 className="text-2xl font-bold text-foreground">
+            <h1 className="text-2xl font-bold text-primary">
               Permission Settings
             </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
+            <p className="mt-1 text-sm text-muted">
               Review service principal access per Genie Space. Where access is
               missing, use the provided SQL commands or sharing instructions to
               grant it.
@@ -278,7 +273,7 @@ function SettingsContent() {
 
           <div className="flex items-center gap-3">
             <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
               <Input
                 placeholder="Search spaces by name, description, or space ID..."
                 value={searchInput}
@@ -298,7 +293,7 @@ function SettingsContent() {
           </div>
 
           {checkedCount < filtered.length && (
-            <p className="text-center text-xs text-muted-foreground">
+            <p className="text-center text-xs text-muted">
               Checked {checkedCount} of {filtered.length} spaces
               {editableCount > 0 && ` · ${editableCount} editable`}
             </p>
@@ -306,7 +301,7 @@ function SettingsContent() {
 
           {paged.length === 0 ? (
             <Card>
-              <CardContent className="py-8 text-center text-sm text-muted-foreground">
+              <CardContent className="py-8 text-center text-sm text-muted">
                 {debouncedSearch
                   ? "No spaces match your search."
                   : editableOnly
@@ -316,12 +311,7 @@ function SettingsContent() {
             </Card>
           ) : (
             <>
-              <Accordion
-                type="multiple"
-                value={expandedItems}
-                onValueChange={setExpandedItems}
-                className="space-y-3"
-              >
+              <div className="space-y-3">
                 {paged.map((space) => (
                   <LazySpacePermissionCard
                     key={space.id}
@@ -329,10 +319,17 @@ function SettingsContent() {
                     title={space.name}
                     workspaceHost={workspaceHost}
                     isExpanded={expandedItems.includes(space.id)}
+                    onToggle={(open) => {
+                      setExpandedItems((prev) =>
+                        open
+                          ? [...prev, space.id]
+                          : prev.filter((id) => id !== space.id)
+                      );
+                    }}
                     accessLevel={accessMap[space.id]}
                   />
                 ))}
-              </Accordion>
+              </div>
               {totalPages > 1 && (
                 <div className="flex items-center justify-center gap-4 pt-2">
                   <Button
@@ -344,7 +341,7 @@ function SettingsContent() {
                     <ChevronLeft className="mr-1 h-4 w-4" />
                     Prev
                   </Button>
-                  <span className="text-sm text-muted-foreground">
+                  <span className="text-sm text-muted">
                     Page {safePage + 1} of {totalPages}
                   </span>
                   <Button
@@ -406,7 +403,7 @@ function SPIdentityCard({
       </CardHeader>
       <CardContent>
         <div className="flex items-center gap-2">
-          <p className="text-base font-semibold text-foreground">
+          <p className="text-base font-semibold text-primary">
             {spDisplayName || spId}
           </p>
           <Button
@@ -422,7 +419,7 @@ function SPIdentityCard({
             )}
           </Button>
         </div>
-        <p className="mt-1 text-xs text-muted-foreground">
+        <p className="mt-1 text-xs text-muted">
           This service principal runs background optimization jobs. Use the
           instructions below to grant it the required access.
         </p>
@@ -431,14 +428,14 @@ function SPIdentityCard({
             <Button
               variant="link"
               size="sm"
-              className="h-auto p-0 text-xs text-muted-foreground"
+              className="h-auto p-0 text-xs text-muted"
               onClick={() => setShowClientId(!showClientId)}
             >
               {showClientId ? "Hide" : "Show"} Client ID
             </Button>
             {showClientId && (
               <div className="mt-1 flex items-center gap-2">
-                <code className="rounded-md bg-muted px-2.5 py-1.5 text-xs font-mono">
+                <code className="rounded-md bg-elevated px-2.5 py-1.5 text-xs font-mono">
                   {spId}
                 </code>
                 <Button
@@ -495,7 +492,7 @@ function StatusBadge({ status }: { status: string }) {
 function AccessLevelBadge({ level }: { level: string | null | undefined }) {
   if (level === undefined) {
     return (
-      <Badge variant="outline" className="gap-1 text-muted-foreground">
+      <Badge variant="outline" className="gap-1 text-muted">
         <Loader2 className="h-3 w-3 animate-spin" />
         Checking
       </Badge>
@@ -519,13 +516,13 @@ function AccessLevelBadge({ level }: { level: string | null | undefined }) {
   }
   if (level === "CAN_VIEW") {
     return (
-      <Badge variant="outline" className="text-muted-foreground">
+      <Badge variant="outline" className="text-muted">
         View Only
       </Badge>
     );
   }
   return (
-    <Badge variant="outline" className="text-muted-foreground">
+    <Badge variant="outline" className="text-muted">
       No Access
     </Badge>
   );
@@ -536,12 +533,14 @@ function LazySpacePermissionCard({
   title,
   workspaceHost,
   isExpanded,
+  onToggle,
   accessLevel,
 }: {
   spaceId: string;
   title: string;
   workspaceHost?: string | null;
   isExpanded: boolean;
+  onToggle: (open: boolean) => void;
   accessLevel?: string | null;
 }) {
   const isEditable = accessLevel === "CAN_EDIT" || accessLevel === "CAN_MANAGE";
@@ -561,47 +560,53 @@ function LazySpacePermissionCard({
 
   const isMuted = accessLevel !== undefined && !isEditable;
 
-  return (
-    <AccordionItem value={spaceId} className={`rounded-lg border bg-card ${isMuted ? "opacity-50" : ""}`}>
-      <AccordionTrigger className="px-4 hover:no-underline" disabled={isMuted}>
-        <div className="flex flex-1 items-center justify-between pr-2">
-          <div className="text-left">
-            <div className="flex items-center gap-1.5">
-              <p className="font-semibold">{title}</p>
-              {spaceUrl && (
-                <a
-                  href={spaceUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-blue-600 hover:text-blue-800"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <ExternalLink className="h-3.5 w-3.5" />
-                </a>
-              )}
-            </div>
-            <p className="text-xs text-muted-foreground">{spaceId}</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <AccessLevelBadge level={accessLevel} />
-            {space && <StatusBadge status={space.status} />}
-          </div>
+  const titleContent = (
+    <div className="flex flex-1 items-center justify-between pr-2">
+      <div className="text-left">
+        <div className="flex items-center gap-1.5">
+          <p className="font-semibold">{title}</p>
+          {spaceUrl && (
+            <a
+              href={spaceUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 hover:text-blue-800"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          )}
         </div>
-      </AccordionTrigger>
-      <AccordionContent className="px-4">
-        {isMuted ? (
-          <p className="py-2 text-sm text-muted-foreground">
-            You need Can Edit or Can Manage access to configure this space.
-          </p>
-        ) : isLoading || !space ? (
-          <div className="space-y-3 py-2">
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-24 w-full" />
-          </div>
-        ) : (
-          <SpacePermissionDetails space={space} />
-        )}
-      </AccordionContent>
+        <p className="text-xs text-muted">{spaceId}</p>
+      </div>
+    </div>
+  );
+
+  return (
+    <AccordionItem
+      title={titleContent}
+      open={isExpanded}
+      onOpenChange={onToggle}
+      disabled={isMuted}
+      action={
+        <div className="flex items-center gap-2">
+          <AccessLevelBadge level={accessLevel} />
+          {space && <StatusBadge status={space.status} />}
+        </div>
+      }
+    >
+      {isMuted ? (
+        <p className="py-2 text-sm text-muted">
+          You need Can Edit or Can Manage access to configure this space.
+        </p>
+      ) : isLoading || !space ? (
+        <div className="space-y-3 py-2">
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-24 w-full" />
+        </div>
+      ) : (
+        <SpacePermissionDetails space={space} />
+      )}
     </AccordionItem>
   );
 }
@@ -650,7 +655,7 @@ function SpacePermissionDetails({ space }: { space: SpacePermissions }) {
                 <TableHead className="text-center">Read (SELECT)</TableHead>
                 <TableHead className="text-center">
                   <span>Write (MODIFY)</span>
-                  <p className="text-[10px] font-normal text-muted-foreground">
+                  <p className="text-[10px] font-normal text-muted">
                     Optional — only for UC write backs
                   </p>
                 </TableHead>
@@ -694,8 +699,8 @@ function SqlHint({ sql }: { sql: string }) {
     toast.info("SQL copied to clipboard");
   };
   return (
-    <div className="mt-1 flex items-start gap-1.5 rounded bg-muted/60 px-2 py-1.5 text-left max-w-xs">
-      <code className="flex-1 whitespace-pre-wrap break-all text-[10px] font-mono leading-tight text-muted-foreground">
+    <div className="mt-1 flex items-start gap-1.5 rounded bg-elevated/60 px-2 py-1.5 text-left max-w-xs">
+      <code className="flex-1 whitespace-pre-wrap break-all text-[10px] font-mono leading-tight text-muted">
         {sql}
       </code>
       <Button
@@ -780,17 +785,17 @@ function FrameworkResourcesCard({
       <CardContent>
         <div className="space-y-2 text-sm">
           <div className="flex justify-between">
-            <span className="text-muted-foreground">Optimization tables</span>
+            <span className="text-muted">Optimization tables</span>
             <code className="font-mono text-xs">
               {catalog}.{schema}
             </code>
           </div>
           <div className="flex justify-between">
-            <span className="text-muted-foreground">MLflow experiments</span>
+            <span className="text-muted">MLflow experiments</span>
             <code className="font-mono text-xs">{experimentBasePath}</code>
           </div>
           <div className="flex justify-between">
-            <span className="text-muted-foreground">Background job</span>
+            <span className="text-muted">Background job</span>
             {jobUrl ? (
               <a
                 href={jobUrl}

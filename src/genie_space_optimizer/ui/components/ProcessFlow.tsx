@@ -113,15 +113,15 @@ function JudgesDetail() {
     <div className="space-y-4">
       <div className="grid grid-cols-3 gap-3 sm:grid-cols-5 lg:grid-cols-5">
         {JUDGES.map((judge) => (
-          <div key={judge.name} className="flex flex-col items-center text-center rounded-xl border border-border/50 bg-background p-3">
+          <div key={judge.name} className="flex flex-col items-center text-center rounded-xl border border-default/50 bg-surface p-3">
             <div className={`flex h-9 w-9 items-center justify-center rounded-lg ${judge.type === "CODE" ? "bg-emerald-100 text-emerald-600" : "bg-violet-100 text-violet-600"}`}>
               <judge.icon className="h-4.5 w-4.5" />
             </div>
-            <p className="mt-2 text-xs font-semibold text-foreground leading-tight">{judge.label}</p>
+            <p className="mt-2 text-xs font-semibold text-primary leading-tight">{judge.label}</p>
             <Badge variant="outline" className={`mt-1 text-[9px] px-1.5 py-0 ${judge.type === "CODE" ? "border-emerald-300 text-emerald-700" : "border-violet-300 text-violet-700"}`}>{judge.type}</Badge>
-            <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">{judge.description}</p>
+            <p className="mt-1.5 text-[11px] text-muted leading-snug">{judge.description}</p>
             {judge.threshold != null && (
-              <p className="mt-1 text-[11px] text-muted-foreground">Threshold: <span className="font-semibold text-foreground">{judge.threshold}%</span></p>
+              <p className="mt-1 text-[11px] text-muted">Threshold: <span className="font-semibold text-primary">{judge.threshold}%</span></p>
             )}
           </div>
         ))}
@@ -168,15 +168,15 @@ function StrategistDetail() {
               </div>
               {idx < loopSteps.length - 1 && (
                 <div className="flex items-center justify-center">
-                  <ArrowRight className="hidden h-5 w-5 text-muted-foreground/40 sm:block" />
-                  <ArrowDown className="block h-5 w-5 text-muted-foreground/40 sm:hidden" />
+                  <ArrowRight className="hidden h-5 w-5 text-muted/40 sm:block" />
+                  <ArrowDown className="block h-5 w-5 text-muted/40 sm:hidden" />
                 </div>
               )}
             </React.Fragment>
           );
         })}
       </div>
-      <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
+      <div className="flex items-center justify-center gap-2 text-xs text-muted">
         <RotateCw className="h-3.5 w-3.5" />
         <span>Repeats each iteration until convergence criteria are met</span>
       </div>
@@ -188,16 +188,16 @@ function LeversDetail() {
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
       {LEVERS.map((lever) => (
-        <div key={lever.number} className="flex flex-col items-center text-center rounded-xl border border-border/50 bg-background p-3">
+        <div key={lever.number} className="flex flex-col items-center text-center rounded-xl border border-default/50 bg-surface p-3">
           <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-100 text-blue-600">
             <lever.icon className="h-4.5 w-4.5" />
           </div>
           <Badge variant="outline" className="mt-1.5 text-[9px] px-1.5 py-0">L{lever.number}</Badge>
-          <p className="mt-1.5 text-xs font-semibold text-foreground leading-tight">{lever.name}</p>
-          <p className="mt-1 text-[11px] text-muted-foreground leading-snug">{lever.description}</p>
+          <p className="mt-1.5 text-xs font-semibold text-primary leading-tight">{lever.name}</p>
+          <p className="mt-1 text-[11px] text-muted leading-snug">{lever.description}</p>
           <div className="mt-2 flex flex-wrap gap-1 justify-center">
             {lever.examples.map((ex) => (
-              <code key={ex} className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-mono text-muted-foreground">{ex}</code>
+              <code key={ex} className="rounded bg-elevated px-1.5 py-0.5 text-[9px] font-mono text-muted">{ex}</code>
             ))}
           </div>
         </div>
@@ -210,9 +210,9 @@ function FailureRoutingDetail() {
   return (
     <div className="flex flex-wrap gap-2">
       {FAILURE_TO_LEVER.map((f) => (
-        <div key={f.failure} className="inline-flex items-center gap-1.5 rounded-lg border border-border/50 bg-background px-3 py-2 text-xs">
-          <code className="font-mono text-muted-foreground">{f.failure}</code>
-          <ArrowRight className="h-3 w-3 text-muted-foreground/50" />
+        <div key={f.failure} className="inline-flex items-center gap-1.5 rounded-lg border border-default/50 bg-surface px-3 py-2 text-xs">
+          <code className="font-mono text-muted">{f.failure}</code>
+          <ArrowRight className="h-3 w-3 text-muted/50" />
           <span className="font-bold text-blue-600">L{f.lever}</span>
         </div>
       ))}
@@ -245,13 +245,13 @@ function ThreeGateDetail() {
                   <gate.icon className={`h-5 w-5 ${c.iconColor}`} />
                 </div>
                 <p className={`text-sm font-semibold ${c.title}`}>Gate {idx + 1}: {gate.name}</p>
-                {gate.disabled && <Badge variant="outline" className="mt-1 text-[8px] px-1.5 py-0 border-muted-foreground/30 text-muted-foreground">Disabled</Badge>}
+                {gate.disabled && <Badge variant="outline" className="mt-1 text-[8px] px-1.5 py-0 border-muted-foreground/30 text-muted">Disabled</Badge>}
                 <p className={`mt-1 text-xs leading-snug ${c.text}`}>{gate.desc}</p>
               </div>
               {idx < gates.length - 1 && (
                 <div className="flex items-center justify-center">
-                  <ArrowRight className="hidden h-5 w-5 text-muted-foreground/40 sm:block" />
-                  <ArrowDown className="block h-5 w-5 text-muted-foreground/40 sm:hidden" />
+                  <ArrowRight className="hidden h-5 w-5 text-muted/40 sm:block" />
+                  <ArrowDown className="block h-5 w-5 text-muted/40 sm:hidden" />
                 </div>
               )}
             </React.Fragment>
@@ -444,21 +444,21 @@ function LeafNode({ leaf, isExpanded, onToggle }: { leaf: LeafDef; isExpanded: b
         <leaf.icon className="h-5 w-5" />
       </div>
       <div className="mt-2.5 flex items-center gap-1 flex-wrap justify-center">
-        <p className="text-sm font-semibold text-foreground leading-tight">{leaf.title}</p>
+        <p className="text-sm font-semibold text-primary leading-tight">{leaf.title}</p>
         {variantBadge}
       </div>
-      <p className="text-xs text-muted-foreground leading-snug mt-1.5">{leaf.description}</p>
+      <p className="text-xs text-muted leading-snug mt-1.5">{leaf.description}</p>
       {hasDetail && (
-        <ChevronDown className={`mt-2 h-4 w-4 text-muted-foreground/60 transition-transform duration-200 ${isExpanded ? "rotate-0" : "-rotate-90"}`} />
+        <ChevronDown className={`mt-2 h-4 w-4 text-muted/60 transition-transform duration-200 ${isExpanded ? "rotate-0" : "-rotate-90"}`} />
       )}
     </div>
   );
 
-  const borderColor = isExpanded ? "border-blue-300 shadow-sm shadow-blue-100" : "border-border/40";
+  const borderColor = isExpanded ? "border-blue-300 shadow-sm shadow-blue-100" : "border-default/40";
 
   if (!hasDetail) {
     return (
-      <div className={`rounded-xl border ${borderColor} bg-background`}>
+      <div className={`rounded-xl border ${borderColor} bg-surface`}>
         {card}
       </div>
     );
@@ -467,7 +467,7 @@ function LeafNode({ leaf, isExpanded, onToggle }: { leaf: LeafDef; isExpanded: b
   return (
     <button
       onClick={onToggle}
-      className={`rounded-xl border ${borderColor} bg-background cursor-pointer hover:border-blue-200 hover:shadow-sm transition-all text-left`}
+      className={`rounded-xl border ${borderColor} bg-surface cursor-pointer hover:border-blue-200 hover:shadow-sm transition-all text-left`}
     >
       {card}
     </button>
@@ -548,8 +548,8 @@ export function ProcessFlow() {
     <div className="space-y-6">
       {/* Header */}
       <div className="text-center">
-        <h2 className="text-xl font-semibold text-foreground">How the Optimizer Works</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <h2 className="text-xl font-semibold text-primary">How the Optimizer Works</h2>
+        <p className="mt-1 text-sm text-muted">
           A {TOTAL_STEPS}-step pipeline that analyzes, benchmarks, and improves your Genie Space configuration using 9 judges and 5 optimization levers.
         </p>
       </div>
@@ -575,7 +575,7 @@ export function ProcessFlow() {
                       ? "border-blue-500 bg-blue-500 text-white shadow-lg shadow-blue-500/30 scale-110"
                       : isPast
                         ? "border-green-500 bg-green-50 text-green-600"
-                        : "border-muted-foreground/30 bg-muted/50 text-muted-foreground group-hover:border-blue-300 group-hover:bg-blue-50 group-hover:text-blue-500"
+                        : "border-muted-foreground/30 bg-elevated/50 text-muted group-hover:border-blue-300 group-hover:bg-blue-50 group-hover:text-blue-500"
                     }
                   `}
                 >
@@ -588,7 +588,7 @@ export function ProcessFlow() {
                 <span
                   className={`
                     text-[10px] font-medium text-center max-w-[90px] leading-tight transition-colors duration-300
-                    ${isActive ? "text-blue-600" : isPast ? "text-green-600" : "text-muted-foreground"}
+                    ${isActive ? "text-blue-600" : isPast ? "text-green-600" : "text-muted"}
                   `}
                 >
                   {step.title}
@@ -603,7 +603,7 @@ export function ProcessFlow() {
                       ? "border-blue-500 bg-blue-600 text-white"
                       : isPast
                         ? "border-green-500 bg-green-500 text-white"
-                        : "border-muted-foreground/30 bg-background text-muted-foreground"
+                        : "border-muted-foreground/30 bg-surface text-muted"
                     }
                   `}
                 >
@@ -614,10 +614,10 @@ export function ProcessFlow() {
               {idx < STEPS.length - 1 && (
                 <div className="flex items-center mx-2 mb-6">
                   <div
-                    className={`h-0.5 w-8 transition-colors duration-500 ${isPast ? "bg-green-400" : "bg-muted-foreground/20"}`}
+                    className={`h-0.5 w-8 transition-colors duration-500 ${isPast ? "bg-green-400" : "bg-elevated-foreground/20"}`}
                   />
                   <ArrowRight
-                    className={`h-3.5 w-3.5 -ml-1 transition-colors duration-500 ${isPast ? "text-green-400" : "text-muted-foreground/20"}`}
+                    className={`h-3.5 w-3.5 -ml-1 transition-colors duration-500 ${isPast ? "text-green-400" : "text-muted/20"}`}
                   />
                 </div>
               )}
@@ -629,20 +629,20 @@ export function ProcessFlow() {
       {/* Detail panel for the active step */}
       <div
         key={activeStep}
-        className="animate-in fade-in slide-in-from-bottom-2 duration-500 rounded-lg border border-border/50 bg-background overflow-hidden"
+        className="animate-in fade-in slide-in-from-bottom-2 duration-500 rounded-lg border border-default/50 bg-surface overflow-hidden"
       >
-        <div className="flex items-center gap-3 border-b border-border/30 px-5 py-3">
+        <div className="flex items-center gap-3 border-b border-default/30 px-5 py-3">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-blue-100 text-blue-600">
             <current.icon className="h-5 w-5" />
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2">
-              <h3 className="text-sm font-semibold text-foreground">{current.title}</h3>
+              <h3 className="text-sm font-semibold text-primary">{current.title}</h3>
               <Badge variant="outline" className="text-[9px] px-1.5 py-0 border-blue-300 text-blue-700">
                 Step {current.number} of {TOTAL_STEPS}
               </Badge>
             </div>
-            <p className="text-xs text-muted-foreground leading-snug mt-0.5">{current.description}</p>
+            <p className="text-xs text-muted leading-snug mt-0.5">{current.description}</p>
           </div>
         </div>
 
@@ -667,16 +667,16 @@ export function ProcessFlow() {
           .map((leaf) => {
             const DetailComp = leaf.detail!;
             return (
-              <div key={leaf.id} className="border-t border-border/30 px-5 py-4 animate-in fade-in slide-in-from-top-2 duration-300">
+              <div key={leaf.id} className="border-t border-default/30 px-5 py-4 animate-in fade-in slide-in-from-top-2 duration-300">
                 <div className="flex items-center gap-2 mb-3">
                   <div className="flex h-7 w-7 items-center justify-center rounded-md bg-blue-100 text-blue-600">
                     <leaf.icon className="h-4 w-4" />
                   </div>
-                  <h4 className="text-sm font-semibold text-foreground">{leaf.title}</h4>
+                  <h4 className="text-sm font-semibold text-primary">{leaf.title}</h4>
                   <div className="h-px flex-1 bg-border/40" />
                   <button
                     onClick={() => handleToggleLeaf(leaf.id)}
-                    className="text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                    className="text-xs text-muted hover:text-primary transition-colors cursor-pointer"
                   >
                     Collapse
                   </button>
@@ -687,7 +687,7 @@ export function ProcessFlow() {
           })}
 
         {/* Progress bar */}
-        <div className="h-1 bg-muted">
+        <div className="h-1 bg-elevated">
           <div
             className="h-full bg-blue-500 transition-all duration-500 ease-out"
             style={{ width: `${(activeStep / TOTAL_STEPS) * 100}%` }}
@@ -718,7 +718,7 @@ export function ProcessFlow() {
                   ? "bg-blue-500 scale-125"
                   : step.number < activeStep
                     ? "bg-green-400"
-                    : "bg-muted-foreground/30 hover:bg-blue-300"
+                    : "bg-elevated-foreground/30 hover:bg-blue-300"
               }`}
               aria-label={`Go to step ${step.number}`}
             />

@@ -86,7 +86,7 @@ export function ConvergenceStage() {
             >
               <div className="space-y-2 text-sm">
                 <p><code className="rounded bg-db-gray-bg px-1.5 py-0.5">{c.formula}</code></p>
-                <p className="text-muted-foreground">{c.description}</p>
+                <p className="text-muted">{c.description}</p>
               </div>
             </ExpandableCard>
           ))}
@@ -104,7 +104,7 @@ export function ConvergenceStage() {
                 <span className="font-mono text-sm font-semibold">{c.name}</span>
                 <span className="rounded bg-db-gray-bg px-2 py-0.5 text-xs font-medium">{c.value}</span>
               </div>
-              <p className="mt-1 text-sm text-muted-foreground">{c.description}</p>
+              <p className="mt-1 text-sm text-muted">{c.description}</p>
             </div>
           ))}
         </div>

@@ -83,7 +83,7 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
           <CardTitle>Optimization Trend</CardTitle>
         </CardHeader>
         <CardContent>
-          <p className="text-sm text-muted-foreground">
+          <p className="text-sm text-muted">
             No optimization data available yet
           </p>
         </CardContent>
@@ -115,11 +115,11 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
     if (!data) return null;
 
     return (
-      <div className="grid min-w-[10rem] gap-1.5 rounded-lg border border-border/50 bg-background px-3 py-2 text-xs shadow-xl">
-        <div className="font-medium text-foreground">
+      <div className="grid min-w-[10rem] gap-1.5 rounded-lg border border-default/50 bg-surface px-3 py-2 text-xs shadow-xl">
+        <div className="font-medium text-primary">
           Run #{data.runId.slice(0, 8)}
         </div>
-        <div className="text-muted-foreground">{data.tooltipDate}</div>
+        <div className="text-muted">{data.tooltipDate}</div>
         <div className="mt-1 grid gap-1.5">
           <div className="flex justify-between gap-6">
             <span className="flex items-center gap-1.5">
@@ -145,10 +145,10 @@ export function CrossRunChart({ runs }: CrossRunChartProps) {
               {data.optimized.toFixed(1)}%
             </span>
           </div>
-          <div className="flex justify-between gap-6 border-t border-border/40 pt-1.5">
-            <span className="text-muted-foreground">Improvement</span>
+          <div className="flex justify-between gap-6 border-t border-default/40 pt-1.5">
+            <span className="text-muted">Improvement</span>
             <span
-              className={`font-mono font-semibold tabular-nums ${data.delta > 0 ? "text-emerald-600" : data.delta < 0 ? "text-red-600" : "text-muted-foreground"}`}
+              className={`font-mono font-semibold tabular-nums ${data.delta > 0 ? "text-emerald-600" : data.delta < 0 ? "text-red-600" : "text-muted"}`}
             >
               {data.delta > 0 ? "+" : ""}
               {data.delta.toFixed(1)}%

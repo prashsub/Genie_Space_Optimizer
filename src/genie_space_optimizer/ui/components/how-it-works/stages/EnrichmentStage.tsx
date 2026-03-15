@@ -53,7 +53,7 @@ export function EnrichmentStage() {
               key={label}
               className="flex justify-between rounded border border-db-gray-border px-3 py-2"
             >
-              <span className="text-sm text-muted-foreground">{label}:</span>
+              <span className="text-sm text-muted">{label}:</span>
               <span className="text-sm font-medium">{value}</span>
             </div>
           ))}

@@ -422,7 +422,7 @@ function PipelineView() {
       <div className="flex items-start justify-between gap-4">
         <div className="space-y-1">
           <button
-            className="mb-2 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+            className="mb-2 flex items-center gap-1 text-sm text-muted hover:text-primary"
             onClick={() =>
               navigate({
                 to: "/spaces/$spaceId",
@@ -444,7 +444,7 @@ function PipelineView() {
                     ? "border-db-green/30 text-db-green"
                     : isFailed
                       ? "border-db-red-error/30 text-db-red-error"
-                      : "text-muted-foreground"
+                      : "text-muted"
               }
             >
               {isActive && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
@@ -457,8 +457,8 @@ function PipelineView() {
               />
             )}
           </div>
-          <p className="text-sm text-muted-foreground">
-            Run <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">{run.runId.slice(0, 8)}</code>
+          <p className="text-sm text-muted">
+            Run <code className="rounded bg-elevated px-1 py-0.5 font-mono text-xs">{run.runId.slice(0, 8)}</code>
             {run.startedAt && (
               <> &middot; Started {new Date(run.startedAt).toLocaleString()}</>
             )}
@@ -487,7 +487,7 @@ function PipelineView() {
 
       {/* Progress */}
       <div className="space-y-2">
-        <div className="flex items-center justify-between text-xs text-muted-foreground">
+        <div className="flex items-center justify-between text-xs text-muted">
           <span className="flex items-center gap-1.5">
             {isActive && <Loader2 className="h-3 w-3 animate-spin" />}
             {isActive
@@ -523,7 +523,7 @@ function PipelineView() {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <Card className="border-db-gray-border bg-white">
               <CardHeader className="pb-1">
-                <CardTitle className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <CardTitle className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted">
                   <FlaskConicalIcon />
                   Baseline
                 </CardTitle>
@@ -551,7 +551,7 @@ function PipelineView() {
               run.optimizedScore > run.baselineScore ? "border-db-green/30 bg-db-green/5" : ""
             }`}>
               <CardHeader className="pb-1">
-                <CardTitle className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <CardTitle className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted">
                   <TrendingUp className="h-3.5 w-3.5" />
                   Improvement
                 </CardTitle>
@@ -561,7 +561,7 @@ function PipelineView() {
                   className={`text-2xl font-bold ${
                     run.optimizedScore > run.baselineScore
                       ? "text-db-green"
-                      : "text-muted-foreground"
+                      : "text-muted"
                   }`}
                 >
                   {run.optimizedScore > run.baselineScore ? "+" : ""}
@@ -810,16 +810,16 @@ function StepInsights({
           {tagsCollected != null && <Badge variant="secondary">Tags: {tagsCollected}</Badge>}
         </div>
         {tables.length > 0 && (
-          <p className="text-muted-foreground">Tables: {tables.slice(0, 8).join(", ")}</p>
+          <p className="text-muted">Tables: {tables.slice(0, 8).join(", ")}</p>
         )}
         {columnSamples.length > 0 && (
-          <p className="text-muted-foreground">Sample columns: {columnSamples.slice(0, 8).join(", ")}</p>
+          <p className="text-muted">Sample columns: {columnSamples.slice(0, 8).join(", ")}</p>
         )}
         {sampleQuestionsPreview.length > 0 && (
           <div className="space-y-1">
-            <p className="font-medium text-muted-foreground">Sample questions</p>
+            <p className="font-medium text-muted">Sample questions</p>
             {sampleQuestionsPreview.slice(0, 3).map((q, i) => (
-              <p key={i} className="text-muted-foreground truncate">{q}</p>
+              <p key={i} className="text-muted truncate">{q}</p>
             ))}
           </div>
         )}
@@ -859,7 +859,7 @@ function StepInsights({
 
         {!!Object.keys(judgeScores).length && (
           <div className="space-y-1">
-            <p className="text-xs font-medium text-muted-foreground">Judge scores</p>
+            <p className="text-xs font-medium text-muted">Judge scores</p>
             <div className="flex flex-wrap gap-2">
               {Object.entries(judgeScores).map(([judge, score]) => (
                 <Badge key={judge} variant="secondary">
@@ -872,12 +872,12 @@ function StepInsights({
 
         {sampleQuestions.length > 0 && (
           <div className="space-y-1">
-            <p className="text-xs font-medium text-muted-foreground">Sample evaluated questions</p>
+            <p className="text-xs font-medium text-muted">Sample evaluated questions</p>
             <div className="space-y-1">
               {sampleQuestions.slice(0, 3).map((row, idx) => (
-                <div key={idx} className="rounded border bg-muted/30 px-2 py-1 text-xs">
+                <div key={idx} className="rounded border bg-elevated/30 px-2 py-1 text-xs">
                   <p className="font-medium">{String(row.question ?? "Question")}</p>
-                  <p className="text-muted-foreground">
+                  <p className="text-muted">
                     result_correctness: {String(row.resultCorrectness ?? "n/a")}
                     {row.matchType ? ` · match: ${String(row.matchType)}` : ""}
                   </p>
@@ -907,7 +907,7 @@ function StepInsights({
     return (
       <div className="space-y-2 text-xs">
         {enrichmentSkipped && (
-          <p className="text-muted-foreground">Enrichment skipped (baseline already meets thresholds)</p>
+          <p className="text-muted">Enrichment skipped (baseline already meets thresholds)</p>
         )}
         {totalEnrichments != null && (
           <Badge variant="secondary">Total enrichments: {totalEnrichments}</Badge>
@@ -973,7 +973,7 @@ function StepInsights({
           {iterationCounter != null && <Badge variant="secondary">Iterations: {iterationCounter}</Badge>}
         </div>
         {baselineAccuracy != null && bestAccuracy != null && (
-          <p className="text-muted-foreground">
+          <p className="text-muted">
             Score: {baselineAccuracy.toFixed(1)}% → {bestAccuracy.toFixed(1)}%
             <span className={bestAccuracy > baselineAccuracy ? "ml-1 text-green-600" : "ml-1"}>
               ({bestAccuracy > baselineAccuracy ? "+" : ""}{(bestAccuracy - baselineAccuracy).toFixed(1)}%)
@@ -1077,7 +1077,7 @@ function DeploymentBadge({
           ? "border-db-red-error/30 text-db-red-error"
           : status === "PENDING_APPROVAL"
             ? "border-amber-500/30 text-amber-500"
-            : "text-muted-foreground";
+            : "text-muted";
 
   const badge = (
     <Badge variant="outline" className={className}>

@@ -47,15 +47,15 @@ export function IterationExplorer({ detail, links = [] }: IterationExplorerProps
   return (
     <div className="space-y-4">
       {/* Iteration Selector Strip */}
-      <div className="flex items-center gap-2 overflow-x-auto rounded-lg border bg-muted/30 p-2">
+      <div className="flex items-center gap-2 overflow-x-auto rounded-lg border bg-elevated/30 p-2">
         {detail.iterations.map((iter) => (
           <button
             key={iter.iteration}
             onClick={() => setActiveIteration(iter.iteration)}
             className={`flex shrink-0 flex-col items-center gap-0.5 rounded-md px-3 py-2 text-xs transition-colors ${
               activeIteration === iter.iteration
-                ? "bg-background shadow-sm ring-1 ring-border"
-                : "hover:bg-muted"
+                ? "bg-surface shadow-sm ring-1 ring-default"
+                : "hover:bg-elevated"
             }`}
           >
             <span className="font-medium">
@@ -65,7 +65,7 @@ export function IterationExplorer({ detail, links = [] }: IterationExplorerProps
                   ? `Iter ${iter.iteration} (Failed)`
                   : `Iter ${iter.iteration}`}
             </span>
-            <span className="tabular-nums text-muted-foreground">
+            <span className="tabular-nums text-muted">
               {iter.status === "patch_failed" ? "—" : `${iter.overallAccuracy.toFixed(1)}%`}
             </span>
             <StatusDot status={iter.status} />
@@ -97,7 +97,7 @@ export function IterationExplorer({ detail, links = [] }: IterationExplorerProps
           <ArrowLeft className="mr-1.5 h-3.5 w-3.5" />
           Previous
         </Button>
-        <span className="text-xs text-muted-foreground">
+        <span className="text-xs text-muted">
           {activeIteration === 0 ? "Baseline" : `Iteration ${activeIteration}`} of{" "}
           {detail.totalIterations}
         </span>
@@ -158,7 +158,7 @@ function PatchFailedView({ iteration }: { iteration: IterationDetail }) {
           {rootCause ? (
             <div className="flex items-center gap-2">
               <Target className="h-3.5 w-3.5 text-orange-500" />
-              <span className="text-muted-foreground">Root cause targeted:</span>
+              <span className="text-muted">Root cause targeted:</span>
               <span>{String(rootCause)}</span>
             </div>
           ) : null}
@@ -176,7 +176,7 @@ function PatchFailedView({ iteration }: { iteration: IterationDetail }) {
               </pre>
             </div>
           ) : null}
-          <p className="text-muted-foreground">
+          <p className="text-muted">
             The strategist's proposed patches could not be applied. The optimizer
             automatically advanced to the next iteration with a different approach.
           </p>
@@ -207,7 +207,7 @@ function IterationView({
       <div className="grid gap-4 sm:grid-cols-3">
         <Card>
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted">
               Accuracy
             </CardTitle>
           </CardHeader>
@@ -219,7 +219,7 @@ function IterationView({
         </Card>
         <Card>
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted">
               Questions
             </CardTitle>
           </CardHeader>
@@ -227,12 +227,12 @@ function IterationView({
             <span className="text-2xl font-bold">
               {iteration.correctCount}/{iteration.totalQuestions}
             </span>
-            <span className="ml-1 text-sm text-muted-foreground">correct</span>
+            <span className="ml-1 text-sm text-muted">correct</span>
           </CardContent>
         </Card>
         <Card>
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted">
               Judges
             </CardTitle>
           </CardHeader>
@@ -268,7 +268,7 @@ function IterationView({
         <CardContent className="space-y-2 text-xs">
           {iteration.agId && (
             <div className="flex items-center gap-2">
-              <span className="text-muted-foreground">Action Group:</span>
+              <span className="text-muted">Action Group:</span>
               <Badge variant="secondary">{iteration.agId}</Badge>
             </div>
           )}
@@ -276,14 +276,14 @@ function IterationView({
             <>
               <div className="flex items-center gap-2">
                 <Target className="h-3.5 w-3.5 text-orange-500" />
-                <span className="text-muted-foreground">Root cause:</span>
+                <span className="text-muted">Root cause:</span>
                 <span>{String(iteration.clusterInfo.root_cause || "—")}</span>
               </div>
               {iteration.clusterInfo.impact_score != null && (
                 <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground">Impact score:</span>
+                  <span className="text-muted">Impact score:</span>
                   <span>{Number(iteration.clusterInfo.impact_score).toFixed(2)}</span>
-                  <span className="text-muted-foreground">
+                  <span className="text-muted">
                     (Rank #{String(iteration.clusterInfo.rank || "?")},{" "}
                     {String(iteration.clusterInfo.question_count || "?")} questions)
                   </span>
@@ -318,10 +318,10 @@ function IterationView({
                     </div>
                     {esc.detail ? (
                       <details className="text-[11px]">
-                        <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                        <summary className="cursor-pointer text-muted hover:text-primary">
                           Escalation details
                         </summary>
-                        <pre className="mt-1 rounded bg-muted p-1.5 text-[10px] overflow-x-auto">
+                        <pre className="mt-1 rounded bg-elevated p-1.5 text-[10px] overflow-x-auto">
                           {JSON.stringify(esc.detail, null, 2)}
                         </pre>
                       </details>
@@ -331,10 +331,10 @@ function IterationView({
               })()}
               {iteration.clusterInfo.instruction_rewrite_preview && (
                 <details className="mt-1">
-                  <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
+                  <summary className="cursor-pointer text-[11px] text-muted hover:text-primary">
                     Instruction rewrite preview
                   </summary>
-                  <pre className="mt-1 rounded bg-muted p-2 text-[10px] whitespace-pre-wrap">
+                  <pre className="mt-1 rounded bg-elevated p-2 text-[10px] whitespace-pre-wrap">
                     {String(iteration.clusterInfo.instruction_rewrite_preview)}
                   </pre>
                 </details>
@@ -342,8 +342,8 @@ function IterationView({
             </>
           )}
           {iteration.reflection && (
-            <div className="mt-2 space-y-2 rounded bg-muted/50 p-2">
-              <p className="mb-1 font-medium text-muted-foreground">Reflection</p>
+            <div className="mt-2 space-y-2 rounded bg-elevated/50 p-2">
+              <p className="mb-1 font-medium text-muted">Reflection</p>
               <p>{iteration.reflection.reflectionText || "—"}</p>
               <div className="flex flex-wrap items-center gap-1.5">
                 {iteration.reflection.refinementMode && (
@@ -376,7 +376,7 @@ function IterationView({
               )}
               {iteration.reflection.doNotRetry.length > 0 && (
                 <details className="text-[11px]">
-                  <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                  <summary className="cursor-pointer text-muted hover:text-primary">
                     {iteration.reflection.doNotRetry.length} patch type(s) will not be retried
                   </summary>
                   <div className="mt-1 flex flex-wrap gap-1">
@@ -426,7 +426,7 @@ function IterationView({
                       </span>
                     )}
                     {gate.totalQuestions != null && (
-                      <span className="text-muted-foreground">
+                      <span className="text-muted">
                         ({gate.totalQuestions} questions)
                       </span>
                     )}
@@ -434,7 +434,7 @@ function IterationView({
                 </div>
               ))
             ) : (
-              <p className="text-xs text-muted-foreground">No gate data available</p>
+              <p className="text-xs text-muted">No gate data available</p>
             )}
           </div>
         </CardContent>
@@ -542,7 +542,7 @@ function BaselineView({
       <div className="grid gap-4 sm:grid-cols-3">
         <Card>
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted">
               Accuracy
             </CardTitle>
           </CardHeader>
@@ -554,7 +554,7 @@ function BaselineView({
         </Card>
         <Card>
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted">
               Questions
             </CardTitle>
           </CardHeader>
@@ -562,12 +562,12 @@ function BaselineView({
             <span className="text-2xl font-bold">
               {iteration.correctCount}/{iteration.totalQuestions}
             </span>
-            <span className="ml-1 text-sm text-muted-foreground">correct</span>
+            <span className="ml-1 text-sm text-muted">correct</span>
           </CardContent>
         </Card>
         <Card>
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs uppercase tracking-wide text-muted">
               Judges
             </CardTitle>
           </CardHeader>
@@ -811,7 +811,7 @@ function PatchRow({ patch }: { patch: Record<string, unknown> }) {
   return (
     <div className="rounded border text-xs">
       <button
-        className="flex w-full items-center gap-2 px-3 py-2 hover:bg-muted/50"
+        className="flex w-full items-center gap-2 px-3 py-2 hover:bg-elevated/50"
         onClick={() => setExpanded(!expanded)}
       >
         {expanded ? (
@@ -820,7 +820,7 @@ function PatchRow({ patch }: { patch: Record<string, unknown> }) {
           <ChevronRight className="h-3.5 w-3.5 shrink-0" />
         )}
         <span className="font-medium">{String(patch.patchType || "patch")}</span>
-        <span className="truncate text-muted-foreground">
+        <span className="truncate text-muted">
           {String(patch.targetObject || "")}
         </span>
         <span className="ml-auto">
@@ -833,7 +833,7 @@ function PatchRow({ patch }: { patch: Record<string, unknown> }) {
       </button>
       {expanded && (
         <div className="border-t p-2">
-          <pre className="max-h-32 overflow-auto rounded bg-muted p-2 text-[10px]">
+          <pre className="max-h-32 overflow-auto rounded bg-elevated p-2 text-[10px]">
             {JSON.stringify(patch.command || patch.patch || patch, null, 2)}
           </pre>
         </div>

@@ -34,7 +34,7 @@ function SidebarLayout({ children }: SidebarLayoutProps) {
         <SidebarRail />
       </Sidebar>
       <SidebarInset className="flex flex-col h-screen">
-        <header className="sticky top-0 z-50 bg-background/80 backdrop-blur-sm border-b flex h-16 shrink-0 items-center gap-2 px-4">
+        <header className="sticky top-0 z-50 bg-surface/80 backdrop-blur-sm border-b flex h-16 shrink-0 items-center gap-2 px-4">
           <SidebarTrigger className="-ml-1 cursor-pointer" />
           <div className="flex-1" />
           <ModeToggle />

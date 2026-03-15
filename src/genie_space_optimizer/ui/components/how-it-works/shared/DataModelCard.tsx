@@ -36,13 +36,13 @@ export function DataModelCard({
             gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)",
           }}
         >
-          <div className="font-medium text-muted-foreground">Field</div>
-          <div className="font-medium text-muted-foreground">Type</div>
-          <div className="font-medium text-muted-foreground">Example</div>
+          <div className="font-medium text-muted">Field</div>
+          <div className="font-medium text-muted">Type</div>
+          <div className="font-medium text-muted">Example</div>
           {fields.map((field) => (
             <React.Fragment key={field.name}>
               <span className="font-mono font-semibold">{field.name}</span>
-              <span className="text-muted-foreground">{field.type}</span>
+              <span className="text-muted">{field.type}</span>
               <span className="font-mono text-xs text-db-blue">
                 {field.example ?? "-"}
               </span>

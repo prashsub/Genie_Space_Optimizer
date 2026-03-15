@@ -25,12 +25,12 @@ export function BeforeAfterSplit({
       )}
     >
       <div className="flex flex-col border-r border-db-gray-border bg-db-gray-bg p-4">
-        <h4 className="text-sm font-medium text-muted-foreground">{before.title}</h4>
+        <h4 className="text-sm font-medium text-muted">{before.title}</h4>
         <ul className="mt-2 space-y-2">
           {before.items.map((item, i) => (
             <li
               key={i}
-              className="whitespace-pre-line rounded border border-db-gray-border bg-white/50 px-2 py-1 text-xs text-muted-foreground"
+              className="whitespace-pre-line rounded border border-db-gray-border bg-white/50 px-2 py-1 text-xs text-muted"
             >
               {item}
             </li>
@@ -57,7 +57,7 @@ export function BeforeAfterSplit({
             {after.items.map((item, i) => (
               <li
                 key={i}
-                className="whitespace-pre-line rounded border border-db-green/30 bg-db-green/5 px-2 py-1 text-xs text-foreground"
+                className="whitespace-pre-line rounded border border-db-green/30 bg-db-green/5 px-2 py-1 text-xs text-primary"
               >
                 {item}
               </li>

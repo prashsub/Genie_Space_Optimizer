@@ -242,7 +242,7 @@ function OverviewTab({
                                 )}
                               </span>
                             ) : (
-                              <span className="text-muted-foreground">—</span>
+                              <span className="text-muted">—</span>
                             )}
                           </TableCell>
                         );
@@ -505,12 +505,12 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
                             <TooltipContent side="left" className="max-w-xs text-xs space-y-1">
                               <p className="font-medium">{data.flagInfo.flag_reason}</p>
                               {data.flagInfo.iterations_failed != null && (
-                                <p className="text-muted-foreground">
+                                <p className="text-muted">
                                   Failed in {data.flagInfo.iterations_failed} iteration(s)
                                 </p>
                               )}
                               {data.flagInfo.patches_tried && (
-                                <p className="text-muted-foreground">
+                                <p className="text-muted">
                                   Patches tried: {data.flagInfo.patches_tried}
                                 </p>
                               )}
@@ -525,7 +525,7 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
             </TableBody>
           </Table>
           {filteredQuestions.length > 100 && (
-            <p className="mt-2 text-center text-xs text-muted-foreground">
+            <p className="mt-2 text-center text-xs text-muted">
               Showing 100 of {filteredQuestions.length} questions
             </p>
           )}
@@ -638,10 +638,10 @@ function RecommendationsCard({ detail }: { detail: IterationDetailResponse }) {
               )}
               <div className="flex-1 min-w-0">
                 <p className="text-xs font-semibold">{rec.title}</p>
-                <p className="mt-0.5 text-xs text-muted-foreground">{rec.description}</p>
+                <p className="mt-0.5 text-xs text-muted">{rec.description}</p>
                 {rec.questions.length > 0 && (
                   <details className="mt-1.5">
-                    <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
+                    <summary className="cursor-pointer text-[11px] text-muted hover:text-primary">
                       {rec.questions.length} affected question{rec.questions.length > 1 ? "s" : ""}
                     </summary>
                     <div className="mt-1 flex flex-wrap gap-1">
@@ -736,7 +736,7 @@ function PatchesTab({ detail }: { detail: IterationDetailResponse }) {
                 return (
                   <React.Fragment key={p._key}>
                     <TableRow
-                      className="cursor-pointer hover:bg-muted/50"
+                      className="cursor-pointer hover:bg-elevated/50"
                       onClick={() => toggleRow(p._key)}
                     >
                       <TableCell className="text-xs">
@@ -767,7 +767,7 @@ function PatchesTab({ detail }: { detail: IterationDetailResponse }) {
                               ? "border-red-300 text-red-600"
                               : p.riskLevel === "medium"
                                 ? "border-amber-300 text-amber-600"
-                                : "text-muted-foreground"
+                                : "text-muted"
                           }
                         >
                           {String(p.riskLevel || "—")}
@@ -786,7 +786,7 @@ function PatchesTab({ detail }: { detail: IterationDetailResponse }) {
                     {isExpanded && (
                       <TableRow>
                         <TableCell colSpan={8}>
-                          <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[10px]">
+                          <pre className="max-h-40 overflow-auto rounded bg-elevated p-2 text-[10px]">
                             {JSON.stringify(p.command || p.patch || p, null, 2)}
                           </pre>
                         </TableCell>
@@ -846,13 +846,13 @@ function ActivityTab({ stageEvents }: { stageEvents: StageEvent[] }) {
                     {event.status}
                   </Badge>
                   {event.durationSeconds != null && (
-                    <span className="text-muted-foreground">
+                    <span className="text-muted">
                       {event.durationSeconds.toFixed(1)}s
                     </span>
                   )}
                 </div>
                 {event.startedAt && (
-                  <span className="text-muted-foreground">
+                  <span className="text-muted">
                     {new Date(event.startedAt).toLocaleString()}
                   </span>
                 )}
@@ -863,7 +863,7 @@ function ActivityTab({ stageEvents }: { stageEvents: StageEvent[] }) {
             </div>
           ))}
           {sortedEvents.length === 0 && (
-            <p className="py-4 text-center text-muted-foreground">No stage events recorded</p>
+            <p className="py-4 text-center text-muted">No stage events recorded</p>
           )}
         </div>
       </CardContent>
@@ -989,7 +989,7 @@ function JudgesTab({
             <CardTitle className="text-sm">Failure Type Trends</CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-xs text-muted-foreground">
+            <p className="text-xs text-muted">
               Showing questions failing across iterations. Total questions: {baseline?.totalQuestions ?? "?"}.
               Baseline failures: {baseline ? baseline.totalQuestions - baseline.correctCount : "?"}.
               Final failures: {final ? final.totalQuestions - final.correctCount : "?"}.

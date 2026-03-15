@@ -55,7 +55,7 @@ export function ProvenancePanel({
       <Button
         variant="ghost"
         size="sm"
-        className="h-7 gap-1.5 px-2 text-xs text-muted-foreground"
+        className="h-7 gap-1.5 px-2 text-xs text-muted"
         onClick={() => setOpen(!open)}
       >
         <GitBranch className="h-3.5 w-3.5" />
@@ -70,19 +70,19 @@ export function ProvenancePanel({
       {open && (
         <div className="space-y-4 rounded-lg border bg-white p-3">
           {isLoading && (
-            <p className="py-4 text-center text-xs text-muted-foreground">
+            <p className="py-4 text-center text-xs text-muted">
               Loading provenance...
             </p>
           )}
 
           {isError && (
-            <p className="py-4 text-center text-xs text-destructive">
+            <p className="py-4 text-center text-xs text-danger">
               Failed to load provenance data
             </p>
           )}
 
           {data && !summary && (
-            <p className="py-4 text-center text-xs text-muted-foreground">
+            <p className="py-4 text-center text-xs text-muted">
               No provenance data for this lever
             </p>
           )}
@@ -131,20 +131,20 @@ function FlowSummary({ summary }: { summary: ProvenanceSummary }) {
       <div className="flex items-center gap-2 overflow-x-auto">
         {steps.map((step, i) => (
           <div key={step.label} className="flex items-center gap-2">
-            <div className="flex flex-col items-center rounded-lg border bg-muted/30 px-3 py-1.5">
+            <div className="flex flex-col items-center rounded-lg border bg-elevated/30 px-3 py-1.5">
               <span className="text-lg font-bold tabular-nums">
                 {step.value}
               </span>
-              <span className="whitespace-nowrap text-[10px] text-muted-foreground">
+              <span className="whitespace-nowrap text-[10px] text-muted">
                 {step.label}
               </span>
             </div>
             {i < steps.length - 1 && (
-              <span className="text-muted-foreground">&rarr;</span>
+              <span className="text-muted">&rarr;</span>
             )}
           </div>
         ))}
-        <span className="text-muted-foreground">&rarr;</span>
+        <span className="text-muted">&rarr;</span>
         <div className="flex flex-col items-center rounded-lg border px-3 py-1.5">
           <span className="text-lg font-bold">
             {gatePass > 0 ? (
@@ -152,10 +152,10 @@ function FlowSummary({ summary }: { summary: ProvenanceSummary }) {
             ) : gateFail > 0 || gateRollback > 0 ? (
               <span className="text-red-600">Fail</span>
             ) : (
-              <span className="text-muted-foreground">?</span>
+              <span className="text-muted">?</span>
             )}
           </span>
-          <span className="whitespace-nowrap text-[10px] text-muted-foreground">
+          <span className="whitespace-nowrap text-[10px] text-muted">
             Gate
           </span>
         </div>
@@ -181,7 +181,7 @@ function RootCauseChart({
 
   return (
     <div>
-      <p className="mb-1 text-xs font-medium text-muted-foreground">
+      <p className="mb-1 text-xs font-medium text-muted">
         Root Causes
       </p>
       <ChartContainer
@@ -226,7 +226,7 @@ function ClusterTable({ records }: { records: ProvenanceRecord[] }) {
 
   return (
     <div className="space-y-2">
-      <p className="text-xs font-medium text-muted-foreground">
+      <p className="text-xs font-medium text-muted">
         Clusters ({clusterEntries.length})
       </p>
       <div className="max-h-[300px] overflow-auto space-y-2">
@@ -256,7 +256,7 @@ function ClusterCard({
   return (
     <div className="rounded-lg border text-xs">
       <button
-        className="flex w-full items-center justify-between px-3 py-2 text-left hover:bg-muted/30"
+        className="flex w-full items-center justify-between px-3 py-2 text-left hover:bg-elevated/30"
         onClick={() => setExpanded(!expanded)}
       >
         <div className="flex items-center gap-2">
@@ -264,7 +264,7 @@ function ClusterCard({
             {uniqueQuestions.size} questions
           </Badge>
           {sample?.resolvedRootCause && (
-            <span className="text-muted-foreground">
+            <span className="text-muted">
               {sample.resolvedRootCause}
             </span>
           )}
@@ -282,7 +282,7 @@ function ClusterCard({
       </button>
 
       {expanded && (
-        <div className="border-t bg-muted/20 px-3 py-2">
+        <div className="border-t bg-elevated/20 px-3 py-2">
           <Table>
             <TableHeader>
               <TableRow>
@@ -312,10 +312,10 @@ function ClusterCard({
                   <TableCell className="py-1 text-[10px]">
                     {r.resolvedRootCause}
                   </TableCell>
-                  <TableCell className="py-1 text-[10px] text-muted-foreground">
+                  <TableCell className="py-1 text-[10px] text-muted">
                     {r.resolutionMethod}
                   </TableCell>
-                  <TableCell className="max-w-[150px] truncate py-1 text-[10px] text-muted-foreground">
+                  <TableCell className="max-w-[150px] truncate py-1 text-[10px] text-muted">
                     {r.counterfactualFix ?? "—"}
                   </TableCell>
                 </TableRow>

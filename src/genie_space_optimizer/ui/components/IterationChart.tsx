@@ -60,7 +60,7 @@ export function IterationChart({ runId }: { runId: string }) {
           <CardTitle>Score Progression</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="flex aspect-video items-center justify-center text-muted-foreground">
+          <div className="flex aspect-video items-center justify-center text-muted">
             Loading...
           </div>
         </CardContent>
@@ -75,7 +75,7 @@ export function IterationChart({ runId }: { runId: string }) {
           <CardTitle>Score Progression</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="flex aspect-video items-center justify-center text-destructive">
+          <div className="flex aspect-video items-center justify-center text-danger">
             {error?.message ?? "Failed to load iteration data"}
           </div>
         </CardContent>
@@ -92,7 +92,7 @@ export function IterationChart({ runId }: { runId: string }) {
           <CardTitle>Score Progression</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="flex aspect-video items-center justify-center text-muted-foreground">
+          <div className="flex aspect-video items-center justify-center text-muted">
             Not enough data to show progression
           </div>
         </CardContent>
@@ -141,13 +141,13 @@ export function IterationChart({ runId }: { runId: string }) {
                     return (
                       <div className="grid gap-1 text-xs">
                         <div>
-                          <span className="text-muted-foreground">
+                          <span className="text-muted">
                             Iteration:
                           </span>{" "}
                           {pt.iteration}
                         </div>
                         <div>
-                          <span className="text-muted-foreground">
+                          <span className="text-muted">
                             Accuracy:
                           </span>{" "}
                           {typeof value === "number"
@@ -155,11 +155,11 @@ export function IterationChart({ runId }: { runId: string }) {
                             : value}
                         </div>
                         <div>
-                          <span className="text-muted-foreground">Lever:</span>{" "}
+                          <span className="text-muted">Lever:</span>{" "}
                           {pt.leverLabel}
                         </div>
                         <div>
-                          <span className="text-muted-foreground">
+                          <span className="text-muted">
                             Total questions:
                           </span>{" "}
                           {pt.totalQuestions}

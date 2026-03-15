@@ -98,12 +98,12 @@ const leverStatusConfig: Record<
   },
   skipped: {
     label: "Skipped",
-    className: "bg-muted text-muted-foreground border-muted-foreground/20",
+    className: "bg-elevated text-muted border-muted-foreground/20",
     icon: <SkipForward className="h-3.5 w-3.5" />,
   },
   pending: {
     label: "Pending",
-    className: "bg-muted/50 text-muted-foreground/50 border-muted-foreground/10",
+    className: "bg-elevated/50 text-muted/50 border-muted-foreground/10",
     icon: <Circle className="h-3.5 w-3.5" />,
   },
   failed: {
@@ -133,11 +133,11 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <h4 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        <h4 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted">
           <Wrench className="h-3.5 w-3.5" />
           Optimization Levers
         </h4>
-        <span className="text-xs text-muted-foreground">
+        <span className="text-xs text-muted">
           {accepted}/{total} accepted
         </span>
       </div>
@@ -166,7 +166,7 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
               }`}
             >
               <div className="flex items-center gap-3">
-                <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted/50 text-xs font-bold text-muted-foreground">
+                <div className="flex h-6 w-6 items-center justify-center rounded-full bg-elevated/50 text-xs font-bold text-muted">
                   {lever.lever}
                 </div>
 
@@ -181,13 +181,13 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
 
                 <div className="ml-auto flex items-center gap-3">
                   {patchCount > 0 && (
-                    <span className="text-xs text-muted-foreground">
+                    <span className="text-xs text-muted">
                       {patchCount} patch{patchCount !== 1 ? "es" : ""}
                     </span>
                   )}
 
                   {lever.scoreAfter != null && lever.scoreBefore != null && (
-                    <span className="text-xs tabular-nums text-muted-foreground">
+                    <span className="text-xs tabular-nums text-muted">
                       {lever.scoreBefore.toFixed(0)}% → {lever.scoreAfter.toFixed(0)}%
                     </span>
                   )}
@@ -204,13 +204,13 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
 
               {hasPatchDetails && (
                 <div className="space-y-1 border-t border-dashed border-db-gray-border pt-2">
-                  <p className="text-xs font-medium text-muted-foreground">Changes</p>
+                  <p className="text-xs font-medium text-muted">Changes</p>
                   {patches.slice(0, 8).map((patch, idx) => (
                     <div key={idx} className="rounded border bg-white px-2 py-1 text-xs">
                       <div className="flex flex-wrap items-center gap-2">
                         <Badge variant="secondary">{patch.patchType ?? "patch"}</Badge>
-                        {patch.scope && <span className="text-muted-foreground">scope: {patch.scope}</span>}
-                        {patch.riskLevel && <span className="text-muted-foreground">risk: {patch.riskLevel}</span>}
+                        {patch.scope && <span className="text-muted">scope: {patch.scope}</span>}
+                        {patch.riskLevel && <span className="text-muted">risk: {patch.riskLevel}</span>}
                         {patch.rolledBack && (
                           <Badge variant="outline" className="border-db-orange/30 text-db-orange">
                             rolled back
@@ -218,14 +218,14 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
                         )}
                       </div>
                       {patch.targetObject && (
-                        <p className="mt-1 text-muted-foreground">target: {patch.targetObject}</p>
+                        <p className="mt-1 text-muted">target: {patch.targetObject}</p>
                       )}
                       {patch.command != null ? (
-                        <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/40 p-1 text-[11px]">
+                        <pre className="mt-1 max-h-24 overflow-auto rounded bg-elevated/40 p-1 text-[11px]">
                           {JSON.stringify(patch.command, null, 2)}
                         </pre>
                       ) : patch.patch != null ? (
-                        <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/40 p-1 text-[11px]">
+                        <pre className="mt-1 max-h-24 overflow-auto rounded bg-elevated/40 p-1 text-[11px]">
                           {JSON.stringify(patch.patch, null, 2)}
                         </pre>
                       ) : null}
@@ -236,7 +236,7 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
 
               {hasIterationDetails && (
                 <div className="space-y-2 border-t border-dashed border-db-gray-border pt-2">
-                  <p className="text-xs font-medium text-muted-foreground">Iteration history</p>
+                  <p className="text-xs font-medium text-muted">Iteration history</p>
                   {iterations.map((iter) => {
                     const iterCfg = leverStatusConfig[iter.status] ?? leverStatusConfig.pending;
                     const iterPatches = iter.patches ?? [];
@@ -254,18 +254,18 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
                             {iterCfg.label}
                           </Badge>
                           {iter.scoreBefore != null && iter.scoreAfter != null && (
-                            <span className="text-muted-foreground tabular-nums">
+                            <span className="text-muted tabular-nums">
                               {iter.scoreBefore.toFixed(1)}% → {iter.scoreAfter.toFixed(1)}%
                             </span>
                           )}
                           {formatDelta(iter.scoreDelta)}
                           {iter.patchCount != null && (
-                            <span className="ml-auto text-muted-foreground">
+                            <span className="ml-auto text-muted">
                               {iter.patchCount} patches
                             </span>
                           )}
                         </summary>
-                        <div className="space-y-2 border-t bg-muted/20 px-2 py-2 text-xs">
+                        <div className="space-y-2 border-t bg-elevated/20 px-2 py-2 text-xs">
                           <div className="flex flex-wrap gap-2">
                             {iter.fullAccuracy != null && (
                               <Badge variant="secondary">full: {iter.fullAccuracy.toFixed(1)}%</Badge>
@@ -285,7 +285,7 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
                           </div>
 
                           {!!iter.patchTypes?.length && (
-                            <p className="text-muted-foreground">
+                            <p className="text-muted">
                               patch types: {iter.patchTypes.join(", ")}
                             </p>
                           )}
@@ -310,15 +310,15 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
                                   <div className="flex flex-wrap items-center gap-2">
                                     <Badge variant="secondary">{patch.patchType ?? "patch"}</Badge>
                                     {patch.targetObject && (
-                                      <span className="text-muted-foreground">{patch.targetObject}</span>
+                                      <span className="text-muted">{patch.targetObject}</span>
                                     )}
                                   </div>
                                   {patch.command != null ? (
-                                    <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/40 p-1 text-[11px]">
+                                    <pre className="mt-1 max-h-24 overflow-auto rounded bg-elevated/40 p-1 text-[11px]">
                                       {JSON.stringify(patch.command, null, 2)}
                                     </pre>
                                   ) : patch.patch != null ? (
-                                    <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/40 p-1 text-[11px]">
+                                    <pre className="mt-1 max-h-24 overflow-auto rounded bg-elevated/40 p-1 text-[11px]">
                                       {JSON.stringify(patch.patch, null, 2)}
                                     </pre>
                                   ) : null}
@@ -329,9 +329,9 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
 
                           {!!iter.stageEvents?.length && (
                             <div className="space-y-1">
-                              <p className="font-medium text-muted-foreground">stage events</p>
+                              <p className="font-medium text-muted">stage events</p>
                               {iter.stageEvents.slice(0, 8).map((event, idx) => (
-                                <p key={idx} className="text-muted-foreground">
+                                <p key={idx} className="text-muted">
                                   {event.stage} - {event.status}
                                   {event.durationSeconds != null ? ` (${Math.round(event.durationSeconds)}s)` : ""}
                                   {event.errorMessage ? ` - ${event.errorMessage}` : ""}

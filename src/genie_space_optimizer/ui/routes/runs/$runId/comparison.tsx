@@ -171,7 +171,7 @@ function ComparisonView() {
       <div className="flex items-start justify-between gap-4">
         <div className="space-y-1">
           <button
-            className="mb-2 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+            className="mb-2 flex items-center gap-1 text-sm text-muted hover:text-primary"
             onClick={() =>
               navigate({ to: "/runs/$runId", params: { runId } })
             }
@@ -180,7 +180,7 @@ function ComparisonView() {
             Back to Pipeline
           </button>
           <h1 className="text-2xl font-bold">Optimization Results</h1>
-          <p className="text-sm text-muted-foreground">
+          <p className="text-sm text-muted">
             Compare baseline vs. optimized configuration for{" "}
             {comparison.spaceName}
           </p>

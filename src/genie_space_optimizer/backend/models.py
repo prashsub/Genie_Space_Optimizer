@@ -294,6 +294,7 @@ class SpacePermissions(BaseModel):
     schemas: list[SchemaPermission]
     status: str
     spGrantInstructions: str | None = None
+    spDisplayName: str | None = None
 
 
 class PermissionDashboard(BaseModel):

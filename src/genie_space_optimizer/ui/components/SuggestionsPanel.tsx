@@ -144,7 +144,7 @@ export function SuggestionsPanel({ runId }: SuggestionsPanelProps) {
   if (suggestions.length === 0) {
     return (
       <Card>
-        <CardContent className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+        <CardContent className="flex flex-col items-center justify-center py-12 text-muted">
           <Lightbulb className="mb-3 h-10 w-10 opacity-40" />
           <p className="text-sm">No improvement suggestions for this run.</p>
           <p className="mt-1 text-xs">
@@ -182,16 +182,16 @@ export function SuggestionsPanel({ runId }: SuggestionsPanelProps) {
             </CardHeader>
             <CardContent className="space-y-3">
               {s.rationale && (
-                <p className="text-sm text-muted-foreground">{s.rationale}</p>
+                <p className="text-sm text-muted">{s.rationale}</p>
               )}
 
               {s.definition && (
-                <pre className="max-h-48 overflow-auto rounded-md border bg-muted/50 p-3 text-xs">
+                <pre className="max-h-48 overflow-auto rounded-md border bg-elevated/50 p-3 text-xs">
                   <code>{s.definition}</code>
                 </pre>
               )}
 
-              <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+              <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
                 {s.estimatedImpact && (
                   <span className="flex items-center gap-1">
                     <BarChart3 className="h-3 w-3" />

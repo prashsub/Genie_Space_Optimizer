@@ -100,7 +100,7 @@ export function SpaceCard({
     >
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
-          <CardTitle className="line-clamp-1 text-base font-semibold text-foreground">
+          <CardTitle className="line-clamp-1 text-base font-semibold text-primary">
             {name}
           </CardTitle>
           <div className="flex items-center gap-1.5">
@@ -117,7 +117,7 @@ export function SpaceCard({
           {description || "No description"}
         </CardDescription>
       </CardHeader>
-      <CardContent className="flex items-center gap-4 text-xs text-muted-foreground">
+      <CardContent className="flex items-center gap-4 text-xs text-muted">
         {!!tableCount && (
           <span className="flex items-center gap-1">
             <Database className="h-3.5 w-3.5" />

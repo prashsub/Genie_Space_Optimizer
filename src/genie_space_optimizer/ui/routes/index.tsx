@@ -158,7 +158,7 @@ function ActivitySection({ navigate }: { navigate: ReturnType<typeof useNavigate
             {activity.map((item) => (
                 <TableRow
                   key={item.runId}
-                  className="cursor-pointer hover:bg-muted/50"
+                  className="cursor-pointer hover:bg-elevated/50"
                   onClick={() =>
                     navigate({
                       to: "/runs/$runId",
@@ -178,7 +178,7 @@ function ActivitySection({ navigate }: { navigate: ReturnType<typeof useNavigate
                       ? `${item.optimizedScore.toFixed(1)}%`
                       : "\u2014"}
                   </TableCell>
-                  <TableCell className="text-right text-xs text-muted-foreground">
+                  <TableCell className="text-right text-xs text-muted">
                     {item.timestamp
                       ? new Date(item.timestamp).toLocaleDateString()
                       : ""}
@@ -289,15 +289,15 @@ function Dashboard({
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Card className="border-db-gray-border bg-white">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted">
               Total Spaces
             </CardTitle>
-            <LayoutGrid className="h-4 w-4 text-muted-foreground" />
+            <LayoutGrid className="h-4 w-4 text-muted" />
           </CardHeader>
           <CardContent>
             <span className="text-2xl font-bold">{totalCount}</span>
             {!scopedToUser && (
-              <p className="mt-1 text-xs text-muted-foreground">
+              <p className="mt-1 text-xs text-muted">
                 All workspace spaces
               </p>
             )}
@@ -306,10 +306,10 @@ function Dashboard({
 
         <Card className="border-db-gray-border bg-white">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted">
               Recent Runs
             </CardTitle>
-            <Activity className="h-4 w-4 text-muted-foreground" />
+            <Activity className="h-4 w-4 text-muted" />
           </CardHeader>
           <CardContent>
             <span className="text-2xl font-bold">
@@ -320,10 +320,10 @@ function Dashboard({
 
         <Card className="border-db-gray-border bg-white">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted">
               Avg Quality
             </CardTitle>
-            <BarChart3 className="h-4 w-4 text-muted-foreground" />
+            <BarChart3 className="h-4 w-4 text-muted" />
           </CardHeader>
           <CardContent>
             <span className="text-2xl font-bold">
@@ -334,7 +334,7 @@ function Dashboard({
       </div>
 
       <div className="relative">
-        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
         <Input
           placeholder="Search spaces by name, description, or space ID..."
           value={search}
@@ -358,7 +358,7 @@ function Dashboard({
           />
         ))}
         {filtered.length === 0 && (
-          <p className="col-span-full py-12 text-center text-sm text-muted-foreground">
+          <p className="col-span-full py-12 text-center text-sm text-muted">
             {debouncedSearch
               ? "No spaces match your search."
               : "No Genie Spaces found."}
@@ -377,7 +377,7 @@ function Dashboard({
             <ChevronLeft className="mr-1 h-4 w-4" />
             Prev
           </Button>
-          <span className="text-sm text-muted-foreground">
+          <span className="text-sm text-muted">
             Page {safePage + 1} of {totalPages}
           </span>
           <Button

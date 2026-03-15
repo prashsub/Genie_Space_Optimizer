@@ -40,12 +40,12 @@ export function GateFunnel({ activeGate, className }: GateFunnelProps) {
               <span
                 className={cn(
                   "text-sm font-semibold",
-                  activeGate === index ? "text-db-green" : "text-muted-foreground"
+                  activeGate === index ? "text-db-green" : "text-muted"
                 )}
               >
                 {gate.name} Gate
               </span>
-              <p className="mt-0.5 text-center text-xs text-muted-foreground">
+              <p className="mt-0.5 text-center text-xs text-muted">
                 {gate.description}
               </p>
             </motion.div>
@@ -57,7 +57,7 @@ export function GateFunnel({ activeGate, className }: GateFunnelProps) {
           </div>
         ))}
       </div>
-      <p className="mt-2 text-center text-xs text-muted-foreground">
+      <p className="mt-2 text-center text-xs text-muted">
         Fast fail: if any gate fails → rollback
       </p>
     </div>

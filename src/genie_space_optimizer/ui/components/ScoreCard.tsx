@@ -18,7 +18,7 @@ interface ScoreCardProps {
 function ImprovementIcon({ pct }: { pct: number }) {
   if (pct > 0.5) return <ArrowUp className="h-5 w-5 text-db-green" />;
   if (pct < -0.5) return <ArrowDown className="h-5 w-5 text-db-red-error" />;
-  return <Minus className="h-5 w-5 text-muted-foreground" />;
+  return <Minus className="h-5 w-5 text-muted" />;
 }
 
 export function ScoreCard({
@@ -32,12 +32,12 @@ export function ScoreCard({
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Card className="border-db-gray-border bg-white">
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted">
               Baseline Score
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <span className="text-3xl font-bold text-foreground">
+            <span className="text-3xl font-bold text-primary">
               {baselineScore.toFixed(1)}%
             </span>
           </CardContent>
@@ -58,7 +58,7 @@ export function ScoreCard({
 
         <Card className="border-db-gray-border bg-white">
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted">
               Improvement
             </CardTitle>
           </CardHeader>
@@ -70,7 +70,7 @@ export function ScoreCard({
                   ? "text-db-green"
                   : improvementPct < 0
                     ? "text-db-red-error"
-                    : "text-muted-foreground"
+                    : "text-muted"
               }`}
             >
               {improvementPct > 0 ? "+" : ""}
@@ -94,7 +94,7 @@ export function ScoreCard({
                   <span className="font-medium capitalize">
                     {dim.dimension.replace(/_/g, " ")}
                   </span>
-                  <span className="text-xs text-muted-foreground">
+                  <span className="text-xs text-muted">
                     {dim.baseline.toFixed(1)}% &rarr; {dim.optimized.toFixed(1)}
                     %
                     <span
@@ -103,7 +103,7 @@ export function ScoreCard({
                           ? "text-db-green"
                           : dim.delta < 0
                             ? "text-db-red-error"
-                            : "text-muted-foreground"
+                            : "text-muted"
                       }`}
                     >
                       ({dim.delta > 0 ? "+" : ""}
@@ -112,13 +112,13 @@ export function ScoreCard({
                   </span>
                 </div>
                 <div className="flex gap-1">
-                  <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-muted">
+                  <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-elevated">
                     <div
-                      className="absolute inset-y-0 left-0 rounded-full bg-muted-foreground/30"
+                      className="absolute inset-y-0 left-0 rounded-full bg-elevated-foreground/30"
                       style={{ width: `${Math.min(dim.baseline, 100)}%` }}
                     />
                   </div>
-                  <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-muted">
+                  <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-elevated">
                     <div
                       className="absolute inset-y-0 left-0 rounded-full bg-db-blue"
                       style={{ width: `${Math.min(dim.optimized, 100)}%` }}
@@ -127,9 +127,9 @@ export function ScoreCard({
                 </div>
               </div>
             ))}
-            <div className="flex justify-end gap-6 text-xs text-muted-foreground">
+            <div className="flex justify-end gap-6 text-xs text-muted">
               <span className="flex items-center gap-1.5">
-                <span className="inline-block h-2 w-4 rounded-full bg-muted-foreground/30" />
+                <span className="inline-block h-2 w-4 rounded-full bg-elevated-foreground/30" />
                 Baseline
               </span>
               <span className="flex items-center gap-1.5">

@@ -40,7 +40,7 @@ export function ExpandableCard({
         <CardHeader className="flex flex-row items-center gap-3 py-4">
           {Icon && (
             <div className="flex shrink-0 items-center justify-center rounded-lg bg-db-gray-bg p-2">
-              <Icon className="h-5 w-5 text-muted-foreground" />
+              <Icon className="h-5 w-5 text-muted" />
             </div>
           )}
           <div className="min-w-0 flex-1">
@@ -53,7 +53,7 @@ export function ExpandableCard({
               )}
             </div>
             {subtitle && (
-              <p className="mt-0.5 text-sm text-muted-foreground">{subtitle}</p>
+              <p className="mt-0.5 text-sm text-muted">{subtitle}</p>
             )}
           </div>
           <motion.span
@@ -61,7 +61,7 @@ export function ExpandableCard({
             transition={{ duration: prefersReducedMotion ? 0 : 0.2 }}
             className="shrink-0"
           >
-            <ChevronDown className="h-5 w-5 text-muted-foreground" />
+            <ChevronDown className="h-5 w-5 text-muted" />
           </motion.span>
         </CardHeader>
       </button>

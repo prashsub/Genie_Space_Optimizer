@@ -403,6 +403,7 @@ def get_permission_dashboard(
             schemas=schemas_out,
             status=status,
             spGrantInstructions=sp_grant_instructions,
+            spDisplayName=sp_human_name if not sp_has_manage else None,
         ))
 
     sp_id = _get_sp_principal(sp_ws)

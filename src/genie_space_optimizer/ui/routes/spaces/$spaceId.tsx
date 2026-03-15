@@ -241,7 +241,7 @@ function SpaceDetail() {
     <div className="space-y-6">
       <div className="space-y-1">
         <button
-          className="mb-2 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+          className="mb-2 flex items-center gap-1 text-sm text-muted hover:text-primary"
           onClick={() => navigate({ to: "/" })}
         >
           <ArrowLeft className="h-4 w-4" />
@@ -349,7 +349,7 @@ function SpaceDetail() {
               <CardTitle className="text-sm font-semibold">Description</CardTitle>
             </CardHeader>
             <CardContent>
-              <p className="text-sm text-muted-foreground">
+              <p className="text-sm text-muted">
                 {space.description || "No description available."}
               </p>
             </CardContent>
@@ -362,7 +362,7 @@ function SpaceDetail() {
               <CardTitle className="text-sm font-semibold">Instructions</CardTitle>
             </CardHeader>
             <CardContent className="overflow-hidden">
-              <pre className="whitespace-pre-wrap break-words text-sm text-muted-foreground overflow-x-auto max-h-96 overflow-y-auto">
+              <pre className="whitespace-pre-wrap break-words text-sm text-muted overflow-x-auto max-h-96 overflow-y-auto">
                 {space.instructions || "No instructions configured."}
               </pre>
             </CardContent>
@@ -376,11 +376,11 @@ function SpaceDetail() {
             </CardHeader>
             <CardContent>
               {space.sampleQuestions.length === 0 ? (
-                <p className="text-sm italic text-muted-foreground">
+                <p className="text-sm italic text-muted">
                   No sample questions configured.
                 </p>
               ) : (
-                <ul className="list-inside list-disc space-y-1 text-sm text-muted-foreground">
+                <ul className="list-inside list-disc space-y-1 text-sm text-muted">
                   {space.sampleQuestions.map((q: string, i: number) => (
                     <li key={`${q}-${i}`}>{q}</li>
                   ))}
@@ -397,11 +397,11 @@ function SpaceDetail() {
             </CardHeader>
             <CardContent>
               {benchmarkQuestions.length === 0 ? (
-                <p className="text-sm italic text-muted-foreground">
+                <p className="text-sm italic text-muted">
                   No benchmark questions found for this space yet.
                 </p>
               ) : (
-                <ul className="list-inside list-disc space-y-1 text-sm text-muted-foreground">
+                <ul className="list-inside list-disc space-y-1 text-sm text-muted">
                   {benchmarkQuestions.map((q: string, i: number) => (
                     <li key={`${q}-${i}`}>{q}</li>
                   ))}
@@ -418,7 +418,7 @@ function SpaceDetail() {
             </CardHeader>
             <CardContent>
               {space.tables.length === 0 ? (
-                <p className="text-sm italic text-muted-foreground">
+                <p className="text-sm italic text-muted">
                   No tables referenced.
                 </p>
               ) : (
@@ -454,7 +454,7 @@ function SpaceDetail() {
             </CardHeader>
             <CardContent>
               {joins.length === 0 ? (
-                <p className="text-sm italic text-muted-foreground">
+                <p className="text-sm italic text-muted">
                   No join specifications referenced.
                 </p>
               ) : (
@@ -513,7 +513,7 @@ function SpaceDetail() {
                   </TableBody>
                 </Table>
               ) : (
-                <p className="text-sm italic text-muted-foreground">
+                <p className="text-sm italic text-muted">
                   No functions referenced.
                 </p>
               )}
@@ -534,7 +534,7 @@ function SpaceDetail() {
             </CardHeader>
             <CardContent>
               {optimizationHistory.length === 0 ? (
-                <p className="text-sm italic text-muted-foreground">
+                <p className="text-sm italic text-muted">
                   No optimization history yet.
                 </p>
               ) : (
@@ -552,7 +552,7 @@ function SpaceDetail() {
                     {optimizationHistory.map((run) => (
                       <TableRow
                         key={run.runId}
-                        className="cursor-pointer hover:bg-muted/50"
+                        className="cursor-pointer hover:bg-elevated/50"
                         onClick={() =>
                           navigate({
                             to: "/runs/$runId",
@@ -576,7 +576,7 @@ function SpaceDetail() {
                             ? `${run.optimizedScore.toFixed(1)}%`
                             : "—"}
                         </TableCell>
-                        <TableCell className="text-right text-xs text-muted-foreground">
+                        <TableCell className="text-right text-xs text-muted">
                           {run.timestamp
                             ? new Date(run.timestamp).toLocaleDateString()
                             : ""}
@@ -600,7 +600,7 @@ function SpaceDetail() {
           <div className="flex flex-wrap items-start gap-6">
             {/* Apply mode toggle */}
             <div className="space-y-2">
-              <p className="text-xs font-medium text-muted-foreground">Apply mode</p>
+              <p className="text-xs font-medium text-muted">Apply mode</p>
               <div className="inline-flex rounded-md border border-db-gray-border p-1">
                 <Button
                   type="button"
@@ -625,7 +625,7 @@ function SpaceDetail() {
                   </span>
                 </div>
               </div>
-              <p className="text-xs text-muted-foreground max-w-xs">
+              <p className="text-xs text-muted max-w-xs">
                 Changes will be applied only to the selected Genie Space configuration. Underlying Unity Catalog tables, columns, and descriptions will not be modified.
               </p>
             </div>
@@ -633,7 +633,7 @@ function SpaceDetail() {
             {/* Lever checkboxes */}
             <div className="space-y-2">
               <Collapsible defaultOpen>
-                <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+                <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-primary">
                   <ChevronDown className="h-3 w-3" />
                   What will be optimized
                 </CollapsibleTrigger>
@@ -650,7 +650,7 @@ function SpaceDetail() {
                       />
                       <div>
                         <span className="text-sm font-medium">{lever.label}</span>
-                        <p className="text-xs text-muted-foreground">{lever.desc}</p>
+                        <p className="text-xs text-muted">{lever.desc}</p>
                       </div>
                     </label>
                   ))}
@@ -661,7 +661,7 @@ function SpaceDetail() {
             {/* Deployment target */}
             <div className="space-y-2">
               <Collapsible>
-                <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+                <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted hover:text-primary">
                   <ChevronDown className="h-3 w-3" />
                   Deployment target (optional)
                 </CollapsibleTrigger>
@@ -672,7 +672,7 @@ function SpaceDetail() {
                     onChange={(e) => setDeployTarget(e.target.value)}
                     className="h-8 w-72 text-xs"
                   />
-                  <p className="mt-1 text-[10px] text-muted-foreground">
+                  <p className="mt-1 text-[10px] text-muted">
                     Leave empty to skip cross-environment deployment.
                   </p>
                 </CollapsibleContent>
@@ -689,9 +689,14 @@ function SpaceDetail() {
                 <PermissionStep
                   step={1}
                   title="Grant Genie Space access"
-                  description={<>The app&apos;s service principal needs <strong>CAN_MANAGE</strong> on this Genie Space.</>}
+                  description={
+                    <>
+                      Open the Genie Space sharing dialog and add{" "}
+                      <CopyableInline text={spacePerms?.spDisplayName ?? ""} />{" "}
+                      with <strong>CAN_MANAGE</strong> permission.
+                    </>
+                  }
                   granted={hasSpaceAccess}
-                  code={spacePerms?.spGrantInstructions}
                 />
                 <PermissionStep
                   step={2}
@@ -722,7 +727,7 @@ function SpaceDetail() {
           {/* UC Write Backs alert hidden — mode is disabled (coming soon) */}
 
           {permsLoading && (
-            <p className="text-xs text-muted-foreground">
+            <p className="text-xs text-muted">
               Checking permissions…
             </p>
           )}
@@ -827,5 +832,32 @@ function PermissionStep({
         </>
       )}
     </div>
+  );
+}
+
+function CopyableInline({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  if (!text) return null;
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  return (
+    <span className="inline-flex items-center gap-1 rounded bg-amber-100/80 px-1.5 py-0.5 font-mono text-[11px] text-amber-900">
+      {text}
+      <button
+        type="button"
+        onClick={handleCopy}
+        className="inline-flex items-center text-amber-600 hover:text-amber-900"
+        title="Copy to clipboard"
+      >
+        {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+      </button>
+    </span>
   );
 }
