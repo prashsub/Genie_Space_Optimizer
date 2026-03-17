@@ -66,3 +66,9 @@ docs/genie_space_config.json
 
 # MLflow
 mlflow.db
+
+# Agent / IDE metadata
+.cursor/
+.claude/
+genie_space_optimizer/
+browser-test-output/
