@@ -1197,8 +1197,6 @@ wheels = [
 name = "genie-space-optimizer"
 source = { editable = "." }
 dependencies = [
-    { name = "databricks-connect", version = "16.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "databricks-connect", version = "18.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "databricks-sdk" },
     { name = "fastapi" },
     { name = "mlflow", extra = ["databricks"] },
@@ -1212,6 +1210,12 @@ dependencies = [
     { name = "uvicorn" },
 ]
 
+[package.optional-dependencies]
+spark = [
+    { name = "databricks-connect", version = "16.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "databricks-connect", version = "18.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
@@ -1221,7 +1225,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "databricks-connect", specifier = ">=15.0.0" },
+    { name = "databricks-connect", marker = "extra == 'spark'", specifier = ">=15.0.0" },
     { name = "databricks-sdk", specifier = ">=0.40.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "mlflow", extras = ["databricks"], specifier = ">=3.4.0" },
@@ -1234,6 +1238,7 @@ requires-dist = [
     { name = "sqlmodel", specifier = ">=0.0.27" },
     { name = "uvicorn", specifier = ">=0.34.0" },
 ]
+provides-extras = ["spark"]
 
 [package.metadata.requires-dev]
 dev = [

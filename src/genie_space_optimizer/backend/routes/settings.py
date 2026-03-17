@@ -65,7 +65,7 @@ def _get_sp_application_id(ws: WorkspaceClient) -> str:
     return ""
 
 
-def _get_sp_principal_aliases(sp_ws: WorkspaceClient) -> set[str]:
+def get_sp_principal_aliases(sp_ws: WorkspaceClient) -> set[str]:
     """Return known principal aliases for the app service principal."""
     aliases: set[str] = set()
     aliases.add(_get_sp_principal(sp_ws).lower())
@@ -123,7 +123,7 @@ def _probe_sp_required_access(
     for cat, sch in schemas:
         by_catalog.setdefault(cat, []).append(sch)
 
-    aliases = _get_sp_principal_aliases(sp_ws)
+    aliases = get_sp_principal_aliases(sp_ws)
     logger.info("SP aliases for privilege probing: %s", aliases)
     read_granted: set[tuple[str, str]] = set()
     write_granted: set[tuple[str, str]] = set()
@@ -220,7 +220,7 @@ def get_permission_dashboard(
 
     Without either parameter the full list of visible spaces is scanned.
     """
-    sp_aliases = _get_sp_principal_aliases(sp_ws)
+    sp_aliases = get_sp_principal_aliases(sp_ws)
     sp_display = _get_sp_display_name(sp_ws)
     sp_app_id = _get_sp_application_id(sp_ws)
 

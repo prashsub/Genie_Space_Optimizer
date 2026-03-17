@@ -25,7 +25,7 @@ sync:
 
 artifacts:
   default:
-    build: apx build && rm -f .build/.gitignore && python resources/patch_app_yml.py .build/app.yml --catalog ${var.catalog} --schema ${var.gold_schema} --warehouse-id ${var.warehouse_id} && cp .build/genie_space_optimizer-*.whl .build/genie_space_optimizer-0.0.0-py3-none-any.whl
+    build: apx build && rm -f .build/.gitignore && python resources/patch_app_yml.py .build/app.yml --catalog ${var.catalog} --schema ${var.gold_schema} --warehouse-id ${var.warehouse_id} && cp .build/genie_space_optimizer-*.whl .build/genie_space_optimizer-0.0.0-py3-none-any.whl && echo "databricks-connect>=15.0.0" >> .build/requirements.txt
 
 resources:
   apps:

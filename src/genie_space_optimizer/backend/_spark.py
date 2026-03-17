@@ -4,6 +4,13 @@ Uses ``databricks.connect`` to create a remote SparkSession that
 communicates with the Databricks workspace.  The session is cached
 but will be automatically recreated when stale credentials are
 detected (e.g. expired AWS STS tokens on the server side).
+
+``databricks-connect`` is an optional dependency.  Install with::
+
+    pip install genie-space-optimizer[spark]
+
+When not installed, :data:`SPARK_AVAILABLE` is ``False`` and
+:func:`get_spark` raises :class:`RuntimeError`.
 """
 
 from __future__ import annotations
@@ -16,6 +23,14 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
+
+try:
+    from databricks.connect import DatabricksSession  # type: ignore[import-untyped]
+
+    SPARK_AVAILABLE = True
+except ImportError:
+    DatabricksSession = None
+    SPARK_AVAILABLE = False
 
 _lock = threading.Lock()
 _session: SparkSession | None = None
@@ -39,16 +54,22 @@ def _is_credential_error(exc: BaseException) -> bool:
 
 
 def _new_session(force_new: bool = False) -> SparkSession:
-    from databricks.connect import DatabricksSession
-
-    builder = DatabricksSession.builder.serverless(True)
+    if not SPARK_AVAILABLE:
+        raise RuntimeError(
+            "databricks-connect is not installed. "
+            "Install with: pip install genie-space-optimizer[spark]"
+        )
+    builder = DatabricksSession.builder.serverless(True)  # type: ignore[union-attr]
     if force_new:
         return builder.create()
     return builder.getOrCreate()
 
 
 def get_spark() -> SparkSession:
-    """Return a live serverless SparkSession, creating one if needed."""
+    """Return a live serverless SparkSession, creating one if needed.
+
+    Raises :class:`RuntimeError` if ``databricks-connect`` is not installed.
+    """
     global _session
     with _lock:
         if _session is None:

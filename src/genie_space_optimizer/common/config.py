@@ -2092,15 +2092,22 @@ REPEATABILITY_FIX_BY_ASSET = {
 # ── 11. Lever Descriptions ─────────────────────────────────────────────
 
 LEVER_NAMES = {
-    0: "Proactive Enrichment",
+    0: "Proactive Enrichment",   # Always runs; NOT user-selectable
     1: "Tables & Columns",
     2: "Metric Views",
     3: "Table-Valued Functions",
     4: "Join Specifications",
     5: "Genie Space Instructions",
 }
+"""Lever ID -> display name mapping.
+
+Lever 0 is a preparatory stage that always runs before the adaptive lever
+loop. It is not included in :data:`DEFAULT_LEVER_ORDER` and should not be
+shown in the UI as a toggleable option.
+"""
 
 DEFAULT_LEVER_ORDER = [1, 2, 3, 4, 5]
+"""Default set of user-selectable levers, in execution order."""
 
 MAX_VALUE_DICTIONARY_COLUMNS = 120
 """Maximum number of string columns per Genie Space that can have

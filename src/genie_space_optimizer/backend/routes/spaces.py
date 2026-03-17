@@ -38,99 +38,21 @@ logger = logging.getLogger(__name__)
 _ACTIVE_RUN_STATUSES = ACTIVE_RUN_STATUSES
 _TERMINAL_JOB_STATES = TERMINAL_JOB_STATES
 _STALE_QUEUE_TIMEOUT = timedelta(minutes=10)
-_SUPPORTED_APPLY_MODES = {"genie_config", "uc_artifact", "both"}
+SUPPORTED_APPLY_MODES = {"genie_config", "uc_artifact", "both"}
+"""Valid ``apply_mode`` values for optimization triggers.
+
+- ``"genie_config"``  -- Apply changes only to the Genie Space config (default).
+- ``"uc_artifact"``   -- Apply UC-level changes only (DDL on tables/columns).
+- ``"both"``          -- Apply both Genie Space config and UC-level changes.
+"""
 _PIPELINE_APPLY_MODE = "genie_config"
 
 
-def _sql_warehouse_query(
-    ws: WorkspaceClient,
-    warehouse_id: str,
-    sql: str,
-) -> Any:
-    """Execute SQL via the SQL Statement Execution API (bypasses Spark Connect).
-
-    Returns results as a pandas DataFrame, consistent with the Spark-based
-    ``run_query`` interface.
-    """
-    import pandas as pd
-    from databricks.sdk.service.sql import StatementState
-
-    resp = ws.statement_execution.execute_statement(
-        warehouse_id=warehouse_id,
-        statement=sql,
-        wait_timeout="50s",
-        disposition=Disposition.INLINE,
-        format=Format.JSON_ARRAY,
-    )
-    if resp.status and resp.status.state == StatementState.SUCCEEDED:
-        manifest_schema = resp.manifest.schema if resp.manifest else None
-        schema_cols = manifest_schema.columns if manifest_schema else None
-        columns = [str(c.name or "") for c in (schema_cols or [])]
-        rows: list[dict] = []
-        if resp.result and resp.result.data_array:
-            for row_data in resp.result.data_array:
-                rows.append(dict(zip(columns, row_data)))
-        return pd.DataFrame(rows, columns=pd.Index(columns) if columns else None)
-    error_msg = ""
-    if resp.status and resp.status.error:
-        error_msg = resp.status.error.message or str(resp.status.error)
-    raise RuntimeError(f"SQL warehouse query failed: {error_msg}")
-
-
-def _sql_warehouse_execute(
-    ws: WorkspaceClient,
-    warehouse_id: str,
-    sql: str,
-) -> None:
-    """Execute a DML/DDL statement via the SQL warehouse (no result expected)."""
-    from databricks.sdk.service.sql import StatementState
-
-    resp = ws.statement_execution.execute_statement(
-        warehouse_id=warehouse_id,
-        statement=sql,
-        wait_timeout="50s",
-    )
-    if resp.status and resp.status.state != StatementState.SUCCEEDED:
-        error_msg = ""
-        if resp.status.error:
-            error_msg = resp.status.error.message or str(resp.status.error)
-        raise RuntimeError(f"SQL warehouse execute failed: {error_msg}")
-
-
-def _wh_create_run(
-    ws: WorkspaceClient,
-    warehouse_id: str,
-    *,
-    run_id: str,
-    space_id: str,
-    domain: str,
-    catalog: str,
-    schema: str,
-    apply_mode: str = "genie_config",
-    triggered_by: str | None = None,
-    experiment_name: str | None = None,
-    config_snapshot: dict | None = None,
-) -> None:
-    """Insert a QUEUED run via SQL warehouse (fallback when Spark is broken)."""
-    from genie_space_optimizer.common.config import DEFAULT_LEVER_ORDER, MAX_ITERATIONS
-
-    snap_json = json.dumps(config_snapshot).replace("'", "''") if config_snapshot else ""
-    levers_json = json.dumps(DEFAULT_LEVER_ORDER)
-    exp = (experiment_name or "").replace("'", "''")
-    user = (triggered_by or "").replace("'", "''")
-
-    sql = (
-        f"INSERT INTO {catalog}.{schema}.genie_opt_runs "
-        f"(run_id, space_id, domain, catalog, uc_schema, status, started_at, "
-        f"max_iterations, levers, apply_mode, updated_at, "
-        f"experiment_name, triggered_by, config_snapshot) VALUES ("
-        f"'{run_id}', '{space_id}', '{domain}', '{catalog}', "
-        f"'{catalog}.{schema}', 'QUEUED', current_timestamp(), "
-        f"{MAX_ITERATIONS}, '{levers_json}', '{apply_mode}', current_timestamp(), "
-        f"'{exp}', '{user}', '{snap_json}')"
-    )
-    _sql_warehouse_execute(ws, warehouse_id, sql)
-    logger.info("Created run %s via SQL warehouse fallback", run_id)
+from genie_space_optimizer.common.warehouse import (
+    sql_warehouse_execute as _sql_warehouse_execute,
+    sql_warehouse_query as _sql_warehouse_query,
+    wh_create_run as _wh_create_run,
+)
 
 
 def _genie_client(ws: WorkspaceClient, sp_ws: WorkspaceClient) -> tuple[WorkspaceClient, bool]:
@@ -262,7 +184,7 @@ def _sql_rows(
     return [{k: v for k, v in zip(cols, row)} for row in rows]
 
 
-def _fetch_uc_metadata_obo(
+def fetch_uc_metadata_obo(
     ws: WorkspaceClient,
     *,
     warehouse_id: str,
@@ -777,12 +699,12 @@ def do_start_optimization(
     levers_str = json.dumps(levers if levers else DEFAULT_LEVER_ORDER)
 
     requested_apply_mode = (apply_mode or "genie_config").strip().lower()
-    if requested_apply_mode not in _SUPPORTED_APPLY_MODES:
+    if requested_apply_mode not in SUPPORTED_APPLY_MODES:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Unsupported apply_mode '{apply_mode}'. "
-                f"Use one of: {sorted(_SUPPORTED_APPLY_MODES)}"
+                f"Use one of: {sorted(SUPPORTED_APPLY_MODES)}"
             ),
         )
 
@@ -940,7 +862,7 @@ def do_start_optimization(
     genie_refs = extract_genie_space_table_refs(space_snapshot) if space_snapshot else []
 
     try:
-        obo_uc_metadata = _fetch_uc_metadata_obo(
+        obo_uc_metadata = fetch_uc_metadata_obo(
             ws,
             warehouse_id=config.warehouse_id,
             catalog=config.catalog,
@@ -953,9 +875,9 @@ def do_start_optimization(
         logger.warning("OBO UC metadata prefetch failed for run %s", run_id, exc_info=True)
 
     from genie_space_optimizer.common.genie_client import sp_can_manage_space
-    from .settings import _get_sp_principal_aliases
+    from .settings import get_sp_principal_aliases
 
-    sp_aliases = _get_sp_principal_aliases(sp_ws)
+    sp_aliases = get_sp_principal_aliases(sp_ws)
     if not sp_can_manage_space(sp_ws, space_id, sp_aliases):
         raise HTTPException(
             status_code=403,
@@ -1014,12 +936,15 @@ def do_start_optimization(
         EXPERIMENT_PATH_TEMPLATE, space_id=space_id, domain=domain,
     )
 
+    resolved_levers = levers if levers else list(DEFAULT_LEVER_ORDER)
+
     if use_warehouse_fallback:
         _wh_create_run(
             ws, config.warehouse_id,
             run_id=run_id, space_id=space_id, domain=domain,
             catalog=config.catalog, schema=config.schema_name,
-            apply_mode=requested_apply_mode, triggered_by=current_user,
+            apply_mode=requested_apply_mode, levers=resolved_levers,
+            triggered_by=current_user,
             experiment_name=experiment_name,
             config_snapshot=space_snapshot if space_snapshot else None,
         )
@@ -1032,6 +957,7 @@ def do_start_optimization(
             config.catalog,
             config.schema_name,
             apply_mode=requested_apply_mode,
+            levers=resolved_levers,
             triggered_by=current_user,
             experiment_name=experiment_name,
             config_snapshot=space_snapshot if space_snapshot else None,
