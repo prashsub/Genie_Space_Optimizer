@@ -19,6 +19,8 @@ from typing import Any
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
+_openai_client_cache: dict[str, Any] = {}
+
 from genie_space_optimizer.common.config import (
     ADAPTIVE_STRATEGIST_PROMPT,
     APPLY_MODE,
@@ -132,6 +134,28 @@ def _truncate_to_budget(
 
 # ── Traced LLM Call Helper ─────────────────────────────────────────────
 
+def _get_openai_client(w: WorkspaceClient | None) -> Any:
+    """Return a cached OpenAI client pointing at the Databricks FMAPI endpoint.
+
+    Uses the same auth credentials as the workspace client.
+    ``mlflow.openai.autolog()`` must be called once before first use
+    to enable automatic token/cost tracking on all spans.
+    """
+    from openai import OpenAI
+
+    wc = _ws_with_timeout(w)
+    host = wc.config.host.rstrip("/")
+    token = wc.config.token
+
+    cache_key = f"{host}:{token[:8]}"
+    if cache_key not in _openai_client_cache:
+        _openai_client_cache[cache_key] = OpenAI(
+            api_key=token,
+            base_url=f"{host}/serving-endpoints",
+        )
+    return _openai_client_cache[cache_key]
+
+
 def _traced_llm_call(
     w: WorkspaceClient | None,
     system_msg: str,
@@ -142,10 +166,11 @@ def _traced_llm_call(
     temperature: float = LLM_TEMPERATURE,
     max_tokens: int | None = None,
 ) -> tuple[str, Any]:
-    """Execute an LLM call wrapped in a ``CHAT_MODEL`` MLflow span.
+    """Execute an LLM call via the OpenAI SDK with automatic MLflow tracing.
 
-    The span captures the full prompt messages, model, temperature,
-    raw response text, token usage, and retry events.
+    ``mlflow.openai.autolog()`` instruments every OpenAI call with a
+    ``CHAT_MODEL`` span that captures token usage, cost, and latency.
+    This wrapper adds retry logic inside a ``CHAIN`` span.
 
     Returns ``(raw_text, response_object)`` for the caller to parse.
     Raises the last exception if all retries are exhausted.
@@ -155,53 +180,40 @@ def _traced_llm_call(
     import mlflow
     from mlflow.entities import SpanEvent, SpanType
 
-    with mlflow.start_span(name=span_name, span_type=SpanType.CHAT_MODEL) as span:
+    with mlflow.start_span(name=span_name, span_type=SpanType.CHAIN) as span:
         span.set_inputs({
-            "messages": [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt},
-            ],
             "model": LLM_ENDPOINT,
             "temperature": temperature,
+            "prompt_chars": len(prompt),
         })
-        span.set_attribute("prompt_chars", len(prompt))
 
+        client = _get_openai_client(w)
         text = ""
         last_err: Exception | None = None
+
         for attempt in range(max_retries):
             try:
-                wc = _ws_with_timeout(w)
-                query_kwargs: dict[str, Any] = {
-                    "name": LLM_ENDPOINT,
+                call_kwargs: dict[str, Any] = {
+                    "model": LLM_ENDPOINT,
                     "messages": [
-                        ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
-                        ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt},
                     ],
                     "temperature": temperature,
                 }
                 if max_tokens is not None:
-                    query_kwargs["max_tokens"] = max_tokens
-                response = wc.serving_endpoints.query(**query_kwargs)
-                choices = getattr(response, "choices", None) or []
-                if not choices:
+                    call_kwargs["max_tokens"] = max_tokens
+
+                response = client.chat.completions.create(**call_kwargs)
+
+                if not response.choices:
                     raise ValueError("LLM response had no choices")
-                content = getattr(choices[0].message, "content", None)
+                content = response.choices[0].message.content
                 if not content:
                     raise ValueError("LLM response content is empty")
                 text = str(content).strip()
 
-                usage = getattr(response, "usage", None)
-                if usage:
-                    _usage_attrs: dict[str, Any] = {}
-                    for attr in ("total_tokens", "prompt_tokens", "completion_tokens"):
-                        val = getattr(usage, attr, None)
-                        if val is not None:
-                            _usage_attrs[attr] = val
-                    if _usage_attrs:
-                        span.set_attributes(_usage_attrs)
-
                 span.set_outputs({
-                    "response_text": text[:10_000],
                     "response_chars": len(text),
                     "attempts": attempt + 1,
                 })

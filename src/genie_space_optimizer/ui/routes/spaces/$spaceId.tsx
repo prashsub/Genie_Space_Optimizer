@@ -331,16 +331,16 @@ function SpaceDetail() {
       />
 
       <Tabs defaultValue="description" className="space-y-4">
-        <TabsList className="h-auto w-full justify-start overflow-x-auto">
+        <TabsList className="h-auto w-full justify-start">
           <TabsTrigger value="description">Description</TabsTrigger>
           <TabsTrigger value="instructions">Instructions</TabsTrigger>
-          <TabsTrigger value="sample-questions">Sample Questions</TabsTrigger>
-          <TabsTrigger value="benchmark-questions">Benchmark Questions</TabsTrigger>
-          <TabsTrigger value="referenced-tables">Referenced Tables</TabsTrigger>
-          <TabsTrigger value="referenced-joins">Referenced Joins</TabsTrigger>
-          <TabsTrigger value="referenced-functions">Referenced Functions</TabsTrigger>
+          <TabsTrigger value="sample-questions">Samples</TabsTrigger>
+          <TabsTrigger value="benchmark-questions">Benchmarks</TabsTrigger>
+          <TabsTrigger value="referenced-tables">Tables</TabsTrigger>
+          <TabsTrigger value="referenced-joins">Joins</TabsTrigger>
+          <TabsTrigger value="referenced-functions">Functions</TabsTrigger>
           <TabsTrigger value="analytics">Analytics</TabsTrigger>
-          <TabsTrigger value="optimization-history">Optimization History</TabsTrigger>
+          <TabsTrigger value="optimization-history">History</TabsTrigger>
         </TabsList>
 
         <TabsContent value="description">

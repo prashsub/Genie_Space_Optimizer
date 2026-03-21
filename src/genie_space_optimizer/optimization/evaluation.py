@@ -1470,15 +1470,18 @@ def make_predict_fn(
                 _trace_tags["genie.lever"] = str(lever)
             if eval_scope:
                 _trace_tags["genie.eval_scope"] = eval_scope
-            _trace_metadata: dict[str, str] = {}
+            _trace_metadata: dict[str, str] = {
+                "space_id": space_id,
+            }
             if triggered_by:
                 _trace_metadata["mlflow.trace.user"] = triggered_by
             if optimization_run_id:
                 _trace_metadata["mlflow.trace.session"] = optimization_run_id
-            if _trace_metadata:
-                mlflow.update_current_trace(tags=_trace_tags, metadata=_trace_metadata)
-            else:
-                mlflow.update_current_trace(tags=_trace_tags)
+            if iteration is not None:
+                _trace_metadata["iteration"] = str(iteration)
+            if eval_scope:
+                _trace_metadata["eval_scope"] = eval_scope
+            mlflow.update_current_trace(tags=_trace_tags, metadata=_trace_metadata)
         except Exception:
             pass
 

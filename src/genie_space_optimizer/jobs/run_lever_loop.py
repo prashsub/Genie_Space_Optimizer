@@ -238,6 +238,7 @@ enrichment_skipped = str(enrichment_skipped_raw).lower() in ("true", "1")
 
 import mlflow
 mlflow.set_experiment(exp_name)
+mlflow.openai.autolog()
 
 _banner("Resolved Upstream Task Values")
 _log(

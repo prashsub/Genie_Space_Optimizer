@@ -218,6 +218,7 @@ if _warehouse_id:
 
 import mlflow
 mlflow.set_experiment(exp_name)
+mlflow.openai.autolog()
 
 _banner("Resolved Upstream Task Values")
 _log(

@@ -51,7 +51,7 @@ mlflow.db
 # Agent / IDE metadata
 .cursor/
 .claude/
-genie_space_optimizer/
+/genie_space_optimizer/
 browser-test-output/
 
 # docs
