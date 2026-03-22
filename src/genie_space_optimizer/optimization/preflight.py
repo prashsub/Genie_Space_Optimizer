@@ -1206,6 +1206,8 @@ def preflight_validate_benchmarks(
     _lines.append(_pf_bar())
     print("\n".join(_lines))
 
+    TOP_UP_THRESHOLD = int(TARGET_BENCHMARK_COUNT * 0.75)
+
     if len(benchmarks) < MIN_VALID_BENCHMARKS:
         logger.warning(
             "Only %d valid benchmarks after filtering (min %d). "
@@ -1233,6 +1235,49 @@ def preflight_validate_benchmarks(
             task_key="preflight",
             detail={"regenerated_count": len(benchmarks)},
             catalog=catalog, schema=schema,
+        )
+    elif len(benchmarks) < TOP_UP_THRESHOLD:
+        gap = TARGET_BENCHMARK_COUNT - len(benchmarks)
+        logger.warning(
+            "Post-validation benchmark count (%d) below 75%% of target (%d). "
+            "Generating %d synthetic benchmarks to top up.",
+            len(benchmarks), TARGET_BENCHMARK_COUNT, gap,
+        )
+        print(
+            f"  Post-validation top-up: {len(benchmarks)} valid < "
+            f"{TOP_UP_THRESHOLD} threshold — generating {gap} more"
+        )
+        write_stage(
+            spark, run_id, "BENCHMARK_TOPUP_AFTER_VALIDATION", "STARTED",
+            task_key="preflight", catalog=catalog, schema=schema,
+            detail={
+                "reason": "post_validation_top_up",
+                "valid_count": len(benchmarks),
+                "target": TARGET_BENCHMARK_COUNT,
+                "gap": gap,
+            },
+        )
+        genie_benchmarks_topup = extract_genie_space_benchmarks(
+            config, spark, catalog=catalog, schema=schema,
+            w=w, warehouse_id=warehouse_id,
+        )
+        topped_up = generate_benchmarks(
+            w, config, uc_columns, uc_tags, uc_routines,
+            domain, catalog, schema, spark,
+            target_count=TARGET_BENCHMARK_COUNT,
+            genie_space_benchmarks=genie_benchmarks_topup,
+            existing_benchmarks=benchmarks,
+            warehouse_id=warehouse_id,
+        )
+        benchmarks = topped_up
+        write_stage(
+            spark, run_id, "BENCHMARK_TOPUP_AFTER_VALIDATION", "COMPLETE",
+            task_key="preflight",
+            detail={"total_count": len(benchmarks)},
+            catalog=catalog, schema=schema,
+        )
+        print(
+            f"  Post-validation top-up complete: {len(benchmarks)} benchmarks"
         )
 
     if not benchmarks:

@@ -77,19 +77,30 @@ def _ws_with_timeout(
     after the fact has no effect.  We therefore always create a fresh
     client.  In a Databricks job the env-var auth (``DATABRICKS_HOST``,
     ``DATABRICKS_TOKEN``, etc.) is inherited automatically.
+
+    When *w* is provided its config is cloned using ``Config.attributes()``
+    (the SDK's own attribute registry) and the original credentials strategy,
+    so every auth method — PAT, OAuth M2M, Azure MI, Google SA, etc. — is
+    preserved automatically.
     """
-    from databricks.sdk import client as _sdk_client
+    from databricks.sdk.config import Config
 
-    cfg_kwargs: dict[str, Any] = {"http_timeout_seconds": timeout}
-    if w is not None:
-        for attr in ("host", "token", "azure_workspace_resource_id",
-                      "azure_client_id", "azure_client_secret", "azure_tenant_id",
-                      "client_id", "client_secret"):
-            val = getattr(w.config, attr, None)
-            if val:
-                cfg_kwargs[attr] = val
+    if w is None:
+        return WorkspaceClient(config=Config(http_timeout_seconds=timeout))
 
-    return WorkspaceClient(config=_sdk_client.Config(**cfg_kwargs))
+    cfg_kwargs: dict[str, Any] = {}
+    for attr in Config.attributes():
+        val = getattr(w.config, attr.name, None)
+        if val is not None:
+            cfg_kwargs[attr.name] = val
+    cfg_kwargs["http_timeout_seconds"] = timeout
+
+    return WorkspaceClient(
+        config=Config(
+            credentials_strategy=w.config._credentials_strategy,
+            **cfg_kwargs,
+        )
+    )
 
 
 def _estimate_tokens(text: str) -> int:
@@ -134,26 +145,56 @@ def _truncate_to_budget(
 
 # ── Traced LLM Call Helper ─────────────────────────────────────────────
 
-def _get_openai_client(w: WorkspaceClient | None) -> Any:
-    """Return a cached OpenAI client pointing at the Databricks FMAPI endpoint.
+def _resolve_bearer_token(wc: WorkspaceClient) -> str:
+    """Extract a bearer token from the workspace client's auth chain.
 
-    Uses the same auth credentials as the workspace client.
+    Tries ``config.token`` first (covers PAT / env-var auth).  Falls back
+    to ``config.authenticate()`` which invokes the SDK's full credential
+    chain — OAuth M2M, Azure MI, Google SA, etc. — and returns fresh
+    ``Authorization`` headers.
+    """
+    token = wc.config.token
+    if token:
+        return token
+
+    try:
+        headers = wc.config.authenticate()
+        auth_value = headers.get("Authorization", "")
+        if auth_value.lower().startswith("bearer "):
+            return auth_value[len("Bearer "):]
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Cannot resolve a bearer token from the WorkspaceClient. "
+        "Ensure DATABRICKS_TOKEN is set or that OAuth/service-principal "
+        "credentials are configured."
+    )
+
+
+def _get_openai_client(w: WorkspaceClient | None) -> Any:
+    """Return an OpenAI client pointing at the Databricks FMAPI endpoint.
+
+    Caches the client by host but **refreshes the bearer token on every
+    call** so that OAuth token rotation is handled transparently.
+
     ``mlflow.openai.autolog()`` must be called once before first use
     to enable automatic token/cost tracking on all spans.
     """
     from openai import OpenAI
 
-    wc = _ws_with_timeout(w)
+    wc = w if w is not None else WorkspaceClient()
     host = wc.config.host.rstrip("/")
-    token = wc.config.token
+    token = _resolve_bearer_token(wc)
 
-    cache_key = f"{host}:{token[:8]}"
-    if cache_key not in _openai_client_cache:
-        _openai_client_cache[cache_key] = OpenAI(
+    if host not in _openai_client_cache:
+        _openai_client_cache[host] = OpenAI(
             api_key=token,
             base_url=f"{host}/serving-endpoints",
         )
-    return _openai_client_cache[cache_key]
+    else:
+        _openai_client_cache[host].api_key = token
+    return _openai_client_cache[host]
 
 
 def _traced_llm_call(
@@ -4370,6 +4411,7 @@ def _call_llm_for_proposal(
     metadata_snapshot: dict,
     patch_type: str,
     lever: int,
+    w: WorkspaceClient | None = None,
 ) -> dict:
     """Call Databricks Claude Opus 4.6 to generate proposal text.
 
@@ -4539,7 +4581,7 @@ def _call_llm_for_proposal(
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            _wc = _ws_with_timeout(None)
+            _wc = _ws_with_timeout(w)
             response = _wc.serving_endpoints.query(
                 name=LLM_ENDPOINT,
                 messages=[
@@ -7775,7 +7817,7 @@ def generate_metadata_proposals(
             ),
         )
 
-        llm_result = _call_llm_for_proposal(cluster, metadata_snapshot, patch_type, lever)
+        llm_result = _call_llm_for_proposal(cluster, metadata_snapshot, patch_type, lever, w=w)
 
         extra_fields: dict = {}
 

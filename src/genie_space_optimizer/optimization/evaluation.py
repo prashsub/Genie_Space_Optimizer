@@ -4506,7 +4506,7 @@ def extract_genie_space_benchmarks(
             continue
         q_raw = ex.get("question", "")
         if isinstance(q_raw, list):
-            q_raw = q_raw[0] if q_raw else ""
+            q_raw = " ".join(str(c) for c in q_raw)
         question = str(q_raw).strip()
         if not question:
             continue
@@ -4517,7 +4517,7 @@ def extract_genie_space_benchmarks(
 
         sql_raw = ex.get("sql", "")
         if isinstance(sql_raw, list):
-            sql_raw = sql_raw[0] if sql_raw else ""
+            sql_raw = "".join(str(c) for c in sql_raw)
         expected_sql = str(sql_raw).strip()
 
         if expected_sql:
@@ -4554,7 +4554,7 @@ def extract_genie_space_benchmarks(
             continue
         q_raw = bq.get("question", [])
         if isinstance(q_raw, list):
-            q_raw = q_raw[0] if q_raw else ""
+            q_raw = " ".join(str(c) for c in q_raw)
         question = str(q_raw).strip()
         if not question:
             continue
