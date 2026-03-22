@@ -48,6 +48,7 @@ def trigger_optimization(
         apply_mode=body.apply_mode,
         levers=body.levers,
         deploy_target=body.deploy_target,
+        target_benchmark_count=body.target_benchmark_count,
     )
     return TriggerResponse(
         runId=result.runId,

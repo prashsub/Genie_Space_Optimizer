@@ -176,6 +176,7 @@ dbutils.widgets.text("apply_mode", "genie_config")
 dbutils.widgets.text("deploy_target", "")
 dbutils.widgets.text("warehouse_id", "")
 dbutils.widgets.text("triggered_by", "")
+dbutils.widgets.text("target_benchmark_count", "")
 
 run_id = dbutils.widgets.get("run_id")
 space_id = dbutils.widgets.get("space_id")
@@ -188,6 +189,13 @@ levers = json.loads(dbutils.widgets.get("levers") or "[1,2,3,4,5]")
 apply_mode = dbutils.widgets.get("apply_mode") or "genie_config"
 deploy_target = dbutils.widgets.get("deploy_target") or None
 triggered_by = dbutils.widgets.get("triggered_by") or ""
+_target_benchmark_count_raw = dbutils.widgets.get("target_benchmark_count").strip()
+target_benchmark_count = int(_target_benchmark_count_raw) if _target_benchmark_count_raw else None
+
+if target_benchmark_count:
+    import genie_space_optimizer.common.config as _cfg
+    _cfg.TARGET_BENCHMARK_COUNT = target_benchmark_count
+    _cfg.MAX_BENCHMARK_COUNT = max(_cfg.MAX_BENCHMARK_COUNT, target_benchmark_count + 5)
 
 _banner("Resolved Widget Inputs")
 _log(
@@ -203,6 +211,7 @@ _log(
     apply_mode=apply_mode,
     deploy_target=deploy_target,
     triggered_by=triggered_by,
+    target_benchmark_count=target_benchmark_count,
 )
 
 # COMMAND ----------
