@@ -112,6 +112,7 @@
 # COMMAND ----------
 
 import json
+import math
 import traceback
 from functools import partial
 from typing import Any, cast
@@ -119,7 +120,12 @@ from typing import Any, cast
 from databricks.sdk import WorkspaceClient
 from pyspark.sql import SparkSession
 
-from genie_space_optimizer.common.config import MAX_ITERATIONS
+from genie_space_optimizer.common.config import (
+    HELD_OUT_RATIO,
+    MAX_BENCHMARK_COUNT,
+    MAX_ITERATIONS,
+    TARGET_BENCHMARK_COUNT,
+)
 from genie_space_optimizer.jobs._helpers import _banner as _banner_base
 from genie_space_optimizer.jobs._helpers import _log as _log_base
 from genie_space_optimizer.optimization.harness import _run_preflight
@@ -192,10 +198,12 @@ triggered_by = dbutils.widgets.get("triggered_by") or ""
 _target_benchmark_count_raw = dbutils.widgets.get("target_benchmark_count").strip()
 target_benchmark_count = int(_target_benchmark_count_raw) if _target_benchmark_count_raw else None
 
-if target_benchmark_count:
-    import genie_space_optimizer.common.config as _cfg
-    _cfg.TARGET_BENCHMARK_COUNT = target_benchmark_count
-    _cfg.MAX_BENCHMARK_COUNT = max(_cfg.MAX_BENCHMARK_COUNT, target_benchmark_count + 5)
+effective_target = target_benchmark_count or TARGET_BENCHMARK_COUNT
+effective_max = (
+    math.ceil(effective_target / (1 - HELD_OUT_RATIO))
+    if target_benchmark_count
+    else MAX_BENCHMARK_COUNT
+)
 
 _banner("Resolved Widget Inputs")
 _log(
@@ -384,6 +392,8 @@ try:
         space_id=space_id,
         experiment_name=experiment_name,
         warehouse_id=warehouse_id,
+        target_benchmark_count=effective_target,
+        max_benchmark_count=effective_max,
     )
     _benchmarks = ctx_bench["benchmarks"]
     _log("Benchmarks loaded", count=len(_benchmarks), regenerated=ctx_bench["regenerated"])
@@ -410,6 +420,8 @@ try:
         ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
         _domain,
         warehouse_id=warehouse_id,
+        target_benchmark_count=effective_target,
+        max_benchmark_count=effective_max,
     )
     _benchmarks = ctx_valid["benchmarks"]
     _log("Validation complete", valid=len(_benchmarks), pre_count=ctx_valid["pre_count"],
@@ -443,6 +455,7 @@ try:
         _config, _benchmarks,
         ctx_uc["uc_columns"], ctx_uc["uc_tags"], ctx_uc["uc_routines"],
         _genie_table_refs, experiment_name,
+        max_benchmark_count=effective_max,
     )
     _log("Experiment created",
          experiment=ctx_exp["experiment_name"],

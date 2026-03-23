@@ -2355,7 +2355,7 @@ def _build_links(
     if best_model_id:
         links.append(PipelineLink(
             label="Best Model",
-            url=f"{host}/ml/models/{best_model_id}",
+            url=f"{host}/ml/logged-models/{best_model_id}",
             category="mlflow",
         ))
 

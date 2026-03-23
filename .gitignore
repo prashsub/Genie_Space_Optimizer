@@ -53,6 +53,7 @@ mlflow.db
 .claude/
 /genie_space_optimizer/
 browser-test-output/
+genie_space_optimizer_docs/
 
 # docs
 docs/

@@ -2963,6 +2963,8 @@ def create_evaluation_dataset(
     catalog: str = "",
     gold_schema: str = "",
     experiment_id: str = "",
+    *,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> Any | None:
     """Create or update the MLflow UC evaluation dataset from benchmarks.
 
@@ -3035,10 +3037,10 @@ def create_evaluation_dataset(
                 "Dropped %d duplicate benchmark(s) by question text before persisting to %s",
                 _dup_count, uc_table_name,
             )
-        if len(records) > MAX_BENCHMARK_COUNT:
+        if len(records) > max_benchmark_count:
             records = _truncate_benchmarks(
                 [{"provenance": r.get("expectations", {}).get("provenance", "other"), **r} for r in records],
-                MAX_BENCHMARK_COUNT,
+                max_benchmark_count,
             )
             for r in records:
                 r.pop("provenance", None)
@@ -3337,6 +3339,7 @@ def run_evaluation(
     optimization_run_id: str = "",
     lever: int | None = None,
     model_creation_kwargs: dict | None = None,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> dict:
     """Run ``mlflow.genai.evaluate()`` and return structured results.
 
@@ -3458,10 +3461,10 @@ def run_evaluation(
                     "expectations": expectations,
                 }
             )
-        if len(eval_records) > MAX_BENCHMARK_COUNT:
+        if len(eval_records) > max_benchmark_count:
             eval_records = _truncate_benchmarks(
                 [{**r, "provenance": r.get("expectations", {}).get("provenance", "other")} for r in eval_records],
-                MAX_BENCHMARK_COUNT,
+                max_benchmark_count,
             )
             for r in eval_records:
                 r.pop("provenance", None)
@@ -5097,6 +5100,8 @@ def _fill_coverage_gaps(
     category_performance: dict[str, dict] | None = None,
     *,
     warehouse_id: str = "",
+    target_benchmark_count: int = TARGET_BENCHMARK_COUNT,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> list[dict]:
     """Generate targeted benchmarks for Genie Space assets with zero coverage.
 
@@ -5112,8 +5117,8 @@ def _fill_coverage_gaps(
     Returns only validated gap-fill benchmarks (may be empty).
     """
     soft_cap = min(
-        int(TARGET_BENCHMARK_COUNT * COVERAGE_GAP_SOFT_CAP_FACTOR),
-        MAX_BENCHMARK_COUNT,
+        int(target_benchmark_count * COVERAGE_GAP_SOFT_CAP_FACTOR),
+        max_benchmark_count,
     )
     if len(benchmarks) >= soft_cap:
         logger.info(
@@ -5427,6 +5432,8 @@ def generate_benchmarks(
     genie_space_benchmarks: list[dict] | None = None,
     existing_benchmarks: list[dict] | None = None,
     warehouse_id: str = "",
+    *,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> list[dict]:
     """Generate benchmark questions via LLM from Genie Space context.
 
@@ -5836,6 +5843,8 @@ def generate_benchmarks(
         domain=domain,
         existing_questions=all_accepted_questions,
         warehouse_id=warehouse_id,
+        target_benchmark_count=target_count,
+        max_benchmark_count=max_benchmark_count,
     )
     gap_fill_offset = len(curated) + len(valid_benchmarks)
     for idx, b in enumerate(gap_fill_benchmarks):

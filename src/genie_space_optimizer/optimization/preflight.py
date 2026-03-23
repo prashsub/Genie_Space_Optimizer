@@ -1033,6 +1033,8 @@ def preflight_generate_benchmarks(
     space_id: str = "",
     experiment_name: str | None = None,
     warehouse_id: str = "",
+    target_benchmark_count: int = TARGET_BENCHMARK_COUNT,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> dict:
     """Sub-step 3: Load existing or generate new benchmarks.
 
@@ -1066,6 +1068,8 @@ def preflight_generate_benchmarks(
             w, spark, config, uc_columns, uc_tags, uc_routines,
             domain, catalog, schema, uc_schema, run_id,
             warehouse_id=warehouse_id,
+            target_benchmark_count=target_benchmark_count,
+            max_benchmark_count=max_benchmark_count,
         )
 
         mlflow.log_params({
@@ -1104,6 +1108,8 @@ def preflight_validate_benchmarks(
     domain: str,
     *,
     warehouse_id: str = "",
+    target_benchmark_count: int = TARGET_BENCHMARK_COUNT,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> dict:
     """Sub-step 4: Validate benchmarks via EXPLAIN gating.
 
@@ -1206,7 +1212,7 @@ def preflight_validate_benchmarks(
     _lines.append(_pf_bar())
     print("\n".join(_lines))
 
-    TOP_UP_THRESHOLD = int(TARGET_BENCHMARK_COUNT * 0.75)
+    TOP_UP_THRESHOLD = int(target_benchmark_count * 0.75)
 
     if len(benchmarks) < MIN_VALID_BENCHMARKS:
         logger.warning(
@@ -1226,9 +1232,10 @@ def preflight_validate_benchmarks(
         benchmarks = generate_benchmarks(
             w, config, uc_columns, uc_tags, uc_routines,
             domain, catalog, schema, spark,
-            target_count=TARGET_BENCHMARK_COUNT,
+            target_count=target_benchmark_count,
             genie_space_benchmarks=genie_benchmarks_regen,
             warehouse_id=warehouse_id,
+            max_benchmark_count=max_benchmark_count,
         )
         write_stage(
             spark, run_id, "BENCHMARK_REGENERATION", "COMPLETE",
@@ -1237,11 +1244,11 @@ def preflight_validate_benchmarks(
             catalog=catalog, schema=schema,
         )
     elif len(benchmarks) < TOP_UP_THRESHOLD:
-        gap = TARGET_BENCHMARK_COUNT - len(benchmarks)
+        gap = target_benchmark_count - len(benchmarks)
         logger.warning(
             "Post-validation benchmark count (%d) below 75%% of target (%d). "
             "Generating %d synthetic benchmarks to top up.",
-            len(benchmarks), TARGET_BENCHMARK_COUNT, gap,
+            len(benchmarks), target_benchmark_count, gap,
         )
         print(
             f"  Post-validation top-up: {len(benchmarks)} valid < "
@@ -1253,7 +1260,7 @@ def preflight_validate_benchmarks(
             detail={
                 "reason": "post_validation_top_up",
                 "valid_count": len(benchmarks),
-                "target": TARGET_BENCHMARK_COUNT,
+                "target": target_benchmark_count,
                 "gap": gap,
             },
         )
@@ -1264,10 +1271,11 @@ def preflight_validate_benchmarks(
         topped_up = generate_benchmarks(
             w, config, uc_columns, uc_tags, uc_routines,
             domain, catalog, schema, spark,
-            target_count=TARGET_BENCHMARK_COUNT,
+            target_count=target_benchmark_count,
             genie_space_benchmarks=genie_benchmarks_topup,
             existing_benchmarks=benchmarks,
             warehouse_id=warehouse_id,
+            max_benchmark_count=max_benchmark_count,
         )
         benchmarks = topped_up
         write_stage(
@@ -1369,6 +1377,8 @@ def preflight_setup_experiment(
     uc_routines: list[dict],
     genie_table_refs: list,
     experiment_name: str | None = None,
+    *,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> dict:
     """Sub-step 6: Create MLflow experiment, register judges, create model.
 
@@ -1441,6 +1451,7 @@ def preflight_setup_experiment(
         spark, benchmarks, uc_schema, domain,
         space_id=space_id, catalog=catalog, gold_schema=schema,
         experiment_id=experiment_id,
+        max_benchmark_count=max_benchmark_count,
     )
 
     _lines = [_pf_section("PREFLIGHT — EXPERIMENT & MODEL SETUP")]
@@ -1561,6 +1572,9 @@ def _load_or_generate_benchmarks(
     uc_schema: str,
     run_id: str,
     warehouse_id: str = "",
+    *,
+    target_benchmark_count: int = TARGET_BENCHMARK_COUNT,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> tuple[list[dict], bool]:
     """Load existing benchmarks or generate new ones from Genie space + LLM.
 
@@ -1594,7 +1608,7 @@ def _load_or_generate_benchmarks(
 
     print(
         f"\n-- BENCHMARK LOADING " + "-" * 31 + "\n"
-        f"  Target count: {TARGET_BENCHMARK_COUNT}\n"
+        f"  Target count: {target_benchmark_count}\n"
         f"  Curated from Genie Space: {len(genie_benchmarks)} "
         f"({curated_with_sql} with SQL, {curated_question_only} question-only)"
     )
@@ -1698,9 +1712,9 @@ def _load_or_generate_benchmarks(
             print(f"  Missing curated: {len(missing_curated)}")
 
             if not missing_curated and valid_existing:
-                if len(valid_existing) >= TARGET_BENCHMARK_COUNT:
+                if len(valid_existing) >= target_benchmark_count:
                     print(
-                        f"  Decision: REUSE ({len(valid_existing)} valid, target {TARGET_BENCHMARK_COUNT} met)\n"
+                        f"  Decision: REUSE ({len(valid_existing)} valid, target {target_benchmark_count} met)\n"
                         + "-" * 52
                     )
                     logger.info(
@@ -1713,20 +1727,20 @@ def _load_or_generate_benchmarks(
                         benchmark.setdefault("validation_reason_code", "ok")
                         benchmark.setdefault("validation_error", None)
                         benchmark.setdefault("correction_source", "")
-                    if len(valid_existing) > MAX_BENCHMARK_COUNT:
+                    if len(valid_existing) > max_benchmark_count:
                         from genie_space_optimizer.optimization.evaluation import _truncate_benchmarks
-                        valid_existing = _truncate_benchmarks(valid_existing, MAX_BENCHMARK_COUNT)
+                        valid_existing = _truncate_benchmarks(valid_existing, max_benchmark_count)
                     return valid_existing, False
                 else:
-                    gap = TARGET_BENCHMARK_COUNT - len(valid_existing)
+                    gap = target_benchmark_count - len(valid_existing)
                     print(
                         f"  Decision: TOP-UP ({len(valid_existing)} valid, "
-                        f"need {gap} more to reach target {TARGET_BENCHMARK_COUNT})\n"
+                        f"need {gap} more to reach target {target_benchmark_count})\n"
                         + "-" * 52
                     )
                     logger.warning(
                         "Only %d valid benchmarks (target %d). Generating %d more to top up.",
-                        len(valid_existing), TARGET_BENCHMARK_COUNT, gap,
+                        len(valid_existing), target_benchmark_count, gap,
                     )
                     for benchmark in valid_existing:
                         benchmark.setdefault("provenance", "synthetic")
@@ -1743,23 +1757,24 @@ def _load_or_generate_benchmarks(
                     new_benchmarks = generate_benchmarks(
                         w, config, uc_columns, uc_tags, uc_routines,
                         domain, catalog, schema, spark,
-                        target_count=TARGET_BENCHMARK_COUNT,
+                        target_count=target_benchmark_count,
                         genie_space_benchmarks=genie_benchmarks,
                         existing_benchmarks=valid_existing,
                         warehouse_id=warehouse_id,
+                        max_benchmark_count=max_benchmark_count,
                     )
                     write_stage(
                         spark, run_id, "BENCHMARK_GENERATION", "COMPLETE",
                         task_key="preflight",
                         detail={
                             "total_count": len(new_benchmarks),
-                            "top_up_reason": f"{len(valid_existing)}<{TARGET_BENCHMARK_COUNT}",
+                            "top_up_reason": f"{len(valid_existing)}<{target_benchmark_count}",
                         },
                         catalog=catalog, schema=schema,
                     )
-                    if len(new_benchmarks) > MAX_BENCHMARK_COUNT:
+                    if len(new_benchmarks) > max_benchmark_count:
                         from genie_space_optimizer.optimization.evaluation import _truncate_benchmarks
-                        new_benchmarks = _truncate_benchmarks(new_benchmarks, MAX_BENCHMARK_COUNT)
+                        new_benchmarks = _truncate_benchmarks(new_benchmarks, max_benchmark_count)
                     return new_benchmarks, False
 
             print(
@@ -1790,7 +1805,7 @@ def _load_or_generate_benchmarks(
 
     logger.info(
         "Generating benchmarks: %d curated from Genie space + synthetic to reach %d",
-        len(genie_benchmarks), TARGET_BENCHMARK_COUNT,
+        len(genie_benchmarks), target_benchmark_count,
     )
     write_stage(
         spark, run_id, "BENCHMARK_GENERATION", "STARTED",
@@ -1800,9 +1815,10 @@ def _load_or_generate_benchmarks(
     benchmarks = generate_benchmarks(
         w, config, uc_columns, uc_tags, uc_routines,
         domain, catalog, schema, spark,
-        target_count=TARGET_BENCHMARK_COUNT,
+        target_count=target_benchmark_count,
         genie_space_benchmarks=genie_benchmarks,
         warehouse_id=warehouse_id,
+        max_benchmark_count=max_benchmark_count,
     )
 
     write_stage(
@@ -1817,7 +1833,7 @@ def _load_or_generate_benchmarks(
         },
         catalog=catalog, schema=schema,
     )
-    if len(benchmarks) > MAX_BENCHMARK_COUNT:
+    if len(benchmarks) > max_benchmark_count:
         from genie_space_optimizer.optimization.evaluation import _truncate_benchmarks
-        benchmarks = _truncate_benchmarks(benchmarks, MAX_BENCHMARK_COUNT)
+        benchmarks = _truncate_benchmarks(benchmarks, max_benchmark_count)
     return benchmarks, True
