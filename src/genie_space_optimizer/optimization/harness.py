@@ -1034,8 +1034,9 @@ def _run_proactive_join_discovery(
         result["fk_candidates"] = len(fk_candidates)
 
         # 3b. Tier 1: Execution-proven joins from baseline eval
-        exec_candidates = _extract_proven_joins(rows_json, metadata_snapshot)
+        exec_candidates, exec_diagnostics = _extract_proven_joins(rows_json, metadata_snapshot)
         result["execution_candidates"] = len(exec_candidates)
+        result["extraction_diagnostics"] = exec_diagnostics
 
         # 3c. Merge: FK candidates take precedence for shared table pairs.
         #     For pairs that appear in both, keep the FK candidate's ON
@@ -1087,6 +1088,13 @@ def _run_proactive_join_discovery(
             _jd_lines.append(_kv("Existing join specs", result['existing_specs']))
             _jd_lines.append(_kv("FK constraint candidates", result['fk_candidates']))
             _jd_lines.append(_kv("Execution-proven candidates", result['execution_candidates']))
+            _diag = result.get("extraction_diagnostics", {})
+            if _diag:
+                _jd_lines.append(_kv("  Eval rows scanned", _diag.get("total_rows", "?")))
+                _jd_lines.append(_kv("  Positive verdicts", _diag.get("positive_verdicts", "?")))
+                _jd_lines.append(_kv("  SQL with JOIN", _diag.get("sql_with_join", "?")))
+                _jd_lines.append(_kv("  FROM unresolved", _diag.get("no_from_resolved", "?")))
+                _jd_lines.append(_kv("  Joined unresolved", _diag.get("no_joined_resolved", "?")))
             _jd_lines.append(_kv("Merged candidates", result['candidates_found']))
             _jd_lines.append(_kv("Already defined", result['already_defined']))
             _jd_lines.append(_kv("Type-incompatible", result['type_incompatible']))
@@ -1147,6 +1155,13 @@ def _run_proactive_join_discovery(
         _jd_lines.append(_kv("Existing join specs", result['existing_specs']))
         _jd_lines.append(_kv("FK constraint candidates", result['fk_candidates']))
         _jd_lines.append(_kv("Execution-proven candidates", result['execution_candidates']))
+        _diag = result.get("extraction_diagnostics", {})
+        if _diag:
+            _jd_lines.append(_kv("  Eval rows scanned", _diag.get("total_rows", "?")))
+            _jd_lines.append(_kv("  Positive verdicts", _diag.get("positive_verdicts", "?")))
+            _jd_lines.append(_kv("  SQL with JOIN", _diag.get("sql_with_join", "?")))
+            _jd_lines.append(_kv("  FROM unresolved", _diag.get("no_from_resolved", "?")))
+            _jd_lines.append(_kv("  Joined unresolved", _diag.get("no_joined_resolved", "?")))
         _jd_lines.append(_kv("Merged candidates", result['candidates_found']))
         _jd_lines.append(_kv("Already defined", result['already_defined']))
         _jd_lines.append(_kv("Type-incompatible", result['type_incompatible']))
@@ -1175,6 +1190,144 @@ def _run_proactive_join_discovery(
             catalog=catalog, schema=schema,
         )
         return result
+
+
+# ── Iterative join mining (runs after each accepted iteration) ────────
+
+
+def _mine_and_apply_proven_joins(
+    w: "WorkspaceClient",
+    spark: "SparkSession",
+    run_id: str,
+    space_id: str,
+    metadata_snapshot: dict,
+    eval_rows: list[dict],
+    catalog: str,
+    schema: str,
+    *,
+    iteration: int = 0,
+) -> dict:
+    """Mine execution-proven joins from eval rows and apply new ones.
+
+    Lightweight wrapper around ``_extract_proven_joins`` →
+    ``_corroborate_with_uc_metadata`` → ``_build_join_specs_from_proven``
+    that can be called after any accepted iteration.
+
+    Returns a result dict with ``total_applied`` count and ``new_specs``.
+    Does NOT re-read from Delta — operates on the in-memory *eval_rows*.
+    """
+    from genie_space_optimizer.common.genie_client import (
+        patch_space_config,
+    )
+    from genie_space_optimizer.optimization.optimizer import (
+        _build_join_specs_from_proven,
+        _corroborate_with_uc_metadata,
+        _extract_proven_joins,
+        _short_name,
+    )
+
+    result: dict = {"total_applied": 0, "new_specs": [], "extraction_diagnostics": {}}
+    if not eval_rows:
+        return result
+
+    exec_candidates, exec_diagnostics = _extract_proven_joins(eval_rows, metadata_snapshot)
+    result["extraction_diagnostics"] = exec_diagnostics
+    if not exec_candidates:
+        return result
+
+    _inst = metadata_snapshot.get("instructions", {})
+    if not isinstance(_inst, dict):
+        _inst = {}
+    existing_specs = _inst.get("join_specs", [])
+    if not isinstance(existing_specs, list):
+        existing_specs = []
+
+    existing_pairs: set[tuple[str, str]] = set()
+    for spec in existing_specs:
+        if not isinstance(spec, dict):
+            continue
+        left_obj = spec.get("left", {})
+        right_obj = spec.get("right", {})
+        lt = left_obj.get("identifier", "") if isinstance(left_obj, dict) else ""
+        rt = right_obj.get("identifier", "") if isinstance(right_obj, dict) else ""
+        if lt and rt:
+            _a, _b = sorted((lt, rt))
+            existing_pairs.add((_a, _b))
+
+    new_candidates = []
+    for cand in exec_candidates:
+        pair_key = tuple(sorted((cand["left_table"], cand["right_table"])))
+        if pair_key not in existing_pairs:
+            new_candidates.append(cand)
+
+    new_candidates = _corroborate_with_uc_metadata(new_candidates, metadata_snapshot)
+    if not new_candidates:
+        return result
+
+    new_specs = _build_join_specs_from_proven(new_candidates, metadata_snapshot)
+    if not new_specs:
+        return result
+
+    parsed = metadata_snapshot
+    inst_block = parsed.setdefault("instructions", {})
+    spec_list = inst_block.setdefault("join_specs", [])
+
+    applied_lines: list[str] = []
+    for spec in new_specs:
+        meta = spec.pop("_proactive_metadata", {})
+        spec_list.append(spec)
+        left_short = _short_name(spec["left"]["identifier"])
+        right_short = _short_name(spec["right"]["identifier"])
+        freq = meta.get("frequency", 0)
+        agreed_tag = "agreed" if meta.get("agreed") else "single_source"
+        applied_lines.append(
+            f"{left_short} <-> {right_short}"
+            f" ON {spec['sql'][0][:60] if spec.get('sql') else '?'}"
+            f" (freq={freq}, {agreed_tag})"
+        )
+        result["total_applied"] += 1
+
+    patch_space_config(w, space_id, parsed)
+    result["new_specs"] = new_specs
+
+    for idx, spec in enumerate(new_specs):
+        write_patch(
+            spark, run_id, iteration, 4, idx,
+            {
+                "patch_type": "iterative_join_mining",
+                "scope": "genie_config",
+                "risk_level": "low",
+                "target_object": (
+                    f"{spec['left']['identifier']}"
+                    f" <-> {spec['right']['identifier']}"
+                ),
+                "patch": spec,
+                "command": None,
+            },
+            catalog, schema,
+        )
+
+    _jm_lines = [_section(f"ITERATIVE JOIN MINING (iter {iteration})", "-")]
+    _diag = result.get("extraction_diagnostics", {})
+    _jm_lines.append(_kv("Eval rows scanned", _diag.get("total_rows", "?")))
+    _jm_lines.append(_kv("Positive verdicts", _diag.get("positive_verdicts", "?")))
+    _jm_lines.append(_kv("SQL with JOIN", _diag.get("sql_with_join", "?")))
+    _jm_lines.append(_kv("Existing join specs", len(existing_specs)))
+    _jm_lines.append(_kv("New candidates", len(new_candidates)))
+    _jm_lines.append(_kv("New joins applied", result["total_applied"]))
+    for al in applied_lines:
+        _jm_lines.append(f"|    {al}")
+    _jm_lines.append(_bar("-"))
+    print("\n".join(_jm_lines))
+
+    write_stage(
+        spark, run_id, f"JOIN_MINING_ITER_{iteration}", "COMPLETE",
+        task_key="lever_loop", iteration=iteration,
+        detail=result,
+        catalog=catalog, schema=schema,
+    )
+
+    return result
 
 
 # ── Stage 2.9: PROACTIVE SPACE METADATA ENRICHMENT ──────────────────
@@ -3872,6 +4025,98 @@ def _run_lever_loop(
             _bar("-"),
         ]))
 
+    # ── Phase 1.5: Restructure unstructured instructions ──────────
+    # If existing instructions lack ALL-CAPS section headers, classify
+    # them into canonical sections via LLM so downstream section-level
+    # merges are safe.  The restructured text is persisted to the Genie
+    # Space so all lever iterations operate on structured input.
+    try:
+        from genie_space_optimizer.optimization.applier import (
+            _get_general_instructions,
+            _set_general_instructions,
+        )
+        from genie_space_optimizer.optimization.optimizer import (
+            _is_unstructured,
+            _pre_structure_instructions,
+            normalize_instructions,
+        )
+
+        _current_instr = _get_general_instructions(metadata_snapshot)
+        if _current_instr and _current_instr.strip() and _is_unstructured(_current_instr):
+            logger.info(
+                "Existing instructions are unstructured (%d chars) "
+                "— restructuring into canonical sections",
+                len(_current_instr),
+            )
+            _restructured_secs = _pre_structure_instructions(
+                _current_instr, metadata_snapshot, w=w,
+            )
+            if _restructured_secs:
+                parts: list[str] = []
+                from genie_space_optimizer.common.config import INSTRUCTION_SECTION_ORDER
+                for _sec in INSTRUCTION_SECTION_ORDER:
+                    _lines_list = _restructured_secs.get(_sec, [])
+                    if not _lines_list:
+                        continue
+                    parts.append(f"{_sec}:")
+                    for _ln in _lines_list:
+                        _s = _ln.strip()
+                        if not _s:
+                            continue
+                        if not _s.startswith("- "):
+                            _s = f"- {_s}"
+                        parts.append(_s)
+                    parts.append("")
+                _restructured_text = normalize_instructions("\n".join(parts).strip())
+
+                if len(_restructured_text.strip()) >= len(_current_instr.strip()) * 0.5:
+                    _set_general_instructions(metadata_snapshot, _restructured_text)
+                    try:
+                        from genie_space_optimizer.common.genie_client import (
+                            patch_space_config,
+                        )
+                        patch_space_config(w, space_id, metadata_snapshot)
+                        logger.info(
+                            "Persisted restructured instructions (%d chars, %d sections)",
+                            len(_restructured_text), len(_restructured_secs),
+                        )
+                        write_patch(
+                            spark, run_id, 0, 0, 0,
+                            {
+                                "patch_type": "instruction_restructure",
+                                "scope": "genie_config",
+                                "risk_level": "low",
+                                "target_object": "instructions.text_instructions",
+                                "patch": {"instructions": _restructured_text[:200] + "..."},
+                                "command": None,
+                                "rollback": None,
+                                "proposal_id": "instruction_restructure",
+                            },
+                            catalog, schema,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Instruction restructure: PATCH to Genie Space failed",
+                            exc_info=True,
+                        )
+                else:
+                    logger.warning(
+                        "Restructured text too short (%d chars vs %d original) "
+                        "— skipping persist",
+                        len(_restructured_text), len(_current_instr),
+                    )
+
+            print("\n".join([
+                _section("INSTRUCTION RESTRUCTURING", "-"),
+                _kv("Original format", "unstructured"),
+                _kv("Sections detected", ", ".join(_restructured_secs.keys()) if _restructured_secs else "none"),
+                _bar("-"),
+            ]))
+        else:
+            logger.debug("Instructions already structured or empty — no restructuring needed")
+    except Exception:
+        logger.warning("Instruction restructuring failed — continuing with existing format", exc_info=True)
+
     # ── Phase 2: Pre-Loop Setup ──
     _pls_lines = [_section("LEVER LOOP — PRE-LOOP SETUP", "-")]
     print("\n".join(_pls_lines))
@@ -4134,6 +4379,7 @@ def _run_lever_loop(
                 skill_exemplars=skill_exemplars or None,
                 human_suggestions=_human_suggestions or None,
             )
+            strategy["_source_clusters"] = clusters + soft_signal_clusters
             action_groups = strategy.get("action_groups", [])
             ag = action_groups[0] if action_groups else None
 
@@ -4853,6 +5099,34 @@ def _run_lever_loop(
         )
 
         metadata_snapshot = apply_log.get("post_snapshot", metadata_snapshot)
+
+        # ── Mine execution-proven joins from latest eval rows ────────
+        try:
+            _eval_rows = full_result.get("rows", [])
+            if not _eval_rows:
+                _eval_rows_json = full_result.get("rows_json")
+                if isinstance(_eval_rows_json, str):
+                    import json as _json_mod
+                    try:
+                        _eval_rows = _json_mod.loads(_eval_rows_json)
+                    except (ValueError, TypeError):
+                        _eval_rows = []
+                elif isinstance(_eval_rows_json, list):
+                    _eval_rows = _eval_rows_json
+            if _eval_rows:
+                _mine_result = _mine_and_apply_proven_joins(
+                    w, spark, run_id, space_id, metadata_snapshot, _eval_rows,
+                    catalog, schema, iteration=iteration_counter,
+                )
+                if _mine_result.get("total_applied", 0) > 0:
+                    from genie_space_optimizer.common.genie_client import fetch_space_config as _fetch_cfg
+                    config = _fetch_cfg(w, space_id)
+                    metadata_snapshot = config.get("_parsed_space", config)
+        except Exception:
+            logger.debug(
+                "Iterative join mining failed at iter %d (non-fatal)",
+                iteration_counter, exc_info=True,
+            )
 
     write_stage(
         spark, run_id, "LEVER_LOOP_STARTED", "COMPLETE",

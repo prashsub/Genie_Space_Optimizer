@@ -692,9 +692,10 @@ def build_asi_metadata(
     actual_value: str | None = None,
     counterfactual_fix: str | None = None,
     affected_question_pattern: str | None = None,
+    join_assessment: dict | None = None,
 ) -> dict:
     """Build an ASI metadata dict conforming to ASI_SCHEMA."""
-    return {
+    md: dict = {
         "failure_type": failure_type if failure_type in FAILURE_TAXONOMY else "other",
         "severity": severity,
         "confidence": confidence,
@@ -708,6 +709,9 @@ def build_asi_metadata(
         "counterfactual_fix": counterfactual_fix,
         "affected_question_pattern": affected_question_pattern,
     }
+    if join_assessment and isinstance(join_assessment, dict):
+        md["join_assessment"] = join_assessment
+    return md
 
 
 def format_asi_markdown(

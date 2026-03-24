@@ -30,6 +30,7 @@ from genie_space_optimizer.common.config import (
     FAILURE_TAXONOMY,
     GENERIC_FIX_PREFIXES,
     INSTRUCTION_SECTION_ORDER,
+    LEVER_TO_SECTIONS,
     LEVER_1_2_COLUMN_PROMPT,
     LEVER_4_JOIN_DISCOVERY_PROMPT,
     LEVER_4_JOIN_SPEC_PROMPT,
@@ -63,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 _LLM_TIMEOUT_SECONDS = 600
 _EXAMPLE_SQL_SIMILARITY_THRESHOLD = 0.85
-_INSTR_LOSS_THRESHOLD = 0.5
+_INSTR_LOSS_THRESHOLD = 0.75
 
 
 def _ws_with_timeout(
@@ -770,6 +771,8 @@ def cluster_failures(
                     or row.get(f"metadata/{judge}/wrong_clause")
                 )
 
+                asi_join_assessment = judge_meta.get("join_assessment")
+
                 if not asi_failure_type and uc_asi_map:
                     uc_asi_entry = uc_asi_map.get((question_id, judge))
                     if uc_asi_entry:
@@ -777,19 +780,22 @@ def cluster_failures(
                         asi_blame_set = asi_blame_set or uc_asi_entry.get("blame_set")
                         asi_counterfactual = asi_counterfactual or uc_asi_entry.get("counterfactual_fix")
                         asi_wrong_clause = asi_wrong_clause or uc_asi_entry.get("wrong_clause")
+                        if not asi_join_assessment:
+                            asi_join_assessment = uc_asi_entry.get("join_assessment")
 
-                failures.append(
-                    {
-                        "question_id": question_id,
-                        "judge": judge,
-                        "rationale": rationale,
-                        "asi_failure_type": asi_failure_type,
-                        "asi_blame_set": asi_blame_set,
-                        "asi_counterfactual_fix": asi_counterfactual,
-                        "asi_wrong_clause": asi_wrong_clause,
-                        "sql_context": sql_ctx,
-                    }
-                )
+                failure_entry: dict = {
+                    "question_id": question_id,
+                    "judge": judge,
+                    "rationale": rationale,
+                    "asi_failure_type": asi_failure_type,
+                    "asi_blame_set": asi_blame_set,
+                    "asi_counterfactual_fix": asi_counterfactual,
+                    "asi_wrong_clause": asi_wrong_clause,
+                    "sql_context": sql_ctx,
+                }
+                if isinstance(asi_join_assessment, dict) and asi_join_assessment.get("left_table"):
+                    failure_entry["asi_join_assessment"] = asi_join_assessment
+                failures.append(failure_entry)
 
     question_profiles: dict[str, dict] = {}
     for f in failures:
@@ -896,6 +902,7 @@ def cluster_failures(
         all_wrong_clauses: list[str] = []
         sql_contexts: list[dict] = []
         sample_asi_type: str | None = None
+        join_assessments: list[dict] = []
 
         question_traces: list[dict] = []
         for qid in qids:
@@ -910,6 +917,10 @@ def cluster_failures(
                     if f.get("asi_failure_type"):
                         sample_asi_type = f["asi_failure_type"]
                         break
+            for f in profile["failures"]:
+                ja = f.get("asi_join_assessment")
+                if isinstance(ja, dict) and ja.get("left_table"):
+                    join_assessments.append({**ja, "question_id": qid})
             q_text = profile["sql_context"].get("question", "") if profile["sql_context"] else ""
             judge_traces = []
             for f in profile["failures"]:
@@ -945,6 +956,8 @@ def cluster_failures(
             "sql_contexts": sql_contexts[:5],
             "question_traces": question_traces,
         }
+        if join_assessments:
+            entry["join_assessments"] = join_assessments
         clusters.append(entry)
 
     clusters.sort(key=lambda c: len(c["question_ids"]), reverse=True)
@@ -1733,7 +1746,7 @@ def _generate_proactive_instructions(
 ) -> str:
     """Generate conservative routing instructions for an empty Genie Space.
 
-    Returns the instruction text (500-1500 chars), or ``""`` on failure.
+    Returns the instruction text (500-4000 chars), or ``""`` on failure.
     """
     from genie_space_optimizer.common.config import PROACTIVE_INSTRUCTION_PROMPT
 
@@ -1769,8 +1782,8 @@ def _generate_proactive_instructions(
         if len(text) < 50:
             logger.warning("Proactive instruction generation: result too short (%d chars)", len(text))
             return ""
-        if len(text) > 1500:
-            text = text[:1500].rsplit("\n", 1)[0]
+        if len(text) > 4000:
+            text = text[:4000].rsplit("\n", 1)[0]
         text = normalize_instructions(text)
         logger.info("Proactive instruction generation: produced %d chars", len(text))
         return text
@@ -2129,17 +2142,26 @@ _FACT_PREFIXES = ("fact_", "fct_")
 
 _JOIN_FQN_RE = re.compile(
     r"\bJOIN\s+"
-    r"((?:`[^`]+`(?:\.`[^`]+`){1,2})"              # backtick-quoted 2- or 3-part
-    r"|(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,2}))"    # unquoted 2- or 3-part
+    r"((?:`[^`]+`(?:\.`[^`]+`){0,2})"              # backtick-quoted 1-, 2-, or 3-part
+    r"|(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){0,2}))"   # unquoted 1-, 2-, or 3-part
     r"(?:\s+(?:AS\s+)?(\w+))?"
-    r"\s*ON\s+(.+?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|;|\Z)",
+    r"\s*ON\s+(.+?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bUNION\b|\bHAVING\b|;|\Z)",
+    re.I | re.S,
+)
+
+_JOIN_USING_RE = re.compile(
+    r"\bJOIN\s+"
+    r"((?:`[^`]+`(?:\.`[^`]+`){0,2})"              # backtick-quoted 1-, 2-, or 3-part
+    r"|(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){0,2}))"   # unquoted 1-, 2-, or 3-part
+    r"(?:\s+(?:AS\s+)?(\w+))?"
+    r"\s*USING\s*\(([^)]+)\)",
     re.I | re.S,
 )
 
 _SQL_FROM_TABLE_RE = re.compile(
     r"\bFROM\s+"
-    r"((?:`[^`]+`(?:\.`[^`]+`){1,2})"              # backtick-quoted 2- or 3-part
-    r"|(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,2}))",   # unquoted 2- or 3-part
+    r"((?:`[^`]+`(?:\.`[^`]+`){0,2})"              # backtick-quoted 1-, 2-, or 3-part
+    r"|(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){0,2}))",  # unquoted 1-, 2-, or 3-part
     re.I,
 )
 
@@ -2289,8 +2311,9 @@ def _extract_proven_joins(
             if not sql:
                 continue
 
-            join_matches = list(_JOIN_FQN_RE.finditer(sql))
-            if not join_matches:
+            join_on_matches = list(_JOIN_FQN_RE.finditer(sql))
+            join_using_matches = list(_JOIN_USING_RE.finditer(sql))
+            if not join_on_matches and not join_using_matches:
                 continue
 
             _diag_has_join += 1
@@ -2309,37 +2332,56 @@ def _extract_proven_joins(
 
             if not from_fqn:
                 _diag_no_from += 1
+                all_matches = len(join_on_matches) + len(join_using_matches)
                 logger.debug(
                     "Join extraction [%s/%s]: no FROM table resolved "
                     "(raw=%r), skipping %d JOINs",
-                    qid, source_label, from_table_raw, len(join_matches),
+                    qid, source_label, from_table_raw, all_matches,
                 )
                 continue
 
-            for m in join_matches:
+            def _resolve_joined_table(raw: str) -> str:
+                """Resolve a raw joined table name to FQN."""
+                fqn = short_to_fqn.get(raw, "")
+                if not fqn:
+                    short = _short_name(raw).lower()
+                    if short not in _ambiguous_shorts:
+                        fqn = short_to_fqn.get(short, "")
+                    elif "." in raw and raw.count(".") >= 2:
+                        fqn = raw
+                if not fqn and "." in raw and raw.count(".") >= 2:
+                    fqn = raw
+                return fqn
+
+            parsed_joins: list[tuple[str, str]] = []
+            for m in join_on_matches:
                 joined_table_raw = m.group(1).replace("`", "").lower()
-                alias = (m.group(2) or "").lower()
                 on_clause = m.group(3).strip()
+                parsed_joins.append((joined_table_raw, on_clause))
 
-                joined_fqn = short_to_fqn.get(joined_table_raw, "")
-                if not joined_fqn:
-                    joined_short = _short_name(joined_table_raw).lower()
-                    if joined_short not in _ambiguous_shorts:
-                        joined_fqn = short_to_fqn.get(joined_short, "")
-                    elif "." in joined_table_raw and joined_table_raw.count(".") >= 2:
-                        joined_fqn = joined_table_raw
+            for m in join_using_matches:
+                joined_table_raw = m.group(1).replace("`", "").lower()
+                using_cols = [c.strip().strip("`") for c in m.group(3).split(",")]
+                from_short = _short_name(from_fqn).lower()
+                joined_short = _short_name(joined_table_raw).lower() or joined_table_raw
+                on_parts = [
+                    f"`{from_short}`.`{c}` = `{joined_short}`.`{c}`"
+                    for c in using_cols
+                ]
+                on_clause = " AND ".join(on_parts)
+                parsed_joins.append((joined_table_raw, on_clause))
+
+            for joined_table_raw, on_clause in parsed_joins:
+                joined_fqn = _resolve_joined_table(joined_table_raw)
 
                 if not joined_fqn:
-                    if "." in joined_table_raw and joined_table_raw.count(".") >= 2:
-                        joined_fqn = joined_table_raw
-                    else:
-                        _diag_no_resolve += 1
-                        logger.debug(
-                            "Join extraction [%s/%s]: cannot resolve "
-                            "joined table %r to FQN",
-                            qid, source_label, joined_table_raw,
-                        )
-                        continue
+                    _diag_no_resolve += 1
+                    logger.debug(
+                        "Join extraction [%s/%s]: cannot resolve "
+                        "joined table %r to FQN",
+                        qid, source_label, joined_table_raw,
+                    )
+                    continue
 
                 _pk_l, _pk_r = sorted((from_fqn, joined_fqn))
                 pair_key = (_pk_l, _pk_r)
@@ -2384,6 +2426,14 @@ def _extract_proven_joins(
 
     result.sort(key=lambda x: (-int(x.get("agreed", False)), -x["frequency"]))
 
+    diagnostics = {
+        "total_rows": len(rows),
+        "positive_verdicts": _diag_positive,
+        "sql_with_join": _diag_has_join,
+        "no_from_resolved": _diag_no_from,
+        "no_joined_resolved": _diag_no_resolve,
+    }
+
     logger.info(
         "Proactive join discovery: %d candidates from %d rows "
         "(positive_verdicts=%d, sql_with_join=%d, "
@@ -2399,7 +2449,7 @@ def _extract_proven_joins(
             cand["frequency"], cand["agreed"],
             cand.get("on_condition", "")[:80],
         )
-    return result
+    return result, diagnostics
 
 
 def _corroborate_with_uc_metadata(
@@ -3733,6 +3783,12 @@ def _build_cluster_data(clusters: list[dict], *, top_n: int = 5) -> list[dict]:
         cf = cluster.get("asi_counterfactual_fixes", [])
         if cf:
             entry["suggested_fixes"] = [str(f)[:200] for f in cf[:5]]
+        ja_list = cluster.get("join_assessments", [])
+        if ja_list:
+            entry["join_assessments"] = [
+                {k: v for k, v in ja.items() if k != "question_id"}
+                for ja in ja_list[:5]
+            ]
         result.append(entry)
     if len(sorted_hard) > top_n:
         for cluster in sorted_hard[top_n:]:
@@ -5027,6 +5083,173 @@ def normalize_instructions(text: str) -> str:
     return _merge_structured_instructions(existing=text, contributions=[], global_guidance="")
 
 
+# ---------------------------------------------------------------------------
+# Instruction pre-structuring: convert unstructured instructions into
+# canonical ALL-CAPS sections so section-level merges are safe.
+# ---------------------------------------------------------------------------
+
+_pre_structure_cache: dict[int, dict[str, list[str]]] = {}
+
+
+def _is_unstructured(text: str) -> bool:
+    """Return True if *text* has no recognized ALL-CAPS section headers."""
+    if not text or not text.strip():
+        return True
+    sanitized = _sanitize_plaintext_instructions(text)
+    sections, preamble = _parse_sections(sanitized)
+    return (not sections) and bool(preamble)
+
+
+def _pre_structure_instructions(
+    raw: str,
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> dict[str, list[str]]:
+    """Classify unstructured instructions into canonical section format via LLM.
+
+    Returns a dict keyed by section header (e.g. ``"PURPOSE"``) with lists
+    of bullet lines.  Falls back to ``_merge_structured_instructions`` if the
+    LLM call fails.
+    """
+    from genie_space_optimizer.common.config import INSTRUCTION_RESTRUCTURE_PROMPT
+
+    cache_key = hash(raw)
+    if cache_key in _pre_structure_cache:
+        return _pre_structure_cache[cache_key]
+
+    ctx = _build_space_schema_context(metadata_snapshot)
+    format_kwargs = {
+        "existing_instructions": raw,
+        "tables_context": ctx.get("tables_context", "(no tables)"),
+    }
+    prompt = format_mlflow_template(INSTRUCTION_RESTRUCTURE_PROMPT, **format_kwargs)
+    system_msg = "You classify Genie Space instructions into canonical sections."
+
+    try:
+        text, _response = _traced_llm_call(
+            w, system_msg, prompt,
+            span_name="pre_structure_instructions",
+            max_tokens=4096,
+        )
+        text = re.sub(r"```[a-z]*\n?", "", text).strip().rstrip("`")
+        text = _sanitize_plaintext_instructions(text)
+        sections, preamble = _parse_sections(text)
+
+        if not sections:
+            logger.warning(
+                "Pre-structuring LLM returned no sections — falling back to heuristic"
+            )
+            raise ValueError("LLM did not produce structured output")
+
+        if preamble:
+            non_blank = [ln for ln in preamble if ln.strip()]
+            if non_blank:
+                target = "PURPOSE" if "PURPOSE" not in sections else "CONSTRAINTS"
+                sections.setdefault(target, []).extend(non_blank)
+
+        result: dict[str, list[str]] = {}
+        for section in INSTRUCTION_SECTION_ORDER:
+            if section in sections:
+                result[section] = [
+                    ln for ln in sections[section] if ln.strip()
+                ]
+
+        logger.info(
+            "Pre-structured instructions into %d sections (%s)",
+            len(result),
+            ", ".join(result.keys()),
+        )
+        _pre_structure_cache[cache_key] = result
+        return result
+
+    except Exception:
+        logger.warning(
+            "Pre-structuring LLM call failed — falling back to heuristic merge",
+            exc_info=True,
+        )
+        fallback_text = _merge_structured_instructions(
+            existing=raw, contributions=[], global_guidance=""
+        )
+        sections, _ = _parse_sections(fallback_text)
+        result = {
+            section: [ln for ln in lines if ln.strip()]
+            for section, lines in sections.items()
+        }
+        _pre_structure_cache[cache_key] = result
+        return result
+
+
+def _ensure_structured(
+    current_instructions: str,
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+) -> dict[str, list[str]]:
+    """Return existing instructions as a structured section dict.
+
+    If already structured, parses directly.  If unstructured, calls
+    ``_pre_structure_instructions`` to classify via LLM.
+    """
+    if not current_instructions or not current_instructions.strip():
+        return {}
+
+    sanitized = _sanitize_plaintext_instructions(current_instructions)
+    sections, preamble = _parse_sections(sanitized)
+
+    if sections and not preamble:
+        return {k: [ln for ln in v if ln.strip()] for k, v in sections.items()}
+
+    if sections and preamble:
+        non_blank = [ln for ln in preamble if ln.strip()]
+        if non_blank:
+            target = "PURPOSE" if "PURPOSE" not in sections else "CONSTRAINTS"
+            sections.setdefault(target, []).extend(non_blank)
+        return {k: [ln for ln in v if ln.strip()] for k, v in sections.items()}
+
+    return _pre_structure_instructions(current_instructions, metadata_snapshot, w=w)
+
+
+# ---------------------------------------------------------------------------
+# Semantic content-preservation check
+# ---------------------------------------------------------------------------
+
+_KEY_PHRASE_RE = re.compile(
+    r'[a-z_]+\.[a-z_]+\.[a-z_]+'    # 3-part identifiers
+    r'|[A-Z]{2,}[A-Z_]*'              # ALL-CAPS acronyms (2+ chars)
+    r'|[a-z_]{2,}\.[a-z_]{2,}'        # 2-part identifiers
+    r"|'[YN]'"                         # flag literals
+)
+
+
+def _extract_key_phrases(text: str) -> set[str]:
+    """Extract domain-significant tokens from instruction text."""
+    phrases: set[str] = set()
+    for m in _KEY_PHRASE_RE.finditer(text):
+        phrases.add(m.group(0))
+    return phrases
+
+
+def _instruction_coverage(old: str, new: str, threshold: float = 0.6) -> bool:
+    """Check that key identifiers from *old* appear in *new*.
+
+    Returns ``True`` if coverage is above *threshold* (i.e. the new text
+    preserves enough of the original's key phrases).
+    """
+    old_tokens = _extract_key_phrases(old)
+    if not old_tokens:
+        return True
+    new_tokens = _extract_key_phrases(new)
+    coverage = len(old_tokens & new_tokens) / len(old_tokens)
+    if coverage < threshold:
+        logger.warning(
+            "Instruction coverage %.1f%% < %.0f%% threshold — "
+            "%d/%d key phrases missing: %s",
+            coverage * 100, threshold * 100,
+            len(old_tokens - new_tokens), len(old_tokens),
+            sorted(old_tokens - new_tokens)[:10],
+        )
+    return coverage >= threshold
+
+
 def _repair_truncated_holistic_json(text: str) -> dict:
     """Extract instruction_text and example_sql_proposals from a truncated JSON.
 
@@ -6245,11 +6468,12 @@ def _generate_holistic_strategy(
         existing_instr = _get_general_instructions(metadata_snapshot)
 
         if dict_contributions:
-            existing_sections, _ = _parse_sections(
-                _sanitize_plaintext_instructions(existing_instr) if existing_instr else ""
+            existing_sections = _ensure_structured(
+                existing_instr, metadata_snapshot, w=w,
             )
             merged_sections: dict[str, list[str]] = {
-                s: existing_sections.get(s, []) for s in INSTRUCTION_SECTION_ORDER
+                s: list(existing_sections.get(s, []))
+                for s in INSTRUCTION_SECTION_ORDER
             }
             valid_keys = set(INSTRUCTION_SECTION_ORDER)
             for dc in dict_contributions:
@@ -6277,6 +6501,17 @@ def _generate_holistic_strategy(
                     parts.append(s)
                 parts.append("")
             global_rewrite = _sanitize_plaintext_instructions("\n".join(parts).strip())
+
+            if existing_instr and not _instruction_coverage(
+                existing_instr, global_rewrite
+            ):
+                logger.warning(
+                    "Two-phase holistic rewrite drops key phrases — force-merging"
+                )
+                global_rewrite = _merge_structured_instructions(
+                    existing=existing_instr,
+                    contributions=[global_rewrite],
+                )
         elif str_contributions or global_guidance:
             global_rewrite = _merge_structured_instructions(
                 existing=existing_instr,
@@ -7128,7 +7363,7 @@ def generate_proposals_from_strategy(
     lever_key = str(target_lever)
     lever_dir = directives.get(lever_key, {})
 
-    if not lever_dir and target_lever != 5:
+    if not lever_dir and target_lever not in (4, 5):
         return proposals
 
     scope = _resolve_scope(target_lever, apply_mode)
@@ -7311,6 +7546,63 @@ def generate_proposals_from_strategy(
                         "provenance": {**provenance_base, "patch_type": "add_join_spec"},
                     })
 
+            # Fallback: use judge-provided join_assessments from source clusters
+            _all_clusters = strategy.get("_source_clusters", [])
+            _ja_entries: list[dict] = []
+            for _sc_id in source_clusters:
+                for _clust in _all_clusters:
+                    if _clust.get("cluster_id") == _sc_id:
+                        _ja_entries.extend(_clust.get("join_assessments", []))
+            _proposed_pairs = {
+                tuple(sorted((p["join_spec"]["left"]["identifier"],
+                               p["join_spec"]["right"]["identifier"])))
+                for p in proposals if p.get("join_spec")
+            }
+            for _ja in _ja_entries:
+                _lt = _ja.get("left_table", "")
+                _rt = _ja.get("right_table", "")
+                if not _lt or not _rt:
+                    continue
+                _pair = tuple(sorted((_lt, _rt)))
+                if _pair in _proposed_pairs:
+                    continue
+                _cond = _ja.get("suggested_condition", "")
+                _sanitized = _sanitize_join_sql(_cond) if _cond else ""
+                _j_spec = ensure_join_spec_fields({
+                    "left": {"identifier": _lt},
+                    "right": {"identifier": _rt},
+                    "sql": [_sanitized] if _sanitized else [],
+                })
+                _valid, _reason = validate_join_spec_types(_j_spec, metadata_snapshot)
+                if not _valid:
+                    logger.info("[%s] Judge join_assessment rejected (type): %s", ag_id, _reason)
+                    continue
+                proposals.append({
+                    "proposal_id": f"P{len(proposals) + 1:03d}",
+                    "cluster_id": f"{ag_id}_JA",
+                    "lever": 4,
+                    "scope": "genie_config",
+                    "patch_type": "add_join_spec",
+                    "change_description": f"[{ag_id}] Judge-assessed join: {_lt} ↔ {_rt}",
+                    "proposed_value": "",
+                    "rationale": f"Judge assessment: {_ja.get('evidence', '')}",
+                    "join_spec": _j_spec,
+                    "dual_persistence": DUAL_PERSIST_PATHS.get(4, DUAL_PERSIST_PATHS[5]),
+                    "confidence": 0.75,
+                    "questions_fixed": q_fixed,
+                    "questions_at_risk": 0,
+                    "net_impact": max(q_fixed * 0.75, 1.0),
+                    "asi": {
+                        "failure_type": "missing_join_spec",
+                        "blame_set": [_lt, _rt],
+                        "severity": "major",
+                        "counterfactual_fixes": [],
+                        "ambiguity_detected": False,
+                    },
+                    "provenance": {**provenance_base, "patch_type": "add_join_spec"},
+                })
+                _proposed_pairs.add(_pair)
+
             discovery_hints = discover_join_candidates(metadata_snapshot)
             if discovery_hints:
                 discovery_specs = _call_llm_for_join_discovery(
@@ -7381,9 +7673,31 @@ def generate_proposals_from_strategy(
                         k: v for k, v in instruction_sections.items() if k in valid_keys
                     }
 
+                # --- Task 4: section ownership enforcement ---
+                allowed_sections = set(LEVER_TO_SECTIONS.get(target_lever, []))
+                if allowed_sections:
+                    unauthorized = {
+                        k for k in instruction_sections if k not in allowed_sections
+                    }
+                    if unauthorized:
+                        logger.warning(
+                            "Lever %d attempted to write instruction sections %s "
+                            "(allowed: %s) — folding into CONSTRAINTS",
+                            target_lever, sorted(unauthorized), sorted(allowed_sections),
+                        )
+                        for k in sorted(unauthorized):
+                            val = instruction_sections.pop(k, "")
+                            if val:
+                                existing_c = instruction_sections.get("CONSTRAINTS", "")
+                                instruction_sections["CONSTRAINTS"] = (
+                                    (existing_c + "\n" + val).strip() if existing_c else val
+                                )
+
                 current_instructions = _get_general_instructions(metadata_snapshot)
-                existing_sections, _ = _parse_sections(
-                    _sanitize_plaintext_instructions(current_instructions) if current_instructions else ""
+
+                # Pre-structure existing instructions if unstructured
+                existing_sections = _ensure_structured(
+                    current_instructions, metadata_snapshot, w=w,
                 )
                 merged_secs: dict[str, list[str]] = {
                     s: list(existing_sections.get(s, []))
@@ -7423,6 +7737,17 @@ def generate_proposals_from_strategy(
                         "Instruction rewrite would lose content (%d -> %d chars) "
                         "— force-merging existing instructions",
                         len(current_instructions), len(merged_text),
+                    )
+                    merged_text = _merge_structured_instructions(
+                        existing=current_instructions,
+                        contributions=[merged_text],
+                    )
+
+                if current_instructions and not _instruction_coverage(
+                    current_instructions, merged_text
+                ):
+                    logger.warning(
+                        "Instruction rewrite drops key phrases — force-merging"
                     )
                     merged_text = _merge_structured_instructions(
                         existing=current_instructions,
@@ -7477,6 +7802,18 @@ def generate_proposals_from_strategy(
                         existing=current_instructions,
                         contributions=[merged_text],
                     )
+
+                if current_instructions and not _instruction_coverage(
+                    current_instructions, merged_text
+                ):
+                    logger.warning(
+                        "Instruction guidance rewrite drops key phrases — force-merging"
+                    )
+                    merged_text = _merge_structured_instructions(
+                        existing=current_instructions,
+                        contributions=[merged_text],
+                    )
+
                 proposals.append({
                     "proposal_id": f"P{len(proposals) + 1:03d}",
                     "cluster_id": ag_id,
@@ -7689,6 +8026,18 @@ def generate_metadata_proposals(
                     existing=current_instructions,
                     contributions=[instruction_text],
                 )
+
+            if current_instructions and not _instruction_coverage(
+                current_instructions, instruction_text
+            ):
+                logger.warning(
+                    "Holistic instruction rewrite drops key phrases — force-merging"
+                )
+                instruction_text = _merge_structured_instructions(
+                    existing=current_instructions,
+                    contributions=[instruction_text],
+                )
+
             total_q = sum(len(c.get("question_ids", [])) for c in all_lever5_clusters)
             holistic_traces = []
             for c in (all_lever5_clusters or clusters):
