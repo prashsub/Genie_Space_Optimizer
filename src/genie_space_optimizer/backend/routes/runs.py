@@ -1405,7 +1405,7 @@ def get_run(
         display_status = "RUNNING"
 
     host = (ws.config.host or "").rstrip("/")
-    links = _build_links(host, run_data, iters_rows, config, ws)
+    links = _build_links(host, run_data, iters_rows, config, ws, stages_rows=stages_rows)
     baseline_eval_link = next(
         (
             l.url for l in links
@@ -2284,6 +2284,7 @@ def _build_links(
     iters_rows: list[dict],
     config,
     ws: WorkspaceClient,
+    stages_rows: list[dict] | None = None,
 ) -> list[PipelineLink]:
     """Build external Databricks links from run metadata."""
     links: list[PipelineLink] = []
@@ -2351,13 +2352,23 @@ def _build_links(
                 category="mlflow",
             ))
 
-    best_model_id = run_data.get("best_model_id")
-    if best_model_id:
-        links.append(PipelineLink(
-            label="Best Model",
-            url=f"{host}/ml/logged-models/{best_model_id}",
-            category="mlflow",
-        ))
+    uc_model = ""
+    uc_version = ""
+    for s in (stages_rows or []):
+        if str(s.get("stage", "")).startswith("FINALIZE") and str(s.get("status", "")).upper() == "COMPLETE":
+            fin_detail = safe_json_parse(s.get("detail_json"))
+            if isinstance(fin_detail, dict):
+                uc_model = fin_detail.get("uc_model_name", "")
+                uc_version = fin_detail.get("uc_model_version", "")
+            break
+    if uc_model and uc_version:
+        parts = uc_model.split(".")
+        if len(parts) == 3:
+            links.append(PipelineLink(
+                label="Best Model",
+                url=f"{host}/explore/data/models/{parts[0]}/{parts[1]}/{parts[2]}/version/{uc_version}",
+                category="mlflow",
+            ))
 
     labeling_url = run_data.get("labeling_session_url")
     labeling_name = run_data.get("labeling_session_name")
