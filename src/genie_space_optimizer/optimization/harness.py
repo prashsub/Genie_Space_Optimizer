@@ -368,13 +368,23 @@ def baseline_setup_scorers(
         warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
         instruction_prompt_name=_instr_prompt,
     )
-    scorers = make_all_scorers(w, spark, catalog, schema)
+
+    from genie_space_optimizer.common.genie_client import fetch_space_config as _fetch_cfg
+    try:
+        _bl_config = _fetch_cfg(w, space_id)
+        _bl_parsed = _bl_config.get("_parsed_space", _bl_config)
+        _bl_instr = _bl_parsed.get("instructions", {}) if isinstance(_bl_parsed, dict) else {}
+        _bl_instr_text = _bl_instr.get("text_instructions", "") if isinstance(_bl_instr, dict) else ""
+    except Exception:
+        _bl_instr_text = ""
+    scorers = make_all_scorers(w, spark, catalog, schema, instruction_context=_bl_instr_text)
 
     _lines = [_section("BASELINE — EVALUATION SETUP", "-")]
     _lines.append(_kv("Space ID", space_id))
     _lines.append(_kv("Model ID", model_id))
     _lines.append(_kv("Experiment", exp_name))
     _lines.append(_kv("Scorers", len(scorers)))
+    _lines.append(_kv("Instruction context", f"{len(_bl_instr_text)} chars" if _bl_instr_text else "(none)"))
     _lines.append(_bar("-"))
     print("\n".join(_lines))
 
@@ -5967,7 +5977,15 @@ def _run_finalize(
                     w, space_id, spark, catalog, schema,
                     warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
                 )
-                ho_scorers = make_all_scorers(w, spark, catalog, schema)
+                try:
+                    from genie_space_optimizer.common.genie_client import fetch_space_config as _ho_fetch
+                    _ho_cfg = _ho_fetch(w, space_id)
+                    _ho_parsed = _ho_cfg.get("_parsed_space", _ho_cfg)
+                    _ho_instr = _ho_parsed.get("instructions", {}) if isinstance(_ho_parsed, dict) else {}
+                    _ho_instr_text = _ho_instr.get("text_instructions", "") if isinstance(_ho_instr, dict) else ""
+                except Exception:
+                    _ho_instr_text = ""
+                ho_scorers = make_all_scorers(w, spark, catalog, schema, instruction_context=_ho_instr_text)
 
                 held_out_result = run_evaluation(
                     space_id, exp_name, iteration_counter, held_out_benchmarks,
