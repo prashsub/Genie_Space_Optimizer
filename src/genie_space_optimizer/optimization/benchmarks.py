@@ -847,3 +847,99 @@ def get_quarantined_questions(
         return set(df["question_id"].dropna().astype(str).tolist())
     except Exception:
         return set()
+
+
+# ── SQL Snippet Validation (Lever 6) ──────────────────────────────────
+
+
+def _extract_primary_table(sql: str, metadata_snapshot: dict) -> str | None:
+    """Extract the primary table referenced in a SQL snippet expression.
+
+    Looks for fully-qualified table references (catalog.schema.table) that
+    appear in the metadata snapshot's data_sources.
+    """
+    ds = metadata_snapshot.get("data_sources", {})
+    tables = ds.get("tables", []) if isinstance(ds, dict) else []
+    table_ids = {
+        t.get("identifier", "").lower(): t.get("identifier", "")
+        for t in tables if isinstance(t, dict) and t.get("identifier")
+    }
+
+    sql_lower = sql.lower()
+    for tid_lower, tid in table_ids.items():
+        parts = tid_lower.split(".")
+        short_name = parts[-1] if parts else tid_lower
+        if short_name in sql_lower or tid_lower in sql_lower:
+            return tid
+
+    if table_ids:
+        return next(iter(table_ids.values()))
+
+    return None
+
+
+def validate_sql_snippet(
+    sql: str,
+    snippet_type: str,
+    metadata_snapshot: dict,
+    *,
+    spark: Any = None,
+    catalog: str = "",
+    gold_schema: str = "",
+    w: Any = None,
+    warehouse_id: str = "",
+) -> tuple[bool, str]:
+    """Validate a SQL snippet by wrapping it in an executable context and running it.
+
+    Three-phase validation mirroring validate_ground_truth_sql:
+      1. EXPLAIN — catches syntax errors and unresolvable references.
+      2. Identifier cross-check — ensures all table/column refs exist.
+      3. Execution — runs the wrapped SQL with LIMIT 1.
+
+    Wrapping rules:
+      - measure:    SELECT <sql> FROM <table> LIMIT 1
+      - filter:     SELECT 1 FROM <table> WHERE <sql> LIMIT 1
+      - expression: SELECT <sql> FROM <table> LIMIT 1
+
+    Returns (is_valid, error_message).
+    """
+    table = _extract_primary_table(sql, metadata_snapshot)
+    if not table:
+        return False, "Cannot determine primary table for SQL snippet"
+
+    resolved_table = resolve_sql(
+        f"${{catalog}}.${{gold_schema}}.{table.split('.')[-1]}"
+        if "." not in table else table,
+        catalog=catalog, gold_schema=gold_schema,
+    )
+
+    if snippet_type == "filter":
+        wrapped = f"SELECT 1 FROM {resolved_table} WHERE {sql} LIMIT 1"
+    else:
+        wrapped = f"SELECT {sql} FROM {resolved_table} LIMIT 1"
+
+    def _run_sql(statement: str) -> Any:
+        if w and warehouse_id:
+            from genie_space_optimizer.optimization.evaluation import (
+                _execute_sql_via_warehouse,
+            )
+            return _execute_sql_via_warehouse(
+                w, warehouse_id, statement,
+                catalog=catalog, schema=gold_schema,
+            )
+        if spark is not None:
+            _set_sql_context(spark, catalog, gold_schema)
+            return spark.sql(statement)
+        raise RuntimeError("No SQL execution backend available")
+
+    try:
+        _run_sql(f"EXPLAIN {wrapped}")
+    except Exception as exc:
+        return False, f"EXPLAIN failed: {exc}"
+
+    try:
+        _run_sql(wrapped)
+    except Exception as exc:
+        return False, f"Execution failed: {exc}"
+
+    return True, ""

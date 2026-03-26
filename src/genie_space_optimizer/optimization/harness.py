@@ -1648,6 +1648,238 @@ def _run_proactive_instruction_seeding(
         return result
 
 
+# ── Stage 2.97: PROACTIVE SQL EXPRESSION SEEDING ─────────────────────
+
+
+def _run_sql_expression_seeding(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    config: dict,
+    metadata_snapshot: dict,
+    benchmarks: list[dict],
+    catalog: str,
+    schema: str,
+    *,
+    warehouse_id: str = "",
+) -> dict:
+    """Proactively seed SQL Expressions (measures, filters, dimensions).
+
+    Mines candidates from benchmark ground-truth SQL and schema patterns.
+    Each candidate is validated by execution before being applied.
+
+    Returns dict with counts of seeded/rejected expressions.
+    """
+    import json as _json
+
+    from genie_space_optimizer.common.config import (
+        SQL_EXPRESSION_SEEDING_MAX_CANDIDATES,
+        SQL_EXPRESSION_SEEDING_THRESHOLD,
+    )
+    from genie_space_optimizer.common.genie_client import patch_space_config
+    from genie_space_optimizer.common.genie_schema import generate_genie_id
+    from genie_space_optimizer.optimization.benchmarks import validate_sql_snippet
+    from genie_space_optimizer.optimization.optimizer import (
+        _discover_schema_sql_expressions,
+        _enrich_candidates_with_llm,
+        _format_existing_sql_snippets,
+        _mine_sql_expression_candidates,
+        _ngram_similarity,
+    )
+
+    result: dict = {
+        "total_candidates": 0,
+        "total_seeded": 0,
+        "total_rejected": 0,
+        "measures_seeded": 0,
+        "filters_seeded": 0,
+        "expressions_seeded": 0,
+        "skipped_reason": None,
+    }
+
+    parsed = config.get("_parsed_space", config)
+    existing_snippets = parsed.get("instructions", {}).get("sql_snippets", {})
+    if not isinstance(existing_snippets, dict):
+        existing_snippets = {}
+
+    existing_count = sum(
+        len(existing_snippets.get(k, []) or [])
+        for k in ("measures", "filters", "expressions")
+    )
+
+    if existing_count >= SQL_EXPRESSION_SEEDING_THRESHOLD:
+        _lines = [_section("SQL EXPRESSION SEEDING", "-")]
+        _lines.append(_kv("Existing snippets", existing_count))
+        _lines.append(_kv("Status", f"Skipped (threshold={SQL_EXPRESSION_SEEDING_THRESHOLD})"))
+        _lines.append(_bar("-"))
+        print("\n".join(_lines))
+        result["skipped_reason"] = "sufficient_existing"
+        return result
+
+    write_stage(
+        spark, run_id, "SQL_EXPRESSION_SEEDING", "STARTED",
+        task_key="sql_expression_seeding", catalog=catalog, schema=schema,
+    )
+
+    try:
+        benchmark_candidates = _mine_sql_expression_candidates(benchmarks, metadata_snapshot)
+        schema_candidates = _discover_schema_sql_expressions(metadata_snapshot)
+
+        all_candidates = benchmark_candidates + schema_candidates
+
+        seen_sqls: set[str] = set()
+        deduped: list[dict] = []
+        for c in all_candidates:
+            key = c["sql"].lower()
+            if any(_ngram_similarity(key, s) > 0.85 for s in seen_sqls):
+                continue
+            seen_sqls.add(key)
+            deduped.append(c)
+
+        deduped = deduped[:SQL_EXPRESSION_SEEDING_MAX_CANDIDATES]
+        result["total_candidates"] = len(deduped)
+
+        if not deduped:
+            _lines = [_section("SQL EXPRESSION SEEDING", "-")]
+            _lines.append(_kv("Candidates found", 0))
+            _lines.append(_kv("Status", "No candidates"))
+            _lines.append(_bar("-"))
+            print("\n".join(_lines))
+            write_stage(
+                spark, run_id, "SQL_EXPRESSION_SEEDING", "COMPLETE",
+                task_key="sql_expression_seeding",
+                detail=result, catalog=catalog, schema=schema,
+            )
+            return result
+
+        deduped = _enrich_candidates_with_llm(deduped, metadata_snapshot, w=w)
+
+        existing_sql_set: set[str] = set()
+        for snippet_type in ("measures", "filters", "expressions"):
+            for item in (existing_snippets.get(snippet_type, []) or []):
+                sql_val = item.get("sql", [])
+                sql_str = sql_val[0] if isinstance(sql_val, list) and sql_val else str(sql_val)
+                existing_sql_set.add(sql_str.lower())
+
+        applied_snippets: list[dict] = []
+        type_key_map = {"measure": "measures", "filter": "filters", "expression": "expressions"}
+
+        for candidate in deduped:
+            sql_raw = candidate["sql"]
+            snippet_type = candidate["snippet_type"]
+
+            if any(_ngram_similarity(sql_raw.lower(), e) > 0.85 for e in existing_sql_set):
+                result["total_rejected"] += 1
+                continue
+
+            is_valid, err = validate_sql_snippet(
+                sql_raw, snippet_type, metadata_snapshot,
+                spark=spark, catalog=catalog, gold_schema=schema,
+                w=w, warehouse_id=warehouse_id,
+            )
+            if not is_valid:
+                logger.info("SQL expression candidate rejected: %s — %s", sql_raw[:80], err)
+                result["total_rejected"] += 1
+                continue
+
+            snippet_entry = {
+                "id": generate_genie_id(),
+                "sql": [sql_raw],
+                "display_name": candidate.get("display_name", ""),
+                "synonyms": candidate.get("synonyms", []),
+                "instruction": [candidate.get("instruction", "")] if candidate.get("instruction") else [],
+            }
+            if candidate.get("alias") and snippet_type != "filter":
+                snippet_entry["alias"] = candidate["alias"]
+
+            type_key = type_key_map[snippet_type]
+            inst = parsed.setdefault("instructions", {})
+            snippets_block = inst.setdefault("sql_snippets", {})
+            items = snippets_block.setdefault(type_key, [])
+            items.append(snippet_entry)
+
+            applied_snippets.append({
+                "snippet_type": snippet_type,
+                "type_key": type_key,
+                "sql": sql_raw,
+                "display_name": candidate.get("display_name", ""),
+                "target_table": candidate.get("target_table", "sql_snippet"),
+                "snippet_id": snippet_entry["id"],
+            })
+
+            count_key = f"{type_key}_seeded"
+            result[count_key] = result.get(count_key, 0) + 1
+            existing_sql_set.add(sql_raw.lower())
+
+        if applied_snippets:
+            try:
+                patch_space_config(w, space_id, parsed)
+            except Exception:
+                logger.warning("SQL expression seeding: PATCH failed", exc_info=True)
+                result["total_seeded"] = 0
+                result["measures_seeded"] = 0
+                result["filters_seeded"] = 0
+                result["expressions_seeded"] = 0
+                write_stage(
+                    spark, run_id, "SQL_EXPRESSION_SEEDING", "FAILED",
+                    task_key="sql_expression_seeding",
+                    error_message="PATCH failed",
+                    catalog=catalog, schema=schema,
+                )
+                return result
+
+            for idx, snippet_entry in enumerate(applied_snippets):
+                write_patch(
+                    spark, run_id, 0, 0, idx,
+                    {
+                        "patch_type": "proactive_sql_expression",
+                        "scope": "genie_config",
+                        "risk_level": "low",
+                        "target_object": snippet_entry.get("target_table", "sql_snippet"),
+                        "patch": {
+                            "snippet_type": snippet_entry["snippet_type"],
+                            "sql": snippet_entry["sql"],
+                            "display_name": snippet_entry["display_name"],
+                        },
+                        "command": None,
+                        "rollback": None,
+                        "proposal_id": f"proactive_sql_expr_{idx}",
+                    },
+                    catalog, schema,
+                )
+
+        result["total_seeded"] = len(applied_snippets)
+
+        _lines = [_section("SQL EXPRESSION SEEDING", "-")]
+        _lines.append(_kv("Candidates evaluated", result["total_candidates"]))
+        _lines.append(_kv("Seeded", result["total_seeded"]))
+        _lines.append(_kv("  Measures", result["measures_seeded"]))
+        _lines.append(_kv("  Filters", result["filters_seeded"]))
+        _lines.append(_kv("  Expressions", result["expressions_seeded"]))
+        _lines.append(_kv("Rejected", result["total_rejected"]))
+        _lines.append(_bar("-"))
+        print("\n".join(_lines))
+
+        write_stage(
+            spark, run_id, "SQL_EXPRESSION_SEEDING", "COMPLETE",
+            task_key="sql_expression_seeding",
+            detail=result, catalog=catalog, schema=schema,
+        )
+        return result
+
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("SQL_EXPRESSION_SEEDING FAILED for run %s", run_id)
+        write_stage(
+            spark, run_id, "SQL_EXPRESSION_SEEDING", "FAILED",
+            task_key="sql_expression_seeding",
+            error_message=err_msg[:500],
+            catalog=catalog, schema=schema,
+        )
+        return result
+
+
 # ── Stage 2.5b: PREPARE LEVER LOOP ──────────────────────────────────
 
 
@@ -1918,6 +2150,22 @@ def _run_enrichment(
                 if uc_columns:
                     enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
+            # ── 5b. SQL Expression Seeding ────────────────────────────────
+            sql_expr_result = _run_sql_expression_seeding(
+                w, spark, run_id, space_id, config=config,
+                metadata_snapshot=metadata_snapshot,
+                benchmarks=benchmarks,
+                catalog=catalog, schema=schema,
+                warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
+            )
+            if sql_expr_result.get("total_seeded", 0) > 0:
+                config = fetch_space_config(w, space_id)
+                config["_uc_columns"] = uc_columns
+                metadata_snapshot = config.get("_parsed_space", config)
+                metadata_snapshot["_data_profile"] = data_profile
+                if uc_columns:
+                    enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
             mined_example_proposals = _mine_benchmark_example_sqls(
                 benchmarks, metadata_snapshot,
                 spark=spark, catalog=catalog, gold_schema=schema,
@@ -1942,6 +2190,7 @@ def _run_enrichment(
                 + (1 if meta_result.get("description_generated") else 0)
                 + (1 if meta_result.get("questions_generated") else 0)
                 + (1 if instruction_result.get("instructions_seeded") else 0)
+                + sql_expr_result.get("total_seeded", 0)
                 + len(mined_example_proposals)
             )
 
@@ -1953,6 +2202,7 @@ def _run_enrichment(
                 "generated" if meta_result.get("questions_generated") else "unchanged",
             )))
             _enr_summary.append(_kv("Instructions seeded", "yes" if instruction_result.get("instructions_seeded") else "no"))
+            _enr_summary.append(_kv("SQL expressions seeded", sql_expr_result.get("total_seeded", 0)))
             _enr_summary.append(_kv("Example SQLs mined", len(mined_example_proposals)))
             _enr_summary.append(_kv("Total enrichments", total_enrichments))
             _enr_summary.append(_bar("-"))
@@ -1965,6 +2215,7 @@ def _run_enrichment(
                 "enrichment.columns_enriched": enrichment_result.get("total_enriched", 0),
                 "enrichment.tables_enriched": enrichment_result.get("tables_enriched", 0),
                 "enrichment.joins_discovered": join_result.get("total_applied", 0),
+                "enrichment.sql_expressions_seeded": sql_expr_result.get("total_seeded", 0),
                 "enrichment.examples_mined": len(mined_example_proposals),
                 "enrichment.total": total_enrichments,
             })
@@ -1993,6 +2244,7 @@ def _run_enrichment(
                 "descriptions_enriched": enrichment_result.get("total_enriched", 0),
                 "joins_discovered": join_result.get("total_applied", 0),
                 "instructions_seeded": bool(instruction_result.get("instructions_seeded")),
+                "sql_expressions_seeded": sql_expr_result.get("total_seeded", 0),
                 "examples_mined": len(mined_example_proposals),
             },
         )
@@ -2007,6 +2259,7 @@ def _run_enrichment(
                 "description_generated": bool(meta_result.get("description_generated")),
                 "questions_generated": bool(meta_result.get("questions_generated")),
                 "instructions_seeded": bool(instruction_result.get("instructions_seeded")),
+                "sql_expressions_seeded": sql_expr_result.get("total_seeded", 0),
                 "examples_mined": len(mined_example_proposals),
                 "total_enrichments": total_enrichments,
             },
@@ -3984,6 +4237,23 @@ def _run_lever_loop(
                 if uc_columns:
                     enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
+            # ── SQL Expression Seeding (legacy path) ──────────────────────
+            sql_expr_result = _run_sql_expression_seeding(
+                w, spark, run_id, space_id, config=config,
+                metadata_snapshot=metadata_snapshot,
+                benchmarks=benchmarks,
+                catalog=catalog, schema=schema,
+                warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
+            )
+            if sql_expr_result.get("total_seeded", 0) > 0:
+                from genie_space_optimizer.common.genie_client import fetch_space_config
+                config = fetch_space_config(w, space_id)
+                config["_uc_columns"] = uc_columns
+                metadata_snapshot = config.get("_parsed_space", config)
+                metadata_snapshot["_data_profile"] = data_profile
+                if uc_columns:
+                    enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
             _enr_summary = [_section("PROACTIVE ENRICHMENT — SUMMARY", "-")]
             _enr_summary.append(_kv("Descriptions enriched", enrichment_result.get("total_enriched", 0)))
             _enr_summary.append(_kv("Joins discovered", join_result.get("total_applied", 0)))
@@ -3992,6 +4262,7 @@ def _run_lever_loop(
                 "generated" if meta_result.get("questions_generated") else "unchanged",
             )))
             _enr_summary.append(_kv("Instructions seeded", "yes" if instruction_result.get("instructions_seeded") else "no"))
+            _enr_summary.append(_kv("SQL expressions seeded", sql_expr_result.get("total_seeded", 0)))
             _enr_summary.append(_bar("-"))
             print("\n".join(_enr_summary))
 
@@ -3999,6 +4270,7 @@ def _run_lever_loop(
                 "enrichment.columns_enriched": enrichment_result.get("total_enriched", 0),
                 "enrichment.tables_enriched": enrichment_result.get("tables_enriched", 0),
                 "enrichment.joins_discovered": join_result.get("total_applied", 0),
+                "enrichment.sql_expressions_seeded": sql_expr_result.get("total_seeded", 0),
             })
     else:
         # Enrichment already handled by the enrichment task -- reload fresh

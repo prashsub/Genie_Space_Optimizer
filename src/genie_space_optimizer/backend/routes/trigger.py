@@ -133,6 +133,7 @@ def list_levers():
         3: "Remove underperforming TVFs",
         4: "Add, update, or remove join relationships between tables",
         5: "Rewrite global routing instructions and add domain-specific guidance",
+        6: "Add reusable SQL expressions (measures, filters, dimensions) for business concepts",
     }
     return [
         LeverInfo(id=k, name=v, description=descriptions.get(k, ""))

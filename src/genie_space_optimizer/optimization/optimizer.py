@@ -36,6 +36,7 @@ from genie_space_optimizer.common.config import (
     LEVER_4_JOIN_SPEC_PROMPT,
     LEVER_5_HOLISTIC_PROMPT,
     LEVER_5_INSTRUCTION_PROMPT,
+    LEVER_6_SQL_EXPRESSION_PROMPT,
     LEVER_NAMES,
     LLM_ENDPOINT,
     LLM_MAX_RETRIES,
@@ -327,6 +328,10 @@ DUAL_PERSIST_PATHS: dict[int, dict[str, str]] = {
         "api": "PATCH /api/2.0/genie/spaces/{space_id}",
         "repo": "src/genie/{domain}_genie_export.json",
     },
+    6: {
+        "api": "PATCH /api/2.0/genie/spaces/{space_id}",
+        "repo": "src/genie/{domain}_genie_export.json",
+    },
 }
 
 
@@ -352,7 +357,7 @@ def _map_to_lever(
     blame_set: list | str | None = None,
     judge: str | None = None,
 ) -> int:
-    """Map a failure root cause to its primary control lever (1-5).
+    """Map a failure root cause to its primary control lever (1-6).
 
     ASI ``failure_type`` takes precedence when present since it comes
     directly from the FAILURE_TAXONOMY and is more precise.
@@ -387,6 +392,8 @@ def _map_to_lever(
         "format_difference": 0,
         "extra_columns_only": 0,
         "select_star": 0,
+        "missing_dimension": 6,
+        "wrong_grouping": 6,
     }
 
     if asi_failure_type and asi_failure_type in mapping:
@@ -401,10 +408,10 @@ def _map_to_lever(
 def _resolve_scope(lever: int, apply_mode: str = APPLY_MODE) -> str:
     """Determine where a patch is applied based on lever and apply_mode.
 
-    Levers 4-5 are always ``genie_config`` (Genie Space native structures).
+    Levers 4-6 are always ``genie_config`` (Genie Space native structures).
     Levers 1-3 are governed by ``apply_mode``.
     """
-    if lever in (4, 5):
+    if lever in (4, 5, 6):
         return "genie_config"
     return apply_mode
 
@@ -4420,13 +4427,27 @@ def _resolve_lever5_llm_result(
         }
 
     if instruction_type == "sql_expression":
+        snippet_type = llm_result.get("snippet_type", "measure")
+        patch_type_map = {
+            "measure": "add_sql_snippet_measure",
+            "filter": "add_sql_snippet_filter",
+            "expression": "add_sql_snippet_expression",
+        }
+        resolved_type = patch_type_map.get(snippet_type, "add_sql_snippet_measure")
         logger.info(
-            "Lever 6 LLM recommended sql_expression (handled by levers 1-5): "
-            "table=%s column=%s — falling back to example_sql",
-            llm_result.get("target_table", ""),
-            llm_result.get("target_column", ""),
+            "Lever 5 LLM recommended sql_expression — routing to Lever 6 "
+            "(type=%s, table=%s)",
+            snippet_type, llm_result.get("target_table", ""),
         )
-        return original_patch_type, {}
+        return resolved_type, {
+            "snippet_type": snippet_type,
+            "display_name": llm_result.get("display_name", ""),
+            "alias": llm_result.get("alias", ""),
+            "sql": llm_result.get("sql", ""),
+            "synonyms": llm_result.get("synonyms", []),
+            "instruction": llm_result.get("instruction", ""),
+            "target_table": llm_result.get("target_table", ""),
+        }
 
     if cluster and cluster.get("root_cause") in _SQL_PATTERN_ROOT_CAUSES:
         sql_ctxs = cluster.get("sql_contexts", [])
@@ -7111,6 +7132,453 @@ def _ngram_similarity(a: str, b: str, n: int = 3) -> float:
     return len(a_ngrams & b_ngrams) / len(a_ngrams | b_ngrams)
 
 
+# ── Lever 6: SQL Expressions ──────────────────────────────────────────
+
+
+def _format_existing_sql_snippets(metadata_snapshot: dict) -> str:
+    """Format existing SQL snippets for the Lever 6 prompt context."""
+    snippets = metadata_snapshot.get("sql_snippets", {})
+    if not isinstance(snippets, dict):
+        return "(No existing SQL expressions.)"
+
+    lines: list[str] = []
+    for snippet_type in ("measures", "filters", "expressions"):
+        items = snippets.get(snippet_type, []) or []
+        if not items:
+            continue
+        lines.append(f"\n### {snippet_type.title()}")
+        for item in items:
+            name = item.get("display_name", item.get("alias", "unnamed"))
+            sql = item.get("sql", [])
+            sql_str = sql[0] if isinstance(sql, list) and sql else str(sql)
+            syns = item.get("synonyms", [])
+            lines.append(f"  - {name}: `{sql_str}`")
+            if syns:
+                lines.append(f"    Synonyms: {', '.join(syns)}")
+
+    return "\n".join(lines) if lines else "(No existing SQL expressions.)"
+
+
+def _generate_lever6_proposal(
+    cluster: dict,
+    metadata_snapshot: dict,
+    *,
+    strategist_hints: list[dict] | None = None,
+    w: WorkspaceClient | None = None,
+    spark: Any = None,
+    catalog: str = "",
+    gold_schema: str = "",
+    warehouse_id: str = "",
+) -> dict | None:
+    """Generate a SQL Expression proposal for a failure cluster.
+
+    Calls the LLM with LEVER_6_SQL_EXPRESSION_PROMPT, validates the output
+    structurally and by SQL execution, and returns a proposal dict or None
+    if validation fails.
+
+    The LLM chooses the snippet_type (measure/filter/expression) — the
+    static _LEVER_TO_PATCH_TYPE mapping is NOT used here.
+    """
+    import json as _json
+
+    import mlflow
+    from mlflow.entities import SpanType as _SpanType
+
+    root_cause = cluster.get("root_cause", "other")
+
+    with mlflow.start_span(name=f"lever6_proposal_{root_cause}", span_type=_SpanType.CHAIN) as span:
+        cluster_context = _format_cluster_briefs([cluster], metadata_snapshot)
+        schema_context = _format_schema_index(metadata_snapshot)
+        existing_snippets = _format_existing_sql_snippets(metadata_snapshot)
+
+        hints_text = "(No strategist hints.)"
+        if strategist_hints:
+            hints_text = _json.dumps(strategist_hints, indent=2)
+
+        prompt = format_mlflow_template(
+            LEVER_6_SQL_EXPRESSION_PROMPT,
+            root_cause=root_cause,
+            cluster_context=cluster_context,
+            schema_context=schema_context,
+            existing_sql_snippets=existing_snippets,
+            strategist_hints=hints_text,
+        )
+
+        span.set_inputs({"root_cause": root_cause, "prompt_chars": len(prompt)})
+
+        try:
+            raw_text, _ = _traced_llm_call(
+                w, "You are a SQL expression expert.", prompt,
+                span_name="lever6_llm",
+            )
+        except Exception:
+            logger.warning("Lever 6 LLM call failed for root_cause=%s", root_cause, exc_info=True)
+            return None
+
+        from genie_space_optimizer.optimization.evaluation import _extract_json
+
+        llm_result = _extract_json(raw_text)
+        if not llm_result or not isinstance(llm_result, dict):
+            logger.warning("Lever 6 LLM returned unparseable JSON for root_cause=%s", root_cause)
+            return None
+
+        snippet_type = llm_result.get("snippet_type", "")
+        if snippet_type not in ("measure", "filter", "expression"):
+            logger.warning("Lever 6 LLM returned invalid snippet_type: %s", snippet_type)
+            return None
+
+        sql_raw = llm_result.get("sql", "")
+        if not sql_raw:
+            logger.warning("Lever 6 LLM returned empty sql")
+            return None
+
+        sql_ok, violations = _validate_sql_identifiers(
+            sql_raw, _build_identifier_allowlist(metadata_snapshot),
+        )
+        if not sql_ok:
+            logger.warning("Lever 6: SQL snippet has invalid identifiers: %s", violations)
+            return None
+
+        if spark is not None or (w is not None and warehouse_id):
+            from genie_space_optimizer.optimization.benchmarks import validate_sql_snippet
+
+            is_valid, err = validate_sql_snippet(
+                sql_raw, snippet_type, metadata_snapshot,
+                spark=spark, catalog=catalog, gold_schema=gold_schema,
+                w=w, warehouse_id=warehouse_id,
+            )
+            if not is_valid:
+                logger.warning("Lever 6: SQL snippet failed execution validation: %s", err)
+                return None
+
+        existing = metadata_snapshot.get("sql_snippets", {})
+        type_key = {"measure": "measures", "filter": "filters", "expression": "expressions"}[snippet_type]
+        for existing_item in (existing.get(type_key, []) or []):
+            existing_sql = existing_item.get("sql", [])
+            existing_sql_str = existing_sql[0] if isinstance(existing_sql, list) and existing_sql else str(existing_sql)
+            if _ngram_similarity(sql_raw.lower(), existing_sql_str.lower()) > 0.85:
+                logger.info("Lever 6: Duplicate SQL snippet detected, skipping")
+                return None
+
+        patch_type_map = {
+            "measure": "add_sql_snippet_measure",
+            "filter": "add_sql_snippet_filter",
+            "expression": "add_sql_snippet_expression",
+        }
+
+        static_default = _LEVER_TO_PATCH_TYPE.get((root_cause, 6), "N/A")
+        logger.info(
+            "Lever 6 LLM chose snippet_type=%s for cluster root_cause=%s "
+            "(static default would have been %s)",
+            snippet_type, root_cause, static_default,
+        )
+
+        span.set_outputs({"snippet_type": snippet_type, "sql": sql_raw[:200]})
+
+        return {
+            "patch_type": patch_type_map[snippet_type],
+            "lever": 6,
+            "snippet_type": snippet_type,
+            "display_name": llm_result.get("display_name", ""),
+            "alias": llm_result.get("alias", ""),
+            "sql": sql_raw,
+            "synonyms": llm_result.get("synonyms", []),
+            "instruction": llm_result.get("instruction", ""),
+            "target_table": llm_result.get("target_table", ""),
+            "rationale": llm_result.get("rationale", ""),
+            "affected_questions": llm_result.get("affected_questions", []),
+            "confidence": 0.7,
+            "questions_fixed": len(cluster.get("question_traces", [])),
+        }
+
+
+# ── Lever 6 / Phase 2: Proactive SQL Expression Mining ─────────────────
+
+_AGG_PATTERN = re.compile(
+    r"((?:SUM|COUNT|AVG|MIN|MAX|COUNT\s+DISTINCT)\s*\([^)]+\))",
+    re.IGNORECASE,
+)
+
+_WHERE_PATTERN = re.compile(
+    r"WHERE\s+(.+?)(?:\s+GROUP\s+BY|\s+ORDER\s+BY|\s+HAVING|\s+LIMIT|\s*$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_DERIVED_PATTERN = re.compile(
+    r"(CASE\s+WHEN.+?END|"
+    r"(?:MONTH|QUARTER|YEAR|DATE_TRUNC|DATE_FORMAT|CONCAT)\s*\([^)]+\))",
+    re.IGNORECASE,
+)
+
+
+def _mine_sql_expression_candidates(
+    benchmarks: list[dict],
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Extract SQL Expression candidates from benchmark ground-truth SQL.
+
+    Scans all benchmark expected_sql for:
+      - Recurring aggregation patterns (2+ occurrences) -> measures
+      - Recurring WHERE patterns (2+ occurrences) -> filters
+      - Recurring derived columns (CASE, date functions) -> expressions
+
+    Returns list of candidate dicts with:
+      {snippet_type, sql, display_name, alias, source_count}
+    """
+    from collections import Counter
+
+    from genie_space_optimizer.common.config import SQL_EXPRESSION_MIN_FREQUENCY
+
+    agg_counter: Counter[str] = Counter()
+    where_counter: Counter[str] = Counter()
+    derived_counter: Counter[str] = Counter()
+
+    for b in benchmarks:
+        sql = b.get("expected_sql", "") or ""
+        if not sql.strip():
+            continue
+
+        for m in _AGG_PATTERN.findall(sql):
+            normalized = " ".join(m.split()).upper()
+            agg_counter[normalized] += 1
+
+        where_match = _WHERE_PATTERN.search(sql)
+        if where_match:
+            clause = where_match.group(1).strip()
+            for condition in re.split(r"\s+AND\s+", clause, flags=re.IGNORECASE):
+                condition = condition.strip()
+                if condition and len(condition) < 200:
+                    normalized = " ".join(condition.split())
+                    where_counter[normalized] += 1
+
+        for m in _DERIVED_PATTERN.findall(sql):
+            normalized = " ".join(m.split())
+            derived_counter[normalized] += 1
+
+    candidates: list[dict] = []
+
+    for sql_expr, count in agg_counter.most_common():
+        if count < SQL_EXPRESSION_MIN_FREQUENCY:
+            break
+        alias = re.sub(r"[^a-z0-9]+", "_", sql_expr.lower()).strip("_")[:50]
+        candidates.append({
+            "snippet_type": "measure",
+            "sql": sql_expr,
+            "display_name": _auto_display_name(sql_expr, "measure"),
+            "alias": alias,
+            "source_count": count,
+        })
+
+    for sql_expr, count in where_counter.most_common():
+        if count < SQL_EXPRESSION_MIN_FREQUENCY:
+            break
+        candidates.append({
+            "snippet_type": "filter",
+            "sql": sql_expr,
+            "display_name": _auto_display_name(sql_expr, "filter"),
+            "alias": "",
+            "source_count": count,
+        })
+
+    for sql_expr, count in derived_counter.most_common():
+        if count < SQL_EXPRESSION_MIN_FREQUENCY:
+            break
+        alias = re.sub(r"[^a-z0-9]+", "_", sql_expr.lower()).strip("_")[:50]
+        candidates.append({
+            "snippet_type": "expression",
+            "sql": sql_expr,
+            "display_name": _auto_display_name(sql_expr, "expression"),
+            "alias": alias,
+            "source_count": count,
+        })
+
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for c in candidates:
+        key = c["sql"].lower()
+        if any(_ngram_similarity(key, s) > 0.85 for s in seen):
+            continue
+        seen.add(key)
+        deduped.append(c)
+
+    return deduped
+
+
+def _auto_display_name(sql: str, snippet_type: str) -> str:
+    """Generate a human-readable display name from a SQL expression."""
+    sql_clean = sql.strip()
+
+    if snippet_type == "measure":
+        match = re.match(r"(SUM|COUNT|AVG|MIN|MAX)\s*\((.+)\)", sql_clean, re.IGNORECASE)
+        if match:
+            func, col = match.group(1).upper(), match.group(2).strip()
+            col_name = col.split(".")[-1].replace("_", " ").title()
+            prefix = {"SUM": "Total", "COUNT": "Count of", "AVG": "Average",
+                       "MIN": "Minimum", "MAX": "Maximum"}.get(func, func)
+            return f"{prefix} {col_name}"
+        return f"Measure: {sql_clean[:40]}"
+
+    if snippet_type == "filter":
+        return f"Filter: {sql_clean[:50]}"
+
+    if snippet_type == "expression":
+        match = re.match(r"(MONTH|QUARTER|YEAR|DATE_TRUNC)\s*\((.+)\)", sql_clean, re.IGNORECASE)
+        if match:
+            func, col = match.group(1).title(), match.group(2).strip()
+            col_name = col.split(".")[-1].replace("_", " ").title()
+            return f"{col_name} {func}"
+        return f"Expression: {sql_clean[:40]}"
+
+    return sql_clean[:50]
+
+
+def _discover_schema_sql_expressions(
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Discover SQL Expression candidates from schema patterns.
+
+    Scans column names, types, and descriptions for strong signals:
+      - Numeric columns named like revenue/cost/amount -> SUM measures
+      - Date/timestamp columns -> MONTH/QUARTER expressions
+
+    Returns conservative candidates that still need execution validation.
+    """
+    _MEASURE_PATTERNS = re.compile(
+        r"(?:revenue|sales|amount|total|cost|expense|price|profit|margin|"
+        r"count|qty|quantity|fee|charge|discount|balance)",
+        re.IGNORECASE,
+    )
+    _DATE_PATTERNS = re.compile(
+        r"(?:date|_at$|_on$|timestamp|datetime|created|updated|modified)",
+        re.IGNORECASE,
+    )
+    _NUMERIC_TYPES = {"int", "integer", "bigint", "float", "double", "decimal", "numeric", "long", "short"}
+
+    ds = metadata_snapshot.get("data_sources", {})
+    if not isinstance(ds, dict):
+        return []
+
+    candidates: list[dict] = []
+    seen_sqls: set[str] = set()
+
+    for table in (ds.get("tables", []) or []):
+        if not isinstance(table, dict):
+            continue
+        table_id = table.get("identifier", "")
+        if not table_id:
+            continue
+
+        columns = table.get("columns", []) or []
+        for col in columns:
+            if not isinstance(col, dict):
+                continue
+            col_name = col.get("name", "") or col.get("column_name", "")
+            col_type = (col.get("type_text", "") or col.get("data_type", "")).lower()
+            if not col_name:
+                continue
+
+            is_hidden = col.get("is_hidden", False) or col.get("hidden", False)
+            if is_hidden:
+                continue
+
+            base_type = col_type.split("(")[0].strip()
+            fq_col = f"{table_id}.{col_name}"
+
+            if base_type in _NUMERIC_TYPES and _MEASURE_PATTERNS.search(col_name):
+                sql_expr = f"SUM({fq_col})"
+                if sql_expr.lower() not in seen_sqls:
+                    seen_sqls.add(sql_expr.lower())
+                    alias = re.sub(r"[^a-z0-9]+", "_", f"total_{col_name}".lower()).strip("_")[:50]
+                    candidates.append({
+                        "snippet_type": "measure",
+                        "sql": sql_expr,
+                        "display_name": f"Total {col_name.replace('_', ' ').title()}",
+                        "alias": alias,
+                        "source_count": 0,
+                    })
+
+            if _DATE_PATTERNS.search(col_name) and ("date" in base_type or "timestamp" in base_type):
+                for func, label in [("MONTH", "Month"), ("QUARTER", "Quarter")]:
+                    sql_expr = f"{func}({fq_col})"
+                    if sql_expr.lower() not in seen_sqls:
+                        seen_sqls.add(sql_expr.lower())
+                        alias = re.sub(
+                            r"[^a-z0-9]+", "_",
+                            f"{col_name}_{func}".lower(),
+                        ).strip("_")[:50]
+                        candidates.append({
+                            "snippet_type": "expression",
+                            "sql": sql_expr,
+                            "display_name": f"{col_name.replace('_', ' ').title()} {label}",
+                            "alias": alias,
+                            "source_count": 0,
+                        })
+
+    return candidates
+
+
+def _enrich_candidates_with_llm(
+    candidates: list[dict],
+    metadata_snapshot: dict,
+    *,
+    w: WorkspaceClient | None = None,
+) -> list[dict]:
+    """Use LLM to generate display_name, synonyms, and instruction for candidates.
+
+    Takes raw (sql, snippet_type) candidates and enriches them with
+    human-friendly metadata.  If the LLM call fails, candidates are returned
+    with auto-generated display names.
+    """
+    if not candidates or w is None:
+        return candidates
+
+    import json as _json
+
+    from genie_space_optimizer.common.config import (
+        SQL_EXPRESSION_SEEDING_PROMPT,
+        format_mlflow_template,
+    )
+
+    candidates_json = _json.dumps(
+        [{"snippet_type": c["snippet_type"], "sql": c["sql"]} for c in candidates],
+        indent=2,
+    )
+    schema_context = _format_schema_index(metadata_snapshot)
+
+    prompt = format_mlflow_template(
+        SQL_EXPRESSION_SEEDING_PROMPT,
+        candidates=candidates_json,
+        schema=schema_context[:4000],
+    )
+
+    try:
+        raw_text, _ = _traced_llm_call(
+            w, "You are a SQL metadata expert.", prompt,
+            span_name="sql_expression_seeding_llm",
+        )
+        from genie_space_optimizer.optimization.evaluation import _extract_json
+        enrichments = _extract_json(raw_text)
+        if isinstance(enrichments, list) and len(enrichments) == len(candidates):
+            for c, e in zip(candidates, enrichments):
+                if isinstance(e, dict):
+                    if e.get("display_name"):
+                        c["display_name"] = e["display_name"]
+                    if e.get("synonyms"):
+                        c["synonyms"] = e["synonyms"]
+                    if e.get("instruction"):
+                        c["instruction"] = e["instruction"]
+                    if e.get("alias") and c["snippet_type"] != "filter":
+                        c["alias"] = e["alias"]
+    except Exception:
+        logger.warning("LLM enrichment for SQL expression candidates failed; using auto-generated names", exc_info=True)
+
+    for c in candidates:
+        c.setdefault("synonyms", [])
+        c.setdefault("instruction", "")
+
+    return candidates
+
+
 def _filter_no_op_proposals(proposals: list[dict], metadata_snapshot: dict) -> list[dict]:
     """Remove proposals that don't meaningfully change the current metadata.
 
@@ -7322,7 +7790,7 @@ def _merge_overlapping_instructions(proposals: list[dict]) -> list[dict]:
     return others + merged
 
 
-_LEVER_NAMES = {0: "Proactive Enrichment", 1: "Tables & Columns", 2: "Metric Views", 3: "Table-Valued Functions", 4: "Join Specifications", 5: "Genie Space Instructions"}
+_LEVER_NAMES = {0: "Proactive Enrichment", 1: "Tables & Columns", 2: "Metric Views", 3: "Table-Valued Functions", 4: "Join Specifications", 5: "Genie Space Instructions", 6: "SQL Expressions"}
 
 
 def _build_provenance(cluster: dict, lever: int, patch_type: str) -> dict:
@@ -7363,7 +7831,7 @@ def generate_proposals_from_strategy(
     lever_key = str(target_lever)
     lever_dir = directives.get(lever_key, {})
 
-    if not lever_dir and target_lever not in (4, 5):
+    if not lever_dir and target_lever not in (4, 5, 6):
         return proposals
 
     scope = _resolve_scope(target_lever, apply_mode)
@@ -7872,6 +8340,52 @@ def generate_proposals_from_strategy(
                         },
                         "provenance": {**provenance_base, "patch_type": "add_example_sql"},
                     })
+
+        # ── Lever 6: SQL Expressions ─────────────────────────────────────
+        elif target_lever == 6:
+            ag_directives = action_group.get("lever_directives", {}).get("6", {})
+            strategist_hints = ag_directives.get("sql_expressions", []) if isinstance(ag_directives, dict) else []
+
+            source_cids = set(action_group.get("source_cluster_ids", []))
+            all_clusters = metadata_snapshot.get("failure_clusters", [])
+            eligible_clusters = [
+                c for c in all_clusters
+                if c.get("cluster_id") in source_cids
+            ]
+            if not eligible_clusters:
+                eligible_clusters = [
+                    {"root_cause": root_cause, "question_traces": affected_qs, "cluster_id": ag_id}
+                ]
+
+            for cluster in eligible_clusters:
+                proposal = _generate_lever6_proposal(
+                    cluster, metadata_snapshot,
+                    strategist_hints=strategist_hints,
+                    w=w, spark=spark, catalog=catalog,
+                    gold_schema=gold_schema, warehouse_id=warehouse_id,
+                )
+                if proposal:
+                    proposal["proposal_id"] = f"P{len(proposals) + 1:03d}"
+                    proposal["cluster_id"] = cluster.get("cluster_id", ag_id)
+                    proposal["scope"] = "genie_config"
+                    proposal["change_description"] = (
+                        f"[{ag_id}] SQL Expression: {proposal.get('display_name', 'unnamed')} "
+                        f"({proposal.get('snippet_type', '?')})"
+                    )
+                    proposal["proposed_value"] = proposal.get("sql", "")
+                    proposal["rationale"] = proposal.get("rationale", f"Strategy: {root_cause}")
+                    proposal["dual_persistence"] = DUAL_PERSIST_PATHS.get(6, DUAL_PERSIST_PATHS[5])
+                    proposal["questions_at_risk"] = 0
+                    proposal["net_impact"] = max(proposal.get("questions_fixed", 0) * 0.7, 1.0)
+                    proposal["asi"] = {
+                        "failure_type": cluster.get("root_cause", root_cause),
+                        "blame_set": source_clusters,
+                        "severity": "major",
+                        "counterfactual_fixes": [],
+                        "ambiguity_detected": False,
+                    }
+                    proposal["provenance"] = {**provenance_base, "patch_type": proposal["patch_type"]}
+                    proposals.append(proposal)
 
         # ── Example SQL from any lever ────────────────────────────────────
         if target_lever != 5 and isinstance(lever_dir, dict):

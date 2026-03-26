@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { SqlSnippetPatch } from "@/components/SqlSnippetPatch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table,
@@ -786,9 +787,14 @@ function PatchesTab({ detail }: { detail: IterationDetailResponse }) {
                     {isExpanded && (
                       <TableRow>
                         <TableCell colSpan={8}>
-                          <pre className="max-h-40 overflow-auto rounded bg-elevated p-2 text-[10px]">
-                            {JSON.stringify(p.command || p.patch || p, null, 2)}
-                          </pre>
+                          {String(p.patchType || p.type || "").includes("sql_snippet") ||
+                           String(p.patchType || "") === "proactive_sql_expression" ? (
+                            <SqlSnippetPatch patch={p as Record<string, unknown>} />
+                          ) : (
+                            <pre className="max-h-40 overflow-auto rounded bg-elevated p-2 text-[10px]">
+                              {JSON.stringify(p.command || p.patch || p, null, 2)}
+                            </pre>
+                          )}
                         </TableCell>
                       </TableRow>
                     )}

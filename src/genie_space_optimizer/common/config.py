@@ -1128,6 +1128,7 @@ LEVER_TO_SECTIONS: dict[int, list[str]] = {
     3: ["FUNCTION ROUTING"],
     4: ["JOIN GUIDANCE", "TEMPORAL FILTERS"],
     5: ["ASSET ROUTING", "QUERY RULES", "QUERY PATTERNS", "DATA QUALITY NOTES", "CONSTRAINTS"],
+    6: ["AGGREGATION RULES", "QUERY PATTERNS"],
 }
 
 INSTRUCTION_FORMAT_RULES = (
@@ -1409,11 +1410,17 @@ STRATEGIST_PROMPT = (
     '\n'
     '## Contract: All Instruments of Power\n'
     'For each root cause, specify EVERY lever that should act:\n'
-    '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5\n'
-    '- wrong_aggregation / missing_filter: Primary Lever 2, also Lever 5\n'
+    '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5 + Lever 6\n'
+    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 2, also Lever 5 + Lever 6\n'
     '- tvf_parameter_error: Primary Lever 3, also Lever 5\n'
     '- wrong_join / missing_join_spec: Primary Lever 4, also Lever 1 + 5\n'
-    '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1\n'
+    '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1 + Lever 6\n'
+    '- missing_dimension / wrong_grouping: Primary Lever 6, also Lever 1 + Lever 5\n'
+    'Lever 6 adds reusable SQL expressions (measures, filters, dimensions) to the '
+    'knowledge store. Use it alongside other levers when a business concept (KPI, '
+    'common condition, or derived attribute) would be better captured as a structured '
+    'definition than as a column description or example SQL. SQL expressions do NOT '
+    'count toward the 100-slot instruction budget.\n'
     '\n'
     '## Contract: Structured Metadata Format\n'
     'ALL metadata changes MUST use structured sections.\n'
@@ -1502,7 +1509,13 @@ STRATEGIST_PROMPT = (
     '        "5": {"instruction_guidance": "<text>", "example_sqls": ['
     '{"question": "<prompt>", "sql_sketch": "<SQL>", '
     '"parameters": [{"name": "...", "type_hint": "STRING", "default_value": "..."}], '
-    '"usage_guidance": "<when to match>"}]}\n'
+    '"usage_guidance": "<when to match>"}]},\n'
+    '        "6": {"sql_expressions": [{"snippet_type": "measure|filter|expression", '
+    '"display_name": "Human-readable name", '
+    '"alias": "snake_case_id (required for measure/expression, omit for filter)", '
+    '"sql": "The SQL expression (raw, no SELECT/WHERE wrapper)", '
+    '"synonyms": ["synonym1", "synonym2"], '
+    '"instruction": "When and how Genie should use this"}]}\n'
     '      },\n'
     '      "coordination_notes": "<how levers reference each other>"\n'
     '    }\n'
@@ -1516,7 +1529,7 @@ STRATEGIST_PROMPT = (
     '}\n'
     '\n'
     'Rules:\n'
-    '- "lever_directives" keys "1"-"5". Only include levers with work to do.\n'
+    '- "lever_directives" keys "1"-"6". Only include levers with work to do.\n'
     '- "sections" keys from structured metadata schema.\n'
     '- Lever 2 uses same column format as Lever 1. Lever 3: {"functions": [...]}.\n'
     '- global_instruction_rewrite: a JSON OBJECT mapping section headers to content.\n'
@@ -1560,13 +1573,15 @@ STRATEGIST_TRIAGE_PROMPT = (
     '- Lever 3: Function descriptions and parameter documentation\n'
     '- Lever 4: Join specifications between tables\n'
     '- Lever 5: Instructions + example SQL queries\n'
+    '- Lever 6: SQL expressions (reusable measures, filters, dimensions)\n'
     '\n'
     '## Lever Mapping (All Instruments of Power)\n'
-    '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5\n'
-    '- wrong_aggregation / missing_filter: Primary Lever 2, also Lever 5\n'
+    '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5 + Lever 6\n'
+    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 2, also Lever 5 + Lever 6\n'
     '- tvf_parameter_error: Primary Lever 3, also Lever 5\n'
     '- wrong_join / missing_join_spec: Primary Lever 4, also Lever 1 + 5\n'
-    '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1\n'
+    '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1 + Lever 6\n'
+    '- missing_dimension / wrong_grouping: Primary Lever 6, also Lever 1 + Lever 5\n'
     '\n'
     '## Contracts\n'
     '- No Cross-AG Conflicts: Two AGs MUST NOT touch same table/column. Merge overlapping.\n'
@@ -1697,10 +1712,13 @@ STRATEGIST_DETAIL_PROMPT = (
     '## Contract: Coordination Notes\n'
     'Explain how changes across levers reinforce each other.\n'
     '\n'
-    '## Contract: Example SQL\n'
+    '## Contract: Example SQL & SQL Expressions\n'
     'For any recurring failure pattern (routing, aggregation, temporal, join, filter), '
     'include example_sqls in lever 5. Propose multiple example SQLs covering distinct '
     'failure patterns — aim for 1 per affected question where a valid SQL sketch exists.\n'
+    'When a business concept (KPI, common condition, derived attribute) is better captured '
+    'as a reusable definition than an example SQL, include sql_expressions in lever 6 instead. '
+    'SQL expressions do NOT count toward the instruction budget.\n'
     '\n'
     '## Contract: Identifier Allowlist\n'
     'You MUST ONLY reference tables, columns, and functions from the Identifier Allowlist. '
@@ -1715,6 +1733,7 @@ STRATEGIST_DETAIL_PROMPT = (
     '  Lever 3 -> FUNCTION ROUTING\n'
     '  Lever 4 -> JOIN GUIDANCE, TEMPORAL FILTERS\n'
     '  Lever 5 -> ASSET ROUTING, QUERY RULES, QUERY PATTERNS, DATA QUALITY NOTES, CONSTRAINTS\n'
+    '  Lever 6 -> (no instruction sections — operates via sql_expressions in lever_directives)\n'
     'Every bullet must reference a specific asset. No generic guidance.\n'
     '\n'
     '## Contract: Improvement Proposals\n'
@@ -1752,6 +1771,7 @@ STRATEGIST_DETAIL_PROMPT = (
     '(NOT purpose/best_for/grain/scd)\n'
     '  Lever 3: purpose, best_for, use_instead_of, parameters, example\n'
     '  Lever 4: relationships, join\n'
+    '  Lever 6: (no description sections — operates via sql_expressions in lever_directives)\n'
     'Proposing sections outside the lever ownership will be rejected.\n'
     '</instructions>\n'
     '\n'
@@ -1859,7 +1879,13 @@ STRATEGIST_DETAIL_PROMPT = (
     '    "5": {"instruction_guidance": "<text>", "example_sqls": ['
     '{"question": "<prompt>", "sql_sketch": "<SQL>", '
     '"parameters": [{"name": "...", "type_hint": "STRING", "default_value": "..."}], '
-    '"usage_guidance": "<when to match>"}]}\n'
+    '"usage_guidance": "<when to match>"}]},\n'
+    '    "6": {"sql_expressions": [{"snippet_type": "measure|filter|expression", '
+    '"display_name": "Human-readable name", '
+    '"alias": "snake_case_id (required for measure/expression, omit for filter)", '
+    '"sql": "The SQL expression (raw, no SELECT/WHERE wrapper)", '
+    '"synonyms": ["synonym1", "synonym2"], '
+    '"instruction": "When and how Genie should use this"}]}\n'
     '  },\n'
     '  "coordination_notes": "<how levers reference each other>",\n'
     '  "instruction_contribution": {\n'
@@ -1888,6 +1914,8 @@ STRATEGIST_DETAIL_PROMPT = (
     '- Lever 2: same column format as Lever 1.\n'
     '- Lever 3: {"functions": [{"function": "...", "sections": {...}}]}\n'
     '- Lever 5 example_sqls: propose 1 per distinct failure pattern. Always include at least one.\n'
+    '- Lever 6 sql_expressions: propose reusable measures/filters/dimensions. '
+    'Prefer over example SQL when the concept applies across multiple question patterns.\n'
     '- proposals: OPTIONAL. Only include if you identify a genuinely missing Metric View or Function.\n'
     '</output_schema>'
 )
@@ -1932,11 +1960,17 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     '## Contract: All Instruments of Power\n'
     'For the root cause you target, specify EVERY lever that should act:\n'
-    '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5\n'
-    '- wrong_aggregation / missing_filter: Primary Lever 2, also Lever 5\n'
+    '- wrong_column / wrong_table / missing_synonym: Primary Lever 1, also Lever 5 + Lever 6\n'
+    '- wrong_aggregation / wrong_measure / missing_filter: Primary Lever 2, also Lever 5 + Lever 6\n'
     '- tvf_parameter_error: Primary Lever 3, also Lever 5\n'
     '- wrong_join / missing_join_spec / wrong_join_spec: Primary Lever 4, also Lever 1 + 5\n'
-    '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1\n'
+    '- asset_routing_error / ambiguous_question: Primary Lever 5, also Lever 1 + Lever 6\n'
+    '- missing_dimension / wrong_grouping: Primary Lever 6, also Lever 1 + Lever 5\n'
+    'Lever 6 adds reusable SQL expressions (measures, filters, dimensions) to the '
+    'knowledge store. Use it alongside other levers when a business concept (KPI, '
+    'common condition, or derived attribute) would be better captured as a structured '
+    'definition than as a column description or example SQL. SQL expressions do NOT '
+    'count toward the 100-slot instruction budget.\n'
     '\n'
     '## Contract: Structured Metadata Format\n'
     'ALL metadata changes MUST use structured sections.\n'
@@ -1958,6 +1992,7 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '(NOT purpose/best_for/grain/scd)\n'
     '  Lever 3: purpose, best_for, use_instead_of, parameters, example\n'
     '  Lever 4: relationships, join\n'
+    '  Lever 6: (no description sections — operates via sql_expressions in lever_directives)\n'
     'Proposing sections outside the lever ownership will be rejected.\n'
     '\n'
     '## Contract: Non-Regressive / Augment-Not-Overwrite\n'
@@ -2027,7 +2062,13 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '        "5": {"instruction_guidance": "<text>", "example_sqls": ['
     '{"question": "<prompt>", "sql_sketch": "<SQL>", '
     '"parameters": [{"name": "...", "type_hint": "STRING", "default_value": "..."}], '
-    '"usage_guidance": "<when to match>"}]}\n'
+    '"usage_guidance": "<when to match>"}]},\n'
+    '        "6": {"sql_expressions": [{"snippet_type": "measure|filter|expression", '
+    '"display_name": "Human-readable name", '
+    '"alias": "snake_case_id (required for measure/expression, omit for filter)", '
+    '"sql": "The SQL expression (raw, no SELECT/WHERE wrapper)", '
+    '"synonyms": ["synonym1", "synonym2"], '
+    '"instruction": "When and how Genie should use this"}]}\n'
     '      },\n'
     '      "coordination_notes": "<how levers reference each other>",\n'
     '      "escalation": "<optional: remove_tvf | gt_repair | flag_for_review>"\n'
@@ -2043,7 +2084,7 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '\n'
     'Rules:\n'
     '- EXACTLY one action group. Pick the single highest-impact fix.\n'
-    '- "lever_directives" keys "1"-"5". Only include levers with work to do.\n'
+    '- "lever_directives" keys "1"-"6". Only include levers with work to do.\n'
     '- "sections" keys from structured metadata schema.\n'
     '- Lever 2 uses same column format as Lever 1. Lever 3: {"functions": [...]}.\n'
     '- global_instruction_rewrite: a JSON OBJECT mapping section headers to content.\n'
@@ -2198,6 +2239,7 @@ LEVER_NAMES = {
     3: "Table-Valued Functions",
     4: "Join Specifications",
     5: "Genie Space Instructions",
+    6: "SQL Expressions",
 }
 """Lever ID -> display name mapping.
 
@@ -2206,7 +2248,7 @@ loop. It is not included in :data:`DEFAULT_LEVER_ORDER` and should not be
 shown in the UI as a toggleable option.
 """
 
-DEFAULT_LEVER_ORDER = [1, 2, 3, 4, 5]
+DEFAULT_LEVER_ORDER = [1, 2, 3, 4, 5, 6]
 """Default set of user-selectable levers, in execution order."""
 
 MAX_VALUE_DICTIONARY_COLUMNS = 120
@@ -2555,6 +2597,61 @@ PATCH_TYPES = {
         "risk_level": "medium",
         "affects": ["filters", "default_filters"],
     },
+    # Lever 6: SQL Expressions (measures, filters, dimensions)
+    "add_sql_snippet_measure": {
+        "type": "add_sql_snippet_measure",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "measures"],
+    },
+    "update_sql_snippet_measure": {
+        "type": "update_sql_snippet_measure",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "measures"],
+    },
+    "remove_sql_snippet_measure": {
+        "type": "remove_sql_snippet_measure",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "measures"],
+    },
+    "add_sql_snippet_filter": {
+        "type": "add_sql_snippet_filter",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "filters"],
+    },
+    "update_sql_snippet_filter": {
+        "type": "update_sql_snippet_filter",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "filters"],
+    },
+    "remove_sql_snippet_filter": {
+        "type": "remove_sql_snippet_filter",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "filters"],
+    },
+    "add_sql_snippet_expression": {
+        "type": "add_sql_snippet_expression",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "expressions"],
+    },
+    "update_sql_snippet_expression": {
+        "type": "update_sql_snippet_expression",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "expressions"],
+    },
+    "remove_sql_snippet_expression": {
+        "type": "remove_sql_snippet_expression",
+        "scope": "genie_config",
+        "risk_level": "medium",
+        "affects": ["sql_snippets", "expressions"],
+    },
 }
 
 # ── 18. Conflict Rules (23 pairs) ─────────────────────────────────────
@@ -2591,7 +2688,7 @@ CONFLICT_RULES = [
     ("rewrite_instruction", "remove_instruction"),
 ]
 
-# ── 19. Failure Taxonomy (22 types) ───────────────────────────────────
+# ── 19. Failure Taxonomy (24 types) ───────────────────────────────────
 
 FAILURE_TAXONOMY = {
     "wrong_table",
@@ -2616,6 +2713,8 @@ FAILURE_TAXONOMY = {
     "wrong_join_spec",
     "missing_format_assistance",
     "missing_entity_matching",
+    "missing_dimension",
+    "wrong_grouping",
 }
 
 # ── 19b. Cluster Priority Weights (adaptive lever loop) ───────────────
@@ -2996,10 +3095,116 @@ _LEVER_TO_PATCH_TYPE: dict[tuple[str, int], str] = {
     ("missing_instruction", 5): "add_example_sql",
     ("ambiguous_question", 5): "add_example_sql",
     ("missing_filter", 5): "add_example_sql",
+    # Lever 6: SQL Expressions — Measures (aggregation / KPI failures)
+    ("wrong_aggregation", 6): "add_sql_snippet_measure",
+    ("wrong_measure", 6): "add_sql_snippet_measure",
+    # Lever 6: SQL Expressions — Filters (condition / WHERE clause failures)
+    ("missing_filter", 6): "add_sql_snippet_filter",
+    ("wrong_filter_condition", 6): "add_sql_snippet_filter",
+    ("missing_temporal_filter", 6): "add_sql_snippet_filter",
+    # Lever 6: SQL Expressions — Dimensions (grouping / derived column failures)
+    ("wrong_column", 6): "add_sql_snippet_expression",
+    ("description_mismatch", 6): "add_sql_snippet_expression",
+    ("ambiguous_question", 6): "add_sql_snippet_expression",
+    ("missing_dimension", 6): "add_sql_snippet_expression",
+    ("wrong_grouping", 6): "add_sql_snippet_expression",
     # Fallback for "other" failure types — avoids falling through to add_instruction
     ("other", 1): "update_column_description",
     ("other", 2): "update_column_description",
     ("other", 3): "update_description",
     ("other", 4): "add_join_spec",
     ("other", 5): "add_example_sql",
+    ("other", 6): "add_sql_snippet_measure",
 }
+
+# ── 23. Lever 6 SQL Expression Prompt ──────────────────────────────────
+
+LEVER_6_SQL_EXPRESSION_PROMPT = """You are an expert at defining SQL Expressions for Databricks Genie Spaces.
+
+## Context
+
+A Genie Space is answering user questions incorrectly. Analysis of the failures
+shows the root cause is: **{{ root_cause }}**
+
+### Failed questions and SQL diffs
+{{ cluster_context }}
+
+### Current schema
+{{ schema_context }}
+
+### Existing SQL Expressions (do NOT duplicate these)
+{{ existing_sql_snippets }}
+
+### Strategist hints (optional — adopt, modify, or override as needed)
+{{ strategist_hints }}
+
+## Task
+
+Based on the failure analysis, define ONE SQL Expression that would fix or
+improve the identified questions.  Choose the most appropriate type:
+
+- **measure**: A KPI or aggregation (e.g. `SUM(revenue) - SUM(cost)`).
+  Use when the failure involves wrong aggregation, missing metric, or
+  incorrect calculation.
+- **filter**: A boolean condition (e.g. `order_total > 1000`).
+  Use when the failure involves missing filters, wrong filter conditions,
+  or common WHERE patterns that recur across questions.
+- **expression** (dimension): A per-row derived value (e.g. `MONTH(date_col)`).
+  Use when the failure involves missing grouping attributes, derived columns,
+  or computed dimensions.
+
+## Output format (strict JSON)
+
+```json
+{{
+  "snippet_type": "measure" | "filter" | "expression",
+  "display_name": "Human-readable name for the concept",
+  "alias": "snake_case_identifier (required for measure/expression, omit for filter)",
+  "sql": "The SQL expression (single string, no trailing semicolon)",
+  "synonyms": ["synonym1", "synonym2"],
+  "instruction": "When and how Genie should use this expression",
+  "rationale": "Why this expression fixes the identified failures",
+  "target_table": "primary table this expression references",
+  "affected_questions": ["q1", "q2"]
+}}
+```
+
+Rules:
+- The SQL MUST reference only tables and columns that exist in the schema.
+- For measures: SQL must be a valid aggregation expression (SUM, COUNT, AVG, etc.).
+- For filters: SQL must evaluate to a boolean.
+- For expressions: SQL must produce a scalar value per row.
+- Do NOT wrap in SELECT or WHERE — provide the raw expression only.
+- Do NOT duplicate an existing SQL Expression.
+- Prefer concise, reusable definitions over question-specific hacks.
+"""
+
+# ── 24. SQL Expression Seeding (Proactive, Lever 0) ───────────────────
+
+SQL_EXPRESSION_SEEDING_THRESHOLD = 5
+"""Skip proactive seeding if the space already has this many SQL snippets."""
+
+SQL_EXPRESSION_MIN_FREQUENCY = 2
+"""Minimum benchmark occurrences for a pattern to become a candidate."""
+
+SQL_EXPRESSION_SEEDING_MAX_CANDIDATES = 20
+"""Maximum candidates to evaluate (budget cap for execution validation)."""
+
+SQL_EXPRESSION_SEEDING_PROMPT = """Given these SQL patterns extracted from \
+proven benchmark queries for a Genie Space, generate business-friendly \
+metadata for each:
+
+{{ candidates }}
+
+Schema context:
+{{ schema }}
+
+For each candidate, provide:
+- display_name: A concise business-friendly name
+- synonyms: 2-3 alternative terms users might use
+- instruction: One sentence on when Genie should use this expression
+- alias: A snake_case identifier (for measures and expressions only)
+
+Output strict JSON array matching the input order. Each element:
+{{"display_name": "...", "synonyms": [...], "instruction": "...", "alias": "..."}}
+"""

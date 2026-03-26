@@ -96,6 +96,7 @@ const LEVERS = [
   { id: 3, label: "Table-Valued Functions", desc: "Remove underperforming TVFs" },
   { id: 4, label: "Join Specifications", desc: "Add, update, or remove join relationships between tables" },
   { id: 5, label: "Genie Space Instructions", desc: "Rewrite global routing instructions and add domain-specific guidance" },
+  { id: 6, label: "SQL Expressions", desc: "Add reusable measures, filters, and dimensions for business concepts" },
 ] as const;
 
 function SpaceDetail() {

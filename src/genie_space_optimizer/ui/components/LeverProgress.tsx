@@ -1,5 +1,6 @@
 import { Badge } from "@/components/ui/badge";
 import { ProvenancePanel } from "@/components/ProvenancePanel";
+import { SqlSnippetPatch } from "@/components/SqlSnippetPatch";
 import {
   CheckCircle2,
   Loader2,
@@ -205,7 +206,12 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
               {hasPatchDetails && (
                 <div className="space-y-1 border-t border-dashed border-db-gray-border pt-2">
                   <p className="text-xs font-medium text-muted">Changes</p>
-                  {patches.slice(0, 8).map((patch, idx) => (
+                  {patches.slice(0, 8).map((patch, idx) => {
+                    const pt = String(patch.patchType || patch.type || patch.action_type || "");
+                    if (pt.includes("sql_snippet") || pt === "proactive_sql_expression") {
+                      return <SqlSnippetPatch key={idx} patch={patch as Record<string, unknown>} />;
+                    }
+                    return (
                     <div key={idx} className="rounded border bg-white px-2 py-1 text-xs">
                       <div className="flex flex-wrap items-center gap-2">
                         <Badge variant="secondary">{patch.patchType ?? "patch"}</Badge>
@@ -230,7 +236,8 @@ export function LeverProgress({ levers, links = [], runId }: LeverProgressProps)
                         </pre>
                       ) : null}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
 

@@ -950,6 +950,11 @@ function StepInsights({
                 Example SQLs: {proactive.exampleSqlsMined as number}
               </Badge>
             )}
+            {(proactive.sqlExpressionsSeeded as number) > 0 && (
+              <Badge variant="outline" className="text-[10px] border-violet-200 text-violet-700">
+                SQL expressions seeded: {proactive.sqlExpressionsSeeded as number}
+              </Badge>
+            )}
           </div>
         )}
       </div>

@@ -379,6 +379,32 @@ export const LEVERS: Lever[] = [
     ],
     ownedSections: [],
   },
+  {
+    number: 6,
+    name: "SQL Expressions",
+    description:
+      "Adds reusable SQL expressions (measures, filters, dimensions) that define business concepts like KPIs, common conditions, and grouping attributes. These structured definitions teach Genie about business terms and do not count toward the instruction budget.",
+    patchTypes: [
+      "add_sql_snippet_measure",
+      "update_sql_snippet_measure",
+      "remove_sql_snippet_measure",
+      "add_sql_snippet_filter",
+      "update_sql_snippet_filter",
+      "remove_sql_snippet_filter",
+      "add_sql_snippet_expression",
+      "update_sql_snippet_expression",
+      "remove_sql_snippet_expression",
+    ],
+    failureTypes: [
+      "wrong_aggregation",
+      "wrong_measure",
+      "missing_filter",
+      "missing_dimension",
+      "wrong_grouping",
+      "ambiguous_question",
+    ],
+    ownedSections: ["AGGREGATION RULES", "QUERY PATTERNS"],
+  },
 ];
 
 /* ═══════════════════════════════════════════════════════════════════
