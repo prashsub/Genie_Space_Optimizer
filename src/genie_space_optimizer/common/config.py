@@ -260,6 +260,12 @@ BENCHMARK_GENERATION_PROMPT = (
     'Write the simplest correct SQL. Prefer fewer columns and filters. '
     'For "multi-table" category questions, JOINs are expected and encouraged.\n'
     '\n'
+    '## Asset Coverage (MANDATORY)\n'
+    'Every table, metric view, and function listed in VALID Data Assets MUST appear '
+    'in at least one benchmark\'s expected_sql (in FROM, JOIN, or function call). '
+    'A single question that JOINs multiple tables counts as coverage for all tables '
+    'in that JOIN. Distribute questions across all assets first, then add variety.\n'
+    '\n'
     '## Diversity\n'
     'At least 2 questions per category. Include edge cases '
     '(filters, temporal ranges, NULL handling).\n'
@@ -2559,7 +2565,7 @@ PATCH_TYPES = {
         "risk_level": "medium",
         "affects": ["instructions"],
     },
-    # Lever 6: Genie Space Example SQL (preferred over text instructions)
+    # Example SQL patches (used by levers 3 and 5; preferred over text instructions)
     "add_example_sql": {
         "type": "add_example_sql",
         "scope": "genie_config",
@@ -3082,9 +3088,10 @@ _LEVER_TO_PATCH_TYPE: dict[tuple[str, int], str] = {
     ("missing_filter", 2): "update_mv_yaml",
     ("missing_temporal_filter", 2): "update_mv_yaml",
     ("wrong_filter_condition", 2): "update_column_description",
-    # Lever 3: Table-Valued Functions
+    # Lever 3: Table-Valued Functions (including routing example SQLs)
     ("tvf_parameter_error", 3): "add_tvf_parameter",
     ("repeatability_issue", 3): "add_tvf_parameter",
+    ("asset_routing_error", 3): "add_example_sql",
     # Lever 4: Join Specifications
     ("wrong_join", 4): "update_join_spec",
     ("missing_join_spec", 4): "add_join_spec",

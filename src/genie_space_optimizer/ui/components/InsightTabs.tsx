@@ -749,7 +749,7 @@ function PatchesTab({ detail }: { detail: IterationDetailResponse }) {
                       </TableCell>
                       <TableCell className="text-xs">{p._iteration}</TableCell>
                       <TableCell className="text-xs">
-                        {String(p.scope || "—")}
+                        {p.lever != null ? String(p.lever) : "—"}
                       </TableCell>
                       <TableCell className="text-xs">
                         {String(p.patchType || "—")}

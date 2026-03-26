@@ -551,7 +551,7 @@ export function ProcessFlow() {
       <div className="text-center">
         <h2 className="text-xl font-semibold text-primary">How the Optimizer Works</h2>
         <p className="mt-1 text-sm text-muted">
-          A {TOTAL_STEPS}-step pipeline that analyzes, benchmarks, and improves your Genie Space configuration using 9 judges and 5 optimization levers.
+          A {TOTAL_STEPS}-step pipeline that analyzes, benchmarks, and improves your Genie Space configuration using 9 judges and 6 optimization levers.
         </p>
       </div>
 

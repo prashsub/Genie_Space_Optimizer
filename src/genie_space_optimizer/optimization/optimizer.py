@@ -7187,7 +7187,7 @@ def _generate_lever6_proposal(
     root_cause = cluster.get("root_cause", "other")
 
     with mlflow.start_span(name=f"lever6_proposal_{root_cause}", span_type=_SpanType.CHAIN) as span:
-        cluster_context = _format_cluster_briefs([cluster], metadata_snapshot)
+        cluster_context = _format_cluster_briefs([cluster])
         schema_context = _format_schema_index(metadata_snapshot)
         existing_snippets = _format_existing_sql_snippets(metadata_snapshot)
 
@@ -8388,6 +8388,8 @@ def generate_proposals_from_strategy(
                     proposals.append(proposal)
 
         # ── Example SQL from any lever ────────────────────────────────────
+        # Preserve the originating lever so patches are attributed correctly
+        # (e.g. TVF routing example SQLs stay under lever 3, not lever 5).
         if target_lever != 5 and isinstance(lever_dir, dict):
             ex_sqls = lever_dir.get("example_sqls", [])
             if not ex_sqls:
@@ -8405,7 +8407,7 @@ def generate_proposals_from_strategy(
                     proposals.append({
                         "proposal_id": f"P{len(proposals) + 1:03d}",
                         "cluster_id": f"{ag_id}_L{target_lever}_EX{ex_idx + 1}",
-                        "lever": 5,
+                        "lever": target_lever,
                         "scope": "genie_config",
                         "patch_type": "add_example_sql",
                         "change_description": f"[{ag_id}] Lever {target_lever} example SQL {ex_idx + 1}: {eq[:80]}",
@@ -8415,7 +8417,7 @@ def generate_proposals_from_strategy(
                         "parameters": ex_sql.get("parameters", []),
                         "usage_guidance": ex_sql.get("usage_guidance", ""),
                         "rationale": f"Example SQL from lever {target_lever}: {root_cause}",
-                        "dual_persistence": DUAL_PERSIST_PATHS.get(5, DUAL_PERSIST_PATHS[5]),
+                        "dual_persistence": DUAL_PERSIST_PATHS.get(target_lever, DUAL_PERSIST_PATHS[5]),
                         "confidence": 0.75,
                         "questions_fixed": 1,
                         "questions_at_risk": 0,

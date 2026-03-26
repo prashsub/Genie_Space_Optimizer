@@ -4869,7 +4869,7 @@ def _run_lever_loop(
                         apply_mode=apply_mode,
                         force_apply=True,
                     )
-                    _tvf_lever = int(lever_keys[0]) if lever_keys else 3
+                    _tvf_lever = 3
                     for idx, entry in enumerate(_tvf_apply_log.get("applied", [])):
                         write_patch(
                             spark, run_id, iteration_counter, _tvf_lever, idx,
@@ -5009,11 +5009,12 @@ def _run_lever_loop(
             w, space_id, patches, metadata_snapshot, apply_mode=apply_mode,
         )
 
-        _primary_lever = int(lever_keys[0]) if lever_keys else 0
+        _fallback_lever = int(lever_keys[0]) if lever_keys else 0
         for idx, entry in enumerate(apply_log.get("applied", [])):
+            _patch_lever = int(entry.get("patch", {}).get("lever", _fallback_lever))
             write_patch(
-                spark, run_id, iteration_counter, _primary_lever, idx,
-                _build_patch_record(entry, _primary_lever, apply_mode),
+                spark, run_id, iteration_counter, _patch_lever, idx,
+                _build_patch_record(entry, _patch_lever, apply_mode),
                 catalog, schema,
             )
 
