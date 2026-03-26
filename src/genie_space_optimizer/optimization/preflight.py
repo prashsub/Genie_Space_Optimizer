@@ -1278,14 +1278,34 @@ def preflight_validate_benchmarks(
             max_benchmark_count=max_benchmark_count,
         )
         benchmarks = topped_up
+
+        topup_revalidation = validate_benchmarks(
+            benchmarks, spark, catalog=catalog, gold_schema=schema,
+            w=w, warehouse_id=warehouse_id,
+        )
+        _pre_reval = len(benchmarks)
+        benchmarks = [
+            b for b, v in zip(benchmarks, topup_revalidation) if v.get("valid")
+        ]
+        _reval_dropped = _pre_reval - len(benchmarks)
+        if _reval_dropped:
+            logger.warning(
+                "Post-top-up re-validation dropped %d/%d benchmarks",
+                _reval_dropped, _pre_reval,
+            )
+
         write_stage(
             spark, run_id, "BENCHMARK_TOPUP_AFTER_VALIDATION", "COMPLETE",
             task_key="preflight",
-            detail={"total_count": len(benchmarks)},
+            detail={
+                "total_count": len(benchmarks),
+                "revalidation_dropped": _reval_dropped,
+            },
             catalog=catalog, schema=schema,
         )
         print(
             f"  Post-validation top-up complete: {len(benchmarks)} benchmarks"
+            + (f" ({_reval_dropped} dropped by re-validation)" if _reval_dropped else "")
         )
 
     if not benchmarks:

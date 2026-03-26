@@ -216,19 +216,21 @@ class TestWsWithTimeout:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestGetOpenaiClient:
+    """Tests for get_openai_client (now in llm_client, re-exported by optimizer)."""
+
     def setup_method(self):
-        from genie_space_optimizer.optimization import optimizer
-        optimizer._openai_client_cache.clear()
+        from genie_space_optimizer.optimization import llm_client
+        llm_client._openai_client_cache.clear()
 
     @patch("openai.OpenAI")
     def test_client_created_with_correct_base_url(self, MockOpenAI):
-        from genie_space_optimizer.optimization.optimizer import _get_openai_client
+        from genie_space_optimizer.optimization.llm_client import get_openai_client
 
         ws = _make_mock_ws(
             host="https://my-workspace.cloud.databricks.com",
             token="dapi_test_token",
         )
-        _get_openai_client(ws)
+        get_openai_client(ws)
 
         MockOpenAI.assert_called_once_with(
             api_key="dapi_test_token",
@@ -237,11 +239,11 @@ class TestGetOpenaiClient:
 
     @patch("openai.OpenAI")
     def test_client_cached_by_host(self, MockOpenAI):
-        from genie_space_optimizer.optimization.optimizer import _get_openai_client
+        from genie_space_optimizer.optimization.llm_client import get_openai_client
 
         ws = _make_mock_ws(token="dapi_tok1")
-        client1 = _get_openai_client(ws)
-        client2 = _get_openai_client(ws)
+        client1 = get_openai_client(ws)
+        client2 = get_openai_client(ws)
 
         assert client1 is client2
         assert MockOpenAI.call_count == 1
@@ -249,28 +251,28 @@ class TestGetOpenaiClient:
     @patch("openai.OpenAI")
     def test_token_refreshed_on_cached_client(self, MockOpenAI):
         """Simulates OAuth token rotation: second call updates api_key."""
-        from genie_space_optimizer.optimization.optimizer import _get_openai_client
+        from genie_space_optimizer.optimization.llm_client import get_openai_client
 
         mock_client = MagicMock()
         MockOpenAI.return_value = mock_client
 
         ws1 = _make_mock_ws(token="token_v1")
-        _get_openai_client(ws1)
+        get_openai_client(ws1)
         assert mock_client.api_key != "token_v2"
 
         ws2 = _make_mock_ws(token="token_v2")
-        _get_openai_client(ws2)
+        get_openai_client(ws2)
         assert mock_client.api_key == "token_v2"
 
     @patch("openai.OpenAI")
     def test_oauth_token_used_when_config_token_is_none(self, MockOpenAI):
-        from genie_space_optimizer.optimization.optimizer import _get_openai_client
+        from genie_space_optimizer.optimization.llm_client import get_openai_client
 
         ws = _make_mock_ws(
             token=None,
             auth_headers={"Authorization": "Bearer oauth_tok_abc"},
         )
-        _get_openai_client(ws)
+        get_openai_client(ws)
 
         MockOpenAI.assert_called_once_with(
             api_key="oauth_tok_abc",
@@ -278,8 +280,8 @@ class TestGetOpenaiClient:
         )
 
     def test_no_auth_raises_runtime_error(self):
-        from genie_space_optimizer.optimization.optimizer import _get_openai_client
+        from genie_space_optimizer.optimization.llm_client import get_openai_client
 
         ws = _make_mock_ws(token=None, auth_headers={})
         with pytest.raises(RuntimeError, match="Cannot resolve a bearer token"):
-            _get_openai_client(ws)
+            get_openai_client(ws)

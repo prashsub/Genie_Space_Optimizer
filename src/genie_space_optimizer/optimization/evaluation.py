@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any, Union
 
 import mlflow
 import pandas as pd
-from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 from mlflow.entities import AssessmentSource, Feedback
 from mlflow.genai.scorers import scorer
 
@@ -323,35 +322,33 @@ def _link_prompt_to_trace(prompt_name: str) -> None:
 
 
 def _call_llm_for_scoring(
-    w: WorkspaceClient,
+    w: "WorkspaceClient",
     prompt: str,
     max_retries: int = LLM_MAX_RETRIES,
     prompt_name: str = "",
 ) -> dict:
-    """Call LLM using Databricks SDK with retry + exponential backoff.
+    """Call LLM via the OpenAI SDK with retry + exponential backoff.
+
+    Uses the shared ``llm_client`` so that ``mlflow.openai.autolog()``
+    captures token usage, cost, and latency automatically.
 
     If *prompt_name* is provided, loads the registered prompt first to
     link it to the current MLflow trace (visible in Linked Prompts tab).
     """
+    from genie_space_optimizer.optimization.llm_client import call_llm
+
     _link_prompt_to_trace(prompt_name)
 
     last_err: Exception | None = None
     for attempt in range(max_retries):
         try:
-            response = w.serving_endpoints.query(
-                name=LLM_ENDPOINT,
-                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+            text, _response = call_llm(
+                w,
+                messages=[{"role": "user", "content": prompt}],
+                max_retries=1,
                 temperature=LLM_TEMPERATURE,
             )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                raise ValueError(f"Empty LLM response choices on attempt {attempt + 1}")
-            first_choice = choices[0]
-            message = getattr(first_choice, "message", None)
-            content = getattr(message, "content", None)
-            if not content or not content.strip():
-                raise ValueError(f"Empty LLM response on attempt {attempt + 1}")
-            return _extract_json(content)
+            return _extract_json(text)
         except Exception as e:
             last_err = e
             if attempt < max_retries - 1:
@@ -1298,12 +1295,31 @@ def _precheck_benchmarks_for_eval(
     mv_names_lower = {n.lower().split(".")[-1] for n in (metric_view_names or set())}
     _mv_measures = metric_view_measures or {}
 
+    from genie_space_optimizer.common.config import REQUIRE_GROUND_TRUTH_SQL
+
     for idx, benchmark in enumerate(benchmarks):
         question = str(benchmark.get("question") or "").strip()
         qid = str(benchmark.get("id") or benchmark.get("question_id") or f"q-{idx}")
         sql = str(benchmark.get("expected_sql") or "").strip()
         if not sql:
-            valid.append(benchmark)
+            if REQUIRE_GROUND_TRUTH_SQL:
+                quarantined.append(
+                    {
+                        "question_id": qid,
+                        "question": question,
+                        "reason": "missing_ground_truth",
+                        "sqlstate": None,
+                        "error": "Benchmark has no expected SQL — cannot evaluate without ground truth",
+                        "expected_sql": "",
+                    }
+                )
+                reason_counts["invalid_benchmark_count"] += 1
+                logger.warning(
+                    "BENCHMARK REJECTED (no ground truth SQL): id=%s question='%s'",
+                    qid, question[:80],
+                )
+            else:
+                valid.append(benchmark)
             continue
 
         resolved_sql = resolve_sql(sql, catalog=catalog, gold_schema=gold_schema)
@@ -5422,6 +5438,136 @@ def _enforce_metadata_constraints(
     return True, "ok", ""
 
 
+def _generate_sql_for_curated_questions(
+    w: WorkspaceClient,
+    config: dict,
+    uc_columns: list[dict],
+    uc_routines: list[dict],
+    question_only_benchmarks: list[dict],
+    catalog: str,
+    schema: str,
+    spark: SparkSession,
+    *,
+    warehouse_id: str = "",
+) -> list[dict]:
+    """Generate and validate expected SQL for curated questions that lack it.
+
+    Uses the same LLM + validation pipeline as synthetic benchmark generation.
+    Questions that fail SQL generation after retries are dropped.
+
+    Returns only benchmarks that ended up with valid ``expected_sql``.
+    """
+    if not question_only_benchmarks:
+        return []
+
+    from genie_space_optimizer.common.config import (
+        CURATED_SQL_GENERATION_PROMPT,
+        CURATED_SQL_GENERATION_MAX_RETRIES,
+        format_mlflow_template,
+    )
+    from genie_space_optimizer.optimization.benchmarks import validate_ground_truth_sql
+
+    ctx = _build_schema_contexts(config, uc_columns, uc_routines)
+    questions_json = json.dumps(
+        [{"question": b["question"]} for b in question_only_benchmarks],
+        indent=2,
+    )
+
+    prompt = format_mlflow_template(
+        CURATED_SQL_GENERATION_PROMPT,
+        valid_assets_context=ctx["valid_assets_context"],
+        tables_context=ctx["tables_context"],
+        column_allowlist=ctx.get("column_allowlist", "(no columns)"),
+        metric_views_context=ctx.get("metric_views_context", "None"),
+        tvfs_context=ctx.get("tvfs_context", "None"),
+        join_specs_context=ctx.get("join_specs_context", "None"),
+        instructions_context=ctx.get("instructions_context", "None"),
+        data_profile_context=ctx.get("data_profile_context", "(no data profile available)"),
+        questions_json=questions_json,
+    )
+
+    try:
+        response = _call_llm_for_scoring(
+            w, prompt,
+            prompt_name=get_registered_prompt_name("curated_sql_generation"),
+        )
+        generated: list[dict] = (
+            response if isinstance(response, list) else response.get("benchmarks", [])
+        )
+    except Exception:
+        logger.warning("Curated SQL generation LLM call failed", exc_info=True)
+        return []
+
+    question_map = {b["question"].strip().lower(): b for b in question_only_benchmarks}
+    enriched: list[dict] = []
+
+    for g in generated:
+        if not isinstance(g, dict):
+            continue
+        sql = g.get("expected_sql")
+        question = str(g.get("question", "")).strip()
+        if not sql or g.get("unfixable_reason"):
+            logger.info(
+                "Curated SQL generation: unfixable '%s' — %s",
+                question[:60],
+                g.get("unfixable_reason", "no SQL generated"),
+            )
+            continue
+
+        is_valid, err = validate_ground_truth_sql(
+            sql, spark, catalog=catalog, gold_schema=schema,
+            w=w, warehouse_id=warehouse_id,
+        )
+        if not is_valid:
+            for _retry in range(CURATED_SQL_GENERATION_MAX_RETRIES):
+                corrections = _attempt_benchmark_correction(
+                    w, config, uc_columns, uc_routines,
+                    [{"question": question, "expected_sql": sql, "validation_error": err}],
+                    catalog, schema, spark,
+                    _build_metadata_allowlist(config=config, uc_columns=uc_columns, uc_routines=uc_routines),
+                    warehouse_id=warehouse_id,
+                )
+                if corrections:
+                    g = corrections[0]
+                    sql = g.get("expected_sql", "")
+                    is_valid = bool(sql)
+                    break
+                logger.info(
+                    "Curated SQL correction attempt %d failed for '%s'",
+                    _retry + 1, question[:60],
+                )
+
+        if is_valid and sql:
+            original = question_map.get(question.lower(), {})
+            enriched.append({
+                **original,
+                "question": question,
+                "expected_sql": sql,
+                "expected_asset": g.get("expected_asset", detect_asset_type(sql)),
+                "category": g.get("category", original.get("category", "curated")),
+                "required_tables": g.get("required_tables", []),
+                "required_columns": g.get("required_columns", []),
+                "expected_facts": g.get("expected_facts", []),
+                "source": "genie_space",
+                "provenance": "curated_sql_generated",
+                "validation_status": "valid",
+                "validation_reason_code": "ok",
+                "validation_error": None,
+                "correction_source": "curated_sql_generation",
+            })
+        else:
+            logger.warning(
+                "Dropping curated question (no valid SQL after retries): %s",
+                question[:80],
+            )
+
+    logger.info(
+        "Curated SQL generation: %d/%d questions got valid SQL",
+        len(enriched), len(question_only_benchmarks),
+    )
+    return enriched
+
+
 def generate_benchmarks(
     w: WorkspaceClient,
     config: dict,
@@ -5770,7 +5916,46 @@ def generate_benchmarks(
 
     all_benchmarks: list[dict] = list(_existing)
 
-    for idx, b in enumerate(curated):
+    from genie_space_optimizer.common.config import REQUIRE_GROUND_TRUTH_SQL
+
+    curated_with_sql = [b for b in curated if str(b.get("expected_sql", "") or "").strip()]
+    curated_no_sql = [b for b in curated if not str(b.get("expected_sql", "") or "").strip()]
+
+    if curated_no_sql and REQUIRE_GROUND_TRUTH_SQL:
+        logger.info(
+            "Generating ground-truth SQL for %d curated question-only benchmarks",
+            len(curated_no_sql),
+        )
+        enriched_curated = _generate_sql_for_curated_questions(
+            w, config, uc_columns, uc_routines,
+            curated_no_sql, catalog, schema, spark,
+            warehouse_id=warehouse_id,
+        )
+        curated_with_sql.extend(enriched_curated)
+        _dropped = len(curated_no_sql) - len(enriched_curated)
+        if _dropped:
+            logger.warning(
+                "Dropped %d curated questions that could not get valid SQL "
+                "(enriched %d/%d)",
+                _dropped, len(enriched_curated), len(curated_no_sql),
+            )
+        _dropped_questions = [
+            b["question"][:80] for b in curated_no_sql
+            if b["question"].strip().lower() not in {
+                e["question"].strip().lower() for e in enriched_curated
+            }
+        ]
+        if _dropped_questions:
+            logger.info(
+                "Dropped curated questions: %s",
+                "; ".join(_dropped_questions[:10]),
+            )
+    elif curated_no_sql:
+        curated_with_sql.extend(curated_no_sql)
+
+    effective_curated = curated_with_sql
+
+    for idx, b in enumerate(effective_curated):
         question_id = f"{domain}_gs_{idx + 1:03d}"
         priority = "P0"
         expected_sql = str(b.get("expected_sql", "") or "")
@@ -5792,15 +5977,15 @@ def generate_benchmarks(
                 "priority": priority,
                 "split": "",
                 "source": b.get("source", "genie_space"),
-                "provenance": "curated",
+                "provenance": b.get("provenance", "curated"),
                 "validation_status": curated_status,
                 "validation_reason_code": "ok" if expected_sql else "missing_expected_sql",
                 "validation_error": None if expected_sql else "No expected SQL in curated sample question",
-                "correction_source": "",
+                "correction_source": b.get("correction_source", ""),
             }
         )
 
-    offset = len(curated)
+    offset = len(effective_curated)
     for idx, b in enumerate(valid_benchmarks):
         question_id = f"{domain}_{offset + idx + 1:03d}"
         priority = "P0" if idx < 3 else "P1"

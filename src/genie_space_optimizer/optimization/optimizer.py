@@ -17,9 +17,12 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
-
-_openai_client_cache: dict[str, Any] = {}
+from genie_space_optimizer.optimization.llm_client import (
+    _openai_client_cache,
+    _resolve_bearer_token,
+    call_llm as _call_llm_openai,
+    get_openai_client as _get_openai_client,
+)
 
 from genie_space_optimizer.common.config import (
     ADAPTIVE_STRATEGIST_PROMPT,
@@ -146,57 +149,10 @@ def _truncate_to_budget(
 
 
 # ── Traced LLM Call Helper ─────────────────────────────────────────────
-
-def _resolve_bearer_token(wc: WorkspaceClient) -> str:
-    """Extract a bearer token from the workspace client's auth chain.
-
-    Tries ``config.token`` first (covers PAT / env-var auth).  Falls back
-    to ``config.authenticate()`` which invokes the SDK's full credential
-    chain — OAuth M2M, Azure MI, Google SA, etc. — and returns fresh
-    ``Authorization`` headers.
-    """
-    token = wc.config.token
-    if token:
-        return token
-
-    try:
-        headers = wc.config.authenticate()
-        auth_value = headers.get("Authorization", "")
-        if auth_value.lower().startswith("bearer "):
-            return auth_value[len("Bearer "):]
-    except Exception:
-        pass
-
-    raise RuntimeError(
-        "Cannot resolve a bearer token from the WorkspaceClient. "
-        "Ensure DATABRICKS_TOKEN is set or that OAuth/service-principal "
-        "credentials are configured."
-    )
-
-
-def _get_openai_client(w: WorkspaceClient | None) -> Any:
-    """Return an OpenAI client pointing at the Databricks FMAPI endpoint.
-
-    Caches the client by host but **refreshes the bearer token on every
-    call** so that OAuth token rotation is handled transparently.
-
-    ``mlflow.openai.autolog()`` must be called once before first use
-    to enable automatic token/cost tracking on all spans.
-    """
-    from openai import OpenAI
-
-    wc = w if w is not None else WorkspaceClient()
-    host = wc.config.host.rstrip("/")
-    token = _resolve_bearer_token(wc)
-
-    if host not in _openai_client_cache:
-        _openai_client_cache[host] = OpenAI(
-            api_key=token,
-            base_url=f"{host}/serving-endpoints",
-        )
-    else:
-        _openai_client_cache[host].api_key = token
-    return _openai_client_cache[host]
+#
+# _resolve_bearer_token, _get_openai_client, and _openai_client_cache
+# now live in ``llm_client.py`` and are re-imported at the top of this
+# module for backward compatibility with tests and other consumers.
 
 
 def _traced_llm_call(
@@ -213,7 +169,8 @@ def _traced_llm_call(
 
     ``mlflow.openai.autolog()`` instruments every OpenAI call with a
     ``CHAT_MODEL`` span that captures token usage, cost, and latency.
-    This wrapper adds retry logic inside a ``CHAIN`` span.
+    This wrapper adds retry logic inside a ``CHAIN`` span and logs
+    token usage on the span for visibility.
 
     Returns ``(raw_text, response_object)`` for the caller to parse.
     Raises the last exception if all retries are exhausted.
@@ -256,6 +213,8 @@ def _traced_llm_call(
                     raise ValueError("LLM response content is empty")
                 text = str(content).strip()
 
+                _log_token_usage(span, response)
+
                 span.set_outputs({
                     "response_chars": len(text),
                     "attempts": attempt + 1,
@@ -276,6 +235,21 @@ def _traced_llm_call(
             "attempts": max_retries,
         })
         raise last_err  # type: ignore[misc]
+
+
+def _log_token_usage(span: Any, response: Any) -> None:
+    """Attach token usage from an OpenAI response to an MLflow span."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return
+    try:
+        span.set_attribute("mlflow.chat.tokenUsage", {
+            "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+        })
+    except Exception:
+        pass
 
 
 def _row_qid(row: dict, *, fallback: str = "unknown") -> str:
@@ -496,6 +470,87 @@ def _extract_join_pairs(sql: str) -> set[tuple[str, str]]:
     return pairs
 
 
+def _extract_instruction_default_filters(
+    metadata_snapshot: dict,
+) -> list[dict]:
+    """Parse Genie Space instructions for default filter rules.
+
+    Returns a list of ``{column, value, pattern}`` dicts representing
+    filters that the instructions mandate by default.
+    """
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
+
+    instructions = _get_general_instructions(metadata_snapshot)
+    if not instructions:
+        return []
+
+    filters: list[dict] = []
+    lines = instructions.split("\n")
+    _FILTER_PATTERNS = [
+        re.compile(r"(?:always|by default|default(?:s)? to)\s+(?:filter|use|apply|set)\s+.*?(\w+)\s*=\s*['\"]?(\w+)", re.IGNORECASE),
+        re.compile(r"(\w+)\s*=\s*['\"]?(\w+)['\"]?\s+(?:by default|unless|is the default)", re.IGNORECASE),
+        re.compile(r"(?:unless\s+(?:explicitly|specifically)\s+(?:asked|requested|stated)\s+otherwise).*?(\w+)\s*=\s*['\"]?(\w+)", re.IGNORECASE),
+    ]
+
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        for pattern in _FILTER_PATTERNS:
+            match = pattern.search(line_stripped)
+            if match:
+                filters.append({
+                    "column": match.group(1).lower(),
+                    "value": match.group(2),
+                    "pattern": line_stripped[:200],
+                })
+
+    instr = metadata_snapshot.get("instructions", {})
+    sql_snippets = instr.get("sql_snippets", {}) if isinstance(instr, dict) else {}
+    for f_item in sql_snippets.get("filters", []):
+        sql = f_item.get("sql", "")
+        eq_match = re.match(r"(\w+)\s*=\s*['\"]?(\w+)", sql.strip())
+        if eq_match:
+            filters.append({
+                "column": eq_match.group(1).lower(),
+                "value": eq_match.group(2),
+                "pattern": f"sql_snippet: {sql}",
+            })
+
+    return filters
+
+
+def _classify_generated_sql_quality(generated_sql: str, question: str = "") -> str:
+    """Classify structural issues in generated SQL when expected SQL is missing.
+
+    Provides more actionable root causes than ``"other"`` by analyzing the
+    SQL's structure against the question text.
+    """
+    gen_lower = generated_sql.lower()
+    q_lower = question.lower() if question else ""
+
+    if re.search(r"\bcount\s*\(\s*\*\s*\)", gen_lower) and not re.search(r"\b(?:count|how many)\b", q_lower):
+        return "exploratory_query"
+
+    gen_has_group = bool(re.search(r"\bgroup\s+by\b", gen_lower))
+    asks_for_by = bool(re.search(r"\bby\s+\w+", q_lower))
+    if asks_for_by and not gen_has_group:
+        return "missing_aggregation"
+
+    gen_has_where = bool(re.search(r"\bwhere\b", gen_lower))
+    filter_keywords = re.findall(r"\b(?:for|only|just|specific|in|from)\s+(\w+)", q_lower)
+    if filter_keywords and not gen_has_where:
+        return "missing_filter"
+
+    gen_selects = re.findall(r"\bselect\b(.+?)\bfrom\b", gen_lower, re.S)
+    if gen_selects:
+        gen_cols = [c.strip() for c in gen_selects[0].split(",")]
+        if len(gen_cols) <= 2 and asks_for_by:
+            return "wrong_granularity"
+
+    return "unverifiable_no_expected_sql"
+
+
 def _classify_sql_diff(ctx: dict) -> str:
     """Classify a failure's root cause by comparing expected vs generated SQL.
 
@@ -524,6 +579,9 @@ def _classify_sql_diff(ctx: dict) -> str:
         generated_sql = (resp.get("response") or "").strip()
 
     if not expected_sql or not generated_sql:
+        if generated_sql:
+            question = (ctx.get("request") or {}).get("question", "") if isinstance(ctx.get("request"), dict) else ""
+            return _classify_generated_sql_quality(generated_sql, question)
         return "other"
 
     exp_lower = expected_sql.lower()
@@ -849,6 +907,24 @@ def cluster_failures(
         if f.get("asi_wrong_clause"):
             profile["wrong_clauses"].append(f["asi_wrong_clause"])
 
+    # ── Filter-aware blame adjustment: clear blame for instruction-mandated filters
+    default_filters = _extract_instruction_default_filters(metadata_snapshot)
+    _default_filter_cols = {f["column"] for f in default_filters}
+    if _default_filter_cols:
+        for qid, profile in question_profiles.items():
+            _adjusted = []
+            for blame_item in profile["blame_sets"]:
+                blame_lower = blame_item.lower()
+                if any(col in blame_lower for col in _default_filter_cols):
+                    logger.debug(
+                        "Clearing blame '%s' for Q=%s — matches instruction default filter",
+                        blame_item, qid,
+                    )
+                    continue
+                _adjusted.append(blame_item)
+            if len(_adjusted) != len(profile["blame_sets"]):
+                profile["blame_sets"] = _adjusted
+
     for qid, profile in question_profiles.items():
         cause_counts = Counter(profile["root_causes"])
         profile["dominant_root_cause"] = cause_counts.most_common(1)[0][0] if cause_counts else "other"
@@ -899,7 +975,17 @@ def cluster_failures(
     cluster_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
     for qid, profile in question_profiles.items():
         blame_key = "|".join(sorted(profile["blame_sets"])) if profile["blame_sets"] else ""
-        group_key = (profile["dominant_root_cause"], blame_key)
+        root = profile["dominant_root_cause"]
+        if root in ("other", "unverifiable_no_expected_sql") and not blame_key:
+            ctx = profile.get("sql_context", {})
+            gen_sql = (ctx.get("response", {}) or {}).get("response", "") if isinstance(ctx.get("response"), dict) else ""
+            if not gen_sql:
+                gen_sql = str(ctx.get("generated_sql", ""))
+            q_text = ctx.get("question", "") if ctx else ""
+            sub_root = _classify_generated_sql_quality(gen_sql, q_text) if gen_sql else root
+            if sub_root != "unverifiable_no_expected_sql":
+                root = sub_root
+        group_key = (root, blame_key)
         cluster_groups[group_key].append(qid)
 
     clusters: list[dict] = []
@@ -4655,35 +4741,25 @@ def _call_llm_for_proposal(
 
     from genie_space_optimizer.optimization.evaluation import _extract_json
 
+    _proposal_system_msg = (
+        "You are a JSON-only responder. Your ENTIRE response must be a single "
+        "valid JSON object. Do not include any analysis, markdown, commentary, "
+        "or explanation outside the JSON. Start your response with '{' and end "
+        "with '}'."
+    )
+
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            _wc = _ws_with_timeout(w)
-            response = _wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
+            text, _response = _call_llm_openai(
+                w,
                 messages=[
-                    ChatMessage(
-                        role=ChatMessageRole.SYSTEM,
-                        content=(
-                            "You are a JSON-only responder. Your ENTIRE response must be a single "
-                            "valid JSON object. Do not include any analysis, markdown, commentary, "
-                            "or explanation outside the JSON. Start your response with '{' and end "
-                            "with '}'."
-                        ),
-                    ),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                    {"role": "system", "content": _proposal_system_msg},
+                    {"role": "user", "content": prompt},
                 ],
+                max_retries=1,
                 temperature=LLM_TEMPERATURE,
             )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                raise ValueError("LLM response had no choices")
-            first_choice = choices[0]
-            message = getattr(first_choice, "message", None)
-            content = getattr(message, "content", None)
-            if not content:
-                raise ValueError("LLM response content is empty")
-            text = str(content).strip()
             parsed = _extract_json(text)
             print(
                 f"│ Attempt {attempt + 1}/{LLM_MAX_RETRIES}:{'':9s} OK -- parsed JSON\n"
@@ -4893,24 +4969,15 @@ def _call_llm_for_join_discovery(
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            wc = _ws_with_timeout(w)
-            response = wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
+            text, _response = _call_llm_openai(
+                w,
                 messages=[
-                    ChatMessage(role=ChatMessageRole.SYSTEM, content=system_msg),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
                 ],
+                max_retries=1,
                 temperature=LLM_TEMPERATURE,
             )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                raise ValueError("LLM response had no choices")
-            first_choice = choices[0]
-            message = getattr(first_choice, "message", None)
-            content = getattr(message, "content", None)
-            if not content:
-                raise ValueError("LLM response content is empty")
-            text = str(content).strip()
             result = _extract_json(text)
             specs = result.get("join_specs", [])
             rationale = result.get("rationale", "")
@@ -5420,24 +5487,15 @@ def _call_llm_for_holistic_instructions(
     text = ""
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            wc = _ws_with_timeout(w)
-            response = wc.serving_endpoints.query(
-                name=LLM_ENDPOINT,
+            text, _response = _call_llm_openai(
+                w,
                 messages=[
-                    ChatMessage(role=ChatMessageRole.SYSTEM, content=holistic_system_msg),
-                    ChatMessage(role=ChatMessageRole.USER, content=prompt),
+                    {"role": "system", "content": holistic_system_msg},
+                    {"role": "user", "content": prompt},
                 ],
+                max_retries=1,
                 temperature=LLM_TEMPERATURE,
             )
-            choices = getattr(response, "choices", None) or []
-            if not choices:
-                raise ValueError("LLM response had no choices")
-            first_choice = choices[0]
-            message = getattr(first_choice, "message", None)
-            content = getattr(message, "content", None)
-            if not content:
-                raise ValueError("LLM response content is empty")
-            text = str(content).strip()
             try:
                 result = _extract_json(text)
             except json.JSONDecodeError:
@@ -7309,6 +7367,122 @@ _DERIVED_PATTERN = re.compile(
     r"(?:MONTH|QUARTER|YEAR|DATE_TRUNC|DATE_FORMAT|CONCAT)\s*\([^)]+\))",
     re.IGNORECASE,
 )
+
+
+def _convert_instructions_to_sql_expressions(
+    metadata_snapshot: dict,
+    w: WorkspaceClient | None = None,
+    *,
+    spark: Any = None,
+    catalog: str = "",
+    gold_schema: str = "",
+    warehouse_id: str = "",
+) -> list[dict]:
+    """Parse Genie Space instructions for business rules expressible as SQL snippets.
+
+    Calls an LLM to extract default filters, KPI definitions, and derived
+    attributes from ``text_instructions``, then validates each candidate
+    via ``validate_sql_snippet``.  Returns only validated candidates.
+    """
+    from genie_space_optimizer.common.config import (
+        INSTRUCTION_TO_SQL_EXPRESSION_PROMPT,
+        format_mlflow_template,
+    )
+    from genie_space_optimizer.optimization.applier import _get_general_instructions
+    from genie_space_optimizer.optimization.benchmarks import validate_sql_snippet
+
+    instructions_text = _get_general_instructions(metadata_snapshot)
+    if not instructions_text or len(instructions_text.strip()) < 20:
+        logger.info("No substantial instructions to convert to SQL expressions")
+        return []
+
+    ds = metadata_snapshot.get("data_sources", {})
+    tables = ds.get("tables", []) if isinstance(ds, dict) else []
+    schema_lines: list[str] = []
+    for t in (tables if isinstance(tables, list) else []):
+        tname = t.get("name", "")
+        for col in t.get("columns", []):
+            cname = col.get("name", "")
+            ctype = col.get("type_text", col.get("type", ""))
+            desc = col.get("description", "")[:80]
+            schema_lines.append(f"{tname}.{cname} ({ctype}): {desc}")
+    schema_context = "\n".join(schema_lines) if schema_lines else "(no schema available)"
+
+    instr = metadata_snapshot.get("instructions", {})
+    existing_snippets = instr.get("sql_snippets", {}) if isinstance(instr, dict) else {}
+    existing_strs: list[str] = []
+    for category in ("measures", "filters", "expressions"):
+        for item in existing_snippets.get(category, []):
+            sql_str = item.get("sql", "")
+            if sql_str:
+                existing_strs.append(f"{category}: {sql_str}")
+    existing_text = "\n".join(existing_strs) if existing_strs else "(none)"
+
+    prompt = format_mlflow_template(
+        INSTRUCTION_TO_SQL_EXPRESSION_PROMPT,
+        instructions_text=instructions_text,
+        schema_context=schema_context,
+        existing_expressions=existing_text,
+    )
+
+    try:
+        text, _response = _traced_llm_call(
+            w, "", prompt, span_name="instruction_to_sql_expression",
+        )
+    except Exception:
+        logger.warning("Instruction-to-SQL-expression LLM call failed", exc_info=True)
+        return []
+
+    from genie_space_optimizer.optimization.evaluation import _extract_json
+    try:
+        result = _extract_json(text)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Instruction-to-SQL-expression response not valid JSON")
+        return []
+
+    candidates = result if isinstance(result, list) else result.get("expressions", [])
+    validated: list[dict] = []
+
+    existing_sql_lower = {s.lower().strip() for s in existing_strs}
+
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        sql = c.get("sql", "").strip()
+        snippet_type = c.get("snippet_type", "").strip().lower()
+        if not sql or snippet_type not in ("measure", "filter", "expression"):
+            continue
+        if sql.lower().strip() in existing_sql_lower:
+            continue
+
+        is_valid, err = validate_sql_snippet(
+            sql, snippet_type, metadata_snapshot,
+            spark=spark, catalog=catalog, gold_schema=gold_schema,
+            w=w, warehouse_id=warehouse_id,
+        )
+        if is_valid:
+            validated.append({
+                "snippet_type": snippet_type,
+                "sql": sql,
+                "display_name": c.get("display_name", ""),
+                "description": c.get("description", ""),
+                "synonyms": c.get("synonyms", []),
+                "alias": c.get("alias", ""),
+                "is_default": c.get("is_default", False),
+                "omit_when": c.get("omit_when"),
+                "source": "instruction_derived",
+            })
+        else:
+            logger.info(
+                "Instruction-derived SQL expression rejected: %s — %s",
+                sql[:80], err,
+            )
+
+    logger.info(
+        "Instruction-to-SQL-expression: %d/%d candidates validated",
+        len(validated), len(candidates),
+    )
+    return validated
 
 
 def _mine_sql_expression_candidates(

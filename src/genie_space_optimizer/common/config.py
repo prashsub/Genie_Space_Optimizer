@@ -125,6 +125,17 @@ LLM_MAX_RETRIES = 3
 
 # ── 5. Benchmark Generation ────────────────────────────────────────────
 
+REQUIRE_GROUND_TRUTH_SQL: bool = True
+"""When True, benchmarks without expected_sql are rejected at every gate:
+generation (curated question-only rows become LLM generation seeds instead),
+preflight validation (re-validate after top-up), and eval pre-check
+(quarantine instead of silently accepting).  Set to False to restore
+legacy behaviour where question-only benchmarks pass through evaluation."""
+
+CURATED_SQL_GENERATION_MAX_RETRIES = 2
+"""Maximum LLM correction attempts when generating SQL for a curated
+question that originally lacked expected_sql."""
+
 HELD_OUT_RATIO = 0.15
 """Fraction of non-curated benchmarks reserved for held-out generalization
 check in Finalize.  The optimizer never sees these during the lever loop."""
@@ -356,6 +367,66 @@ BENCHMARK_CORRECTION_PROMPT = (
     'Each object: "question", "expected_sql" (corrected or null), "expected_asset", '
     '"category", "required_tables", "required_columns", "expected_facts", '
     '"unfixable_reason" (null if fixed).\n'
+    '</output_schema>'
+)
+
+CURATED_SQL_GENERATION_PROMPT = (
+    '<role>\n'
+    'You are a Databricks SQL expert generating ground-truth SQL for benchmark questions.\n'
+    '</role>\n'
+    '\n'
+    '<context>\n'
+    '## VALID Data Assets (ONLY these exist)\n'
+    '{{ valid_assets_context }}\n'
+    '\n'
+    '## Tables and Columns\n'
+    '{{ tables_context }}\n'
+    '\n'
+    '## Column Allowlist (Extract-Over-Generate — use ONLY these column names)\n'
+    '{{ column_allowlist }}\n'
+    '\n'
+    '## Metric Views\n'
+    '{{ metric_views_context }}\n'
+    '\n'
+    '## Table-Valued Functions\n'
+    '{{ tvfs_context }}\n'
+    '\n'
+    '## Join Specifications (how tables relate)\n'
+    '{{ join_specs_context }}\n'
+    '\n'
+    '## Genie Space Instructions (business rules — follow these)\n'
+    '{{ instructions_context }}\n'
+    '\n'
+    '## Data Profile (actual values from database)\n'
+    '{{ data_profile_context }}\n'
+    '\n'
+    '## Curated Questions (generate SQL for each)\n'
+    '{{ questions_json }}\n'
+    '</context>\n'
+    '\n'
+    '<instructions>\n'
+    'Generate valid Databricks SQL for each curated question using ONLY the assets and '
+    'columns listed above.\n'
+    '\n'
+    '- The SQL must answer EXACTLY what the question asks — no more, no less.\n'
+    '- Use only columns from the Column Allowlist.\n'
+    '- Follow the Genie Space Instructions for default filters, business definitions, '
+    'and measure semantics. If instructions say to apply a filter by default, include it.\n'
+    '- Metric views: use MEASURE() syntax for aggregates in SELECT/ORDER BY.\n'
+    '- Multi-table queries: use Join Specifications for valid join paths.\n'
+    '- Data Profile: use realistic filter values from the profile.\n'
+    '- If a question truly cannot be answered with the available assets, set expected_sql '
+    'to null with unfixable_reason explaining why.\n'
+    '</instructions>\n'
+    '\n'
+    '<output_schema>\n'
+    'Return a JSON array of objects. No markdown, just JSON.\n'
+    '\n'
+    'Each object: {{"question": "...", "expected_sql": "..." or null, '
+    '"expected_asset": "TABLE"|"MV"|"TVF", '
+    '"category": "aggregation"|"ranking"|"time-series"|"comparison"|"detail"|"list"|"threshold"|"multi-table", '
+    '"required_tables": [...], "required_columns": [...], "expected_facts": [], '
+    '"unfixable_reason": null or "..."}}\n'
     '</output_schema>'
 )
 
@@ -1978,6 +2049,26 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     'definition than as a column description or example SQL. SQL expressions do NOT '
     'count toward the 100-slot instruction budget.\n'
     '\n'
+    '## Contract: Compound-Concept Queries\n'
+    'When a question requires resolving MULTIPLE business concepts simultaneously '
+    '(e.g. "Canada 7Now delivery PSD sales by zone" = country filter + channel filter '
+    '+ metric + grouping dimension), apply a multi-lever approach:\n'
+    '1. Lever 6: Add SQL expressions for each atomic concept — a filter for the '
+    'country, a filter for the channel, a measure for the metric.\n'
+    '2. Lever 2: Ensure column descriptions include concept-to-column mappings '
+    '(e.g. "Canada = country_code=CA", "PSD sales = psd_sales column").\n'
+    '3. Lever 5: Add an example SQL that demonstrates the FULL filter chain for '
+    'this type of compound query.\n'
+    'NEVER leave a compound-concept failure with just an instruction rewrite — '
+    'Genie needs structured metadata (Lever 6 + Lever 2) to reliably decompose '
+    'natural language into multi-filter SQL.\n'
+    '\n'
+    '## Contract: Instruction-Defined Default Filters\n'
+    'If the Genie Space instructions define a default filter (e.g. "always filter by '
+    'same_store_7now = Y unless explicitly requested otherwise"), that filter is '
+    'CORRECT BEHAVIOR. Do NOT blame it as "over-filtering" in root cause analysis. '
+    'Only flag the filter as a problem if the user explicitly asked to exclude it.\n'
+    '\n'
     '## Contract: Structured Metadata Format\n'
     'ALL metadata changes MUST use structured sections.\n'
     'Tables: purpose, best_for, grain, scd, relationships.\n'
@@ -2041,6 +2132,13 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     'for human review in the labeling session.\n'
     'If INTERMITTENT, the question may be non-deterministic — monitor but do not '
     'escalate unless it becomes PERSISTENT.\n'
+    '\n'
+    '## Contract: Improvement Proposals\n'
+    'When lever fixes alone cannot resolve a pattern, propose a new object via "proposals". '
+    'Propose METRIC_VIEW when 3+ questions need the same aggregation across varying dimensions, '
+    'or when ratios/distinct-counts cannot be safely re-aggregated from a flat table. '
+    'Propose FUNCTION when 2+ clusters need the same date/category transformation. '
+    'Only propose objects genuinely missing from the Identifier Allowlist.\n'
     '</instructions>\n'
     '\n'
     '<context>\n'
@@ -2077,7 +2175,12 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     '"instruction": "When and how Genie should use this"}]}\n'
     '      },\n'
     '      "coordination_notes": "<how levers reference each other>",\n'
-    '      "escalation": "<optional: remove_tvf | gt_repair | flag_for_review>"\n'
+    '      "escalation": "<optional: remove_tvf | gt_repair | flag_for_review>",\n'
+    '      "proposals": [\n'
+    '        {"type": "METRIC_VIEW | FUNCTION", "title": "<short name>", '
+    '"rationale": "<failure pattern it fixes>", "definition": "<SQL CREATE or YAML>", '
+    '"affected_questions": ["<qid>"], "estimated_impact": "<accuracy improvement>"}\n'
+    '      ]\n'
     '    }\n'
     '  ],\n'
     '  "global_instruction_rewrite": {\n'
@@ -2099,6 +2202,7 @@ ADAPTIVE_STRATEGIST_PROMPT = (
     'TEMPORAL FILTERS, DATA QUALITY NOTES, CONSTRAINTS.\n'
     '  Only include sections you want to ADD or REPLACE. Omitted sections are PRESERVED unchanged.\n'
     '  Values are plain-text bullet lists (no Markdown). Empty string means delete the section.\n'
+    '- proposals: OPTIONAL. Only include when lever fixes are insufficient and a missing MV or Function would resolve the pattern.\n'
     '- Do NOT repeat any approach listed in the DO NOT RETRY section.\n'
     '- If no actionable improvements remain:\n'
     '  {"action_groups": [], "global_instruction_rewrite": {}, '
@@ -3053,6 +3157,7 @@ BENCHMARK_PROMPTS: dict[str, str] = {
     "benchmark_correction": BENCHMARK_CORRECTION_PROMPT,
     "benchmark_alignment_check": BENCHMARK_ALIGNMENT_CHECK_PROMPT,
     "benchmark_coverage_gap": BENCHMARK_COVERAGE_GAP_PROMPT,
+    "curated_sql_generation": CURATED_SQL_GENERATION_PROMPT,
 }
 
 # ── 21. ASI Schema (12 fields) ─────────────────────────────────────────
@@ -3186,7 +3291,63 @@ Rules:
 - Prefer concise, reusable definitions over question-specific hacks.
 """
 
-# ── 24. SQL Expression Seeding (Proactive, Lever 0) ───────────────────
+# ── 24. Instruction-to-SQL-Expression Conversion ──────────────────────
+
+INSTRUCTION_TO_SQL_EXPRESSION_PROMPT = """\
+<role>
+You are a Databricks SQL expert extracting reusable SQL expressions from \
+Genie Space instructions.
+</role>
+
+<context>
+## Genie Space Instructions
+{{ instructions_text }}
+
+## Table Schema
+{{ schema_context }}
+
+## Existing SQL Expressions (do NOT duplicate)
+{{ existing_expressions }}
+</context>
+
+<instructions>
+Extract business rules from the instructions above that can be expressed as \
+reusable SQL snippets.  Focus on:
+
+1. **Default filters**: Rules like "always filter by X = Y", "default to ...", \
+"exclude ... unless explicitly requested".  These become snippet_type="filter".
+2. **Business KPI definitions**: "PSD sales means ...", "average transaction \
+size = ...".  These become snippet_type="measure".
+3. **Derived attributes**: "growth % = (CY - PY) / PY * 100", "day vs MTD".  \
+These become snippet_type="expression".
+
+Rules:
+- SQL must reference ONLY columns that exist in the Table Schema.
+- For filters: SQL must be a valid boolean expression (e.g. `same_store_7now = 'Y'`).
+- For measures: SQL must be a valid aggregation (e.g. `SUM(cy_sales) - SUM(py_sales)`).
+- For expressions: SQL must produce a scalar per row.
+- Do NOT wrap in SELECT or WHERE — raw expression only.
+- Do NOT duplicate any Existing SQL Expression.
+- Set is_default=true if the instruction says to apply this by default.
+- Set omit_when to describe when the filter should NOT be applied \
+(e.g. "user explicitly asks for all stores").
+</instructions>
+
+<output_schema>
+Return a JSON array. Each element:
+{{"snippet_type": "measure"|"filter"|"expression", \
+"sql": "...", \
+"display_name": "...", \
+"description": "One sentence on what this computes/filters", \
+"synonyms": ["term1", "term2"], \
+"alias": "snake_case_identifier", \
+"is_default": true|false, \
+"omit_when": "..." or null}}
+
+Return [] if no extractable business rules are found.
+</output_schema>"""
+
+# ── 25. SQL Expression Seeding (Proactive, Lever 0) ───────────────────
 
 SQL_EXPRESSION_SEEDING_THRESHOLD = 5
 """Skip proactive seeding if the space already has this many SQL snippets."""

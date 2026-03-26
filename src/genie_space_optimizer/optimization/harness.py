@@ -1648,6 +1648,97 @@ def _run_proactive_instruction_seeding(
         return result
 
 
+# ── Stage 2.96: INSTRUCTION-TO-SQL-EXPRESSION CONVERSION ─────────────
+
+
+def _apply_instruction_sql_expressions(
+    w: WorkspaceClient,
+    spark: SparkSession,
+    run_id: str,
+    space_id: str,
+    candidates: list[dict],
+    metadata_snapshot: dict,
+    catalog: str,
+    schema: str,
+) -> int:
+    """Apply validated instruction-derived SQL expression candidates to the Genie Space.
+
+    Returns the count of expressions successfully applied.
+    """
+    from genie_space_optimizer.common.genie_client import patch_space_config
+    from genie_space_optimizer.common.genie_schema import generate_genie_id
+
+    if not candidates:
+        return 0
+
+    write_stage(
+        spark, run_id, "INSTRUCTION_SQL_EXPRESSION_CONVERSION", "STARTED",
+        task_key="enrichment", catalog=catalog, schema=schema,
+    )
+
+    instr = metadata_snapshot.get("instructions", {})
+    if not isinstance(instr, dict):
+        instr = {}
+    snippets = instr.setdefault("sql_snippets", {})
+
+    applied = 0
+    for c in candidates:
+        stype = c["snippet_type"]
+        category = f"{stype}s"
+        if category not in snippets:
+            snippets[category] = []
+
+        entry: dict = {
+            "id": generate_genie_id(),
+            "sql": c["sql"],
+        }
+        if c.get("display_name"):
+            entry["display_name"] = c["display_name"]
+        if c.get("description"):
+            entry["description"] = c["description"]
+        if c.get("alias"):
+            entry["alias"] = c["alias"]
+        if c.get("synonyms"):
+            entry["synonyms"] = c["synonyms"]
+
+        snippets[category].append(entry)
+        applied += 1
+
+    if applied:
+        try:
+            patch_space_config(w, space_id, metadata_snapshot)
+            logger.info(
+                "Applied %d instruction-derived SQL expressions to space %s",
+                applied, space_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to PATCH instruction-derived SQL expressions",
+                exc_info=True,
+            )
+            applied = 0
+
+    write_stage(
+        spark, run_id, "INSTRUCTION_SQL_EXPRESSION_CONVERSION", "COMPLETE",
+        task_key="enrichment",
+        detail={
+            "candidates_total": len(candidates),
+            "applied": applied,
+        },
+        catalog=catalog, schema=schema,
+    )
+
+    _lines = [_section("INSTRUCTION → SQL EXPRESSION CONVERSION", "-")]
+    _lines.append(_kv("Candidates", len(candidates)))
+    _lines.append(_kv("Applied", applied))
+    for c in candidates[:5]:
+        _lines.append(f"  |  {c['snippet_type']}: {c['sql'][:60]}")
+    _lines.append(_bar("-"))
+    print("\n".join(_lines))
+
+    return applied
+
+
 # ── Stage 2.97: PROACTIVE SQL EXPRESSION SEEDING ─────────────────────
 
 
@@ -2150,6 +2241,29 @@ def _run_enrichment(
                 if uc_columns:
                     enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
 
+            # ── 5b-pre. Instruction-to-SQL-Expression Conversion ─────────
+            from genie_space_optimizer.optimization.optimizer import (
+                _convert_instructions_to_sql_expressions,
+            )
+            _instr_sql_candidates = _convert_instructions_to_sql_expressions(
+                metadata_snapshot, w=w,
+                spark=spark, catalog=catalog, gold_schema=schema,
+                warehouse_id=os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", ""),
+            )
+            _instr_sql_applied = 0
+            if _instr_sql_candidates:
+                _instr_sql_applied = _apply_instruction_sql_expressions(
+                    w, spark, run_id, space_id, _instr_sql_candidates,
+                    metadata_snapshot, catalog, schema,
+                )
+                if _instr_sql_applied > 0:
+                    config = fetch_space_config(w, space_id)
+                    config["_uc_columns"] = uc_columns
+                    metadata_snapshot = config.get("_parsed_space", config)
+                    metadata_snapshot["_data_profile"] = data_profile
+                    if uc_columns:
+                        enrich_metadata_with_uc_types(metadata_snapshot, uc_columns)
+
             # ── 5b. SQL Expression Seeding ────────────────────────────────
             sql_expr_result = _run_sql_expression_seeding(
                 w, spark, run_id, space_id, config=config,
@@ -2190,6 +2304,7 @@ def _run_enrichment(
                 + (1 if meta_result.get("description_generated") else 0)
                 + (1 if meta_result.get("questions_generated") else 0)
                 + (1 if instruction_result.get("instructions_seeded") else 0)
+                + _instr_sql_applied
                 + sql_expr_result.get("total_seeded", 0)
                 + len(mined_example_proposals)
             )
@@ -2202,6 +2317,7 @@ def _run_enrichment(
                 "generated" if meta_result.get("questions_generated") else "unchanged",
             )))
             _enr_summary.append(_kv("Instructions seeded", "yes" if instruction_result.get("instructions_seeded") else "no"))
+            _enr_summary.append(_kv("Instruction-derived SQL expressions", _instr_sql_applied))
             _enr_summary.append(_kv("SQL expressions seeded", sql_expr_result.get("total_seeded", 0)))
             _enr_summary.append(_kv("Example SQLs mined", len(mined_example_proposals)))
             _enr_summary.append(_kv("Total enrichments", total_enrichments))
@@ -2393,23 +2509,32 @@ def _diminishing_returns(
 
 def _filter_tried_clusters(
     clusters: list[dict],
-    tried_root_causes: set[tuple[str, str]],
+    tried_root_causes: set[tuple],
 ) -> list[dict]:
-    """Remove clusters whose (failure_type, blame_set) was already tried
-    and rolled back.  Keeps clusters that were tried and *accepted* (they
-    should no longer appear in fresh failure data anyway).
+    """Remove clusters whose root cause was already tried and rolled back.
 
-    *tried_root_causes* stores ``(asi_failure_type, asi_blame_set)`` tuples
-    recorded at rollback time so the key space matches the cluster fields.
+    *tried_root_causes* stores tuples recorded at rollback time.  Supports
+    both legacy 2-tuples ``(ft, blame)`` and new 3-tuples
+    ``(ft, blame, frozenset_of_levers)`` — the 3-tuple variant allows the
+    same root cause to be retried with a different lever combination.
     """
     if not tried_root_causes:
         return clusters
+    legacy_keys: set[tuple[str, str]] = set()
+    lever_keys: set[tuple[str, str, frozenset]] = set()
+    for entry in tried_root_causes:
+        if len(entry) == 2:
+            legacy_keys.add(entry)
+        elif len(entry) >= 3:
+            lever_keys.add(entry)
+
     filtered: list[dict] = []
     for c in clusters:
         ft = c.get("asi_failure_type") or c.get("root_cause", "other")
         blame = c.get("asi_blame_set") or ""
-        if (ft, blame) not in tried_root_causes:
-            filtered.append(c)
+        if (ft, blame) in legacy_keys:
+            continue
+        filtered.append(c)
     return filtered
 
 
@@ -4155,9 +4280,12 @@ def _run_lever_loop(
         triggered_by=triggered_by,
         instruction_prompt_name=_instr_prompt,
     )
-    scorers = make_all_scorers(w, spark, catalog, schema)
+    _parsed_space = config.get("_parsed_space", config)
+    _instr_section = _parsed_space.get("instructions", {}) if isinstance(_parsed_space, dict) else {}
+    _instr_text_for_scorers = _instr_section.get("text_instructions", "") if isinstance(_instr_section, dict) else ""
+    scorers = make_all_scorers(w, spark, catalog, schema, instruction_context=_instr_text_for_scorers)
     uc_schema = f"{catalog}.{schema}"
-    metadata_snapshot = config.get("_parsed_space", config)
+    metadata_snapshot = _parsed_space
     data_profile = (
         metadata_snapshot.get("_data_profile", {})
         or config.get("_data_profile", {})
@@ -4683,6 +4811,43 @@ def _run_lever_loop(
                     strategy = fallback_strategy
         finally:
             _mlflow.end_run()
+
+        if ag is None and clusters:
+            _remaining_qids = set()
+            for c in clusters:
+                _remaining_qids.update(c.get("question_ids", []))
+            if _remaining_qids and _iter_num <= max_iterations - 1:
+                logger.info(
+                    "Strategist returned 0 AGs but %d clusters with %d questions remain — "
+                    "constructing diagnostic fallback AG",
+                    len(clusters), len(_remaining_qids),
+                )
+                _top_cluster = ranked[0] if ranked else clusters[0]
+                ag = {
+                    "id": f"AG{iteration_counter}_fallback",
+                    "root_cause_summary": _top_cluster.get("root_cause", "unresolved_failures"),
+                    "affected_questions": _top_cluster.get("question_ids", []),
+                    "source_cluster_ids": [_top_cluster.get("cluster_id", "")],
+                    "lever_directives": {
+                        "5": {"instruction_guidance": "Add example SQLs and routing instructions for remaining failure patterns"},
+                        "6": {"generate_expressions": True},
+                    },
+                    "rationale": (
+                        f"Diagnostic fallback: {len(_remaining_qids)} question(s) still failing. "
+                        f"Trying Lever 5 (instructions/examples) + Lever 6 (SQL expressions) "
+                        f"as a broad-spectrum fix."
+                    ),
+                    "coordination_notes": "Fallback AG — strategist returned empty, applying broad-spectrum lever 5+6",
+                }
+                strategy = strategy or {}
+                strategy["action_groups"] = [ag]
+                print(
+                    _section(f"DIAGNOSTIC FALLBACK AG — {len(_remaining_qids)} questions remain", "!") + "\n"
+                    + _kv("Cluster", _top_cluster.get("cluster_id", "?")) + "\n"
+                    + _kv("Root cause", _top_cluster.get("root_cause", "?")) + "\n"
+                    + _kv("Questions", len(_top_cluster.get("question_ids", []))) + "\n"
+                    + _bar("!")
+                )
 
         if ag is None:
             logger.info("Strategist produced 0 action groups — ending lever loop")
@@ -5222,6 +5387,7 @@ def _run_lever_loop(
                 tgt = p.get("target_object", "")
                 if ft and tgt:
                     tried_patches.add((ft, tgt))
+            _lever_frozenset = frozenset(int(lk) for lk in lever_keys)
             source_cids = set(ag.get("source_cluster_ids", []))
             for c in clusters:
                 cid = c.get("cluster_id", "")
@@ -5231,6 +5397,7 @@ def _run_lever_loop(
                 rc_blame = c.get("asi_blame_set") or ""
                 if rc_ft:
                     tried_root_causes.add((rc_ft, rc_blame))
+                    tried_root_causes.add((rc_ft, rc_blame, _lever_frozenset))
             continue
 
         # ── Accept action group ──────────────────────────────────────

@@ -47,9 +47,18 @@ def _make_arbiter_scorer(
     catalog: str,
     schema: str,
     loaded_prompts: dict[str, str] | None = None,
+    instruction_context: str = "",
 ):
     """Factory that binds the workspace client and SQL resolution context."""
     _loaded = loaded_prompts or {}
+    _instruction_note = ""
+    if instruction_context:
+        _trimmed = instruction_context[:2000]
+        _instruction_note = (
+            "\nGENIE SPACE INSTRUCTIONS (these define the business rules for this space — "
+            "treat mandated default filters as correct behavior, not over-filtering):\n"
+            f"{_trimmed}\n\n"
+        )
 
     @scorer
     def arbiter_scorer(inputs: dict, outputs: dict, expectations: dict) -> Feedback:
@@ -224,7 +233,7 @@ def _make_arbiter_scorer(
             f"Result comparison: match={cmp.get('match')}, "
             f"match_type={cmp.get('match_type')}, "
             f"gt_rows={gt_rows}, genie_rows={genie_rows}\n"
-            f"{row_cap_note}{gt_empty_note}{genie_empty_note}{build_temporal_note(cmp)}\n"
+            f"{row_cap_note}{gt_empty_note}{genie_empty_note}{_instruction_note}{build_temporal_note(cmp)}\n"
             f"Ground Truth Result (first 5 rows):\n{gt_sample}\n\n"
             f"Genie Result (first 5 rows):\n{genie_sample}\n\n"
             'Respond with JSON only: {"verdict": "<genie_correct|ground_truth_correct|both_correct|neither_correct>", '

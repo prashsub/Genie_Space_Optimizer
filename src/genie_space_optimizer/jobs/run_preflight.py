@@ -139,6 +139,9 @@ from genie_space_optimizer.optimization.preflight import (
 )
 from genie_space_optimizer.optimization.state import ensure_optimization_tables, update_run_status
 
+import mlflow
+mlflow.openai.autolog()
+
 dbutils = cast(Any, globals().get("dbutils"))
 
 _TASK_LABEL = "TASK-1 PREFLIGHT"

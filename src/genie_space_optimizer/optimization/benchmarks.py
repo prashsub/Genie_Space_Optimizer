@@ -554,12 +554,21 @@ def validate_question_sql_alignment(
         format_mlflow_template,
     )
 
+    from genie_space_optimizer.common.config import REQUIRE_GROUND_TRUTH_SQL
+
     results: list[dict] = []
     to_check: list[tuple[int, dict]] = []
     for i, b in enumerate(benchmarks):
         sql = b.get("expected_sql", "")
         if not sql or not sql.strip():
-            results.append({"question": b.get("question", ""), "aligned": True, "issues": []})
+            if REQUIRE_GROUND_TRUTH_SQL:
+                results.append({
+                    "question": b.get("question", ""),
+                    "aligned": False,
+                    "issues": ["missing_expected_sql"],
+                })
+            else:
+                results.append({"question": b.get("question", ""), "aligned": True, "issues": []})
         else:
             results.append({"question": b.get("question", ""), "aligned": True, "issues": []})
             to_check.append((i, b))
@@ -579,24 +588,19 @@ def validate_question_sql_alignment(
         )
 
         try:
-            from databricks.sdk import WorkspaceClient
-            from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
-
             from genie_space_optimizer.optimization.evaluation import (
                 _link_prompt_to_trace,
                 get_registered_prompt_name,
             )
+            from genie_space_optimizer.optimization.llm_client import call_llm
 
             _link_prompt_to_trace(get_registered_prompt_name("benchmark_alignment_check"))
 
-            w = WorkspaceClient()
-            response = w.serving_endpoints.query(
-                name=LLM_ENDPOINT,
-                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+            raw, _response = call_llm(
+                None,
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
             )
-            choices = response.choices or []
-            raw = (choices[0].message.content or "").strip() if choices and choices[0].message else ""
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             checks = json.loads(raw)
