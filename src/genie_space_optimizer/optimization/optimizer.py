@@ -521,6 +521,90 @@ def _extract_instruction_default_filters(
     return filters
 
 
+def _detect_instruction_contradictions(
+    original_sections: dict[str, list[str]],
+    proposed_sections: dict[str, str | list[str]],
+) -> list[dict]:
+    """Detect contradictions between user-authored and optimizer-proposed instruction sections.
+
+    Compares filter polarity (always/default vs never/only-when-explicit) for
+    the same column across original and proposed sections.  Returns a list of
+    contradiction dicts with ``section``, ``original_rule``, ``proposed_line``,
+    and ``contradiction_type``.
+
+    Only flags clear inversions to avoid false positives on nuanced rewording.
+    """
+    _ALWAYS_PATTERNS = [
+        re.compile(r"(?:always|by default|default(?:s)?\s+(?:to|filter))\s+.*?(\w+)\s*=\s*['\"]?(\w+)", re.IGNORECASE),
+        re.compile(r"default\s+filter[:\s]+(\w+)\s*=\s*['\"]?(\w+)", re.IGNORECASE),
+    ]
+    _NEVER_PATTERNS = [
+        re.compile(r"(?:never|do\s+not|don'?t)\s+(?:apply|add|filter|use|include)\s+.*?(\w+)\s*=\s*['\"]?(\w+)", re.IGNORECASE),
+        re.compile(r"only\s+(?:apply|add|filter|use)\s+.*?(\w+)\s*=\s*['\"]?(\w+)['\"]?\s+when\s+.*?(?:explicitly|specifically)", re.IGNORECASE),
+        re.compile(r"(\w+)\s*=\s*['\"]?(\w+)['\"]?\s+only\s+when\s+.*?(?:explicitly|specifically)", re.IGNORECASE),
+        re.compile(r"absolutely\s+never\s+(?:apply|add|filter|use).*?(\w+)\s*=\s*['\"]?(\w+)", re.IGNORECASE),
+    ]
+
+    def _extract_filter_rules(sections: dict, patterns: list, polarity: str) -> list[dict]:
+        rules: list[dict] = []
+        for section_name, lines in sections.items():
+            if isinstance(lines, str):
+                lines = [lines]
+            for line in lines:
+                if not isinstance(line, str):
+                    continue
+                for pat in patterns:
+                    match = pat.search(line)
+                    if match:
+                        rules.append({
+                            "column": match.group(1).lower(),
+                            "value": match.group(2).lower(),
+                            "polarity": polarity,
+                            "section": section_name,
+                            "line": line.strip(),
+                        })
+        return rules
+
+    original_always = _extract_filter_rules(original_sections, _ALWAYS_PATTERNS, "always")
+    proposed_never = _extract_filter_rules(
+        {k: v if isinstance(v, list) else [v] for k, v in proposed_sections.items()},
+        _NEVER_PATTERNS, "never",
+    )
+    original_never = _extract_filter_rules(original_sections, _NEVER_PATTERNS, "never")
+    proposed_always = _extract_filter_rules(
+        {k: v if isinstance(v, list) else [v] for k, v in proposed_sections.items()},
+        _ALWAYS_PATTERNS, "always",
+    )
+
+    contradictions: list[dict] = []
+
+    for orig in original_always:
+        for prop in proposed_never:
+            if orig["column"] == prop["column"]:
+                contradictions.append({
+                    "section": prop["section"],
+                    "original_rule": orig["line"],
+                    "proposed_line": prop["line"],
+                    "contradiction_type": "filter_inversion",
+                    "detail": f"Original says always/default {orig['column']}={orig['value']}, "
+                              f"proposed says never/only-explicit",
+                })
+
+    for orig in original_never:
+        for prop in proposed_always:
+            if orig["column"] == prop["column"]:
+                contradictions.append({
+                    "section": prop["section"],
+                    "original_rule": orig["line"],
+                    "proposed_line": prop["line"],
+                    "contradiction_type": "filter_inversion",
+                    "detail": f"Original says never {orig['column']}={orig['value']}, "
+                              f"proposed says always/default",
+                })
+
+    return contradictions
+
+
 def _classify_generated_sql_quality(generated_sql: str, question: str = "") -> str:
     """Classify structural issues in generated SQL when expected SQL is missing.
 
@@ -8336,6 +8420,42 @@ def generate_proposals_from_strategy(
                                 instruction_sections["CONSTRAINTS"] = (
                                     (existing_c + "\n" + val).strip() if existing_c else val
                                 )
+
+                # --- Contradiction check against user-authored instructions ---
+                _orig_sections = metadata_snapshot.get("_original_instruction_sections")
+                if _orig_sections and isinstance(_orig_sections, dict):
+                    _contradictions = _detect_instruction_contradictions(
+                        _orig_sections, instruction_sections,
+                    )
+                    for _c in _contradictions:
+                        logger.warning(
+                            "REJECTED contradictory instruction: section=%s "
+                            "proposed='%s' contradicts original='%s' (%s)",
+                            _c["section"],
+                            _c["proposed_line"][:120],
+                            _c["original_rule"][:120],
+                            _c["contradiction_type"],
+                        )
+                        _c_section = _c["section"]
+                        _c_line = _c["proposed_line"]
+                        _sec_val = instruction_sections.get(_c_section, "")
+                        if isinstance(_sec_val, str) and _c_line in _sec_val:
+                            instruction_sections[_c_section] = _sec_val.replace(
+                                _c_line, ""
+                            ).strip()
+                        elif isinstance(_sec_val, list):
+                            instruction_sections[_c_section] = [
+                                ln for ln in _sec_val if _c_line not in ln
+                            ]
+                    if _contradictions:
+                        instruction_sections = {
+                            k: v for k, v in instruction_sections.items()
+                            if (isinstance(v, str) and v.strip()) or (isinstance(v, list) and v)
+                        }
+                        logger.info(
+                            "Stripped %d contradictory line(s) from proposed instructions",
+                            len(_contradictions),
+                        )
 
                 current_instructions = _get_general_instructions(metadata_snapshot)
 

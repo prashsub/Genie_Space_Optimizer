@@ -4536,6 +4536,28 @@ def _run_lever_loop(
     except Exception:
         logger.warning("Instruction restructuring failed — continuing with existing format", exc_info=True)
 
+    # ── Phase 1.6: Snapshot user-authored instruction sections ────────
+    # Capture the instruction sections AFTER restructuring but BEFORE any
+    # lever patches.  This snapshot is the user's ground truth — the
+    # optimizer must never generate content that contradicts it.
+    _original_instruction_sections: dict[str, list[str]] = {}
+    try:
+        from genie_space_optimizer.optimization.applier import _get_general_instructions
+        from genie_space_optimizer.optimization.optimizer import _ensure_structured
+        _pre_loop_instr = _get_general_instructions(metadata_snapshot)
+        if _pre_loop_instr and _pre_loop_instr.strip():
+            _original_instruction_sections = _ensure_structured(
+                _pre_loop_instr, metadata_snapshot, w=w,
+            )
+            metadata_snapshot["_original_instruction_sections"] = _original_instruction_sections
+            logger.info(
+                "Snapshotted %d user-authored instruction section(s): %s",
+                len(_original_instruction_sections),
+                list(_original_instruction_sections.keys()),
+            )
+    except Exception:
+        logger.warning("Could not snapshot original instruction sections", exc_info=True)
+
     # ── Phase 2: Pre-Loop Setup ──
     _pls_lines = [_section("LEVER LOOP — PRE-LOOP SETUP", "-")]
     print("\n".join(_pls_lines))
@@ -5063,6 +5085,8 @@ def _run_lever_loop(
                     if _tvf_apply_log.get("patch_deployed", False):
                         logger.info("TVF %s removed successfully (tier=%s)", _tvf_id, _esc_tier)
                         metadata_snapshot = _tvf_apply_log.get("post_snapshot", metadata_snapshot)
+                        if _original_instruction_sections:
+                            metadata_snapshot["_original_instruction_sections"] = _original_instruction_sections
                     else:
                         logger.warning(
                             "TVF removal patch deploy failed: %s",
@@ -5559,6 +5583,8 @@ def _run_lever_loop(
         )
 
         metadata_snapshot = apply_log.get("post_snapshot", metadata_snapshot)
+        if _original_instruction_sections:
+            metadata_snapshot["_original_instruction_sections"] = _original_instruction_sections
 
         # ── Mine execution-proven joins from latest eval rows ────────
         try:

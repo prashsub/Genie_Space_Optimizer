@@ -1190,6 +1190,31 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
             return True
         if op == "rewrite":
             text = cmd.get("new_text", "")
+            _orig_sections = config.get("_original_instruction_sections")
+            if _orig_sections and isinstance(_orig_sections, dict) and text:
+                try:
+                    from genie_space_optimizer.optimization.optimizer import (
+                        _detect_instruction_contradictions,
+                        _ensure_structured,
+                    )
+                    _proposed_secs = _ensure_structured(text, config)
+                    _contradictions = _detect_instruction_contradictions(
+                        _orig_sections, _proposed_secs,
+                    )
+                    if _contradictions:
+                        for _c in _contradictions:
+                            logger.warning(
+                                "Applier safety net: stripping contradictory line "
+                                "from rewrite: '%s' (contradicts '%s')",
+                                _c["proposed_line"][:100],
+                                _c["original_rule"][:100],
+                            )
+                            text = text.replace(_c["proposed_line"], "").strip()
+                except Exception:
+                    logger.debug(
+                        "Applier contradiction check failed — proceeding with rewrite",
+                        exc_info=True,
+                    )
             _set_general_instructions(config, normalize_instructions(text))
             return True
 
