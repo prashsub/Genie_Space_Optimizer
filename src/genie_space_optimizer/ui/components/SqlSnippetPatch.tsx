@@ -8,6 +8,23 @@ const TYPE_LABELS: Record<string, { label: string; className: string }> = {
   expressions: { label: "Dimension", className: "bg-purple-100 text-purple-800" },
 };
 
+const PATCH_TYPE_TO_SNIPPET: Record<string, { snippetType: string; op: string }> = {
+  add_sql_snippet_measure: { snippetType: "measures", op: "add" },
+  update_sql_snippet_measure: { snippetType: "measures", op: "update" },
+  remove_sql_snippet_measure: { snippetType: "measures", op: "remove" },
+  add_sql_snippet_filter: { snippetType: "filters", op: "add" },
+  update_sql_snippet_filter: { snippetType: "filters", op: "update" },
+  remove_sql_snippet_filter: { snippetType: "filters", op: "remove" },
+  add_sql_snippet_expression: { snippetType: "expressions", op: "add" },
+  update_sql_snippet_expression: { snippetType: "expressions", op: "update" },
+  remove_sql_snippet_expression: { snippetType: "expressions", op: "remove" },
+  proactive_sql_expression: { snippetType: "measures", op: "add" },
+};
+
+function inferFromPatchType(pt: string): { snippetType: string; op: string } {
+  return PATCH_TYPE_TO_SNIPPET[pt] ?? { snippetType: "unknown", op: "add" };
+}
+
 export function SqlSnippetPatch({ patch }: SqlSnippetPatchProps) {
   let command: Record<string, unknown> = {};
   try {
@@ -19,17 +36,31 @@ export function SqlSnippetPatch({ patch }: SqlSnippetPatchProps) {
     command = {};
   }
 
+  const patchData =
+    typeof patch.patch === "object" && patch.patch
+      ? (patch.patch as Record<string, unknown>)
+      : {};
+
+  const pt = String(patch.patchType || patch.type || patch.action_type || "");
+  const inferred = inferFromPatchType(pt);
+
   const snippet =
     (command.snippet as Record<string, unknown>) ||
     (patch.sql_snippet as Record<string, unknown>) ||
-    (patch.patch as Record<string, unknown>) ||
+    (patchData.sql_snippet as Record<string, unknown>) ||
+    patchData ||
     {};
+
   const snippetType =
-    (command.snippet_type as string) || (patch.snippet_type as string) || "unknown";
-  const op = (command.op as string) || "add";
+    (command.snippet_type as string) ||
+    (patch.snippet_type as string) ||
+    (patchData.snippet_type as string) ||
+    inferred.snippetType;
+
+  const op = (command.op as string) || inferred.op;
 
   const displayName =
-    (snippet.display_name as string) || (snippet.alias as string) || "Unnamed";
+    (snippet.display_name as string) || (snippet.alias as string) || (patchData.display_name as string) || "";
   const sql = Array.isArray(snippet.sql)
     ? (snippet.sql as string[]).join("\n")
     : (snippet.sql as string) || "";
@@ -44,6 +75,7 @@ export function SqlSnippetPatch({ patch }: SqlSnippetPatchProps) {
   };
   const opLabel =
     op === "add" ? "Add" : op === "update" ? "Update" : op === "remove" ? "Remove" : op;
+  const target = String(patch.targetObject || "");
 
   return (
     <div className="space-y-2 rounded border bg-white p-3 text-xs">
@@ -54,8 +86,11 @@ export function SqlSnippetPatch({ patch }: SqlSnippetPatchProps) {
           {typeInfo.label}
         </span>
         <span className="font-medium">
-          {opLabel}: {displayName}
+          {opLabel}{displayName ? `: ${displayName}` : ""}
         </span>
+        {target && !displayName && (
+          <span className="text-muted">{target}</span>
+        )}
       </div>
 
       {sql && (

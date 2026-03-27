@@ -257,15 +257,20 @@ BENCHMARK_GENERATION_PROMPT = (
     '\n'
     '## Question-SQL Alignment\n'
     '- expected_sql MUST answer EXACTLY what the question asks — no more, no less.\n'
-    '- Do NOT add WHERE filters the question does not mention.\n'
     '- Do NOT add extra columns beyond what the question asks for.\n'
     '- Do NOT add JOINs that only serve to add unrequested columns.\n'
-    '- If the question is ambiguous about a filter, do NOT assume one.\n'
-    '- If the Genie Space Instructions specify a default filter (e.g., same-store only, '
-    'active status), and you include that filter in the SQL, you MUST mention it in the '
-    'question text so the question and SQL stay aligned. Example: instead of '
-    '"What are the KPIs by zone?" with WHERE is_same_store = \'Y\', write '
-    '"What are the same-store KPIs by zone?"\n'
+    '- If the question is ambiguous about a filter, do NOT assume one UNLESS the Genie '
+    'Space Instructions mandate it as a default.\n'
+    '\n'
+    '## CRITICAL: Instruction-Mandated Default Filters\n'
+    'The Genie Space Instructions section above may define default filters (e.g. '
+    '"Default filter: same_store_7now = Y for all PSD queries"). These are MANDATORY:\n'
+    '- EVERY benchmark SQL that falls under the scope of a default filter MUST include '
+    'that filter in its WHERE clause. Omitting it produces incorrect ground truth.\n'
+    '- The question text MUST reflect the default filter so question and SQL stay aligned. '
+    'Example: instead of "What are the PSD KPIs by zone?" with WHERE same_store_7now = \'Y\', '
+    'write "What are the same-store PSD KPIs by zone?"\n'
+    '- Do NOT add filters that are neither mentioned in the question NOR mandated by instructions.\n'
     '\n'
     '## Minimal SQL Principle\n'
     'Write the simplest correct SQL. Prefer fewer columns and filters. '
@@ -410,13 +415,20 @@ CURATED_SQL_GENERATION_PROMPT = (
     '\n'
     '- The SQL must answer EXACTLY what the question asks — no more, no less.\n'
     '- Use only columns from the Column Allowlist.\n'
-    '- Follow the Genie Space Instructions for default filters, business definitions, '
-    'and measure semantics. If instructions say to apply a filter by default, include it.\n'
     '- Metric views: use MEASURE() syntax for aggregates in SELECT/ORDER BY.\n'
     '- Multi-table queries: use Join Specifications for valid join paths.\n'
     '- Data Profile: use realistic filter values from the profile.\n'
     '- If a question truly cannot be answered with the available assets, set expected_sql '
     'to null with unfixable_reason explaining why.\n'
+    '\n'
+    '## CRITICAL: Instruction-Mandated Default Filters\n'
+    'The Genie Space Instructions above define the business rules for this space, including '
+    'default filters. These instructions are the SOURCE OF TRUTH.\n'
+    '- If instructions say "Default filter: X = Y for all Z queries", EVERY SQL for Z-type '
+    'questions MUST include WHERE X = Y. Omitting an instruction-mandated default filter '
+    'produces incorrect ground truth that will penalize Genie for correct behavior.\n'
+    '- Only omit a default filter if the question EXPLICITLY asks to exclude it '
+    '(e.g. "including non-same-store locations").\n'
     '</instructions>\n'
     '\n'
     '<output_schema>\n'
@@ -3282,6 +3294,8 @@ improve the identified questions.  Choose the most appropriate type:
 ```
 
 Rules:
+- ALL column references MUST use table_name.column_name syntax (e.g. `mv_sales.revenue`, \
+NOT bare `revenue`). The Genie API rejects bare column names.
 - The SQL MUST reference only tables and columns that exist in the schema.
 - For measures: SQL must be a valid aggregation expression (SUM, COUNT, AVG, etc.).
 - For filters: SQL must evaluate to a boolean.
@@ -3322,15 +3336,20 @@ size = ...".  These become snippet_type="measure".
 These become snippet_type="expression".
 
 Rules:
+- ALL column references MUST use table_name.column_name syntax \
+(e.g. `mv_7now_fact_sales.same_store_7now = 'Y'`, NOT bare `same_store_7now = 'Y'`). \
+The Genie API rejects bare column names. Use the Table Schema to determine the correct table prefix.
 - SQL must reference ONLY columns that exist in the Table Schema.
-- For filters: SQL must be a valid boolean expression (e.g. `same_store_7now = 'Y'`).
-- For measures: SQL must be a valid aggregation (e.g. `SUM(cy_sales) - SUM(py_sales)`).
+- For filters: SQL must be a valid boolean expression.
+- For measures: SQL must be a valid aggregation (e.g. `SUM(mv_sales.cy_sales) - SUM(mv_sales.py_sales)`).
 - For expressions: SQL must produce a scalar per row.
 - Do NOT wrap in SELECT or WHERE — raw expression only.
 - Do NOT duplicate any Existing SQL Expression.
-- Set is_default=true if the instruction says to apply this by default.
+- is_default=true means the instruction says to apply this filter BY DEFAULT (Genie SHOULD \
+include it automatically). Do NOT invert the logic — if the instruction says "Default filter: \
+X = Y for all Z queries", then is_default=true and the SQL is `table.X = 'Y'`.
 - Set omit_when to describe when the filter should NOT be applied \
-(e.g. "user explicitly asks for all stores").
+(e.g. "user explicitly asks for all stores including non-same-store").
 </instructions>
 
 <output_schema>

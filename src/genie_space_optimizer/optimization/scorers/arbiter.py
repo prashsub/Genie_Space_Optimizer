@@ -55,9 +55,17 @@ def _make_arbiter_scorer(
     if instruction_context:
         _trimmed = instruction_context[:2000]
         _instruction_note = (
-            "\nGENIE SPACE INSTRUCTIONS (these define the business rules for this space — "
-            "treat mandated default filters as correct behavior, not over-filtering):\n"
+            "\nGENIE SPACE INSTRUCTIONS (SOURCE OF TRUTH for this space's business rules):\n"
             f"{_trimmed}\n\n"
+            "CRITICAL RULE FOR DEFAULT FILTERS: If the instructions above define a DEFAULT "
+            "FILTER (e.g. 'Default filter: same_store_7now = Y for all PSD queries'), then:\n"
+            "- Genie is CORRECT to include that filter even if the question does not "
+            "explicitly mention it — the filter is mandated by the space's business rules.\n"
+            "- Ground Truth is WRONG if it omits a mandated default filter.\n"
+            "- Verdict MUST be genie_correct (not ground_truth_correct or neither_correct) "
+            "when GT lacks a filter that the instructions mandate by default.\n"
+            "- Do NOT penalize Genie for 'over-filtering' when the filter matches an "
+            "instruction-defined default.\n\n"
         )
 
     @scorer

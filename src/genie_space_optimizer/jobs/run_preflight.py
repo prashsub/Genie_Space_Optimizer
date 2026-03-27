@@ -553,6 +553,7 @@ dbutils.jobs.taskValues.set(key="deploy_target", value=deploy_target or "")
 dbutils.jobs.taskValues.set(key="warehouse_id", value=warehouse_id)
 dbutils.jobs.taskValues.set(key="triggered_by", value=triggered_by)
 dbutils.jobs.taskValues.set(key="human_corrections", value=json.dumps(preflight_out.get("human_corrections", []), default=str))
+dbutils.jobs.taskValues.set(key="max_benchmark_count", value=effective_max)
 
 _log(
     "Task values published",

@@ -882,6 +882,59 @@ def _extract_primary_table(sql: str, metadata_snapshot: dict) -> str | None:
     return None
 
 
+def _auto_prefix_bare_columns(
+    sql: str,
+    table_identifier: str,
+    metadata_snapshot: dict,
+) -> str:
+    """Add table prefix to bare column references in a SQL snippet.
+
+    The Genie API requires ``table.column`` syntax in SQL expressions.
+    This function detects bare column names (those not already prefixed
+    with ``table.``) and prepends the short table name.
+
+    Returns the SQL with prefixed columns (original SQL unchanged if
+    all columns are already qualified or no columns are recognized).
+    """
+    import re as _re
+
+    ds = metadata_snapshot.get("data_sources", {})
+    tables = ds.get("tables", []) if isinstance(ds, dict) else []
+
+    short_name = table_identifier.split(".")[-1] if table_identifier else ""
+    if not short_name:
+        return sql
+
+    column_names: set[str] = set()
+    for t in (tables if isinstance(tables, list) else []):
+        tid = (t.get("identifier") or t.get("name") or "").lower()
+        if short_name.lower() in tid:
+            for col in t.get("columns", []):
+                cname = (col.get("name") or "").strip()
+                if cname:
+                    column_names.add(cname.lower())
+            break
+
+    if not column_names:
+        return sql
+
+    result = sql
+    for col in sorted(column_names, key=len, reverse=True):
+        pattern = _re.compile(
+            r'(?<![.\w])(' + _re.escape(col) + r')(?!\w)',
+            _re.IGNORECASE,
+        )
+        def _replacer(m: _re.Match) -> str:
+            start = m.start()
+            prefix_check = result[:start]
+            if prefix_check.rstrip().endswith("."):
+                return m.group(0)
+            return f"{short_name}.{m.group(1)}"
+        result = pattern.sub(_replacer, result)
+
+    return result
+
+
 def validate_sql_snippet(
     sql: str,
     snippet_type: str,
@@ -916,6 +969,8 @@ def validate_sql_snippet(
         if "." not in table else table,
         catalog=catalog, gold_schema=gold_schema,
     )
+
+    sql = _auto_prefix_bare_columns(sql, table, metadata_snapshot)
 
     if snippet_type == "filter":
         wrapped = f"SELECT 1 FROM {resolved_table} WHERE {sql} LIMIT 1"

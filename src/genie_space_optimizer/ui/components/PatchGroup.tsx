@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { SqlSnippetPatch } from "@/components/SqlSnippetPatch";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 
 interface PatchItem {
   patchType?: string;
@@ -20,6 +20,23 @@ interface PatchItem {
 interface PatchGroupProps {
   patches: PatchItem[];
   maxCollapsed?: number;
+}
+
+function parseCommand(raw: unknown): Record<string, unknown> {
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null) return parsed;
+      if (typeof parsed === "string") {
+        const inner = JSON.parse(parsed);
+        if (typeof inner === "object" && inner !== null) return inner;
+      }
+    } catch { /* not JSON */ }
+  }
+  return {};
 }
 
 const PATCH_TYPE_LABELS: Record<string, { label: string; className: string }> = {
@@ -105,13 +122,11 @@ function PatchInlineRenderer({ patch }: { patch: PatchItem }) {
   }
 
   if (pt === "add_example_sql" || pt === "update_example_sql" || pt === "proactive_example_sql") {
-    const cmd = typeof patch.command === "object" && patch.command
-      ? (patch.command as Record<string, unknown>)
-      : {};
+    const cmd = parseCommand(patch.command);
     const patchData = typeof patch.patch === "object" && patch.patch
       ? (patch.patch as Record<string, unknown>)
       : {};
-    const question = String(cmd.example_question || patchData.question || patchData.example_question || "").slice(0, 100);
+    const question = String(cmd.example_question || cmd.question || patchData.question || patchData.example_question || "").slice(0, 100);
     return (
       <span className="text-xs text-muted">
         {question ? `"${question}"` : target}
@@ -120,15 +135,7 @@ function PatchInlineRenderer({ patch }: { patch: PatchItem }) {
   }
 
   if (pt === "add_instruction" || pt === "update_instruction" || pt === "rewrite_instruction") {
-    const cmd = typeof patch.command === "object" && patch.command
-      ? (patch.command as Record<string, unknown>)
-      : {};
-    const preview = String(cmd.instruction_text || cmd.new_text || "").slice(0, 120);
-    return (
-      <span className="text-xs text-muted">
-        {preview ? `${preview}${preview.length >= 120 ? "…" : ""}` : target}
-      </span>
-    );
+    return <InstructionPatchInline patch={patch} target={target} />;
   }
 
   if (pt === "update_column_description" || pt === "add_column_synonym") {
@@ -153,6 +160,64 @@ function PatchInlineRenderer({ patch }: { patch: PatchItem }) {
   }
 
   return null;
+}
+
+function InstructionPatchInline({ patch, target }: { patch: PatchItem; target: string }) {
+  const [showDetail, setShowDetail] = useState(false);
+  const cmd = parseCommand(patch.command);
+  const patchData = typeof patch.patch === "object" && patch.patch
+    ? (patch.patch as Record<string, unknown>)
+    : {};
+  const newText = String(cmd.new_text || patchData.new_text || cmd.instruction_text || "");
+  const oldText = String(cmd.old_text || patchData.old_text || patchData.old_value || "");
+  const pt = getPatchType(patch);
+  const isRewrite = pt === "rewrite_instruction";
+  const preview = newText.slice(0, 140);
+
+  if (!newText && !oldText) {
+    return (
+      <span className="text-xs text-muted">
+        {target || "instruction change"}
+      </span>
+    );
+  }
+
+  return (
+    <div className="flex-1 text-xs">
+      <div className="flex items-start gap-1">
+        <button
+          type="button"
+          className="mt-0.5 shrink-0 text-muted/50 hover:text-muted"
+          onClick={(e) => { e.stopPropagation(); setShowDetail((v) => !v); }}
+        >
+          {showDetail
+            ? <ChevronDown className="h-3 w-3" />
+            : <ChevronRight className="h-3 w-3" />}
+        </button>
+        <span className="text-muted">
+          {preview}{preview.length >= 140 ? "…" : ""}
+        </span>
+      </div>
+      {showDetail && (
+        <div className="mt-1.5 ml-4 space-y-1.5">
+          {isRewrite && oldText && (
+            <div className="rounded border border-red-200 bg-red-50/50 px-2 py-1.5">
+              <p className="mb-0.5 text-[10px] font-medium text-red-600">Old instruction</p>
+              <p className="whitespace-pre-wrap text-[11px] leading-relaxed text-muted">{oldText}</p>
+            </div>
+          )}
+          {newText && (
+            <div className="rounded border border-green-200 bg-green-50/50 px-2 py-1.5">
+              <p className="mb-0.5 text-[10px] font-medium text-green-600">
+                {isRewrite ? "New instruction" : "Instruction"}
+              </p>
+              <p className="whitespace-pre-wrap text-[11px] leading-relaxed text-muted">{newText}</p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function PatchDetailRenderer({ patch }: { patch: PatchItem }) {

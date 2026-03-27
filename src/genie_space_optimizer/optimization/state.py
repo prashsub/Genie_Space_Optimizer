@@ -709,11 +709,11 @@ def write_patch(
 
     command = patch_record.get("command")
     if command is not None:
-        row["command_json"] = json.dumps(command)
+        row["command_json"] = command if isinstance(command, str) else json.dumps(command)
 
     rollback = patch_record.get("rollback")
     if rollback is not None:
-        row["rollback_json"] = json.dumps(rollback)
+        row["rollback_json"] = rollback if isinstance(rollback, str) else json.dumps(rollback)
 
     proposal_id = patch_record.get("proposal_id")
     if proposal_id is not None:
@@ -862,17 +862,21 @@ def update_provenance_proposals(
     catalog: str,
     schema: str,
 ) -> None:
-    """Backfill ``proposal_id`` and ``patch_type`` into provenance rows."""
+    """Backfill ``proposal_id``, ``patch_type``, and ``lever`` into provenance rows."""
     fqn = _fqn(catalog, schema, TABLE_PROVENANCE)
     for m in proposal_mappings:
         cid = (m.get("cluster_id") or "").replace("'", "''")
         pid = (m.get("proposal_id") or "").replace("'", "''")
         pt = (m.get("patch_type") or "").replace("'", "''")
+        lever = m.get("lever")
         if not cid:
             continue
         try:
+            set_clause = f"proposal_id = '{pid}', patch_type = '{pt}'"
+            if lever is not None:
+                set_clause += f", lever = {int(lever)}"
             spark.sql(
-                f"UPDATE {fqn} SET proposal_id = '{pid}', patch_type = '{pt}' "
+                f"UPDATE {fqn} SET {set_clause} "
                 f"WHERE run_id = '{run_id}' AND iteration = {iteration} AND cluster_id = '{cid}'"
             )
         except Exception:

@@ -47,6 +47,7 @@ from genie_space_optimizer.common.config import (
     INLINE_EVAL_DELAY,
     INSTRUCTION_PROMPT_NAME_TEMPLATE,
     LEVER_NAMES,
+    MAX_BENCHMARK_COUNT,
     MAX_ITERATIONS,
     MAX_NOISE_FLOOR,
     NEITHER_CORRECT_QUARANTINE_THRESHOLD,
@@ -407,6 +408,7 @@ def baseline_run_evaluation(
     setup_ctx: dict,
     w: WorkspaceClient | None = None,
     model_creation_kwargs: dict | None = None,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> dict:
     """Sub-step 2b: Run 9-judge evaluation with retry."""
     _ensure_sql_context(spark, catalog, schema)
@@ -419,6 +421,7 @@ def baseline_run_evaluation(
         spark=spark, w=w, catalog=catalog, gold_schema=schema,
         uc_schema=f"{catalog}.{schema}",
         model_creation_kwargs=model_creation_kwargs,
+        max_benchmark_count=max_benchmark_count,
     )
     return eval_result
 
@@ -3773,6 +3776,7 @@ def _run_gate_checks(
     noise_floor: float,
     affected_question_ids: set[str] | None = None,
     lever_keys: list[str] | None = None,
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> dict:
     """Run slice → P0 → full eval gate sequence for an action group.
 
@@ -3853,6 +3857,7 @@ def _run_gate_checks(
             spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
             patched_objects=patched_objects,
             reference_sqls=reference_sqls if reference_sqls else None,
+            max_benchmark_count=max_benchmark_count,
         )
         slice_scores = slice_result.get("scores", {})
         slice_accuracy = slice_result.get("overall_accuracy", 0.0)
@@ -3929,6 +3934,7 @@ def _run_gate_checks(
             predict_fn, scorers,
             spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
             reference_sqls=reference_sqls if reference_sqls else None,
+            max_benchmark_count=max_benchmark_count,
         )
         try:
             write_iteration(
@@ -3982,6 +3988,7 @@ def _run_gate_checks(
         spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
         reference_sqls=reference_sqls if reference_sqls else None,
         model_creation_kwargs=_model_kwargs,
+        max_benchmark_count=max_benchmark_count,
     )
     new_model_id = full_result_1.get("model_id", "")
 
@@ -4007,6 +4014,7 @@ def _run_gate_checks(
             predict_fn, scorers,
             spark=spark, w=w, catalog=catalog, gold_schema=schema, uc_schema=uc_schema,
             reference_sqls=reference_sqls if reference_sqls else None,
+            max_benchmark_count=max_benchmark_count,
         )
         scores_2 = full_result_2.get("scores", {})
         accuracy_2 = full_result_2.get("overall_accuracy", 0.0)
@@ -4181,6 +4189,7 @@ def _run_lever_loop(
     human_corrections: list[dict] | None = None,
     enrichment_done: bool = False,
     enrichment_model_id: str = "",
+    max_benchmark_count: int = MAX_BENCHMARK_COUNT,
 ) -> dict:
     """Stage 3: Iterate levers with convergence checking.
 
@@ -5152,7 +5161,7 @@ def _run_lever_loop(
         print("\n".join(_prov_patch_lines))
 
         _prop_mappings = [
-            {"cluster_id": p.get("cluster_id"), "proposal_id": p.get("proposal_id"), "patch_type": p.get("patch_type")}
+            {"cluster_id": p.get("cluster_id"), "proposal_id": p.get("proposal_id"), "patch_type": p.get("patch_type"), "lever": p.get("lever")}
             for p in all_proposals if p.get("cluster_id")
         ]
         try:
@@ -5307,6 +5316,7 @@ def _run_lever_loop(
             noise_floor=noise_floor,
             affected_question_ids=set(ag.get("affected_questions", [])),
             lever_keys=lever_keys,
+            max_benchmark_count=max_benchmark_count,
         )
 
         # ── 3B.7: Accept or rollback ────────────────────────────────
@@ -6115,6 +6125,23 @@ def _run_finalize(
                 all_failure_question_ids.extend(
                     qid for qid in _persistent_qids if qid not in set(all_failure_question_ids)
                 )
+
+            # Resolve stale flags for questions that now pass in the latest evaluation
+            _PASSING_VERDICTS = {"both_correct", "genie_correct"}
+            _now_passing: set[str] = set()
+            for _qid, _entries in _verdict_history.items():
+                if _entries and _entries[-1].verdict in _PASSING_VERDICTS:
+                    _now_passing.add(_qid)
+            _still_failing = {item["question_id"] for item in _persistent_items} if _persistent_items else set()
+            _resolve_candidates = _now_passing - _still_failing
+            if _resolve_candidates:
+                try:
+                    from genie_space_optimizer.optimization.labeling import resolve_stale_flags
+                    _resolved = resolve_stale_flags(spark, catalog, schema, domain, _resolve_candidates)
+                    if _resolved:
+                        logger.info("Resolved %d stale flag(s) for now-passing questions", _resolved)
+                except Exception:
+                    logger.debug("Failed to resolve stale flags", exc_info=True)
 
             _session_trace_ids = [
                 question_trace_map[qid][-1]

@@ -54,6 +54,13 @@ interface InsightTabsProps {
 
 type QuestionFilter = "all" | "failing" | "fixed" | "regressed" | "persistent";
 
+function questionPassed(r: QuestionResult | undefined): boolean {
+  if (!r) return false;
+  const arbiter = r.judgeVerdicts?.arbiter;
+  if (arbiter === "both_correct" || arbiter === "genie_correct") return true;
+  return r.resultCorrectness === "yes" || r.resultCorrectness === "pass";
+}
+
 export type FlagCategory = "persistence" | "tvf_removal" | "strategist" | "other";
 
 export function categorizeFlagReason(reason: string): FlagCategory {
@@ -386,7 +393,7 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
 
     for (const [, data] of qMap) {
       const allFail = Array.from(data.results.values()).every(
-        (r) => r.resultCorrectness !== "yes" && r.resultCorrectness !== "pass",
+        (r) => !questionPassed(r),
       );
       data.persistentFail = allFail && data.results.size > 1;
     }
@@ -405,15 +412,13 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
     return entries.filter(([, data]) => {
       const baseResult = data.results.get(0);
       const finalResult = data.results.get(final?.iteration ?? 0);
-      const basePassed =
-        baseResult?.resultCorrectness === "yes" || baseResult?.resultCorrectness === "pass";
-      const finalPassed =
-        finalResult?.resultCorrectness === "yes" || finalResult?.resultCorrectness === "pass";
+      const basePassed = questionPassed(baseResult);
+      const finalPassed = questionPassed(finalResult);
 
       if (filter === "failing") return !finalPassed;
       if (filter === "fixed") return !basePassed && finalPassed;
       if (filter === "regressed") return basePassed && !finalPassed;
-      if (filter === "persistent") return data.persistentFail || data.flagged;
+      if (filter === "persistent") return data.persistentFail || (data.flagged && !finalPassed);
       return true;
     });
   }, [questionJourney, filter, detail.iterations]);
@@ -464,8 +469,7 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
                   {iters.map((it) => {
                     const r = data.results.get(it);
                     if (!r) return <TableCell key={it} className="text-center text-xs">—</TableCell>;
-                    const passed =
-                      r.resultCorrectness === "yes" || r.resultCorrectness === "pass";
+                    const passed = questionPassed(r);
                     return (
                       <TableCell key={it} className="text-center">
                         {passed ? (
@@ -483,7 +487,7 @@ function QuestionsTab({ detail }: { detail: IterationDetailResponse }) {
                           Persistent
                         </Badge>
                       )}
-                      {data.flagInfo && (
+                      {data.flagInfo && !questionPassed(data.results.get(iters[iters.length - 1])) && (
                         <TooltipProvider>
                           <Tooltip>
                             <TooltipTrigger asChild>

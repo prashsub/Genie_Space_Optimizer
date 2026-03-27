@@ -2775,16 +2775,15 @@ def _run_evaluate_with_retries(
 
     attempts: list[dict[str, Any]] = []
     initial_workers = os.getenv("MLFLOW_GENAI_EVAL_MAX_WORKERS")
+    initial_scorer_workers = os.getenv("MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS")
     initial_skip_validation = os.getenv("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION")
     os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = "True"
+    os.environ["MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS"] = "10"
 
     try:
         for attempt in range(1, max(1, EVAL_MAX_ATTEMPTS) + 1):
-            workers = initial_workers if attempt == 1 else EVAL_SINGLE_WORKER_FALLBACK
-            if workers is None:
-                os.environ.pop("MLFLOW_GENAI_EVAL_MAX_WORKERS", None)
-            else:
-                os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = workers
+            workers = "1" if attempt == 1 else EVAL_SINGLE_WORKER_FALLBACK
+            os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = workers
 
             try:
                 result = mlflow.genai.evaluate(**evaluate_kwargs)
@@ -2825,6 +2824,10 @@ def _run_evaluate_with_retries(
             os.environ.pop("MLFLOW_GENAI_EVAL_MAX_WORKERS", None)
         else:
             os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = initial_workers
+        if initial_scorer_workers is None:
+            os.environ.pop("MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS", None)
+        else:
+            os.environ["MLFLOW_GENAI_EVAL_MAX_SCORER_WORKERS"] = initial_scorer_workers
         if initial_skip_validation is None:
             os.environ.pop("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION", None)
         else:
@@ -5568,6 +5571,65 @@ def _generate_sql_for_curated_questions(
     return enriched
 
 
+def _enforce_instruction_default_filters_on_benchmarks(
+    benchmarks: list[dict],
+    config: dict,
+) -> int:
+    """Ensure benchmarks include instruction-mandated default filters in their SQL.
+
+    Reads default filter rules from the Genie Space instructions and checks
+    each benchmark's ``expected_sql``. If a benchmark's SQL is missing a
+    mandated filter, appends it to the WHERE clause.
+
+    Returns the count of benchmarks patched.
+    """
+    try:
+        from genie_space_optimizer.optimization.optimizer import (
+            _extract_instruction_default_filters,
+        )
+    except ImportError:
+        return 0
+
+    parsed_space = config.get("_parsed_space", config)
+    default_filters = _extract_instruction_default_filters(parsed_space)
+    if not default_filters:
+        return 0
+
+    patched = 0
+    for b in benchmarks:
+        sql = b.get("expected_sql", "")
+        if not sql or not sql.strip():
+            continue
+        sql_lower = sql.lower()
+        for df in default_filters:
+            col = df["column"]
+            val = df["value"]
+            if col.lower() in sql_lower:
+                continue
+            if "where" in sql_lower:
+                sql = re.sub(
+                    r"(?i)\bWHERE\b",
+                    f"WHERE {col} = '{val}' AND",
+                    sql,
+                    count=1,
+                )
+            else:
+                group_match = re.search(r"(?i)\b(GROUP\s+BY|ORDER\s+BY|LIMIT)\b", sql)
+                if group_match:
+                    pos = group_match.start()
+                    sql = sql[:pos] + f"WHERE {col} = '{val}' " + sql[pos:]
+                else:
+                    sql = sql.rstrip().rstrip(";") + f" WHERE {col} = '{val}'"
+            b["expected_sql"] = sql
+            b["_instruction_filter_patched"] = True
+            patched += 1
+            logger.info(
+                "Added instruction-mandated filter '%s=%s' to benchmark: %s",
+                col, val, b.get("question", "")[:80],
+            )
+    return patched
+
+
 def generate_benchmarks(
     w: WorkspaceClient,
     config: dict,
@@ -6060,6 +6122,17 @@ def generate_benchmarks(
                 "validation_error": b.get("validation_error"),
                 "correction_source": "",
             }
+        )
+
+    # ── Post-generation: enforce instruction-mandated default filters ──
+    _filter_patched = _enforce_instruction_default_filters_on_benchmarks(
+        all_benchmarks, config,
+    )
+    if _filter_patched:
+        logger.info(
+            "Post-generation filter enforcement: patched %d benchmark(s) "
+            "with instruction-mandated default filters",
+            _filter_patched,
         )
 
     from genie_space_optimizer.optimization.benchmarks import assign_splits

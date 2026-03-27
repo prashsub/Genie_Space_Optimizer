@@ -508,8 +508,9 @@ def _extract_instruction_default_filters(
     instr = metadata_snapshot.get("instructions", {})
     sql_snippets = instr.get("sql_snippets", {}) if isinstance(instr, dict) else {}
     for f_item in sql_snippets.get("filters", []):
-        sql = f_item.get("sql", "")
-        eq_match = re.match(r"(\w+)\s*=\s*['\"]?(\w+)", sql.strip())
+        sql_raw = f_item.get("sql", "")
+        sql = "".join(str(s) for s in sql_raw).strip() if isinstance(sql_raw, list) else str(sql_raw).strip()
+        eq_match = re.match(r"(\w+)\s*=\s*['\"]?(\w+)", sql)
         if eq_match:
             filters.append({
                 "column": eq_match.group(1).lower(),
@@ -7413,7 +7414,8 @@ def _convert_instructions_to_sql_expressions(
     existing_strs: list[str] = []
     for category in ("measures", "filters", "expressions"):
         for item in existing_snippets.get(category, []):
-            sql_str = item.get("sql", "")
+            sql_raw = item.get("sql", "")
+            sql_str = "".join(str(s) for s in sql_raw).strip() if isinstance(sql_raw, list) else str(sql_raw).strip()
             if sql_str:
                 existing_strs.append(f"{category}: {sql_str}")
     existing_text = "\n".join(existing_strs) if existing_strs else "(none)"

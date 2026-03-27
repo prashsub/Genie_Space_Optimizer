@@ -2278,7 +2278,10 @@ def get_iteration_detail(run_id: str, config: Dependencies.Config):
     domain = run_data.get("domain", run_data.get("space_id", ""))
     try:
         from genie_space_optimizer.optimization.labeling import get_flagged_questions
-        flagged = get_flagged_questions(spark, config.catalog, config.schema_name, domain)
+        flagged = get_flagged_questions(
+            spark, config.catalog, config.schema_name, domain,
+            run_id=run_id,
+        )
     except Exception:
         logger.debug("Could not load flagged questions for iteration detail", exc_info=True)
 
