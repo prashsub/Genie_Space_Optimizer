@@ -5432,6 +5432,15 @@ def _run_lever_loop(
                 if ft and tgt:
                     tried_patches.add((ft, tgt))
             _lever_frozenset = frozenset(int(lk) for lk in lever_keys)
+            _consecutive_rb_count = 0
+            for _rb_entry in reversed(reflection_buffer):
+                if _rb_entry.get("escalation_handled"):
+                    continue
+                if not _rb_entry.get("accepted"):
+                    _consecutive_rb_count += 1
+                else:
+                    break
+            _should_mark_tried = _consecutive_rb_count >= CONSECUTIVE_ROLLBACK_LIMIT - 1
             source_cids = set(ag.get("source_cluster_ids", []))
             for c in clusters:
                 cid = c.get("cluster_id", "")
@@ -5439,9 +5448,15 @@ def _run_lever_loop(
                     continue
                 rc_ft = c.get("asi_failure_type") or c.get("root_cause", "other")
                 rc_blame = c.get("asi_blame_set") or ""
-                if rc_ft:
+                if rc_ft and _should_mark_tried:
                     tried_root_causes.add((rc_ft, rc_blame))
                     tried_root_causes.add((rc_ft, rc_blame, _lever_frozenset))
+            if not _should_mark_tried:
+                logger.info(
+                    "Rollback %d/%d — keeping cluster available for retry "
+                    "(root causes NOT marked as tried)",
+                    _consecutive_rb_count, CONSECUTIVE_ROLLBACK_LIMIT,
+                )
             continue
 
         # ── Accept action group ──────────────────────────────────────

@@ -38,7 +38,7 @@ DEFAULT_THRESHOLDS = {
     "completeness": 90.0,
     "response_quality": 0.0,
     "result_correctness": 85.0,
-    "asset_routing": 95.0,
+    "asset_routing": 85.0,
 }
 
 REPEATABILITY_TARGET = 90.0
@@ -51,7 +51,7 @@ MLFLOW_THRESHOLDS = {
     "completeness/mean": 0.90,
     "response_quality/mean": 0.0,
     "result_correctness/mean": 0.85,
-    "asset_routing/mean": 0.95,
+    "asset_routing/mean": 0.85,
 }
 
 # ── 2. Rate Limits and Timing ──────────────────────────────────────────
@@ -83,9 +83,11 @@ SLICE_GATE_MIN_REDUCTION = 0.5
 REGRESSION_THRESHOLD = 5.0
 MAX_NOISE_FLOOR = 5.0
 PLATEAU_ITERATIONS = 2
-CONSECUTIVE_ROLLBACK_LIMIT = 2
+CONSECUTIVE_ROLLBACK_LIMIT = 3
 """Stop the lever loop after this many consecutive rollbacks, indicating
-the optimizer is stuck and further iterations are unlikely to help."""
+the optimizer is stuck and further iterations are unlikely to help.
+Root causes are only marked as tried when the limit is about to be hit,
+giving the strategist a chance to retry with a different lever."""
 ARBITER_CORRECTION_TRIGGER = 3  # deprecated — use per-question thresholds below
 GENIE_CORRECT_CONFIRMATION_THRESHOLD = 2
 """Minimum independent evaluations where a question must receive ``genie_correct``

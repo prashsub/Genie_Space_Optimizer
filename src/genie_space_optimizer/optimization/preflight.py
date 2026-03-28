@@ -1119,7 +1119,7 @@ def preflight_validate_benchmarks(
 
     validation_results = validate_benchmarks(
         benchmarks, spark, catalog=catalog, gold_schema=schema,
-        w=w, warehouse_id=warehouse_id,
+        w=w, warehouse_id=warehouse_id, config=config,
     )
     pre_count = len(benchmarks)
     filtered_benchmarks: list[dict] = []
@@ -1281,7 +1281,7 @@ def preflight_validate_benchmarks(
 
         topup_revalidation = validate_benchmarks(
             benchmarks, spark, catalog=catalog, gold_schema=schema,
-            w=w, warehouse_id=warehouse_id,
+            w=w, warehouse_id=warehouse_id, config=config,
         )
         _pre_reval = len(benchmarks)
         benchmarks = [

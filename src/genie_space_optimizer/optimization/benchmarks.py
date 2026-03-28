@@ -364,6 +364,9 @@ def _resolve_params_with_defaults(
     return resolved, all_resolved
 
 
+_MV_JOIN_RE = _re.compile(r"\bJOIN\b", _re.IGNORECASE)
+
+
 def validate_ground_truth_sql(
     sql: str,
     spark: Any,
@@ -373,6 +376,7 @@ def validate_ground_truth_sql(
     execute: bool = False,
     parameters: list[dict] | None = None,
     w: Any = None,
+    config: dict | None = None,
     warehouse_id: str = "",
 ) -> tuple[bool, str]:
     """Validate a single expected SQL via EXPLAIN + table existence checks.
@@ -462,6 +466,28 @@ def validate_ground_truth_sql(
         if not exists:
             return False, err
 
+    # ── Metric view JOIN ban ────────────────────────────────────────
+    # MEASURE() queries cannot use JOINs (METRIC_VIEW_JOIN_NOT_SUPPORTED).
+    # This matches the check in _precheck_benchmarks_for_eval so that
+    # preflight catches the same issues and can regenerate replacements.
+    uses_measure = "MEASURE(" in resolved.upper()
+    if not uses_measure and config:
+        _parsed = config.get("_parsed_space", config)
+        _ds = _parsed.get("data_sources", {}) if isinstance(_parsed, dict) else {}
+        _mv_names = {
+            (mv.get("identifier") or mv.get("name") or "").lower().split(".")[-1]
+            for mv in (_ds.get("metric_views", []) if isinstance(_ds, dict) else [])
+            if isinstance(mv, dict) and (mv.get("identifier") or mv.get("name"))
+        }
+        if _mv_names and any(mv in resolved.lower() for mv in _mv_names):
+            uses_measure = True
+    if uses_measure and _MV_JOIN_RE.search(resolved):
+        return False, (
+            "METRIC_VIEW_JOIN: Metric view / MEASURE() SQL cannot use JOINs "
+            "(METRIC_VIEW_JOIN_NOT_SUPPORTED). Remove the JOIN or use a "
+            "non-metric-view query pattern."
+        )
+
     if execute:
         if w and warehouse_id:
             try:
@@ -503,8 +529,12 @@ def validate_benchmarks(
     *,
     w: Any = None,
     warehouse_id: str = "",
+    config: dict | None = None,
 ) -> list[dict]:
     """Validate each benchmark's ``expected_sql`` via EXPLAIN.
+
+    When *config* is provided, also checks for metric view JOIN violations
+    that would be caught at eval time by ``_precheck_benchmarks_for_eval``.
 
     Returns a list of validation result dicts:
     ``{question, expected_sql, valid, error}``.
@@ -515,7 +545,7 @@ def validate_benchmarks(
         question = b.get("question", "")
         is_valid, error = validate_ground_truth_sql(
             sql, spark, catalog=catalog, gold_schema=gold_schema,
-            w=w, warehouse_id=warehouse_id,
+            w=w, warehouse_id=warehouse_id, config=config,
         )
         results.append(
             {
