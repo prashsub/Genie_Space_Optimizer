@@ -482,7 +482,8 @@ def validate_ground_truth_sql(
         if _mv_names and any(mv in resolved.lower() for mv in _mv_names):
             uses_measure = True
     if uses_measure and _MV_JOIN_RE.search(resolved):
-        _uses_cte = bool(_re.search(r"\bWITH\b\s+\w+\s+AS\s*\(", resolved, _re.IGNORECASE))
+        import re as _re_mod
+        _uses_cte = bool(_re_mod.search(r"\bWITH\b\s+\w+\s+AS\s*\(", resolved, _re_mod.IGNORECASE))
         if not _uses_cte:
             return False, (
                 "METRIC_VIEW_JOIN: Metric view / MEASURE() SQL cannot use direct JOINs "
