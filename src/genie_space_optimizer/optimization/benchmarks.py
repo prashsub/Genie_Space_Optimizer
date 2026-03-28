@@ -893,13 +893,16 @@ def _extract_primary_table(sql: str, metadata_snapshot: dict) -> str | None:
     """Extract the primary table referenced in a SQL snippet expression.
 
     Looks for fully-qualified table references (catalog.schema.table) that
-    appear in the metadata snapshot's data_sources.
+    appear in the metadata snapshot's data_sources (both tables and metric views).
     """
     ds = metadata_snapshot.get("data_sources", {})
-    tables = ds.get("tables", []) if isinstance(ds, dict) else []
+    all_sources: list = []
+    if isinstance(ds, dict):
+        all_sources.extend(ds.get("tables", []) or [])
+        all_sources.extend(ds.get("metric_views", []) or [])
     table_ids = {
         t.get("identifier", "").lower(): t.get("identifier", "")
-        for t in tables if isinstance(t, dict) and t.get("identifier")
+        for t in all_sources if isinstance(t, dict) and t.get("identifier")
     }
 
     sql_lower = sql.lower()
@@ -932,14 +935,19 @@ def _auto_prefix_bare_columns(
     import re as _re
 
     ds = metadata_snapshot.get("data_sources", {})
-    tables = ds.get("tables", []) if isinstance(ds, dict) else []
+    all_sources: list = []
+    if isinstance(ds, dict):
+        all_sources.extend(ds.get("tables", []) or [])
+        all_sources.extend(ds.get("metric_views", []) or [])
 
     short_name = table_identifier.split(".")[-1] if table_identifier else ""
     if not short_name:
         return sql
 
     column_names: set[str] = set()
-    for t in (tables if isinstance(tables, list) else []):
+    for t in all_sources:
+        if not isinstance(t, dict):
+            continue
         tid = (t.get("identifier") or t.get("name") or "").lower()
         if short_name.lower() in tid:
             for col in t.get("columns", []):
