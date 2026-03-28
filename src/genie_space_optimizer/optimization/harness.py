@@ -1701,9 +1701,10 @@ def _apply_instruction_sql_expressions(
         if category not in snippets:
             snippets[category] = []
 
+        _sql_val = c["sql"]
         entry: dict = {
             "id": generate_genie_id(),
-            "sql": c["sql"],
+            "sql": [_sql_val] if isinstance(_sql_val, str) else _sql_val,
         }
         if c.get("display_name"):
             entry["display_name"] = c["display_name"]
@@ -1877,11 +1878,14 @@ def _run_sql_expression_seeding(
                 result["total_rejected"] += 1
                 continue
 
-            is_valid, err = validate_sql_snippet(
+            _valid_result = validate_sql_snippet(
                 sql_raw, snippet_type, metadata_snapshot,
                 spark=spark, catalog=catalog, gold_schema=schema,
                 w=w, warehouse_id=warehouse_id,
             )
+            is_valid = _valid_result[0]
+            err = _valid_result[1]
+            prefixed_sql = _valid_result[2] if len(_valid_result) > 2 else sql_raw
             if not is_valid:
                 logger.info("SQL expression candidate rejected: %s — %s", sql_raw[:80], err)
                 result["total_rejected"] += 1
@@ -1889,7 +1893,7 @@ def _run_sql_expression_seeding(
 
             snippet_entry = {
                 "id": generate_genie_id(),
-                "sql": [sql_raw],
+                "sql": [prefixed_sql],
                 "display_name": candidate.get("display_name", ""),
                 "synonyms": candidate.get("synonyms", []),
                 "instruction": [candidate.get("instruction", "")] if candidate.get("instruction") else [],

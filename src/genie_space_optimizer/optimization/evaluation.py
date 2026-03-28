@@ -1395,14 +1395,19 @@ def _precheck_benchmarks_for_eval(
             mv in resolved_sql.lower() for mv in mv_names_lower
         ) if mv_names_lower else False
         is_mv_context = expected_asset == "MV" or uses_measure or refs_metric_view
-        if is_mv_context and _MV_JOIN_RE.search(resolved_sql):
+        _uses_cte = bool(re.search(r"\bWITH\b\s+\w+\s+AS\s*\(", resolved_sql, re.IGNORECASE))
+        if is_mv_context and _MV_JOIN_RE.search(resolved_sql) and not _uses_cte:
             quarantined.append(
                 {
                     "question_id": qid,
                     "question": question,
                     "reason": "metric_view_join",
                     "sqlstate": None,
-                    "error": "Metric view / MEASURE() benchmarks cannot use JOINs (METRIC_VIEW_JOIN_NOT_SUPPORTED)",
+                    "error": (
+                        "Metric view / MEASURE() benchmarks cannot use direct JOINs "
+                        "(METRIC_VIEW_JOIN_NOT_SUPPORTED). Use the CTE-first pattern: "
+                        "materialize the metric view in a WITH clause, then JOIN the CTE."
+                    ),
                     "expected_sql": resolved_sql[:1500],
                 }
             )

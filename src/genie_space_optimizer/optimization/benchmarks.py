@@ -467,9 +467,9 @@ def validate_ground_truth_sql(
             return False, err
 
     # ── Metric view JOIN ban ────────────────────────────────────────
-    # MEASURE() queries cannot use JOINs (METRIC_VIEW_JOIN_NOT_SUPPORTED).
-    # This matches the check in _precheck_benchmarks_for_eval so that
-    # preflight catches the same issues and can regenerate replacements.
+    # MEASURE() queries cannot use direct JOINs (METRIC_VIEW_JOIN_NOT_SUPPORTED).
+    # However, the CTE-first pattern IS valid: MEASURE() inside a WITH clause,
+    # then JOIN the CTE result to a dimension table.
     uses_measure = "MEASURE(" in resolved.upper()
     if not uses_measure and config:
         _parsed = config.get("_parsed_space", config)
@@ -482,11 +482,13 @@ def validate_ground_truth_sql(
         if _mv_names and any(mv in resolved.lower() for mv in _mv_names):
             uses_measure = True
     if uses_measure and _MV_JOIN_RE.search(resolved):
-        return False, (
-            "METRIC_VIEW_JOIN: Metric view / MEASURE() SQL cannot use JOINs "
-            "(METRIC_VIEW_JOIN_NOT_SUPPORTED). Remove the JOIN or use a "
-            "non-metric-view query pattern."
-        )
+        _uses_cte = bool(_re.search(r"\bWITH\b\s+\w+\s+AS\s*\(", resolved, _re.IGNORECASE))
+        if not _uses_cte:
+            return False, (
+                "METRIC_VIEW_JOIN: Metric view / MEASURE() SQL cannot use direct JOINs "
+                "(METRIC_VIEW_JOIN_NOT_SUPPORTED). Use the CTE-first pattern: "
+                "materialize the metric view in a WITH clause, then JOIN the CTE result."
+            )
 
     if execute:
         if w and warehouse_id:
@@ -975,12 +977,12 @@ def validate_sql_snippet(
     gold_schema: str = "",
     w: Any = None,
     warehouse_id: str = "",
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     """Validate a SQL snippet by wrapping it in an executable context and running it.
 
     Three-phase validation mirroring validate_ground_truth_sql:
-      1. EXPLAIN — catches syntax errors and unresolvable references.
-      2. Identifier cross-check — ensures all table/column refs exist.
+      1. Auto-prefix bare column names with table name (Genie API requirement).
+      2. EXPLAIN — catches syntax errors and unresolvable references.
       3. Execution — runs the wrapped SQL with LIMIT 1.
 
     Wrapping rules:
@@ -988,11 +990,13 @@ def validate_sql_snippet(
       - filter:     SELECT 1 FROM <table> WHERE <sql> LIMIT 1
       - expression: SELECT <sql> FROM <table> LIMIT 1
 
-    Returns (is_valid, error_message).
+    Returns ``(is_valid, error_message, prefixed_sql)`` — callers should
+    use ``prefixed_sql`` (the 3rd element) when storing the snippet to
+    ensure ``table.column`` syntax required by the Genie API.
     """
     table = _extract_primary_table(sql, metadata_snapshot)
     if not table:
-        return False, "Cannot determine primary table for SQL snippet"
+        return False, "Cannot determine primary table for SQL snippet", sql
 
     resolved_table = resolve_sql(
         f"${{catalog}}.${{gold_schema}}.{table.split('.')[-1]}"
@@ -1024,11 +1028,11 @@ def validate_sql_snippet(
     try:
         _run_sql(f"EXPLAIN {wrapped}")
     except Exception as exc:
-        return False, f"EXPLAIN failed: {exc}"
+        return False, f"EXPLAIN failed: {exc}", sql
 
     try:
         _run_sql(wrapped)
     except Exception as exc:
-        return False, f"Execution failed: {exc}"
+        return False, f"Execution failed: {exc}", sql
 
-    return True, ""
+    return True, "", sql

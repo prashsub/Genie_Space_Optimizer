@@ -2766,7 +2766,7 @@ def _build_join_specs_from_proven(
             "right": {"identifier": right_fqn, "alias": right_short},
             "sql": sql_parts,
         }
-        spec = ensure_join_spec_fields(spec)
+        spec = ensure_join_spec_fields(spec, config=metadata_snapshot)
 
         if not _validate_join_spec_entry(spec):
             logger.info(
@@ -7385,14 +7385,15 @@ def _generate_lever6_proposal(
         if spark is not None or (w is not None and warehouse_id):
             from genie_space_optimizer.optimization.benchmarks import validate_sql_snippet
 
-            is_valid, err = validate_sql_snippet(
+            _valid_result = validate_sql_snippet(
                 sql_raw, snippet_type, metadata_snapshot,
                 spark=spark, catalog=catalog, gold_schema=gold_schema,
                 w=w, warehouse_id=warehouse_id,
             )
-            if not is_valid:
-                logger.warning("Lever 6: SQL snippet failed execution validation: %s", err)
+            if not _valid_result[0]:
+                logger.warning("Lever 6: SQL snippet failed execution validation: %s", _valid_result[1])
                 return None
+            sql_raw = _valid_result[2] if len(_valid_result) > 2 else sql_raw
 
         existing = metadata_snapshot.get("sql_snippets", {})
         type_key = {"measure": "measures", "filter": "filters", "expression": "expressions"}[snippet_type]
@@ -7541,15 +7542,18 @@ def _convert_instructions_to_sql_expressions(
         if sql.lower().strip() in existing_sql_lower:
             continue
 
-        is_valid, err = validate_sql_snippet(
+        _valid_result = validate_sql_snippet(
             sql, snippet_type, metadata_snapshot,
             spark=spark, catalog=catalog, gold_schema=gold_schema,
             w=w, warehouse_id=warehouse_id,
         )
+        is_valid = _valid_result[0]
+        err = _valid_result[1]
+        prefixed_sql = _valid_result[2] if len(_valid_result) > 2 else sql
         if is_valid:
             validated.append({
                 "snippet_type": snippet_type,
-                "sql": sql,
+                "sql": prefixed_sql,
                 "display_name": c.get("display_name", ""),
                 "description": c.get("description", ""),
                 "synonyms": c.get("synonyms", []),
@@ -8244,7 +8248,7 @@ def generate_proposals_from_strategy(
                         "left": {"identifier": left_table},
                         "right": {"identifier": right_table},
                         "sql": [sanitized_guidance] if sanitized_guidance else [],
-                    })
+                    }, config=metadata_snapshot)
                     valid, reason = validate_join_spec_types(join_spec, metadata_snapshot)
                     if not valid:
                         logger.info("[%s] Join spec rejected (type mismatch): %s", ag_id, reason)
@@ -8300,7 +8304,7 @@ def generate_proposals_from_strategy(
                     "left": {"identifier": _lt},
                     "right": {"identifier": _rt},
                     "sql": [_sanitized] if _sanitized else [],
-                })
+                }, config=metadata_snapshot)
                 _valid, _reason = validate_join_spec_types(_j_spec, metadata_snapshot)
                 if not _valid:
                     logger.info("[%s] Judge join_assessment rejected (type): %s", ag_id, _reason)
@@ -8340,7 +8344,7 @@ def generate_proposals_from_strategy(
                     join_spec = spec_result.get("join_spec")
                     if not isinstance(join_spec, dict):
                         continue
-                    join_spec = ensure_join_spec_fields(join_spec)
+                    join_spec = ensure_join_spec_fields(join_spec, config=metadata_snapshot)
                     spec_result["join_spec"] = join_spec
                     valid, reason = validate_join_spec_types(join_spec, metadata_snapshot)
                     if not valid:
@@ -8983,7 +8987,7 @@ def generate_metadata_proposals(
         extra_fields: dict = {}
 
         if lever == 4 and isinstance(llm_result.get("join_spec"), dict):
-            llm_result["join_spec"] = ensure_join_spec_fields(llm_result["join_spec"])
+            llm_result["join_spec"] = ensure_join_spec_fields(llm_result["join_spec"], config=metadata_snapshot)
             valid, reason = validate_join_spec_types(
                 llm_result["join_spec"], metadata_snapshot
             )
@@ -9155,7 +9159,7 @@ def generate_metadata_proposals(
                 join_spec = spec_result.get("join_spec")
                 if not isinstance(join_spec, dict):
                     continue
-                join_spec = ensure_join_spec_fields(join_spec)
+                join_spec = ensure_join_spec_fields(join_spec, config=metadata_snapshot)
                 spec_result["join_spec"] = join_spec
 
                 valid, reason = validate_join_spec_types(join_spec, metadata_snapshot)

@@ -1424,7 +1424,7 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
         if op == "add":
             js = cmd.get("join_spec", {})
             if js:
-                js = ensure_join_spec_fields(js)
+                js = ensure_join_spec_fields(js, config=config)
                 if not _validate_join_spec_entry(js):
                     return False
                 specs.append(js)
@@ -1440,7 +1440,7 @@ def _apply_action_to_config(config: dict, action: dict) -> bool:
             lt, rt = cmd.get("left_table", ""), cmd.get("right_table", "")
             new_spec = cmd.get("join_spec", {})
             if new_spec:
-                new_spec = ensure_join_spec_fields(new_spec)
+                new_spec = ensure_join_spec_fields(new_spec, config=config)
                 if not _validate_join_spec_entry(new_spec):
                     return False
             for i, s in enumerate(specs):
