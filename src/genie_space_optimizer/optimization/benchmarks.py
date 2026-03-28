@@ -950,8 +950,12 @@ def _auto_prefix_bare_columns(
             continue
         tid = (t.get("identifier") or t.get("name") or "").lower()
         if short_name.lower() in tid:
-            for col in t.get("columns", []):
+            for col in (t.get("columns", []) or []):
                 cname = (col.get("name") or "").strip()
+                if cname:
+                    column_names.add(cname.lower())
+            for cc in (t.get("column_configs", []) or []):
+                cname = (cc.get("column_name") or "").strip()
                 if cname:
                     column_names.add(cname.lower())
             break

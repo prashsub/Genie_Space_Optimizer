@@ -7483,15 +7483,25 @@ def _convert_instructions_to_sql_expressions(
         return []
 
     ds = metadata_snapshot.get("data_sources", {})
-    tables = ds.get("tables", []) if isinstance(ds, dict) else []
+    all_sources: list = []
+    if isinstance(ds, dict):
+        all_sources.extend(ds.get("tables", []) or [])
+        all_sources.extend(ds.get("metric_views", []) or [])
     schema_lines: list[str] = []
-    for t in (tables if isinstance(tables, list) else []):
-        tname = t.get("name", "")
-        for col in t.get("columns", []):
+    for t in all_sources:
+        if not isinstance(t, dict):
+            continue
+        tname = t.get("identifier", t.get("name", "")).split(".")[-1]
+        for col in (t.get("columns", []) or []):
             cname = col.get("name", "")
             ctype = col.get("type_text", col.get("type", ""))
             desc = col.get("description", "")[:80]
-            schema_lines.append(f"{tname}.{cname} ({ctype}): {desc}")
+            if cname:
+                schema_lines.append(f"{tname}.{cname} ({ctype}): {desc}")
+        for cc in (t.get("column_configs", []) or []):
+            cname = cc.get("column_name", "")
+            if cname and not any(cname in ln for ln in schema_lines):
+                schema_lines.append(f"{tname}.{cname}: (from column_configs)")
     schema_context = "\n".join(schema_lines) if schema_lines else "(no schema available)"
 
     instr = metadata_snapshot.get("instructions", {})
