@@ -3713,6 +3713,7 @@ def _analyze_and_distribute(
                     "wrong_clause": jt.get("wrong_clause"),
                     "rationale_snippet": jt.get("rationale_snippet"),
                     "cluster_id": c.get("cluster_id", ""),
+                    "mapped_lever": c.get("_mapped_lever"),
                 })
 
     # ── Pipeline lineage summary ───────────────────────────────────
@@ -3795,6 +3796,7 @@ def _run_gate_checks(
     import mlflow
 
     uc_schema = f"{catalog}.{schema}"
+    _primary_lever = int(lever_keys[0]) if lever_keys else 0
 
     has_dict_changes = any(
         (entry.get("patch", {}) or {}).get("enable_entity_matching")
@@ -3898,7 +3900,7 @@ def _run_gate_checks(
             )
             try:
                 update_provenance_gate(
-                    spark, run_id, iteration_counter, 0,
+                    spark, run_id, iteration_counter - 1, _primary_lever,
                     "slice", "rollback",
                     {"regressions": [{"judge": d["judge"], "drop": d["drop"]} for d in slice_drops]},
                     catalog, schema,
@@ -3908,7 +3910,7 @@ def _run_gate_checks(
             try:
                 log_gate_feedback_on_traces(
                     slice_result, "slice", "rollback",
-                    regressions=slice_drops, lever=0, iteration=iteration_counter,
+                    regressions=slice_drops, lever=_primary_lever, iteration=iteration_counter,
                 )
             except Exception:
                 logger.debug("Failed to log gate feedback", exc_info=True)
@@ -4120,7 +4122,7 @@ def _run_gate_checks(
         )
         try:
             update_provenance_gate(
-                spark, run_id, iteration_counter, 0,
+                spark, run_id, iteration_counter - 1, _primary_lever,
                 "full", "rollback",
                 {"regressions": [{"judge": r["judge"], "drop": r["drop"]} for r in regressions]},
                 catalog, schema,
@@ -4130,7 +4132,7 @@ def _run_gate_checks(
         try:
             log_gate_feedback_on_traces(
                 full_result, "full", "rollback",
-                regressions=regressions, lever=0, iteration=iteration_counter,
+                regressions=regressions, lever=_primary_lever, iteration=iteration_counter,
             )
         except Exception:
             logger.debug("Failed to log full eval gate feedback", exc_info=True)
@@ -4149,7 +4151,7 @@ def _run_gate_checks(
     )
     try:
         update_provenance_gate(
-            spark, run_id, iteration_counter, 0,
+            spark, run_id, iteration_counter - 1, _primary_lever,
             "full", "pass", None, catalog, schema,
         )
     except Exception:
@@ -4157,7 +4159,7 @@ def _run_gate_checks(
     try:
         log_gate_feedback_on_traces(
             full_result, "full", "pass",
-            lever=0, iteration=iteration_counter,
+            lever=_primary_lever, iteration=iteration_counter,
         )
     except Exception:
         logger.debug("Failed to log full eval gate feedback", exc_info=True)
@@ -5193,7 +5195,7 @@ def _run_lever_loop(
             for p in all_proposals if p.get("cluster_id")
         ]
         try:
-            update_provenance_proposals(spark, run_id, iteration_counter, _prop_mappings, catalog, schema)
+            update_provenance_proposals(spark, run_id, iteration_counter - 1, _prop_mappings, catalog, schema)
         except Exception:
             logger.debug("Failed to update provenance proposals", exc_info=True)
 

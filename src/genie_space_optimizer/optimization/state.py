@@ -825,10 +825,11 @@ def write_provenance(
         blame = p.get("blame_set")
         if isinstance(blame, list):
             blame = json.dumps(blame)
+        row_lever = p.get("mapped_lever") if p.get("mapped_lever") is not None else lever
         row: dict[str, Any] = {
             "run_id": run_id,
             "iteration": iteration,
-            "lever": lever,
+            "lever": int(row_lever),
             "question_id": p.get("question_id", ""),
             "signal_type": p.get("signal_type", "hard"),
             "arbiter_verdict": p.get("arbiter_verdict"),
